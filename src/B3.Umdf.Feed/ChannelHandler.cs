@@ -16,11 +16,11 @@ public sealed class ChannelHandler
         _eventHandler = eventHandler;
     }
 
-    public void HandlePacket(in UmdfPacket packet)
+    public GapResult HandlePacket(in UmdfPacket packet)
     {
         var span = packet.Data.Span;
         if (span.Length < UmdfPacketHeader.Size)
-            return;
+            return GapResult.InSequence;
 
         ref readonly var header = ref UmdfPacketHeader.Read(span);
         var gapResult = _gapDetector.Check(header.SequenceNumber);
@@ -28,7 +28,7 @@ public sealed class ChannelHandler
         switch (gapResult)
         {
             case GapResult.Duplicate:
-                return; // Feed A/B dedup
+                return GapResult.Duplicate; // Feed A/B dedup
 
             case GapResult.Gap:
                 _inRecovery = true;
@@ -37,6 +37,7 @@ public sealed class ChannelHandler
         }
 
         MessageDispatcher.Dispatch(in packet, _eventHandler);
+        return gapResult;
     }
 
     public void Reset()

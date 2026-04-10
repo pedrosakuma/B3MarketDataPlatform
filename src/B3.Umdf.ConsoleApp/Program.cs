@@ -33,20 +33,25 @@ var bookHandler = new ConsoleBookEventHandler();
 var bookManager = new BookManager(bookHandler);
 var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = 0 }); // burst mode
 
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
 using var feedHandler = new FeedHandler(replayer, bookManager);
-await feedHandler.StartAsync();
+await feedHandler.StartAsync(cts.Token);
 
 try
 {
-    // Wait for the replay to finish (replayer will close the channel)
-    await Task.Delay(Timeout.Infinite, CancellationToken.None);
+    // Wait for the replay to finish (replayer closes the channel when done)
+    await feedHandler.WaitForCompletionAsync();
 }
 catch (OperationCanceledException)
 {
+    Console.WriteLine("Cancelled.");
 }
 
 Console.WriteLine();
 Console.WriteLine("Replay complete.");
+Console.WriteLine($"  State: {feedHandler.State}");
 Console.WriteLine($"  Books tracked: {bookManager.Books.Count}");
 
 return 0;
@@ -54,9 +59,13 @@ return 0;
 sealed class ConsoleBookEventHandler : IBookEventHandler
 {
     private int _tradeCount;
+    private int _orderCount;
 
     public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
     {
+        _orderCount++;
+        if (_orderCount <= 10 || _orderCount % 100_000 == 0)
+            Console.WriteLine($"  Order #{_orderCount}: SecurityId={entry.SecurityId} {entry.Side} Price={entry.Price} Qty={entry.Quantity}");
     }
 
     public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
@@ -70,7 +79,7 @@ sealed class ConsoleBookEventHandler : IBookEventHandler
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
     {
         _tradeCount++;
-        if (_tradeCount <= 100 || _tradeCount % 1000 == 0)
+        if (_tradeCount <= 100 || _tradeCount % 10_000 == 0)
         {
             Console.WriteLine($"  Trade #{_tradeCount}: SecurityId={securityId} Price={price} Qty={quantity} TradeId={tradeId}");
         }
