@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.Umdf.Sbe</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- CS8656 is emitted by SbeSourceGenerator composites (ToString calling non-readonly getters).
+         Tracked upstream — suppress until generator is fixed. -->
+    <NoWarn>CS8656</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SbeSourceGenerator" Version="1.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AdditionalFiles Include="..\..\schemas\b3-market-data-messages-2.2.0.xml" />
+  </ItemGroup>
+
+</Project>

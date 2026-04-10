@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>B3.Umdf.ConsoleApp</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\B3.Umdf.Sbe\B3.Umdf.Sbe.csproj" />
+    <ProjectReference Include="..\B3.Umdf.Transport\B3.Umdf.Transport.csproj" />
+    <ProjectReference Include="..\B3.Umdf.Feed\B3.Umdf.Feed.csproj" />
+    <ProjectReference Include="..\B3.Umdf.Book\B3.Umdf.Book.csproj" />
+    <ProjectReference Include="..\B3.Umdf.PcapReplay\B3.Umdf.PcapReplay.csproj" />
+  </ItemGroup>
+
+</Project>
