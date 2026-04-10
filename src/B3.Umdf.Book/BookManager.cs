@@ -2,6 +2,11 @@ using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
 
+using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data;
+using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V6.DeleteOrder_MBO_51Data;
+using MassDeleteOrders_MBO_52Data = B3.Umdf.Mbo.Sbe.V16.V6.MassDeleteOrders_MBO_52Data;
+using Trade_53Data = B3.Umdf.Mbo.Sbe.V16.V6.Trade_53Data;
+
 namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler
