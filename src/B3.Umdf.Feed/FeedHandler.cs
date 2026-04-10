@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
 
 namespace B3.Umdf.Feed;
@@ -97,7 +98,6 @@ public sealed class FeedHandler : IDisposable
                 break;
 
             case FeedState.CatchUp:
-                // Should not receive new packets in catch-up (it's a drain of the queue)
                 break;
 
             case FeedState.RealTime:
@@ -122,8 +122,6 @@ public sealed class FeedHandler : IDisposable
             case ChannelType.IncrementalB:
                 _incrementalQueue.Enqueue(packet);
                 break;
-
-            // Ignore snapshot during this phase
         }
     }
 
@@ -139,8 +137,6 @@ public sealed class FeedHandler : IDisposable
             case ChannelType.IncrementalB:
                 _incrementalQueue.Enqueue(packet);
                 break;
-
-            // Ignore instrument definition during this phase
         }
     }
 
@@ -157,7 +153,6 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.InstrumentDefinition:
             case ChannelType.SnapshotRecovery:
-                // In real-time, we still dispatch these for the event handler
                 MessageDispatcher.Dispatch(in packet, _eventHandler);
                 break;
         }
@@ -179,68 +174,51 @@ public sealed class FeedHandler : IDisposable
     }
 
     private long _instrDefPacketCount;
-    private long _instrDefMsgCount;
-    private long _instrDefParseFailCount;
 
     private void DispatchAndTrackInstrDef(in UmdfPacket packet)
     {
         var span = packet.Data.Span;
-        if (span.Length < UmdfPacketHeader.Size)
+        if (!PacketHeader.TryParse(span, out var pktHeader, out _))
             return;
 
         _instrDefPacketCount++;
 
-        ref readonly var header = ref UmdfPacketHeader.Read(span);
-        int offset = UmdfPacketHeader.Size;
+        int offset = PacketHeader.MESSAGE_SIZE;
 
-        if (_instrDefPacketCount <= 3)
-            Console.WriteLine($"[InstrDef] Packet #{_instrDefPacketCount}: SeqNum={header.SequenceNumber} MsgCount={header.MessageCount} DataLen={span.Length}");
-
-        for (int i = 0; i < header.MessageCount; i++)
+        while (offset + FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize <= span.Length)
         {
-            if (offset + MessageDispatcher.SbeHeaderSize > span.Length)
+            var framingSlice = span[offset..];
+            if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
                 break;
 
-            ushort blockLength = MemoryMarshal.Read<ushort>(span[offset..]);
-            ushort templateId = MemoryMarshal.Read<ushort>(span[(offset + 2)..]);
-            ushort schemaId = MemoryMarshal.Read<ushort>(span[(offset + 4)..]);
-            ushort version = MemoryMarshal.Read<ushort>(span[(offset + 6)..]);
+            if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize)
+                break;
 
-            _instrDefMsgCount++;
+            if (offset + framing.MessageLength > span.Length)
+                break;
 
-            if (_instrDefMsgCount <= 5)
-                Console.WriteLine($"[InstrDef]   Msg #{_instrDefMsgCount}: templateId={templateId} blockLen={blockLength} schemaId={schemaId} version={version} offset={offset}");
+            var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
+            ushort templateId = MemoryMarshal.Read<ushort>(sbeSlice[2..]);
 
-            var messageSpan = span[offset..];
-            _eventHandler.OnPacket(in packet, messageSpan, templateId);
+            _eventHandler.OnPacket(in packet, sbeSlice, templateId);
 
-            // Track SecurityDefinition_12 to detect end of cycle
-            if (templateId == 12) // SecurityDefinition
+            if (templateId == 12) // SecurityDefinition_12
             {
-                var body = messageSpan[MessageDispatcher.SbeHeaderSize..];
+                var body = sbeSlice[MessageDispatcher.SbeHeaderSize..];
                 TrackSecurityDefinition(body);
             }
 
-            offset += MessageDispatcher.SbeHeaderSize + blockLength;
+            offset += framing.MessageLength;
         }
     }
 
     private void TrackSecurityDefinition(ReadOnlySpan<byte> body)
     {
-        if (!B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(body, out var reader))
-        {
-            _instrDefParseFailCount++;
-            if (_instrDefParseFailCount <= 3)
-                Console.WriteLine($"[InstrDef] TryParse FAILED (bodyLen={body.Length})");
+        if (!SecurityDefinition_12Data.TryParse(body, out var reader))
             return;
-        }
 
         ref readonly var msg = ref reader.Data;
-
         _instrDefReceived++;
-
-        if (_instrDefReceived <= 3)
-            Console.WriteLine($"[InstrDef] Parsed #{_instrDefReceived}: SecurityID={(ulong)msg.SecurityID} TotNoRelatedSym={msg.TotNoRelatedSym}");
 
         if (_instrDefTotalExpected == 0)
             _instrDefTotalExpected = msg.TotNoRelatedSym;
@@ -255,20 +233,15 @@ public sealed class FeedHandler : IDisposable
     private void DispatchAndTrackSnapshot(in UmdfPacket packet)
     {
         var span = packet.Data.Span;
-        if (span.Length < UmdfPacketHeader.Size)
+        if (!PacketHeader.TryParse(span, out var pktHeader, out _))
             return;
 
-        ref readonly var header = ref UmdfPacketHeader.Read(span);
-
         // Snapshot stream cycles continuously. SeqNum=1 marks start of a cycle.
-        // When we see SeqNum=1 after having already consumed a cycle, it's complete.
-        if (header.SequenceNumber == 1)
+        if (pktHeader.SequenceNumber == 1)
         {
             if (_snapshotCycleStarted && _snapshotLastSeqNum > 0)
             {
-                // We've consumed a full cycle — transition
                 CompleteSnapshotCycle();
-                // Don't return — also process this packet as part of the new cycle (or ignore)
                 return;
             }
             _snapshotCycleStarted = true;
@@ -276,41 +249,43 @@ public sealed class FeedHandler : IDisposable
         }
 
         if (!_snapshotCycleStarted)
-            return; // Wait for start of cycle
+            return;
 
-        int offset = UmdfPacketHeader.Size;
+        int offset = PacketHeader.MESSAGE_SIZE;
 
-        for (int i = 0; i < header.MessageCount; i++)
+        while (offset + FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize <= span.Length)
         {
-            if (offset + MessageDispatcher.SbeHeaderSize > span.Length)
+            var framingSlice = span[offset..];
+            if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
                 break;
 
-            ushort blockLength = MemoryMarshal.Read<ushort>(span[offset..]);
-            ushort templateId = MemoryMarshal.Read<ushort>(span[(offset + 2)..]);
+            if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize)
+                break;
 
-            var messageSpan = span[offset..];
-            _eventHandler.OnPacket(in packet, messageSpan, templateId);
+            if (offset + framing.MessageLength > span.Length)
+                break;
 
-            // Track SnapshotFullRefresh_Header_30 for LastMsgSeqNumProcessed
-            if (templateId == 30) // SnapshotFullRefresh_Header
+            var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
+            ushort templateId = MemoryMarshal.Read<ushort>(sbeSlice[2..]);
+
+            _eventHandler.OnPacket(in packet, sbeSlice, templateId);
+
+            if (templateId == 30) // SnapshotFullRefresh_Header_30
             {
-                var body = messageSpan[MessageDispatcher.SbeHeaderSize..];
+                var body = sbeSlice[MessageDispatcher.SbeHeaderSize..];
                 TrackSnapshotHeader(body);
             }
 
-            offset += MessageDispatcher.SbeHeaderSize + blockLength;
+            offset += framing.MessageLength;
         }
     }
 
     private void TrackSnapshotHeader(ReadOnlySpan<byte> body)
     {
-        if (!B3.Umdf.Mbo.Sbe.V16.SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader))
+        if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader))
             return;
 
         ref readonly var msg = ref reader.Data;
-
-        // Track the highest LastMsgSeqNumProcessed from the snapshot.
-        // This tells us which incremental SeqNum the snapshot is consistent with.
         uint lastProcessed = (uint)msg.LastMsgSeqNumProcessed;
         if (lastProcessed > _snapshotLastSeqNum)
             _snapshotLastSeqNum = lastProcessed;
@@ -332,20 +307,15 @@ public sealed class FeedHandler : IDisposable
 
         TransitionTo(FeedState.CatchUp);
 
-        // Reset incremental gap detector to expect SeqNum after the snapshot
         _incrementalHandler.CompleteRecovery(catchUpFrom + 1);
 
-        // Drain the queue: discard packets with SeqNum <= catchUpFrom, process the rest
         int discarded = 0;
         int applied = 0;
 
         while (_incrementalQueue.TryDequeue(out var queued))
         {
-            var span = queued.Data.Span;
-            if (span.Length < UmdfPacketHeader.Size)
+            if (!queued.TryGetHeader(out var hdr))
                 continue;
-
-            ref readonly var hdr = ref UmdfPacketHeader.Read(span);
 
             if (hdr.SequenceNumber <= catchUpFrom)
             {

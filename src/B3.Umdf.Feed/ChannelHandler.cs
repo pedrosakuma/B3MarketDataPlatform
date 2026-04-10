@@ -1,3 +1,4 @@
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
 
 namespace B3.Umdf.Feed;
@@ -19,16 +20,15 @@ public sealed class ChannelHandler
     public GapResult HandlePacket(in UmdfPacket packet)
     {
         var span = packet.Data.Span;
-        if (span.Length < UmdfPacketHeader.Size)
+        if (!PacketHeader.TryParse(span, out var header, out _))
             return GapResult.InSequence;
 
-        ref readonly var header = ref UmdfPacketHeader.Read(span);
         var gapResult = _gapDetector.Check(header.SequenceNumber);
 
         switch (gapResult)
         {
             case GapResult.Duplicate:
-                return GapResult.Duplicate; // Feed A/B dedup
+                return GapResult.Duplicate;
 
             case GapResult.Gap:
                 _inRecovery = true;

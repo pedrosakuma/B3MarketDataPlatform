@@ -1,11 +1,11 @@
-using System.Runtime.InteropServices;
+using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
 
 namespace B3.Umdf.Feed;
 
 public static class MessageDispatcher
 {
-    public const int SbeHeaderSize = 8;
+    public const int SbeHeaderSize = 8; // SBE MessageHeader: blockLength(2) + templateId(2) + schemaId(2) + version(2)
 
     public static void Dispatch(in UmdfPacket packet, IFeedEventHandler handler)
     {
@@ -13,22 +13,27 @@ public static class MessageDispatcher
         if (span.Length < UmdfPacketHeader.Size)
             return;
 
-        ref readonly var header = ref UmdfPacketHeader.Read(span);
         int offset = UmdfPacketHeader.Size;
 
-        for (int i = 0; i < header.MessageCount; i++)
+        while (offset + FramingHeader.MESSAGE_SIZE + SbeHeaderSize <= span.Length)
         {
-            if (offset + SbeHeaderSize > span.Length)
+            var framingSlice = span[offset..];
+            if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
                 break;
 
-            ushort blockLength = MemoryMarshal.Read<ushort>(span[offset..]);
-            ushort templateId = MemoryMarshal.Read<ushort>(span[(offset + 2)..]);
+            if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + SbeHeaderSize)
+                break;
 
-            var messageSpan = span[offset..];
-            handler.OnPacket(in packet, messageSpan, templateId);
+            if (offset + framing.MessageLength > span.Length)
+                break;
 
-            // Advance past SBE header + block
-            offset += SbeHeaderSize + blockLength;
+            // SBE message starts right after the FramingHeader
+            var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
+            ushort templateId = System.Runtime.InteropServices.MemoryMarshal.Read<ushort>(sbeSlice[2..]);
+
+            handler.OnPacket(in packet, sbeSlice, templateId);
+
+            offset += framing.MessageLength;
         }
     }
 }
