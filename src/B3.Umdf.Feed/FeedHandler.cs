@@ -13,6 +13,7 @@ public sealed class FeedHandler : IDisposable
 
     private FeedState _state = FeedState.WaitInstrumentDefinition;
     private readonly Queue<UmdfPacket> _incrementalQueue = new();
+    private long _packetCount;
 
     // Instrument Definition tracking
     private uint _instrDefTotalExpected;
@@ -23,6 +24,7 @@ public sealed class FeedHandler : IDisposable
     private bool _snapshotCycleStarted;
 
     public FeedState State => _state;
+    public long PacketCount => _packetCount;
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
     public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler)
@@ -65,6 +67,7 @@ public sealed class FeedHandler : IDisposable
             try
             {
                 var packet = await _source.ReceiveAsync(ct);
+                _packetCount++;
                 HandlePacket(in packet);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
