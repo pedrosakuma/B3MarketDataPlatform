@@ -22,4 +22,26 @@ public sealed class OrderBook
         Asks.Clear();
         LastRptSeq = 0;
     }
+
+    /// <summary>
+    /// Validates the full book state. Returns a list of errors (empty if valid).
+    /// Checks internal consistency of both sides and cross-side invariants
+    /// (e.g. no order appearing on both sides).
+    /// </summary>
+    public List<string> Validate()
+    {
+        var errors = new List<string>();
+
+        errors.AddRange(Bids.Validate().Select(e => $"[Bids] {e}"));
+        errors.AddRange(Asks.Validate().Select(e => $"[Asks] {e}"));
+
+        // Cross-side: no orderId should exist on both sides
+        foreach (var orderId in Bids.Orders.Keys)
+        {
+            if (Asks.Orders.ContainsKey(orderId))
+                errors.Add($"Order {orderId} exists on both Bid and Ask sides");
+        }
+
+        return errors;
+    }
 }
