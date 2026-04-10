@@ -50,6 +50,8 @@ using var statsTimer = new Timer(_ =>
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] State: {state} ──");
     Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  Books: {bookManager.Books.Count:N0}");
+    if (state == FeedState.WaitInstrumentDefinition)
+        Console.WriteLine($"   InstrDef: {feedHandler.InstrDefReceived:N0}/{feedHandler.InstrDefTotalExpected:N0} parsed  ({feedHandler.InstrDefPacketCount:N0} packets)");
 
     if (state == FeedState.RealTime && bookManager.Books.Count > 0)
         PrintBookSample(bookManager);

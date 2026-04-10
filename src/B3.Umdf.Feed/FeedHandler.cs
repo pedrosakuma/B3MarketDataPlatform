@@ -25,6 +25,9 @@ public sealed class FeedHandler : IDisposable
 
     public FeedState State => _state;
     public long PacketCount => _packetCount;
+    public long InstrDefPacketCount => _instrDefPacketCount;
+    public uint InstrDefReceived => _instrDefReceived;
+    public uint InstrDefTotalExpected => _instrDefTotalExpected;
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
     public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler)
@@ -175,14 +178,23 @@ public sealed class FeedHandler : IDisposable
         }
     }
 
+    private long _instrDefPacketCount;
+    private long _instrDefMsgCount;
+    private long _instrDefParseFailCount;
+
     private void DispatchAndTrackInstrDef(in UmdfPacket packet)
     {
         var span = packet.Data.Span;
         if (span.Length < UmdfPacketHeader.Size)
             return;
 
+        _instrDefPacketCount++;
+
         ref readonly var header = ref UmdfPacketHeader.Read(span);
         int offset = UmdfPacketHeader.Size;
+
+        if (_instrDefPacketCount <= 3)
+            Console.WriteLine($"[InstrDef] Packet #{_instrDefPacketCount}: SeqNum={header.SequenceNumber} MsgCount={header.MessageCount} DataLen={span.Length}");
 
         for (int i = 0; i < header.MessageCount; i++)
         {
@@ -191,6 +203,13 @@ public sealed class FeedHandler : IDisposable
 
             ushort blockLength = MemoryMarshal.Read<ushort>(span[offset..]);
             ushort templateId = MemoryMarshal.Read<ushort>(span[(offset + 2)..]);
+            ushort schemaId = MemoryMarshal.Read<ushort>(span[(offset + 4)..]);
+            ushort version = MemoryMarshal.Read<ushort>(span[(offset + 6)..]);
+
+            _instrDefMsgCount++;
+
+            if (_instrDefMsgCount <= 5)
+                Console.WriteLine($"[InstrDef]   Msg #{_instrDefMsgCount}: templateId={templateId} blockLen={blockLength} schemaId={schemaId} version={version} offset={offset}");
 
             var messageSpan = span[offset..];
             _eventHandler.OnPacket(in packet, messageSpan, templateId);
@@ -209,11 +228,19 @@ public sealed class FeedHandler : IDisposable
     private void TrackSecurityDefinition(ReadOnlySpan<byte> body)
     {
         if (!B3.Umdf.Mbo.Sbe.V16.SecurityDefinition_12Data.TryParse(body, out var reader))
+        {
+            _instrDefParseFailCount++;
+            if (_instrDefParseFailCount <= 3)
+                Console.WriteLine($"[InstrDef] TryParse FAILED (bodyLen={body.Length})");
             return;
+        }
 
         ref readonly var msg = ref reader.Data;
 
         _instrDefReceived++;
+
+        if (_instrDefReceived <= 3)
+            Console.WriteLine($"[InstrDef] Parsed #{_instrDefReceived}: SecurityID={(ulong)msg.SecurityID} TotNoRelatedSym={msg.TotNoRelatedSym}");
 
         if (_instrDefTotalExpected == 0)
             _instrDefTotalExpected = msg.TotNoRelatedSym;

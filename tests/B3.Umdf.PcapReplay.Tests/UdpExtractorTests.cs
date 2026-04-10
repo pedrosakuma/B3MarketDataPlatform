@@ -48,4 +48,27 @@ public class UdpExtractorTests
         Assert.Throws<NotSupportedException>(() =>
             UdpExtractor.ExtractUdpPayload(new byte[100], linkType: 99));
     }
+
+    [Fact]
+    public void ExtractUdpPayload_VlanTagged_ReturnsPayload()
+    {
+        // Ethernet + 802.1Q VLAN tag (4 extra bytes) + IP + UDP + payload
+        byte[] payload = "VLAN"u8.ToArray();
+        byte[] frame = new byte[14 + 4 + 20 + 8 + payload.Length]; // 18 byte eth + IP + UDP
+
+        // EtherType at offset 12 = 0x8100 (VLAN)
+        frame[12] = 0x81;
+        frame[13] = 0x00;
+        // VLAN TCI at 14-15 (don't care)
+        // Real EtherType at offset 16 = 0x0800 (IPv4)
+        frame[16] = 0x08;
+        frame[17] = 0x00;
+        // IP header at offset 18: version=4, IHL=5
+        frame[18] = 0x45;
+        // UDP header at offset 38, payload at offset 46
+        Array.Copy(payload, 0, frame, 46, payload.Length);
+
+        var extracted = UdpExtractor.ExtractUdpPayload(frame, linkType: 1);
+        Assert.Equal(payload, extracted.ToArray());
+    }
 }
