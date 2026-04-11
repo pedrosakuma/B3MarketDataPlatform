@@ -2,43 +2,97 @@ using System.Diagnostics;
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
 using B3.Umdf.PcapReplay;
+using B3.Umdf.Server;
 using B3.Umdf.Transport;
 
-if (args.Length < 1)
+// Parse named arguments
+int? wsPort = null;
+var positionalArgs = new List<string>();
+
+for (int i = 0; i < args.Length; i++)
 {
-    Console.WriteLine("Usage: B3.Umdf.ConsoleApp <incremental-a.pcap> [incremental-b.pcap] [instrdef.pcap] [snapshot.pcap]");
+    if (args[i] == "--ws-port" && i + 1 < args.Length)
+    {
+        if (!int.TryParse(args[++i], out var p) || p < 1 || p > 65535)
+        {
+            Console.Error.WriteLine("Invalid --ws-port value.");
+            return 1;
+        }
+        wsPort = p;
+    }
+    else
+    {
+        positionalArgs.Add(args[i]);
+    }
+}
+
+if (positionalArgs.Count < 1)
+{
+    Console.WriteLine("Usage: B3.Umdf.ConsoleApp <incremental-a.pcap> [incremental-b.pcap] [instrdef.pcap] [snapshot.pcap] [--ws-port <port>]");
     Console.WriteLine();
     Console.WriteLine("Replays B3 UMDF Binary PCAP files and prints decoded market data.");
     Console.WriteLine("Files are merged by timestamp for accurate cross-channel ordering.");
+    Console.WriteLine();
+    Console.WriteLine("Options:");
+    Console.WriteLine("  --ws-port <port>   Start WebSocket subscription server on the given port");
     return 1;
 }
 
 var sources = new List<PcapChannelSource>();
 var channelTypes = new[] { ChannelType.IncrementalA, ChannelType.IncrementalB, ChannelType.InstrumentDefinition, ChannelType.SnapshotRecovery };
 
-for (int i = 0; i < args.Length && i < channelTypes.Length; i++)
+for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
 {
-    if (!File.Exists(args[i]))
+    if (!File.Exists(positionalArgs[i]))
     {
-        Console.Error.WriteLine($"File not found: {args[i]}");
+        Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
         return 1;
     }
-    sources.Add(new PcapChannelSource(args[i], channelTypes[i]));
-    Console.WriteLine($"  {channelTypes[i],-25} <- {args[i]}");
+    sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i]));
+    Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
 }
 
 Console.WriteLine();
 
 var stats = new Stats();
-var bookManager = new BookManager(stats);
-var marketDataManager = new MarketDataManager(stats);
+
+// Wire up subscription manager if WebSocket port is specified
+SubscriptionManager? subscriptionManager = null;
+WebSocketHost? wsHost = null;
+var symbolRegistry = new SymbolRegistry();
+
+IBookEventHandler bookHandler;
+IMarketDataEventHandler mdHandler;
+
+if (wsPort is not null)
+{
+    subscriptionManager = new SubscriptionManager();
+    bookHandler = new CompositeBookEventHandler(stats, subscriptionManager);
+    mdHandler = new CompositeMarketDataEventHandler(stats, subscriptionManager);
+}
+else
+{
+    bookHandler = stats;
+    mdHandler = stats;
+}
+
+var bookManager = new BookManager(bookHandler);
+var marketDataManager = new MarketDataManager(mdHandler);
 var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = 0 });
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-var composite = new CompositeFeedHandler(bookManager, marketDataManager);
+var composite = new CompositeFeedHandler(bookManager, marketDataManager, symbolRegistry);
 using var feedHandler = new FeedHandler(replayer, composite);
+
+if (subscriptionManager is not null)
+{
+    subscriptionManager.SetDataSources(bookManager, marketDataManager, symbolRegistry);
+    subscriptionManager.Start();
+    wsHost = new WebSocketHost(subscriptionManager);
+    await wsHost.StartAsync(wsPort!.Value, cts.Token);
+}
 
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
@@ -48,6 +102,9 @@ using var statsTimer = new Timer(_ =>
     var state = feedHandler.State;
     var stateChanged = state != lastState;
     lastState = state;
+
+    if (stateChanged && state == FeedState.RealTime)
+        subscriptionManager?.SetReady();
 
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] State: {state} ──");
@@ -75,6 +132,11 @@ catch (OperationCanceledException)
 statsTimer.Change(Timeout.Infinite, Timeout.Infinite);
 sw.Stop();
 
+if (wsHost is not null)
+    await wsHost.StopAsync();
+subscriptionManager?.Dispose();
+wsHost?.Dispose();
+
 Console.WriteLine();
 Console.WriteLine($"═══ Replay complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
 Console.WriteLine($"  Final state:  {feedHandler.State}");
@@ -89,6 +151,7 @@ Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
 Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
 Console.WriteLine($"  Books:        {bookManager.Books.Count:N0}");
 Console.WriteLine($"  Instruments:  {marketDataManager.InstrumentData.Count:N0}");
+Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
 
 if (bookManager.Books.Count > 0)
     PrintBookSample(bookManager);

@@ -143,15 +143,24 @@ public sealed class BookManager : IFeedEventHandler
         if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
         {
             long oldPrice = existing.Price;
-            existing.Price = price;
-            existing.Quantity = quantity;
-            existing.EnteringFirm = enteringFirm;
 
-            if (oldPrice != price)
-                bookSide.MoveOrder(existing, oldPrice);
+            book.BeginWrite();
+            try
+            {
+                existing.Price = price;
+                existing.Quantity = quantity;
+                existing.EnteringFirm = enteringFirm;
 
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                if (oldPrice != price)
+                    bookSide.MoveOrder(existing, oldPrice);
+
+                if (msg.RptSeq is { } rptSeq)
+                    book.LastRptSeq = (uint)rptSeq;
+            }
+            finally
+            {
+                book.EndWrite();
+            }
 
             _eventHandler?.OnOrderUpdated(book, existing);
         }
@@ -167,10 +176,18 @@ public sealed class BookManager : IFeedEventHandler
                 Side = side
             };
 
-            bookSide.Add(entry);
+            book.BeginWrite();
+            try
+            {
+                bookSide.Add(entry);
 
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                if (msg.RptSeq is { } rptSeq)
+                    book.LastRptSeq = (uint)rptSeq;
+            }
+            finally
+            {
+                book.EndWrite();
+            }
 
             _eventHandler?.OnOrderAdded(book, entry);
         }
@@ -190,10 +207,18 @@ public sealed class BookManager : IFeedEventHandler
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
         ulong orderId = (ulong)msg.SecondaryOrderID;
 
-        book.GetSide(side).Remove(orderId);
+        book.BeginWrite();
+        try
+        {
+            book.GetSide(side).Remove(orderId);
 
-        if (msg.RptSeq is { } rptSeq)
-            book.LastRptSeq = (uint)rptSeq;
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+        }
+        finally
+        {
+            book.EndWrite();
+        }
 
         _eventHandler?.OnOrderDeleted(book, orderId, side);
     }
@@ -209,16 +234,24 @@ public sealed class BookManager : IFeedEventHandler
         if (!TryLookupBook(securityId, out var book))
             return;
 
-        var entryType = msg.MDEntryType;
-        if (entryType == MDEntryType.BID)
-            book.Bids.Clear();
-        else if (entryType == MDEntryType.OFFER)
-            book.Asks.Clear();
-        else
-            book.Clear();
+        book.BeginWrite();
+        try
+        {
+            var entryType = msg.MDEntryType;
+            if (entryType == MDEntryType.BID)
+                book.Bids.Clear();
+            else if (entryType == MDEntryType.OFFER)
+                book.Asks.Clear();
+            else
+                book.Clear();
 
-        if (msg.RptSeq is { } rptSeq)
-            book.LastRptSeq = (uint)rptSeq;
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+        }
+        finally
+        {
+            book.EndWrite();
+        }
 
         _eventHandler?.OnBookCleared(securityId);
     }
@@ -237,7 +270,17 @@ public sealed class BookManager : IFeedEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+            {
+                book.BeginWrite();
+                try
+                {
+                    book.LastRptSeq = (uint)rptSeq;
+                }
+                finally
+                {
+                    book.EndWrite();
+                }
+            }
         }
 
         _eventHandler?.OnTrade(securityId, price, quantity, tradeId);
@@ -253,7 +296,15 @@ public sealed class BookManager : IFeedEventHandler
 
         if (TryLookupBook(securityId, out var book))
         {
-            book.Clear();
+            book.BeginWrite();
+            try
+            {
+                book.Clear();
+            }
+            finally
+            {
+                book.EndWrite();
+            }
             _eventHandler?.OnBookCleared(securityId);
         }
     }
@@ -272,7 +323,17 @@ public sealed class BookManager : IFeedEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+            {
+                book.BeginWrite();
+                try
+                {
+                    book.LastRptSeq = (uint)rptSeq;
+                }
+                finally
+                {
+                    book.EndWrite();
+                }
+            }
         }
 
         _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId);
@@ -291,7 +352,17 @@ public sealed class BookManager : IFeedEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+            {
+                book.BeginWrite();
+                try
+                {
+                    book.LastRptSeq = (uint)rptSeq;
+                }
+                finally
+                {
+                    book.EndWrite();
+                }
+            }
         }
 
         _eventHandler?.OnExecutionSummary(securityId, lastPx, fillQty);
@@ -311,7 +382,17 @@ public sealed class BookManager : IFeedEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+            {
+                book.BeginWrite();
+                try
+                {
+                    book.LastRptSeq = (uint)rptSeq;
+                }
+                finally
+                {
+                    book.EndWrite();
+                }
+            }
         }
 
         _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
@@ -326,28 +407,36 @@ public sealed class BookManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var book = GetOrCreateBook(securityId);
 
-        book.Clear();
-
-        reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
+        book.BeginWrite();
+        try
         {
-            var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
-            long price = entry.MDEntryPx.Mantissa ?? 0;
-            long quantity = (long)entry.MDEntrySize;
-            ulong orderId = (ulong)entry.SecondaryOrderID;
-            uint enteringFirm = entry.EnteringFirm.Value ?? 0;
+            book.Clear();
 
-            var bookEntry = new OrderBookEntry
+            reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
             {
-                OrderId = orderId,
-                Price = price,
-                Quantity = quantity,
-                EnteringFirm = enteringFirm,
-                SecurityId = securityId,
-                Side = side
-            };
+                var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
+                long price = entry.MDEntryPx.Mantissa ?? 0;
+                long quantity = (long)entry.MDEntrySize;
+                ulong orderId = (ulong)entry.SecondaryOrderID;
+                uint enteringFirm = entry.EnteringFirm.Value ?? 0;
 
-            book.GetSide(side).Add(bookEntry);
-        });
+                var bookEntry = new OrderBookEntry
+                {
+                    OrderId = orderId,
+                    Price = price,
+                    Quantity = quantity,
+                    EnteringFirm = enteringFirm,
+                    SecurityId = securityId,
+                    Side = side
+                };
+
+                book.GetSide(side).Add(bookEntry);
+            });
+        }
+        finally
+        {
+            book.EndWrite();
+        }
     }
 
     /// <summary>
@@ -368,7 +457,15 @@ public sealed class BookManager : IFeedEventHandler
             : _mutableBooks;
         foreach (var (secId, book) in books)
         {
-            book.Clear();
+            book.BeginWrite();
+            try
+            {
+                book.Clear();
+            }
+            finally
+            {
+                book.EndWrite();
+            }
             _eventHandler?.OnBookCleared(secId);
         }
     }
