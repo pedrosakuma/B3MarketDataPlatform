@@ -2,27 +2,10 @@ namespace B3.Umdf.Book;
 
 public sealed class OrderBook
 {
-    private int _version;
-    private uint _lastRptSeq;
-
     public ulong SecurityId { get; }
     public BookSide Bids { get; }
     public BookSide Asks { get; }
-
-    public uint LastRptSeq
-    {
-        get => _lastRptSeq;
-        set => _lastRptSeq = value;
-    }
-
-    /// <summary>Current version. Even = stable, Odd = mutation in progress.</summary>
-    public int Version => Volatile.Read(ref _version);
-
-    /// <summary>Call before mutating the book. Increments version to odd.</summary>
-    public void BeginWrite() => Interlocked.Increment(ref _version);
-
-    /// <summary>Call after mutating the book. Increments version to even.</summary>
-    public void EndWrite() => Interlocked.Increment(ref _version);
+    public uint LastRptSeq { get; set; }
 
     public OrderBook(ulong securityId)
     {
@@ -37,7 +20,7 @@ public sealed class OrderBook
     {
         Bids.Clear();
         Asks.Clear();
-        _lastRptSeq = 0;
+        LastRptSeq = 0;
     }
 
     /// <summary>
