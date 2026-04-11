@@ -93,6 +93,35 @@ The `TimestampMergedReplayer` reads all PCAP files simultaneously and merges pac
 - Cross-channel ordering is preserved (e.g., instrument definition before first incremental)
 - Optional speed control via `SpeedMultiplier` (0 = burst, 1.0 = real-time)
 
+## Performance
+
+Benchmark on 52M UMDF packets (EQT 2025-03-31 PCAPs, ~20GB):
+
+| Metric | Value |
+|--------|-------|
+| Packets processed | 52,075,408 |
+| Orders | 15,737,471 |
+| Trades | 1,122,008 |
+| Books | 3,639 |
+| **Total time** | **~30s** |
+| **Throughput** | **~1.7M pkts/s** |
+
+Key optimizations:
+- **Synchronous packet processing** (`ISyncPacketSource`) — eliminates async/await overhead per packet
+- **ArrayPool\<byte\>** — reuses buffers instead of allocating per-packet (`new byte[]` × 52M)
+- **1MB BufferedStream** — reduces I/O syscalls in `PcapReader`
+- **Zero-copy SBE** — `SbeSourceGenerator` produces blittable structs, no deserialization
+
+### Profiling
+
+```bash
+# Install dotnet-trace (one time)
+dotnet tool install -g dotnet-trace
+
+# Run profiling script
+./tools/profile.sh
+```
+
 ## B3 Schema
 
 This project uses the [B3 Market Data Messages v2.2.0](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/) SBE XML schema.
