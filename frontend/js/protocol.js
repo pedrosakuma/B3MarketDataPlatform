@@ -1,0 +1,156 @@
+// Wire protocol constants, message builders, and parser.
+// Pure module — no DOM or state dependencies.
+
+export const MSG = {
+  SUBSCRIBE: 0x0001, UNSUBSCRIBE: 0x0002, GET: 0x0003,
+  SUBSCRIBE_OK: 0x0010, SUBSCRIBE_ERROR: 0x0011, UNSUBSCRIBED: 0x0012,
+  BOOK_SNAPSHOT: 0x0020, INFO_SNAPSHOT: 0x0021,
+  ORDER_ADDED: 0x0030, ORDER_UPDATED: 0x0031, ORDER_DELETED: 0x0032,
+  TRADE: 0x0033, BOOK_CLEARED: 0x0034,
+};
+
+export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
+
+export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, ALL: 0x03 };
+
+export const INFO_FIELDS = [
+  'OpeningPrice', 'ClosingPrice', 'HighPrice', 'LowPrice',
+  'LastTradePrice', 'LastTradeSize', 'SettlementPrice', 'TheoreticalOpeningPrice',
+  'TheoreticalOpeningSize', 'AuctionImbalanceSize', 'TradeVolume', 'VwapPrice',
+  'NetChange', 'NumberOfTrades', 'OpenInterest', 'PriceBandLow',
+  'PriceBandHigh', 'TradingReferencePrice', 'AvgDailyTradedQty', 'MaxTradeVol',
+  'TradingStatus', 'TradingEvent',
+];
+
+export const PRICE_FIELDS = new Set([
+  'OpeningPrice', 'ClosingPrice', 'HighPrice', 'LowPrice',
+  'LastTradePrice', 'SettlementPrice', 'TheoreticalOpeningPrice',
+  'VwapPrice', 'NetChange', 'PriceBandLow', 'PriceBandHigh', 'TradingReferencePrice',
+]);
+
+export function flagsStr(f) {
+  const parts = [];
+  if (f & DATA_FLAGS.BOOK) parts.push('Book');
+  if (f & DATA_FLAGS.INFO) parts.push('Info');
+  return parts.join('+') || 'None';
+}
+
+// ── Message builders (client → server) ──
+
+const encoder = new TextEncoder();
+
+export function buildSubscribeOrGet(msgType, symbol, flags) {
+  const symBytes = encoder.encode(symbol.toUpperCase().trim());
+  const totalLen = 4 + 1 + 1 + symBytes.length;
+  const buf = new ArrayBuffer(totalLen);
+  const v = new DataView(buf);
+  v.setUint16(0, totalLen, true);
+  v.setUint16(2, msgType, true);
+  v.setUint8(4, flags);
+  v.setUint8(5, symBytes.length);
+  new Uint8Array(buf, 6).set(symBytes);
+  return buf;
+}
+
+export function buildUnsubscribe(securityId) {
+  const buf = new ArrayBuffer(12);
+  const v = new DataView(buf);
+  v.setUint16(0, 12, true);
+  v.setUint16(2, MSG.UNSUBSCRIBE, true);
+  v.setBigUint64(4, securityId, true);
+  return buf;
+}
+
+// ── Message parser (server → client) ──
+
+const decoder = new TextDecoder();
+
+export function parseMessage(data) {
+  const v = new DataView(data);
+  if (data.byteLength < 4) return null;
+  const length = v.getUint16(0, true);
+  const type = v.getUint16(2, true);
+  let o = 4;
+
+  switch (type) {
+    case MSG.SUBSCRIBE_OK: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const flags = v.getUint8(o); o += 1;
+      const sLen = v.getUint8(o); o += 1;
+      const symbol = decoder.decode(new Uint8Array(data, o, sLen));
+      return { type: 'SubscribeOk', securityId, flags, symbol };
+    }
+    case MSG.SUBSCRIBE_ERROR: {
+      const errorCode = v.getUint8(o); o += 1;
+      const sLen = v.getUint8(o); o += 1;
+      const symbol = decoder.decode(new Uint8Array(data, o, sLen));
+      const errorNames = { 1: 'UnknownSymbol', 2: 'NotReady' };
+      return { type: 'SubscribeError', errorCode, errorName: errorNames[errorCode] || `Code ${errorCode}`, symbol };
+    }
+    case MSG.UNSUBSCRIBED: {
+      const securityId = v.getBigUint64(o, true);
+      return { type: 'Unsubscribed', securityId };
+    }
+    case MSG.BOOK_SNAPSHOT: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const rptSeq = v.getUint32(o, true); o += 4;
+      const bidCount = v.getUint16(o, true); o += 2;
+      const askCount = v.getUint16(o, true); o += 2;
+      const bids = [], asks = [];
+      for (let i = 0; i < bidCount; i++) {
+        const price = Number(v.getBigInt64(o, true)); o += 8;
+        const qty = Number(v.getBigInt64(o, true)); o += 8;
+        const count = v.getUint16(o, true); o += 2;
+        bids.push({ price, qty, count });
+      }
+      for (let i = 0; i < askCount; i++) {
+        const price = Number(v.getBigInt64(o, true)); o += 8;
+        const qty = Number(v.getBigInt64(o, true)); o += 8;
+        const count = v.getUint16(o, true); o += 2;
+        asks.push({ price, qty, count });
+      }
+      return { type: 'BookSnapshot', securityId, rptSeq, bids, asks };
+    }
+    case MSG.INFO_SNAPSHOT: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const mask = v.getUint32(o, true); o += 4;
+      const fields = {};
+      for (let i = 0; i < INFO_FIELDS.length; i++) {
+        if (mask & (1 << i)) {
+          fields[INFO_FIELDS[i]] = Number(v.getBigInt64(o, true));
+          o += 8;
+        }
+      }
+      return { type: 'InfoSnapshot', securityId, fields };
+    }
+    case MSG.ORDER_ADDED:
+    case MSG.ORDER_UPDATED: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const orderId = v.getBigUint64(o, true); o += 8;
+      const side = v.getUint8(o); o += 1;
+      const price = Number(v.getBigInt64(o, true)); o += 8;
+      const qty = Number(v.getBigInt64(o, true));
+      const typeName = type === MSG.ORDER_ADDED ? 'OrderAdded' : 'OrderUpdated';
+      return { type: typeName, securityId, orderId, side, price, qty };
+    }
+    case MSG.ORDER_DELETED: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const orderId = v.getBigUint64(o, true); o += 8;
+      const side = v.getUint8(o);
+      return { type: 'OrderDeleted', securityId, orderId, side };
+    }
+    case MSG.TRADE: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const price = Number(v.getBigInt64(o, true)); o += 8;
+      const qty = Number(v.getBigInt64(o, true)); o += 8;
+      const tradeId = Number(v.getBigInt64(o, true));
+      return { type: 'Trade', securityId, price, qty, tradeId };
+    }
+    case MSG.BOOK_CLEARED: {
+      const securityId = v.getBigUint64(o, true);
+      return { type: 'BookCleared', securityId };
+    }
+    default:
+      return { type: 'Unknown', msgType: type };
+  }
+}
