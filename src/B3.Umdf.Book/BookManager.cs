@@ -21,6 +21,15 @@ public sealed class BookManager : IFeedEventHandler
         _eventHandler = eventHandler;
     }
 
+    /// <summary>
+    /// Pre-allocate dictionary capacity after instrument definitions are known.
+    /// Avoids rehashing during the hot path.
+    /// </summary>
+    public void EnsureCapacity(int instrumentCount)
+    {
+        _books.EnsureCapacity(instrumentCount);
+    }
+
     public OrderBook GetOrCreateBook(ulong securityId)
     {
         if (!_books.TryGetValue(securityId, out var book))
@@ -65,6 +74,7 @@ public sealed class BookManager : IFeedEventHandler
     public void OnSequenceReset() { ClearAllBooks(); }
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount) => EnsureCapacity(instrumentCount);
 
     private void HandleOrder(ReadOnlySpan<byte> body)
     {
@@ -83,8 +93,6 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
-        bool isUpdate = bookSide.Orders.ContainsKey(orderId);
-
         var entry = new OrderBookEntry
         {
             OrderId = orderId,
@@ -95,7 +103,7 @@ public sealed class BookManager : IFeedEventHandler
             Side = side
         };
 
-        bookSide.AddOrUpdate(entry);
+        bool isUpdate = bookSide.AddOrUpdate(entry);
 
         if (msg.RptSeq is { } rptSeq)
             book.LastRptSeq = (uint)rptSeq;

@@ -4,13 +4,19 @@ public static class UdpExtractor
 {
     public static ReadOnlyMemory<byte> ExtractUdpPayload(ReadOnlyMemory<byte> frame, uint linkType = 1)
     {
-        int offset = GetIpOffset(frame.Span, linkType);
-        var span = frame.Span;
-        int ihl = (span[offset] & 0x0F) * 4;
-        offset += ihl;
-        // UDP header is 8 bytes: src_port(2) dst_port(2) length(2) checksum(2)
-        offset += 8;
+        int offset = ComputeUdpPayloadOffset(frame.Span, linkType);
         return frame[offset..];
+    }
+
+    /// <summary>
+    /// Computes the byte offset from frame start to the UDP payload.
+    /// Constant per PCAP file — cache this for zero-overhead packet slicing.
+    /// </summary>
+    public static int ComputeUdpPayloadOffset(ReadOnlySpan<byte> frame, uint linkType = 1)
+    {
+        int offset = GetIpOffset(frame, linkType);
+        int ihl = (frame[offset] & 0x0F) * 4;
+        return offset + ihl + 8; // IP header + UDP header (8 bytes)
     }
 
     public static ushort ExtractUdpDstPort(ReadOnlySpan<byte> frame, uint linkType = 1)

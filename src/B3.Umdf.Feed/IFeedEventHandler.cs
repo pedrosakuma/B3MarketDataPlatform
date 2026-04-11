@@ -9,4 +9,5 @@ public interface IFeedEventHandler
     void OnSequenceReset();
     void OnSnapshotStart();
     void OnSnapshotComplete(uint lastRptSeq);
+    void OnInstrumentDefinitionsComplete(int instrumentCount);
 }

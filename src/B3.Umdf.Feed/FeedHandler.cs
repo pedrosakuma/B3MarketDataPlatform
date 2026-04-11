@@ -249,6 +249,7 @@ public sealed class FeedHandler : IDisposable
         if (_instrDefReceived >= _instrDefTotalExpected && _instrDefTotalExpected > 0)
         {
             Console.WriteLine($"[FeedHandler] Instrument definitions complete: {_instrDefReceived}/{_instrDefTotalExpected}");
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected);
             TransitionTo(FeedState.WaitSnapshot);
         }
     }

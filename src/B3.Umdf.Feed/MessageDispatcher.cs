@@ -9,7 +9,14 @@ public static class MessageDispatcher
 
     public static void Dispatch(in UmdfPacket packet, IFeedEventHandler handler)
     {
-        var span = packet.Data.Span;
+        Dispatch(in packet, packet.Data.Span, handler);
+    }
+
+    /// <summary>
+    /// Dispatches SBE messages from a pre-computed span, avoiding redundant .Data.Span calls.
+    /// </summary>
+    public static void Dispatch(in UmdfPacket packet, ReadOnlySpan<byte> span, IFeedEventHandler handler)
+    {
         if (span.Length < UmdfPacketHeader.Size)
             return;
 

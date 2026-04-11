@@ -6,13 +6,15 @@ namespace B3.Umdf.PcapReplay;
 /// Merges multiple PCAP files by timestamp using a priority queue.
 /// Uses memory-mapped readers for zero-copy I/O — packet data points directly
 /// into mmap'd pages, eliminating per-packet allocations and copies.
+/// UDP payload offset is computed once per reader (constant per PCAP file).
 /// Implements ISyncPacketSource for zero-overhead synchronous consumption,
 /// and IPacketSource for async compatibility.
 /// </summary>
 public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 {
     private readonly PriorityQueue<(PcapPacket Packet, int ReaderIndex), long> _pq = new();
-    private readonly List<(MmapPcapReader Reader, ChannelType Channel, uint LinkType)> _readers = new();
+    private readonly List<(MmapPcapReader Reader, ChannelType Channel)> _readers = new();
+    private readonly int[] _cachedUdpOffset;
     private readonly ReplayOptions _options;
     private long? _firstTimestamp;
     private long _startTicks;
@@ -22,14 +24,18 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     {
         _options = options ?? new ReplayOptions();
         _startTicks = Environment.TickCount64;
+        _cachedUdpOffset = new int[sources.Count];
 
         for (int i = 0; i < sources.Count; i++)
         {
             var src = sources[i];
             var reader = new MmapPcapReader(src.FilePath);
-            _readers.Add((reader, src.Channel, reader.LinkType));
+            _readers.Add((reader, src.Channel));
             if (reader.TryReadNext(out var pkt))
+            {
+                _cachedUdpOffset[i] = UdpExtractor.ComputeUdpPayloadOffset(pkt.Data.Span, reader.LinkType);
                 _pq.Enqueue((pkt, i), pkt.TimestampMicros);
+            }
         }
     }
 
@@ -56,8 +62,8 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
                 Thread.Sleep((int)delayMs);
         }
 
-        var (reader, channel, linkType) = _readers[item.ReaderIndex];
-        var payload = UdpExtractor.ExtractUdpPayload(item.Packet.Data, linkType);
+        var (reader, channel) = _readers[item.ReaderIndex];
+        var payload = item.Packet.Data.Slice(_cachedUdpOffset[item.ReaderIndex]);
 
         packet = new UmdfPacket
         {
@@ -88,7 +94,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var (reader, _, _) in _readers)
+        foreach (var (reader, _) in _readers)
             reader.Dispose();
     }
 }

@@ -46,14 +46,17 @@ public sealed class BookSide
         _ascending = side == BookSideType.Bid;
     }
 
-    public void AddOrUpdate(OrderBookEntry entry)
+    /// <returns>true if the order already existed (update); false if new (add).</returns>
+    public bool AddOrUpdate(OrderBookEntry entry)
     {
-        if (_orders.TryGetValue(entry.OrderId, out var existing))
-            RemoveFromPriceLevels(existing);
+        bool isUpdate = _orders.TryGetValue(entry.OrderId, out var existing);
+        if (isUpdate)
+            RemoveFromPriceLevels(existing!);
 
         _orders[entry.OrderId] = entry;
         AddToPriceLevels(entry);
         AssertValid();
+        return isUpdate;
     }
 
     public bool Remove(ulong orderId)
