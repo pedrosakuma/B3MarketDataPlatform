@@ -7,6 +7,7 @@ using B3.Umdf.Transport;
 
 // Parse named arguments
 int? wsPort = null;
+double speed = 0;
 var positionalArgs = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -19,6 +20,14 @@ for (int i = 0; i < args.Length; i++)
             return 1;
         }
         wsPort = p;
+    }
+    else if (args[i] == "--speed" && i + 1 < args.Length)
+    {
+        if (!double.TryParse(args[++i], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out speed) || speed < 0)
+        {
+            Console.Error.WriteLine("Invalid --speed value. Use 0 for max speed, 1 for real-time, >1 for accelerated.");
+            return 1;
+        }
     }
     else
     {
@@ -35,6 +44,7 @@ if (positionalArgs.Count < 1)
     Console.WriteLine();
     Console.WriteLine("Options:");
     Console.WriteLine("  --ws-port <port>   Start WebSocket subscription server on the given port");
+    Console.WriteLine("  --speed <mult>     Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
     return 1;
 }
 
@@ -52,6 +62,7 @@ for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
     Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
 }
 
+Console.WriteLine($"  Speed: {(speed == 0 ? "max" : $"{speed}x")}");
 Console.WriteLine();
 
 var stats = new Stats();
@@ -78,7 +89,7 @@ else
 
 var bookManager = new BookManager(bookHandler);
 var marketDataManager = new MarketDataManager(mdHandler);
-var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = 0 });
+var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = speed });
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
