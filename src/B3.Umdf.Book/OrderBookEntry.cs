@@ -8,6 +8,12 @@ public sealed class OrderBookEntry
     public uint EnteringFirm { get; set; }
     public ulong SecurityId { get; set; }
     public BookSideType Side { get; set; }
+
+    /// <summary>
+    /// Index within the price level's order list. Used for O(1) swap-remove.
+    /// Managed internally by BookSide.
+    /// </summary>
+    internal int PriceLevelIndex { get; set; }
 }
 
 public enum BookSideType : byte

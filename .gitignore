@@ -45,3 +45,4 @@ pcap/
 TestResults/
 coverage/
 dotnet_*.nettrace
+BenchmarkDotNet.Artifacts/

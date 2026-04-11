@@ -119,8 +119,10 @@ public class BookSideTests
         side.AddOrUpdate(new OrderBookEntry { OrderId = 1, Price = 100, Quantity = 50 });
 
         Assert.Equal(1, side.OrderCount);
-        Assert.Single(side.PriceLevels[100]);
-        Assert.Equal(50, side.PriceLevels[100][0].Quantity);
+        var orders = side.GetOrdersAtPrice(100);
+        Assert.NotNull(orders);
+        Assert.Single(orders);
+        Assert.Equal(50, orders[0].Quantity);
         AssertValid(side);
     }
 
@@ -147,7 +149,7 @@ public class BookSideTests
 
         AssertValid(side);
         Assert.Equal(50, side.OrderCount);
-        Assert.Single(side.PriceLevels); // all at same price
+        Assert.Equal(1, side.LevelCount); // all at same price
     }
 
     [Fact]
@@ -165,7 +167,7 @@ public class BookSideTests
         side.Remove(3);
         AssertValid(side);
 
-        Assert.Empty(side.PriceLevels);
+        Assert.Equal(0, side.LevelCount);
         Assert.Equal(0, side.OrderCount);
     }
 }

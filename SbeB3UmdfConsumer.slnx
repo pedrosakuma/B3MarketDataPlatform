@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/B3.Umdf.Book.Benchmarks/B3.Umdf.Book.Benchmarks.csproj" />
+  </Folder>
   <Folder Name="/src/">
     <Project Path="src/B3.Umdf.Book/B3.Umdf.Book.csproj" />
     <Project Path="src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj" />
