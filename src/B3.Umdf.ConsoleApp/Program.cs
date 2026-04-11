@@ -89,7 +89,6 @@ using var feedHandler = new FeedHandler(replayer, composite);
 if (subscriptionManager is not null)
 {
     subscriptionManager.SetDataSources(bookManager, marketDataManager, symbolRegistry);
-    subscriptionManager.Start();
     wsHost = new WebSocketHost(subscriptionManager);
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
 }
@@ -134,7 +133,6 @@ sw.Stop();
 
 if (wsHost is not null)
     await wsHost.StopAsync();
-subscriptionManager?.Dispose();
 wsHost?.Dispose();
 
 Console.WriteLine();
