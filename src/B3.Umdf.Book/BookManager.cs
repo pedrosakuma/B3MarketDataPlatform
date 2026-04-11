@@ -93,25 +93,42 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
-        var entry = new OrderBookEntry
+        if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
         {
-            OrderId = orderId,
-            Price = price,
-            Quantity = quantity,
-            EnteringFirm = enteringFirm,
-            SecurityId = securityId,
-            Side = side
-        };
+            // Reuse existing object — zero allocation for updates
+            long oldPrice = existing.Price;
+            existing.Price = price;
+            existing.Quantity = quantity;
+            existing.EnteringFirm = enteringFirm;
 
-        bool isUpdate = bookSide.AddOrUpdate(entry);
+            if (oldPrice != price)
+                bookSide.MoveOrder(existing, oldPrice);
+            // else: same price, fields already updated in-place — nothing to do
 
-        if (msg.RptSeq is { } rptSeq)
-            book.LastRptSeq = (uint)rptSeq;
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
 
-        if (isUpdate)
-            _eventHandler?.OnOrderUpdated(book, entry);
+            _eventHandler?.OnOrderUpdated(book, existing);
+        }
         else
+        {
+            var entry = new OrderBookEntry
+            {
+                OrderId = orderId,
+                Price = price,
+                Quantity = quantity,
+                EnteringFirm = enteringFirm,
+                SecurityId = securityId,
+                Side = side
+            };
+
+            bookSide.Add(entry);
+
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+
             _eventHandler?.OnOrderAdded(book, entry);
+        }
     }
 
     private void HandleDeleteOrder(ReadOnlySpan<byte> body)

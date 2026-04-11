@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace B3.Umdf.Book;
 
@@ -13,6 +14,7 @@ public sealed class BookSide
     // Most activity is near top-of-book → inserts/removes near the end = O(1) amortized.
     private readonly List<(long Price, List<OrderBookEntry> Orders)> _levels = new();
     private readonly bool _ascending;
+    private readonly Stack<List<OrderBookEntry>> _listPool = new();
 
     public BookSideType Side => _side;
     public int OrderCount => _orders.Count;
@@ -40,23 +42,64 @@ public sealed class BookSide
         return idx >= 0 ? _levels[idx].Orders : null;
     }
 
+    public bool TryGetOrder(ulong orderId, out OrderBookEntry? entry)
+        => _orders.TryGetValue(orderId, out entry);
+
     public BookSide(BookSideType side)
     {
         _side = side;
         _ascending = side == BookSideType.Bid;
     }
 
+    /// <summary>
+    /// Add a new order (caller must ensure orderId doesn't exist yet).
+    /// Uses single-hash dictionary insert via CollectionsMarshal.
+    /// </summary>
+    public void Add(OrderBookEntry entry)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orders, entry.OrderId, out _);
+        slot = entry;
+        AddToPriceLevels(entry);
+        AssertValid();
+    }
+
+    /// <summary>
+    /// Update an existing order's price level placement after its fields were mutated.
+    /// Only call when the price has changed.
+    /// </summary>
+    public void MoveOrder(OrderBookEntry entry, long oldPrice)
+    {
+        RemoveFromPriceLevelsByPrice(entry, oldPrice);
+        AddToPriceLevels(entry);
+        AssertValid();
+    }
+
     /// <returns>true if the order already existed (update); false if new (add).</returns>
     public bool AddOrUpdate(OrderBookEntry entry)
     {
-        bool isUpdate = _orders.TryGetValue(entry.OrderId, out var existing);
-        if (isUpdate)
-            RemoveFromPriceLevels(existing!);
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orders, entry.OrderId, out bool existed);
 
-        _orders[entry.OrderId] = entry;
+        if (existed && slot is not null)
+        {
+            var existing = slot;
+            if (existing.Price == entry.Price)
+            {
+                // Same-price: swap entry in-place, no level restructuring
+                entry.PriceLevelIndex = existing.PriceLevelIndex;
+                int levelIdx = BinarySearchPrice(entry.Price);
+                if (levelIdx >= 0)
+                    _levels[levelIdx].Orders[existing.PriceLevelIndex] = entry;
+                slot = entry;
+                AssertValid();
+                return true;
+            }
+            RemoveFromPriceLevels(existing);
+        }
+
+        slot = entry;
         AddToPriceLevels(entry);
         AssertValid();
-        return isUpdate;
+        return existed;
     }
 
     public bool Remove(ulong orderId)
@@ -71,6 +114,8 @@ public sealed class BookSide
     public void Clear()
     {
         _orders.Clear();
+        foreach (var (_, list) in _levels)
+            ReturnList(list);
         _levels.Clear();
     }
 
@@ -170,7 +215,8 @@ public sealed class BookSide
         else
         {
             int insertIdx = ~idx;
-            var orders = new List<OrderBookEntry> { entry };
+            var orders = RentList();
+            orders.Add(entry);
             entry.PriceLevelIndex = 0;
             _levels.Insert(insertIdx, (entry.Price, orders));
         }
@@ -178,7 +224,12 @@ public sealed class BookSide
 
     private void RemoveFromPriceLevels(OrderBookEntry entry)
     {
-        int levelIdx = BinarySearchPrice(entry.Price);
+        RemoveFromPriceLevelsByPrice(entry, entry.Price);
+    }
+
+    private void RemoveFromPriceLevelsByPrice(OrderBookEntry entry, long price)
+    {
+        int levelIdx = BinarySearchPrice(price);
         if (levelIdx < 0) return;
 
         var orders = _levels[levelIdx].Orders;
@@ -194,7 +245,10 @@ public sealed class BookSide
         orders.RemoveAt(lastIdx);
 
         if (orders.Count == 0)
+        {
+            ReturnList(orders);
             _levels.RemoveAt(levelIdx);
+        }
     }
 
     private int BinarySearchPrice(long price)
@@ -212,4 +266,16 @@ public sealed class BookSide
         }
         return ~lo;
     }
+
+    private List<OrderBookEntry> RentList()
+    {
+        if (_listPool.TryPop(out var list))
+        {
+            list.Clear();
+            return list;
+        }
+        return new List<OrderBookEntry>();
+    }
+
+    private void ReturnList(List<OrderBookEntry> list) => _listPool.Push(list);
 }
