@@ -49,7 +49,7 @@ using var statsTimer = new Timer(_ =>
 
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] State: {state} ──");
-    Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  Books: {bookManager.Books.Count:N0}");
+    Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}");
     if (state == FeedState.WaitInstrumentDefinition)
         Console.WriteLine($"   InstrDef: {feedHandler.InstrDefReceived:N0}/{feedHandler.InstrDefTotalExpected:N0} parsed  ({feedHandler.InstrDefPacketCount:N0} packets)");
 
@@ -80,6 +80,11 @@ Console.WriteLine($"  Packets:      {feedHandler.PacketCount:N0}");
 Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");
 Console.WriteLine($"  Trades:       {stats.TradeCount:N0}");
 Console.WriteLine($"  Deletes:      {stats.DeleteCount:N0}");
+Console.WriteLine($"  MarketData:   {stats.MarketDataCount:N0}");
+Console.WriteLine($"  StatusChg:    {stats.StatusChangeCount:N0}");
+Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
+Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
+Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
 Console.WriteLine($"  Books:        {bookManager.Books.Count:N0}");
 
 if (bookManager.Books.Count > 0)
@@ -143,6 +148,11 @@ sealed class Stats : IBookEventHandler
     public long OrderCount;
     public long TradeCount;
     public long DeleteCount;
+    public long MarketDataCount;
+    public long StatusChangeCount;
+    public long ForwardTradeCount;
+    public long TradeBustCount;
+    public long ExecSummaryCount;
 
     public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
     {
@@ -165,5 +175,30 @@ sealed class Stats : IBookEventHandler
 
     public void OnBookCleared(ulong securityId)
     {
+    }
+
+    public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
+    {
+        Interlocked.Increment(ref StatusChangeCount);
+    }
+
+    public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
+    {
+        Interlocked.Increment(ref MarketDataCount);
+    }
+
+    public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
+    {
+        Interlocked.Increment(ref ForwardTradeCount);
+    }
+
+    public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
+    {
+        Interlocked.Increment(ref TradeBustCount);
+    }
+
+    public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty)
+    {
+        Interlocked.Increment(ref ExecSummaryCount);
     }
 }

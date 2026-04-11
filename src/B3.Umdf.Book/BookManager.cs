@@ -7,6 +7,10 @@ using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data;
 using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V6.DeleteOrder_MBO_51Data;
 using MassDeleteOrders_MBO_52Data = B3.Umdf.Mbo.Sbe.V16.V6.MassDeleteOrders_MBO_52Data;
 using Trade_53Data = B3.Umdf.Mbo.Sbe.V16.V6.Trade_53Data;
+using LastTradePrice_27Data = B3.Umdf.Mbo.Sbe.V16.V6.LastTradePrice_27Data;
+using ForwardTrade_54Data = B3.Umdf.Mbo.Sbe.V16.V6.ForwardTrade_54Data;
+using ExecutionSummary_55Data = B3.Umdf.Mbo.Sbe.V16.V6.ExecutionSummary_55Data;
+using TradeBust_57Data = B3.Umdf.Mbo.Sbe.V16.V6.TradeBust_57Data;
 
 namespace B3.Umdf.Book;
 
@@ -95,6 +99,57 @@ public sealed class BookManager : IFeedEventHandler
                 break;
             case ChannelReset_11Data.MESSAGE_ID:
                 ClearAllBooks();
+                break;
+            case SecurityStatus_3Data.MESSAGE_ID:
+                HandleSecurityStatus(body);
+                break;
+            case OpeningPrice_15Data.MESSAGE_ID:
+                HandleOpeningPrice(body);
+                break;
+            case TheoreticalOpeningPrice_16Data.MESSAGE_ID:
+                HandleTheoreticalOpeningPrice(body);
+                break;
+            case ClosingPrice_17Data.MESSAGE_ID:
+                HandleClosingPrice(body);
+                break;
+            case AuctionImbalance_19Data.MESSAGE_ID:
+                HandleAuctionImbalance(body);
+                break;
+            case QuantityBand_21Data.MESSAGE_ID:
+                HandleQuantityBand(body);
+                break;
+            case PriceBand_22Data.MESSAGE_ID:
+                HandlePriceBand(body);
+                break;
+            case HighPrice_24Data.MESSAGE_ID:
+                HandleHighPrice(body);
+                break;
+            case LowPrice_25Data.MESSAGE_ID:
+                HandleLowPrice(body);
+                break;
+            case LastTradePrice_27Data.MESSAGE_ID:
+                HandleLastTradePrice(body);
+                break;
+            case SettlementPrice_28Data.MESSAGE_ID:
+                HandleSettlementPrice(body);
+                break;
+            case OpenInterest_29Data.MESSAGE_ID:
+                HandleOpenInterest(body);
+                break;
+            case ForwardTrade_54Data.MESSAGE_ID:
+                HandleForwardTrade(body);
+                break;
+            case ExecutionSummary_55Data.MESSAGE_ID:
+                HandleExecutionSummary(body);
+                break;
+            case ExecutionStatistics_56Data.MESSAGE_ID:
+                HandleExecutionStatistics(body);
+                break;
+            case TradeBust_57Data.MESSAGE_ID:
+                HandleTradeBust(body);
+                break;
+            case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
+                HandleSnapshotOrders(body);
                 break;
         }
     }
@@ -241,6 +296,356 @@ public sealed class BookManager : IFeedEventHandler
             book.Clear();
             _eventHandler?.OnBookCleared(securityId);
         }
+    }
+
+    private void HandleSecurityStatus(ReadOnlySpan<byte> body)
+    {
+        if (!SecurityStatus_3Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.TradingStatus = (int)msg.SecurityTradingStatus;
+        info.TradingEvent = msg.SecurityTradingEvent is { } evt ? (int)evt : null;
+        info.TradSesOpenTime = msg.TradSesOpenTime.Time;
+        info.LastUpdateTimestamp = msg.TransactTime.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnSecurityStatusChanged(securityId, info);
+    }
+
+    private void HandleOpeningPrice(ReadOnlySpan<byte> body)
+    {
+        if (!OpeningPrice_15Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.OpeningPrice = msg.MDEntryPx.Mantissa;
+        info.NetChangeFromPrevDay = msg.NetChgPrevDay.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleTheoreticalOpeningPrice(ReadOnlySpan<byte> body)
+    {
+        if (!TheoreticalOpeningPrice_16Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.TheoreticalOpeningPrice = msg.MDEntryPx.Mantissa;
+        info.TheoreticalOpeningSize = msg.MDEntrySize;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleClosingPrice(ReadOnlySpan<byte> body)
+    {
+        if (!ClosingPrice_17Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.ClosingPrice = msg.MDEntryPx.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleAuctionImbalance(ReadOnlySpan<byte> body)
+    {
+        if (!AuctionImbalance_19Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.AuctionImbalanceSize = msg.MDEntrySize;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleQuantityBand(ReadOnlySpan<byte> body)
+    {
+        if (!QuantityBand_21Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.AvgDailyTradedQty = msg.AvgDailyTradedQty;
+        info.MaxTradeVol = msg.MaxTradeVol;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandlePriceBand(ReadOnlySpan<byte> body)
+    {
+        if (!PriceBand_22Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.PriceBandLow = msg.LowLimitPrice.Mantissa;
+        info.PriceBandHigh = msg.HighLimitPrice.Mantissa;
+        info.TradingReferencePrice = msg.TradingReferencePrice.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleHighPrice(ReadOnlySpan<byte> body)
+    {
+        if (!HighPrice_24Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.HighPrice = msg.MDEntryPx.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleLowPrice(ReadOnlySpan<byte> body)
+    {
+        if (!LowPrice_25Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.LowPrice = msg.MDEntryPx.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleLastTradePrice(ReadOnlySpan<byte> body)
+    {
+        if (!LastTradePrice_27Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.LastTradePrice = msg.MDEntryPx.Mantissa;
+        info.LastTradeSize = (long)msg.MDEntrySize;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleSettlementPrice(ReadOnlySpan<byte> body)
+    {
+        if (!SettlementPrice_28Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.SettlementPrice = msg.MDEntryPx.Mantissa;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleOpenInterest(ReadOnlySpan<byte> body)
+    {
+        if (!OpenInterest_29Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.OpenInterest = (long)msg.MDEntrySize;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleForwardTrade(ReadOnlySpan<byte> body)
+    {
+        if (!ForwardTrade_54Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        long price = msg.MDEntryPx.Mantissa;
+        long quantity = (long)msg.MDEntrySize;
+        long tradeId = (long)(uint)msg.TradeID;
+
+        if (TryLookupBook(securityId, out var book))
+        {
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+        }
+
+        _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId);
+    }
+
+    private void HandleExecutionSummary(ReadOnlySpan<byte> body)
+    {
+        if (!ExecutionSummary_55Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        long lastPx = msg.LastPx.Mantissa;
+        long fillQty = (long)msg.FillQty;
+
+        if (TryLookupBook(securityId, out var book))
+        {
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+        }
+
+        _eventHandler?.OnExecutionSummary(securityId, lastPx, fillQty);
+    }
+
+    private void HandleExecutionStatistics(ReadOnlySpan<byte> body)
+    {
+        if (!ExecutionStatistics_56Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+        var info = book.Info;
+
+        info.TradeVolume = (long)msg.TradeVolume;
+        info.VwapPrice = msg.VwapPx.Mantissa;
+        info.NetChangeFromPrevDay = msg.NetChgPrevDay.Mantissa;
+        info.NumberOfTrades = (long)(uint)msg.NumberOfTrades;
+        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
+
+        _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    private void HandleTradeBust(ReadOnlySpan<byte> body)
+    {
+        if (!TradeBust_57Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        long price = msg.MDEntryPx.Mantissa;
+        long quantity = (long)msg.MDEntrySize;
+        long tradeId = (long)(uint)msg.TradeID;
+
+        if (TryLookupBook(securityId, out var book))
+        {
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+        }
+
+        _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
+    }
+
+    private void HandleSnapshotOrders(ReadOnlySpan<byte> body)
+    {
+        if (!SnapshotFullRefresh_Orders_MBO_71Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var book = GetOrCreateBook(securityId);
+
+        book.Clear();
+
+        reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
+        {
+            var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
+            long price = entry.MDEntryPx.Mantissa ?? 0;
+            long quantity = (long)entry.MDEntrySize;
+            ulong orderId = (ulong)entry.SecondaryOrderID;
+            uint enteringFirm = entry.EnteringFirm.Value ?? 0;
+
+            var bookEntry = new OrderBookEntry
+            {
+                OrderId = orderId,
+                Price = price,
+                Quantity = quantity,
+                EnteringFirm = enteringFirm,
+                SecurityId = securityId,
+                Side = side
+            };
+
+            book.GetSide(side).Add(bookEntry);
+        });
     }
 
     /// <summary>

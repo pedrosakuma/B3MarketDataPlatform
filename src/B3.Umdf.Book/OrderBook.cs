@@ -7,6 +7,9 @@ public sealed class OrderBook
     public BookSide Asks { get; }
     public uint LastRptSeq { get; set; }
 
+    private InstrumentInfo? _info;
+    public InstrumentInfo Info => _info ??= new InstrumentInfo();
+
     public OrderBook(ulong securityId)
     {
         SecurityId = securityId;
