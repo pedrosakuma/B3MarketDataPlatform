@@ -1,0 +1,22 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${WS_PORT:-8080}:${WS_PORT:-8080}"
+    volumes:
+      - ./pcap:/app/pcap:ro
+    environment:
+      PCAP_DIR: /app/pcap
+      PCAP_PREFIX: "${PCAP_PREFIX:-20250331_MBO_084_EQT}"
+      WS_PORT: "${WS_PORT:-8080}"
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
