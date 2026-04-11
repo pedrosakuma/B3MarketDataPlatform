@@ -1,0 +1,25 @@
+{
+  // B3 UMDF Multicast Channel Configuration
+  // Replace IPs and ports with actual values from B3's channel configuration guide.
+  // See: https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/
+  "channelGroups": [
+    {
+      "name": "EQT",
+      "channels": [
+        { "channelId": 84, "type": "IncrementalA",        "multicastGroup": "224.0.20.84", "port": 30084 },
+        { "channelId": 84, "type": "IncrementalB",        "multicastGroup": "224.0.20.85", "port": 30085 },
+        { "channelId": 84, "type": "InstrumentDefinition", "multicastGroup": "224.0.20.86", "port": 30086 },
+        { "channelId": 84, "type": "SnapshotRecovery",    "multicastGroup": "224.0.20.87", "port": 30087 }
+      ]
+    },
+    {
+      "name": "DRV",
+      "channels": [
+        { "channelId": 72, "type": "IncrementalA",        "multicastGroup": "224.0.20.72", "port": 30072 },
+        { "channelId": 72, "type": "IncrementalB",        "multicastGroup": "224.0.20.73", "port": 30073 },
+        { "channelId": 72, "type": "InstrumentDefinition", "multicastGroup": "224.0.20.74", "port": 30074 },
+        { "channelId": 72, "type": "SnapshotRecovery",    "multicastGroup": "224.0.20.75", "port": 30075 }
+      ]
+    }
+  ]
+}

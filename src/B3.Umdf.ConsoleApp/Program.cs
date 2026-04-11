@@ -10,6 +10,7 @@ int? wsPort = null;
 double speed = 0;
 var pcapPrefixes = new List<string>();
 var positionalArgs = new List<string>();
+string? multicastConfig = null;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -34,78 +35,125 @@ for (int i = 0; i < args.Length; i++)
     {
         pcapPrefixes.Add(args[++i]);
     }
+    else if (args[i] == "--multicast-config" && i + 1 < args.Length)
+    {
+        multicastConfig = args[++i];
+    }
     else
     {
         positionalArgs.Add(args[i]);
     }
 }
 
-// Build PCAP sources — either from --pcap-prefix or positional args
-var sources = new List<PcapChannelSource>();
+// Build packet source — either from multicast config, --pcap-prefix, or positional args
+IPacketSource packetSource;
 var groupIds = new List<int>();
+MulticastChannelMerger? multicastMerger = null;
 
-var channelSuffixes = new[]
+if (multicastConfig is not null)
 {
-    ("Incremental_FeedA", ChannelType.IncrementalA),
-    ("Incremental_FeedB", ChannelType.IncrementalB),
-    ("InstrumentDefinition", ChannelType.InstrumentDefinition),
-    ("SnapshotRecovery", ChannelType.SnapshotRecovery),
-};
-
-if (pcapPrefixes.Count > 0)
-{
-    // --pcap-prefix mode: auto-discover files by naming convention
-    for (int g = 0; g < pcapPrefixes.Count; g++)
+    // Live multicast mode
+    if (!File.Exists(multicastConfig))
     {
-        var prefix = pcapPrefixes[g];
-        Console.WriteLine($"  Channel group {g}: {Path.GetFileName(prefix)}");
-        groupIds.Add(g);
-
-        foreach (var (suffix, channelType) in channelSuffixes)
-        {
-            var filePath = $"{prefix}_{suffix}.pcap";
-            if (!File.Exists(filePath))
-            {
-                Console.Error.WriteLine($"  File not found: {filePath}");
-                return 1;
-            }
-            sources.Add(new PcapChannelSource(filePath, channelType, g));
-            Console.WriteLine($"    {channelType,-25} <- {Path.GetFileName(filePath)}");
-        }
+        Console.Error.WriteLine($"Multicast config not found: {multicastConfig}");
+        return 1;
     }
-}
-else if (positionalArgs.Count >= 1)
-{
-    // Legacy positional mode: single channel group
-    var channelTypes = new[] { ChannelType.IncrementalA, ChannelType.IncrementalB, ChannelType.InstrumentDefinition, ChannelType.SnapshotRecovery };
-    groupIds.Add(0);
 
-    for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
+    var feedConfig = MulticastFeedConfig.Load(multicastConfig);
+    groupIds = feedConfig.GetGroupIds();
+    var channelConfigs = feedConfig.ToChannelConfigs();
+
+    Console.WriteLine("  Mode: Live multicast");
+    foreach (var group in feedConfig.ChannelGroups)
     {
-        if (!File.Exists(positionalArgs[i]))
-        {
-            Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
-            return 1;
-        }
-        sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i], 0));
-        Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
+        int g = feedConfig.ChannelGroups.IndexOf(group);
+        Console.WriteLine($"  Channel group {g}: {group.Name}");
+        foreach (var ch in group.Channels)
+            Console.WriteLine($"    {ch.Type,-25} <- {ch.MulticastGroup}:{ch.Port}");
     }
+
+    var multicastSources = channelConfigs
+        .Select(c => new MulticastPacketSource(c))
+        .ToList();
+
+    multicastMerger = new MulticastChannelMerger(multicastSources);
+    packetSource = multicastMerger;
 }
 else
 {
-    Console.WriteLine("Usage:");
-    Console.WriteLine("  B3.Umdf.ConsoleApp --pcap-prefix <prefix> [--pcap-prefix <prefix2>] [options]");
-    Console.WriteLine("  B3.Umdf.ConsoleApp <incrA.pcap> [incrB.pcap] [instrdef.pcap] [snapshot.pcap] [options]");
-    Console.WriteLine();
-    Console.WriteLine("The --pcap-prefix mode auto-discovers files by naming convention:");
-    Console.WriteLine("  <prefix>_Incremental_FeedA.pcap, <prefix>_Incremental_FeedB.pcap,");
-    Console.WriteLine("  <prefix>_InstrumentDefinition.pcap, <prefix>_SnapshotRecovery.pcap");
-    Console.WriteLine();
-    Console.WriteLine("Options:");
-    Console.WriteLine("  --ws-port <port>        Start WebSocket subscription server on the given port");
-    Console.WriteLine("  --speed <mult>          Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
-    Console.WriteLine("  --pcap-prefix <prefix>  Channel group PCAP prefix (repeatable for multi-channel)");
-    return 1;
+    // PCAP replay mode
+    var sources = new List<PcapChannelSource>();
+
+    var channelSuffixes = new[]
+    {
+        ("Incremental_FeedA", ChannelType.IncrementalA),
+        ("Incremental_FeedB", ChannelType.IncrementalB),
+        ("InstrumentDefinition", ChannelType.InstrumentDefinition),
+        ("SnapshotRecovery", ChannelType.SnapshotRecovery),
+    };
+
+    if (pcapPrefixes.Count > 0)
+    {
+        for (int g = 0; g < pcapPrefixes.Count; g++)
+        {
+            var prefix = pcapPrefixes[g];
+            Console.WriteLine($"  Channel group {g}: {Path.GetFileName(prefix)}");
+            groupIds.Add(g);
+
+            foreach (var (suffix, channelType) in channelSuffixes)
+            {
+                var filePath = $"{prefix}_{suffix}.pcap";
+                if (!File.Exists(filePath))
+                {
+                    Console.Error.WriteLine($"  File not found: {filePath}");
+                    return 1;
+                }
+                sources.Add(new PcapChannelSource(filePath, channelType, g));
+                Console.WriteLine($"    {channelType,-25} <- {Path.GetFileName(filePath)}");
+            }
+        }
+    }
+    else if (positionalArgs.Count >= 1)
+    {
+        var channelTypes = new[] { ChannelType.IncrementalA, ChannelType.IncrementalB, ChannelType.InstrumentDefinition, ChannelType.SnapshotRecovery };
+        groupIds.Add(0);
+
+        for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
+        {
+            if (!File.Exists(positionalArgs[i]))
+            {
+                Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
+                return 1;
+            }
+            sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i], 0));
+            Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
+        }
+    }
+    else
+    {
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  B3.Umdf.ConsoleApp --pcap-prefix <prefix> [--pcap-prefix <prefix2>] [options]");
+        Console.WriteLine("  B3.Umdf.ConsoleApp --multicast-config <config.json> [options]");
+        Console.WriteLine("  B3.Umdf.ConsoleApp <incrA.pcap> [incrB.pcap] [instrdef.pcap] [snapshot.pcap] [options]");
+        Console.WriteLine();
+        Console.WriteLine("The --pcap-prefix mode auto-discovers files by naming convention:");
+        Console.WriteLine("  <prefix>_Incremental_FeedA.pcap, <prefix>_Incremental_FeedB.pcap,");
+        Console.WriteLine("  <prefix>_InstrumentDefinition.pcap, <prefix>_SnapshotRecovery.pcap");
+        Console.WriteLine();
+        Console.WriteLine("The --multicast-config mode reads channel configs from a JSON file.");
+        Console.WriteLine("  See config/multicast-sample.json for the format.");
+        Console.WriteLine();
+        Console.WriteLine("Options:");
+        Console.WriteLine("  --ws-port <port>              Start WebSocket subscription server on the given port");
+        Console.WriteLine("  --speed <mult>                Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
+        Console.WriteLine("  --pcap-prefix <prefix>        Channel group PCAP prefix (repeatable for multi-channel)");
+        Console.WriteLine("  --multicast-config <file>     JSON config with multicast group addresses/ports");
+        return 1;
+    }
+
+    Console.WriteLine($"  Mode: PCAP replay");
+
+    packetSource = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = speed });
 }
 
 Console.WriteLine($"  Speed: {(speed == 0 ? "max" : $"{speed}x")}");
@@ -136,7 +184,6 @@ else
 
 var bookManager = new BookManager(bookHandler);
 var marketDataManager = new MarketDataManager(mdHandler);
-var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = speed });
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -149,13 +196,13 @@ FeedHandler? singleFeed = null;
 
 if (groupIds.Count > 1)
 {
-    multiFeed = new MultiFeedManager(replayer, groupIds, composite);
+    multiFeed = new MultiFeedManager(packetSource, groupIds, composite);
     if (subscriptionManager is not null)
         multiFeed.AllGroupsReady += () => subscriptionManager.SetReady();
 }
 else
 {
-    singleFeed = new FeedHandler(replayer, composite);
+    singleFeed = new FeedHandler(packetSource, composite);
 }
 
 if (subscriptionManager is not null)
@@ -208,7 +255,7 @@ using var statsTimer = new Timer(_ =>
 
 }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
-Console.WriteLine("Starting replay...");
+Console.WriteLine($"Starting {(multicastMerger is not null ? "live feed" : "replay")}...");
 
 if (multiFeed is not null)
 {
@@ -233,9 +280,13 @@ if (wsHost is not null)
 
 multiFeed?.Dispose();
 singleFeed?.Dispose();
+if (multicastMerger is not null)
+    await multicastMerger.DisposeAsync();
+else
+    packetSource.Dispose();
 
 Console.WriteLine();
-Console.WriteLine($"═══ Replay complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
+Console.WriteLine($"═══ Complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
 Console.WriteLine($"  Channel groups: {groupIds.Count}");
 Console.WriteLine($"  Packets:      {(multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0):N0}");
 Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");

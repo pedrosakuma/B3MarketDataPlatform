@@ -7,4 +7,5 @@ public sealed record ChannelConfig(
     ChannelType Type,
     IPAddress MulticastGroup,
     int Port,
-    IPAddress? SourceAddress = null);
+    IPAddress? SourceAddress = null,
+    int ChannelGroup = 0);

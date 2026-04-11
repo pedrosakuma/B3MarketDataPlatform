@@ -7,10 +7,12 @@ public sealed class MulticastPacketSource : IPacketSource
 {
     private readonly UdpClient _client;
     private readonly ChannelType _channelType;
+    private readonly int _channelGroup;
 
     public MulticastPacketSource(ChannelConfig config)
     {
         _channelType = config.Type;
+        _channelGroup = config.ChannelGroup;
         _client = new UdpClient();
         _client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _client.Client.Bind(new IPEndPoint(IPAddress.Any, config.Port));
@@ -24,6 +26,7 @@ public sealed class MulticastPacketSource : IPacketSource
         {
             Data = result.Buffer,
             Channel = _channelType,
+            ChannelGroup = _channelGroup,
             ReceivedTimestampTicks = Environment.TickCount64
         };
     }

@@ -115,6 +115,18 @@ dotnet run --project src/B3.Umdf.ConsoleApp -- \
 
 Each prefix expands to `{prefix}_Incremental_FeedA.pcap`, `_Incremental_FeedB.pcap`, `_InstrumentDefinition.pcap`, and `_SnapshotRecovery.pcap`.
 
+### Run with Live Multicast (UDP)
+
+For production or certification environments with B3 multicast feeds:
+
+```bash
+dotnet run --project src/B3.Umdf.ConsoleApp -- \
+  --multicast-config config/multicast-sample.json \
+  --ws-port 8080
+```
+
+The JSON config defines multicast group addresses and ports for each channel. See `config/multicast-sample.json` for the format.
+
 ### Run with WebSocket Server
 
 ```bash
@@ -133,6 +145,7 @@ Then open `frontend/index.html` in a browser and connect to `ws://localhost:8080
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--pcap-prefix <path>` | — | PCAP file prefix (repeatable for multi-channel). Auto-discovers 4 files per prefix |
+| `--multicast-config <file>` | — | JSON config with multicast group addresses/ports for live UDP |
 | `--ws-port <port>` | *(off)* | Start WebSocket subscription server on the given port |
 | `--speed <mult>` | `0` | Replay speed: `0` = max, `1` = real-time, `5` = 5× accelerated |
 
@@ -261,11 +274,42 @@ The application supports processing multiple UMDF channel groups simultaneously 
 
 ### How It Works
 
-- Each channel group has 4 PCAP files (Incremental A/B, Instrument Definition, Snapshot Recovery)
+- Each channel group has 4 channels (Incremental A/B, Instrument Definition, Snapshot Recovery)
 - `MultiFeedManager` routes packets by `ChannelGroup` to per-group `FeedHandler` instances
 - Each `FeedHandler` has an independent state machine (WaitInstrDef → WaitSnapshot → CatchUp → RealTime)
 - All groups share `BookManager`, `MarketDataManager`, and `SymbolRegistry` — security IDs are globally unique
 - The WebSocket server activates once **all** channel groups reach RealTime
+
+### Transport Modes
+
+| Mode | Source | Use Case |
+|------|--------|----------|
+| **PCAP Replay** | `TimestampMergedReplayer` (sync) | Development, testing, backtesting |
+| **Live Multicast** | `MulticastChannelMerger` (async) | Production, B3 certification environment |
+
+Both implement `IPacketSource` — the feed handler layer is fully transport-agnostic.
+
+### Multicast Config Format
+
+The `--multicast-config` option takes a JSON file defining channel groups:
+
+```json
+{
+  "channelGroups": [
+    {
+      "name": "EQT",
+      "channels": [
+        { "channelId": 84, "type": "IncrementalA", "multicastGroup": "224.0.20.84", "port": 30084 },
+        { "channelId": 84, "type": "IncrementalB", "multicastGroup": "224.0.20.85", "port": 30085 },
+        { "channelId": 84, "type": "InstrumentDefinition", "multicastGroup": "224.0.20.86", "port": 30086 },
+        { "channelId": 84, "type": "SnapshotRecovery", "multicastGroup": "224.0.20.87", "port": 30087 }
+      ]
+    }
+  ]
+}
+```
+
+Optional `sourceAddress` field enables source-specific multicast (SSM). See `config/multicast-sample.json` for a complete example.
 
 ### Timestamp Ordering Note
 
