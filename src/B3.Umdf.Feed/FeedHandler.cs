@@ -41,7 +41,12 @@ public sealed class FeedHandler : IDisposable
     public Task StartAsync(CancellationToken ct = default)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _runTask = RunLoop(_cts.Token);
+
+        if (_source is ISyncPacketSource syncSource)
+            _runTask = Task.Run(() => RunSyncLoop(syncSource, _cts.Token));
+        else
+            _runTask = RunLoop(_cts.Token);
+
         return Task.CompletedTask;
     }
 
@@ -85,6 +90,15 @@ public sealed class FeedHandler : IDisposable
         }
     }
 
+    private void RunSyncLoop(ISyncPacketSource source, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && source.TryReceive(out var packet))
+        {
+            _packetCount++;
+            HandlePacket(in packet);
+        }
+    }
+
     private void HandlePacket(in UmdfPacket packet)
     {
         switch (_state)
@@ -120,7 +134,7 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
-                _incrementalQueue.Enqueue(packet);
+                EnqueueCopy(in packet);
                 break;
         }
     }
@@ -135,7 +149,7 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
-                _incrementalQueue.Enqueue(packet);
+                EnqueueCopy(in packet);
                 break;
         }
     }
@@ -168,12 +182,26 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
-                _incrementalQueue.Enqueue(packet);
+                EnqueueCopy(in packet);
                 break;
         }
     }
 
     private long _instrDefPacketCount;
+
+    /// <summary>
+    /// Enqueues an incremental packet with a deep copy of Data,
+    /// since the underlying buffer may be reused by ArrayPool.
+    /// </summary>
+    private void EnqueueCopy(in UmdfPacket packet)
+    {
+        _incrementalQueue.Enqueue(new UmdfPacket
+        {
+            Data = packet.Data.ToArray(),
+            Channel = packet.Channel,
+            ReceivedTimestampTicks = packet.ReceivedTimestampTicks
+        });
+    }
 
     private void DispatchAndTrackInstrDef(in UmdfPacket packet)
     {

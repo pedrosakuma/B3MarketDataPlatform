@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 
 namespace B3.Umdf.PcapReplay;
@@ -23,7 +24,8 @@ public sealed class PcapReader : IDisposable
         _linkType = ReadUInt32(header[20..]);
     }
 
-    public PcapReader(string filePath) : this(File.OpenRead(filePath)) { }
+    public PcapReader(string filePath)
+        : this(new BufferedStream(File.OpenRead(filePath), 1024 * 1024)) { }
 
     public bool TryReadNext(out PcapPacket packet)
     {
@@ -38,13 +40,14 @@ public sealed class PcapReader : IDisposable
         uint tsUsec = ReadUInt32(_recordHeader.AsSpan(4));
         uint inclLen = ReadUInt32(_recordHeader.AsSpan(8));
 
-        byte[] data = new byte[inclLen];
-        _stream.ReadExactly(data);
+        byte[] data = ArrayPool<byte>.Shared.Rent((int)inclLen);
+        _stream.ReadExactly(data.AsSpan(0, (int)inclLen));
 
         packet = new PcapPacket
         {
             TimestampMicros = (long)tsSec * 1_000_000 + tsUsec,
-            Data = data
+            Data = new ReadOnlyMemory<byte>(data, 0, (int)inclLen),
+            PooledArray = data
         };
         return true;
     }

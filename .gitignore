@@ -44,3 +44,4 @@ pcap/
 ## Test results
 TestResults/
 coverage/
+dotnet_*.nettrace

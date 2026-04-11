@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace B3.Umdf.Book;
 
 public sealed class BookSide
@@ -26,6 +28,7 @@ public sealed class BookSide
 
         _orders[entry.OrderId] = entry;
         AddToPriceLevels(entry);
+        AssertValid();
     }
 
     public bool Remove(ulong orderId)
@@ -33,6 +36,7 @@ public sealed class BookSide
         if (!_orders.Remove(orderId, out var entry))
             return false;
         RemoveFromPriceLevels(entry);
+        AssertValid();
         return true;
     }
 
@@ -102,6 +106,14 @@ public sealed class BookSide
         }
 
         return errors;
+    }
+
+    [Conditional("DEBUG")]
+    private void AssertValid()
+    {
+        var errors = Validate();
+        if (errors.Count > 0)
+            throw new InvalidOperationException($"BookSide({_side}) invalid: {string.Join("; ", errors)}");
     }
 
     private void AddToPriceLevels(OrderBookEntry entry)
