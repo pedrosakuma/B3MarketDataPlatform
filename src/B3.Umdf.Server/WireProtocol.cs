@@ -10,6 +10,7 @@ public enum MessageType : ushort
     // Client → Server
     Subscribe = 0x0001,
     Unsubscribe = 0x0002,
+    Get = 0x0003,
 
     // Server → Client
     SubscribeOk = 0x0010,
@@ -28,6 +29,21 @@ public enum SubscribeErrorCode : byte
 {
     UnknownSymbol = 0x01,
     NotReady = 0x02,
+}
+
+/// <summary>
+/// Bitmask for the data channels a client wants to receive.
+/// Sent in the Subscribe message; echoed back in SubscribeOk.
+/// </summary>
+[Flags]
+public enum DataFlags : byte
+{
+    None = 0x00,
+    /// <summary>BookSnapshot + order incrementals (OrderAdded/Updated/Deleted, Trade, BookCleared).</summary>
+    Book = 0x01,
+    /// <summary>InfoSnapshot + incremental market data / security status updates.</summary>
+    Info = 0x02,
+    All = Book | Info,
 }
 
 /// <summary>
@@ -60,12 +76,17 @@ public static class WireProtocol
 
     // --- Client → Server ---
 
-    /// <summary>Parse a Subscribe message. Returns symbol string.</summary>
-    public static string ReadSubscribe(ReadOnlySpan<byte> payload)
+    /// <summary>
+    /// Parse a Subscribe message. Returns symbol and data flags.
+    /// Format: [flags 1B][symbolLen 1B][symbol...].
+    /// </summary>
+    public static (string symbol, DataFlags flags) ReadSubscribe(ReadOnlySpan<byte> payload)
     {
-        // payload starts after framing header
-        byte symbolLen = payload[0];
-        return Encoding.UTF8.GetString(payload.Slice(1, symbolLen));
+        var flags = (DataFlags)payload[0];
+        if (flags == DataFlags.None) flags = DataFlags.All; // treat 0 as "all"
+        byte symbolLen = payload[1];
+        var symbol = Encoding.UTF8.GetString(payload.Slice(2, symbolLen));
+        return (symbol, flags);
     }
 
     /// <summary>Parse an Unsubscribe message. Returns securityId.</summary>
@@ -76,15 +97,16 @@ public static class WireProtocol
 
     // --- Server → Client ---
 
-    /// <summary>Write SubscribeOk: securityId + symbol.</summary>
-    public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, string symbol)
+    /// <summary>Write SubscribeOk: securityId + flags + symbol.</summary>
+    public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, DataFlags flags, string symbol)
     {
         byte[] symbolBytes = Encoding.UTF8.GetBytes(symbol);
-        ushort totalLen = (ushort)(FramingHeaderSize + 8 + 1 + symbolBytes.Length);
+        ushort totalLen = (ushort)(FramingHeaderSize + 8 + 1 + 1 + symbolBytes.Length);
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeOk);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        dest[12] = (byte)symbolBytes.Length;
-        symbolBytes.CopyTo(dest[13..]);
+        dest[12] = (byte)flags;
+        dest[13] = (byte)symbolBytes.Length;
+        symbolBytes.CopyTo(dest[14..]);
         return totalLen;
     }
 

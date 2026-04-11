@@ -52,9 +52,18 @@ public sealed class WebSocketHost : IDisposable
                     switch (type)
                     {
                         case MessageType.Subscribe:
-                            var symbol = WireProtocol.ReadSubscribe(payload.Span);
-                            _subscriptionManager.RequestSubscribe(session.Id, symbol);
+                        {
+                            var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
+                            _subscriptionManager.RequestSubscribe(session.Id, symbol, flags);
                             break;
+                        }
+
+                        case MessageType.Get:
+                        {
+                            var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
+                            _subscriptionManager.RequestGet(session.Id, symbol, flags);
+                            break;
+                        }
 
                         case MessageType.Unsubscribe:
                             var securityId = WireProtocol.ReadUnsubscribe(payload.Span);
