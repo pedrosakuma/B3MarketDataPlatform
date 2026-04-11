@@ -176,38 +176,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private static void SendInfoSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
     {
-        void Send(byte fieldId, long? value)
-        {
-            if (value is null) return;
-            var buf = new byte[21];
-            int len = WireProtocol.WriteMarketData(buf, securityId, fieldId, value.Value);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-
-        Send(WireProtocol.FieldOpeningPrice, info.OpeningPrice);
-        Send(WireProtocol.FieldClosingPrice, info.ClosingPrice);
-        Send(WireProtocol.FieldHighPrice, info.HighPrice);
-        Send(WireProtocol.FieldLowPrice, info.LowPrice);
-        Send(WireProtocol.FieldLastTradePrice, info.LastTradePrice);
-        Send(WireProtocol.FieldLastTradeSize, info.LastTradeSize);
-        Send(WireProtocol.FieldSettlementPrice, info.SettlementPrice);
-        Send(WireProtocol.FieldTheoreticalOpeningPrice, info.TheoreticalOpeningPrice);
-        Send(WireProtocol.FieldTradeVolume, info.TradeVolume);
-        Send(WireProtocol.FieldVwapPrice, info.VwapPrice);
-        Send(WireProtocol.FieldNetChange, info.NetChangeFromPrevDay);
-        Send(WireProtocol.FieldNumberOfTrades, info.NumberOfTrades);
-        Send(WireProtocol.FieldOpenInterest, info.OpenInterest);
-        Send(WireProtocol.FieldPriceBandLow, info.PriceBandLow);
-        Send(WireProtocol.FieldPriceBandHigh, info.PriceBandHigh);
-        Send(WireProtocol.FieldTradingReferencePrice, info.TradingReferencePrice);
-
-        if (info.TradingStatus is not null)
-        {
-            var statusBuf = new byte[20];
-            int len = WireProtocol.WriteSecurityStatus(statusBuf, securityId,
-                info.TradingStatus.Value, info.TradingEvent ?? 0);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(statusBuf, 0, len));
-        }
+        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
+        int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
+        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     // --- IBookEventHandler (called on feed thread) ---
@@ -279,20 +250,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
     {
         ProcessPendingRequests();
-        if (!_subscriptions.ContainsKey(securityId)) return;
-
-        var buf = new byte[20];
-        int len = WireProtocol.WriteSecurityStatus(buf, securityId,
-            info.TradingStatus ?? 0, info.TradingEvent ?? 0);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
+        SendInfoUpdate(securityId, info);
     }
 
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
         ProcessPendingRequests();
-        if (!_subscriptions.ContainsKey(securityId)) return;
-
-        SendInfoFields(securityId, info);
+        SendInfoUpdate(securityId, info);
     }
 
     // --- Helpers ---
@@ -317,32 +281,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         }
     }
 
-    private void SendInfoFields(ulong securityId, InstrumentInfo info)
+    private void SendInfoUpdate(ulong securityId, InstrumentInfo info)
     {
-        if (info.LastTradePrice is { } ltp)
-        {
-            var buf = new byte[21];
-            int len = WireProtocol.WriteMarketData(buf, securityId, WireProtocol.FieldLastTradePrice, ltp);
-            SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-        if (info.HighPrice is { } hp)
-        {
-            var buf = new byte[21];
-            int len = WireProtocol.WriteMarketData(buf, securityId, WireProtocol.FieldHighPrice, hp);
-            SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-        if (info.LowPrice is { } lp)
-        {
-            var buf = new byte[21];
-            int len = WireProtocol.WriteMarketData(buf, securityId, WireProtocol.FieldLowPrice, lp);
-            SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-        if (info.TradeVolume is { } tv)
-        {
-            var buf = new byte[21];
-            int len = WireProtocol.WriteMarketData(buf, securityId, WireProtocol.FieldTradeVolume, tv);
-            SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
-        }
+        if (!_subscriptions.ContainsKey(securityId)) return;
+
+        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
+        int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
+        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>

@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Text;
+using B3.Umdf.Book;
 
 namespace B3.Umdf.Server;
 
@@ -21,8 +22,6 @@ public enum MessageType : ushort
     OrderDeleted = 0x0032,
     Trade = 0x0033,
     BookCleared = 0x0034,
-    MarketData = 0x0040,
-    SecurityStatus = 0x0041,
 }
 
 public enum SubscribeErrorCode : byte
@@ -158,27 +157,73 @@ public static class WireProtocol
         return totalLen;
     }
 
-    /// <summary>Write MarketData: securityId, fieldId, value.</summary>
-    public static int WriteMarketData(Span<byte> dest, ulong securityId, byte fieldId, long value)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 1 + 8; // 21
-        WriteFramingHeader(dest, totalLen, MessageType.MarketData);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        dest[offset++] = fieldId;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], value);
-        return totalLen;
-    }
+    // --- InfoSnapshot (variable-length, bitmask-driven) ---
 
-    /// <summary>Write SecurityStatus: securityId, tradingStatus, tradingEvent.</summary>
-    public static int WriteSecurityStatus(Span<byte> dest, ulong securityId, int tradingStatus, int tradingEvent)
+    // Bit positions in InfoSnapshot field mask (u32).
+    // Values are written as i64 in bit order for set bits.
+    public const int FieldOpeningPrice = 0;
+    public const int FieldClosingPrice = 1;
+    public const int FieldHighPrice = 2;
+    public const int FieldLowPrice = 3;
+    public const int FieldLastTradePrice = 4;
+    public const int FieldLastTradeSize = 5;
+    public const int FieldSettlementPrice = 6;
+    public const int FieldTheoreticalOpeningPrice = 7;
+    public const int FieldTheoreticalOpeningSize = 8;
+    public const int FieldAuctionImbalanceSize = 9;
+    public const int FieldTradeVolume = 10;
+    public const int FieldVwapPrice = 11;
+    public const int FieldNetChange = 12;
+    public const int FieldNumberOfTrades = 13;
+    public const int FieldOpenInterest = 14;
+    public const int FieldPriceBandLow = 15;
+    public const int FieldPriceBandHigh = 16;
+    public const int FieldTradingReferencePrice = 17;
+    public const int FieldAvgDailyTradedQty = 18;
+    public const int FieldMaxTradeVol = 19;
+    public const int FieldTradingStatus = 20;
+    public const int FieldTradingEvent = 21;
+
+    /// <summary>Max buffer size for InfoSnapshot: header + securityId + mask + 22 fields × 8.</summary>
+    public const int InfoSnapshotMaxSize = FramingHeaderSize + 8 + 4 + 22 * 8; // 192
+
+    /// <summary>
+    /// Write InfoSnapshot: securityId + u32 field bitmask + i64 values for present fields.
+    /// Returns total message length.
+    /// </summary>
+    public static int WriteInfoSnapshot(Span<byte> dest, ulong securityId, InstrumentInfo info)
     {
-        const ushort totalLen = FramingHeaderSize + 8 + 4 + 4; // 20
-        WriteFramingHeader(dest, totalLen, MessageType.SecurityStatus);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        BinaryPrimitives.WriteInt32LittleEndian(dest[offset..], tradingStatus); offset += 4;
-        BinaryPrimitives.WriteInt32LittleEndian(dest[offset..], tradingEvent);
+        int offset = FramingHeaderSize + 8 + 4; // skip header + securityId + mask placeholder
+        uint mask = 0;
+
+        if (info.OpeningPrice is { } v0) { mask |= 1u << FieldOpeningPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v0); offset += 8; }
+        if (info.ClosingPrice is { } v1) { mask |= 1u << FieldClosingPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v1); offset += 8; }
+        if (info.HighPrice is { } v2) { mask |= 1u << FieldHighPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v2); offset += 8; }
+        if (info.LowPrice is { } v3) { mask |= 1u << FieldLowPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v3); offset += 8; }
+        if (info.LastTradePrice is { } v4) { mask |= 1u << FieldLastTradePrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v4); offset += 8; }
+        if (info.LastTradeSize is { } v5) { mask |= 1u << FieldLastTradeSize; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v5); offset += 8; }
+        if (info.SettlementPrice is { } v6) { mask |= 1u << FieldSettlementPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v6); offset += 8; }
+        if (info.TheoreticalOpeningPrice is { } v7) { mask |= 1u << FieldTheoreticalOpeningPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v7); offset += 8; }
+        if (info.TheoreticalOpeningSize is { } v8) { mask |= 1u << FieldTheoreticalOpeningSize; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v8); offset += 8; }
+        if (info.AuctionImbalanceSize is { } v9) { mask |= 1u << FieldAuctionImbalanceSize; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v9); offset += 8; }
+        if (info.TradeVolume is { } v10) { mask |= 1u << FieldTradeVolume; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v10); offset += 8; }
+        if (info.VwapPrice is { } v11) { mask |= 1u << FieldVwapPrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v11); offset += 8; }
+        if (info.NetChangeFromPrevDay is { } v12) { mask |= 1u << FieldNetChange; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v12); offset += 8; }
+        if (info.NumberOfTrades is { } v13) { mask |= 1u << FieldNumberOfTrades; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v13); offset += 8; }
+        if (info.OpenInterest is { } v14) { mask |= 1u << FieldOpenInterest; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v14); offset += 8; }
+        if (info.PriceBandLow is { } v15) { mask |= 1u << FieldPriceBandLow; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v15); offset += 8; }
+        if (info.PriceBandHigh is { } v16) { mask |= 1u << FieldPriceBandHigh; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v16); offset += 8; }
+        if (info.TradingReferencePrice is { } v17) { mask |= 1u << FieldTradingReferencePrice; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v17); offset += 8; }
+        if (info.AvgDailyTradedQty is { } v18) { mask |= 1u << FieldAvgDailyTradedQty; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v18); offset += 8; }
+        if (info.MaxTradeVol is { } v19) { mask |= 1u << FieldMaxTradeVol; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v19); offset += 8; }
+        if (info.TradingStatus is { } v20) { mask |= 1u << FieldTradingStatus; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v20); offset += 8; }
+        if (info.TradingEvent is { } v21) { mask |= 1u << FieldTradingEvent; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v21); offset += 8; }
+
+        // Write framing header, securityId, and mask
+        ushort totalLen = (ushort)offset;
+        WriteFramingHeader(dest, totalLen, MessageType.InfoSnapshot);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[FramingHeaderSize..], securityId);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[(FramingHeaderSize + 8)..], mask);
         return totalLen;
     }
 
@@ -217,24 +262,4 @@ public static class WireProtocol
         BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], orderCount); offset += 2;
         return offset;
     }
-
-    // --- InfoSnapshot ---
-
-    // Field IDs for InfoSnapshot
-    public const byte FieldOpeningPrice = 1;
-    public const byte FieldClosingPrice = 2;
-    public const byte FieldHighPrice = 3;
-    public const byte FieldLowPrice = 4;
-    public const byte FieldLastTradePrice = 5;
-    public const byte FieldLastTradeSize = 6;
-    public const byte FieldSettlementPrice = 7;
-    public const byte FieldTheoreticalOpeningPrice = 8;
-    public const byte FieldTradeVolume = 9;
-    public const byte FieldVwapPrice = 10;
-    public const byte FieldNetChange = 11;
-    public const byte FieldNumberOfTrades = 12;
-    public const byte FieldOpenInterest = 13;
-    public const byte FieldPriceBandLow = 14;
-    public const byte FieldPriceBandHigh = 15;
-    public const byte FieldTradingReferencePrice = 16;
 }
