@@ -1,3 +1,4 @@
+using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
@@ -11,10 +12,16 @@ namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler
 {
-    private readonly Dictionary<ulong, OrderBook> _books = new();
+    private Dictionary<ulong, OrderBook> _mutableBooks = new();
+    private FrozenDictionary<ulong, OrderBook>? _frozenBooks;
     private readonly IBookEventHandler? _eventHandler;
 
-    public IReadOnlyDictionary<ulong, OrderBook> Books => _books;
+    /// <summary>
+    /// Returns FrozenDictionary after instrument definitions (optimized lookups),
+    /// falls back to mutable dictionary during setup.
+    /// </summary>
+    public IReadOnlyDictionary<ulong, OrderBook> Books =>
+        (IReadOnlyDictionary<ulong, OrderBook>?)_frozenBooks ?? _mutableBooks;
 
     public BookManager(IBookEventHandler? eventHandler = null)
     {
@@ -27,17 +34,39 @@ public sealed class BookManager : IFeedEventHandler
     /// </summary>
     public void EnsureCapacity(int instrumentCount)
     {
-        _books.EnsureCapacity(instrumentCount);
+        _mutableBooks.EnsureCapacity(instrumentCount);
+    }
+
+    /// <summary>
+    /// Freeze the books dictionary for optimized lookups during the hot path.
+    /// Called after all instruments are discovered (InstrDef + Snapshot).
+    /// </summary>
+    public void FreezeBooks()
+    {
+        _frozenBooks = _mutableBooks.ToFrozenDictionary();
     }
 
     public OrderBook GetOrCreateBook(ulong securityId)
     {
-        if (!_books.TryGetValue(securityId, out var book))
+        // Fast path: frozen dictionary lookup (optimized hash)
+        if (_frozenBooks is not null)
         {
+            if (_frozenBooks.TryGetValue(securityId, out var book))
+                return book;
+            // New instrument after freeze — create and re-freeze
             book = new OrderBook(securityId);
-            _books[securityId] = book;
+            _mutableBooks[securityId] = book;
+            _frozenBooks = _mutableBooks.ToFrozenDictionary();
+            return book;
         }
-        return book;
+
+        // Setup path: mutable dictionary
+        if (!_mutableBooks.TryGetValue(securityId, out var mBook))
+        {
+            mBook = new OrderBook(securityId);
+            _mutableBooks[securityId] = mBook;
+        }
+        return mBook;
     }
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
@@ -73,8 +102,11 @@ public sealed class BookManager : IFeedEventHandler
     public void OnGapDetected(uint expected, uint received) { }
     public void OnSequenceReset() { ClearAllBooks(); }
     public void OnSnapshotStart() { }
-    public void OnSnapshotComplete(uint lastRptSeq) { }
-    public void OnInstrumentDefinitionsComplete(int instrumentCount) => EnsureCapacity(instrumentCount);
+    public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount)
+    {
+        EnsureCapacity(instrumentCount);
+    }
 
     private void HandleOrder(ReadOnlySpan<byte> body)
     {
@@ -95,7 +127,6 @@ public sealed class BookManager : IFeedEventHandler
 
         if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
         {
-            // Reuse existing object — zero allocation for updates
             long oldPrice = existing.Price;
             existing.Price = price;
             existing.Quantity = quantity;
@@ -103,7 +134,6 @@ public sealed class BookManager : IFeedEventHandler
 
             if (oldPrice != price)
                 bookSide.MoveOrder(existing, oldPrice);
-            // else: same price, fields already updated in-place — nothing to do
 
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
@@ -139,7 +169,7 @@ public sealed class BookManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!_books.TryGetValue(securityId, out var book))
+        if (!TryLookupBook(securityId, out var book))
             return;
 
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
@@ -161,7 +191,7 @@ public sealed class BookManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!_books.TryGetValue(securityId, out var book))
+        if (!TryLookupBook(securityId, out var book))
             return;
 
         var entryType = msg.MDEntryType;
@@ -189,7 +219,7 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         long tradeId = (long)(uint)msg.TradeID;
 
-        if (_books.TryGetValue(securityId, out var book))
+        if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
@@ -206,16 +236,30 @@ public sealed class BookManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (_books.TryGetValue(securityId, out var book))
+        if (TryLookupBook(securityId, out var book))
         {
             book.Clear();
             _eventHandler?.OnBookCleared(securityId);
         }
     }
 
+    /// <summary>
+    /// Fast book lookup — uses FrozenDictionary when available (hot path),
+    /// falls back to mutable dictionary during setup.
+    /// </summary>
+    private bool TryLookupBook(ulong securityId, out OrderBook book)
+    {
+        if (_frozenBooks is not null)
+            return _frozenBooks.TryGetValue(securityId, out book!);
+        return _mutableBooks.TryGetValue(securityId, out book!);
+    }
+
     private void ClearAllBooks()
     {
-        foreach (var (secId, book) in _books)
+        var books = _frozenBooks is not null
+            ? (IEnumerable<KeyValuePair<ulong, OrderBook>>)_frozenBooks
+            : _mutableBooks;
+        foreach (var (secId, book) in books)
         {
             book.Clear();
             _eventHandler?.OnBookCleared(secId);
