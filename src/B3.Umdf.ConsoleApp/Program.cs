@@ -31,12 +31,14 @@ Console.WriteLine();
 
 var stats = new Stats();
 var bookManager = new BookManager(stats);
+var marketDataManager = new MarketDataManager(stats);
 var replayer = new TimestampMergedReplayer(sources, new ReplayOptions { SpeedMultiplier = 0 });
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-using var feedHandler = new FeedHandler(replayer, bookManager);
+var composite = new CompositeFeedHandler(bookManager, marketDataManager);
+using var feedHandler = new FeedHandler(replayer, composite);
 
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
@@ -49,7 +51,7 @@ using var statsTimer = new Timer(_ =>
 
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] State: {state} ──");
-    Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}");
+    Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}  |  Instruments: {marketDataManager.InstrumentData.Count:N0}");
     if (state == FeedState.WaitInstrumentDefinition)
         Console.WriteLine($"   InstrDef: {feedHandler.InstrDefReceived:N0}/{feedHandler.InstrDefTotalExpected:N0} parsed  ({feedHandler.InstrDefPacketCount:N0} packets)");
 
@@ -86,6 +88,7 @@ Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
 Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
 Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
 Console.WriteLine($"  Books:        {bookManager.Books.Count:N0}");
+Console.WriteLine($"  Instruments:  {marketDataManager.InstrumentData.Count:N0}");
 
 if (bookManager.Books.Count > 0)
     PrintBookSample(bookManager);
@@ -143,7 +146,7 @@ static void PrintBookSample(BookManager bookManager)
     }
 }
 
-sealed class Stats : IBookEventHandler
+sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 {
     public long OrderCount;
     public long TradeCount;

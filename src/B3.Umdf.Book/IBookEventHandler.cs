@@ -8,8 +8,6 @@ public interface IBookEventHandler
     void OnTrade(ulong securityId, long price, long quantity, long tradeId);
     void OnBookCleared(ulong securityId);
 
-    void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info) { }
-    void OnMarketDataUpdated(ulong securityId, InstrumentInfo info) { }
     void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId) { }
     void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
     void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
