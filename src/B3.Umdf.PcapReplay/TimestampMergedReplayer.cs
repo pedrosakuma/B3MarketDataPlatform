@@ -1,18 +1,18 @@
-using System.Buffers;
 using B3.Umdf.Transport;
 
 namespace B3.Umdf.PcapReplay;
 
 /// <summary>
 /// Merges multiple PCAP files by timestamp using a priority queue.
+/// Uses memory-mapped readers for zero-copy I/O — packet data points directly
+/// into mmap'd pages, eliminating per-packet allocations and copies.
 /// Implements ISyncPacketSource for zero-overhead synchronous consumption,
 /// and IPacketSource for async compatibility.
 /// </summary>
 public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 {
     private readonly PriorityQueue<(PcapPacket Packet, int ReaderIndex), long> _pq = new();
-    private readonly List<(PcapReader Reader, ChannelType Channel, uint LinkType)> _readers = new();
-    private readonly byte[]?[] _previousRented;
+    private readonly List<(MmapPcapReader Reader, ChannelType Channel, uint LinkType)> _readers = new();
     private readonly ReplayOptions _options;
     private long? _firstTimestamp;
     private long _startTicks;
@@ -22,12 +22,11 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     {
         _options = options ?? new ReplayOptions();
         _startTicks = Environment.TickCount64;
-        _previousRented = new byte[]?[sources.Count];
 
         for (int i = 0; i < sources.Count; i++)
         {
             var src = sources[i];
-            var reader = new PcapReader(src.FilePath);
+            var reader = new MmapPcapReader(src.FilePath);
             _readers.Add((reader, src.Channel, reader.LinkType));
             if (reader.TryReadNext(out var pkt))
                 _pq.Enqueue((pkt, i), pkt.TimestampMicros);
@@ -36,14 +35,13 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 
     /// <summary>
     /// Synchronous receive — no async overhead, no Channel&lt;T&gt;, no thread pool.
-    /// The returned packet's Data is valid until the next TryReceive call.
-    /// If you need to store the data beyond that, call .Data.ToArray().
+    /// With mmap, the returned packet's Data points directly into the mmap'd region
+    /// and remains valid for the lifetime of the replayer.
     /// </summary>
     public bool TryReceive(out UmdfPacket packet)
     {
         if (!_pq.TryDequeue(out var item, out long timestampMicros))
         {
-            ReturnAllRented();
             packet = default;
             return false;
         }
@@ -68,10 +66,6 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             ReceivedTimestampTicks = Environment.TickCount64
         };
 
-        // Return the previously rented array for this reader (from a prior TryReceive)
-        ReturnRented(item.ReaderIndex);
-        _previousRented[item.ReaderIndex] = item.Packet.PooledArray;
-
         if (reader.TryReadNext(out var next))
             _pq.Enqueue((next, item.ReaderIndex), next.TimestampMicros);
 
@@ -90,26 +84,10 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
         throw new System.Threading.Channels.ChannelClosedException();
     }
 
-    private void ReturnRented(int readerIndex)
-    {
-        if (_previousRented[readerIndex] is { } arr)
-        {
-            ArrayPool<byte>.Shared.Return(arr);
-            _previousRented[readerIndex] = null;
-        }
-    }
-
-    private void ReturnAllRented()
-    {
-        for (int i = 0; i < _previousRented.Length; i++)
-            ReturnRented(i);
-    }
-
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        ReturnAllRented();
         foreach (var (reader, _, _) in _readers)
             reader.Dispose();
     }

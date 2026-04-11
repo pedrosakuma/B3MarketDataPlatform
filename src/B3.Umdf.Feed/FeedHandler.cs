@@ -190,17 +190,12 @@ public sealed class FeedHandler : IDisposable
     private long _instrDefPacketCount;
 
     /// <summary>
-    /// Enqueues an incremental packet with a deep copy of Data,
-    /// since the underlying buffer may be reused by ArrayPool.
+    /// Enqueues an incremental packet for later replay during catch-up.
+    /// With mmap-backed readers, packet data remains valid for the replayer's lifetime.
     /// </summary>
     private void EnqueueCopy(in UmdfPacket packet)
     {
-        _incrementalQueue.Enqueue(new UmdfPacket
-        {
-            Data = packet.Data.ToArray(),
-            Channel = packet.Channel,
-            ReceivedTimestampTicks = packet.ReceivedTimestampTicks
-        });
+        _incrementalQueue.Enqueue(packet);
     }
 
     private void DispatchAndTrackInstrDef(in UmdfPacket packet)
