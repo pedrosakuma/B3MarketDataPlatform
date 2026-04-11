@@ -13,7 +13,7 @@ namespace B3.Umdf.PcapReplay;
 public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 {
     private readonly PriorityQueue<(PcapPacket Packet, int ReaderIndex), long> _pq = new();
-    private readonly List<(MmapPcapReader Reader, ChannelType Channel)> _readers = new();
+    private readonly List<(MmapPcapReader Reader, ChannelType Channel, int Group)> _readers = new();
     private readonly int[] _cachedUdpOffset;
     private readonly ReplayOptions _options;
     private long? _firstTimestamp;
@@ -30,7 +30,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
         {
             var src = sources[i];
             var reader = new MmapPcapReader(src.FilePath);
-            _readers.Add((reader, src.Channel));
+            _readers.Add((reader, src.Channel, src.Group));
             if (reader.TryReadNext(out var pkt))
             {
                 _cachedUdpOffset[i] = UdpExtractor.ComputeUdpPayloadOffset(pkt.Data.Span, reader.LinkType);
@@ -62,13 +62,14 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
                 Thread.Sleep((int)delayMs);
         }
 
-        var (reader, channel) = _readers[item.ReaderIndex];
+        var (reader, channel, group) = _readers[item.ReaderIndex];
         var payload = item.Packet.Data.Slice(_cachedUdpOffset[item.ReaderIndex]);
 
         packet = new UmdfPacket
         {
             Data = payload,
             Channel = channel,
+            ChannelGroup = group,
             ReceivedTimestampTicks = Environment.TickCount64
         };
 
@@ -94,7 +95,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var (reader, _) in _readers)
+        foreach (var (reader, _, _) in _readers)
             reader.Dispose();
     }
 }

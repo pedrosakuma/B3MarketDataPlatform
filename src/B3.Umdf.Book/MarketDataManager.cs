@@ -14,11 +14,10 @@ public sealed class MarketDataManager : IFeedEventHandler
     private readonly IMarketDataEventHandler? _eventHandler;
 
     /// <summary>
-    /// Returns FrozenDictionary after instrument definitions (optimized lookups),
-    /// falls back to mutable dictionary during setup.
+    /// Returns the mutable dictionary which always has the complete set of instrument data.
+    /// FrozenDictionary is used internally as a lookup optimization only.
     /// </summary>
-    public IReadOnlyDictionary<ulong, InstrumentInfo> InstrumentData =>
-        (IReadOnlyDictionary<ulong, InstrumentInfo>?)_frozenData ?? _mutableData;
+    public IReadOnlyDictionary<ulong, InstrumentInfo> InstrumentData => _mutableData;
 
     public MarketDataManager(IMarketDataEventHandler? eventHandler = null)
     {
@@ -332,9 +331,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     private void ClearAllInfo()
     {
-        foreach (var (_, info) in _frozenData is not null
-            ? (IEnumerable<KeyValuePair<ulong, InstrumentInfo>>)_frozenData
-            : _mutableData)
+        foreach (var (_, info) in _mutableData)
         {
             info.Reset();
         }

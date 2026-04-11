@@ -20,11 +20,10 @@ public sealed class BookManager : IFeedEventHandler
     private readonly IBookEventHandler? _eventHandler;
 
     /// <summary>
-    /// Returns FrozenDictionary after instrument definitions (optimized lookups),
-    /// falls back to mutable dictionary during setup.
+    /// Returns the mutable dictionary which always has the complete set of books.
+    /// FrozenDictionary is used internally as a lookup optimization only.
     /// </summary>
-    public IReadOnlyDictionary<ulong, OrderBook> Books =>
-        (IReadOnlyDictionary<ulong, OrderBook>?)_frozenBooks ?? _mutableBooks;
+    public IReadOnlyDictionary<ulong, OrderBook> Books => _mutableBooks;
 
     public BookManager(IBookEventHandler? eventHandler = null)
     {
@@ -365,10 +364,7 @@ public sealed class BookManager : IFeedEventHandler
 
     private void ClearAllBooks()
     {
-        var books = _frozenBooks is not null
-            ? (IEnumerable<KeyValuePair<ulong, OrderBook>>)_frozenBooks
-            : _mutableBooks;
-        foreach (var (secId, book) in books)
+        foreach (var (secId, book) in _mutableBooks)
         {
             book.Clear();
             _eventHandler?.OnBookCleared(secId);

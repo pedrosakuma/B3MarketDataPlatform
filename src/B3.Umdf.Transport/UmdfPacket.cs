@@ -6,6 +6,7 @@ public readonly struct UmdfPacket
 {
     public ReadOnlyMemory<byte> Data { get; init; }
     public ChannelType Channel { get; init; }
+    public int ChannelGroup { get; init; }
     public long ReceivedTimestampTicks { get; init; }
 
     public bool TryGetHeader(out PacketHeader header)

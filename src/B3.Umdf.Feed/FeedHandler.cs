@@ -6,7 +6,7 @@ namespace B3.Umdf.Feed;
 
 public sealed class FeedHandler : IDisposable
 {
-    private readonly IPacketSource _source;
+    private readonly IPacketSource? _source;
     private readonly ChannelHandler _incrementalHandler;
     private readonly IFeedEventHandler _eventHandler;
     private CancellationTokenSource? _cts;
@@ -39,8 +39,22 @@ public sealed class FeedHandler : IDisposable
         _incrementalHandler = new ChannelHandler(eventHandler);
     }
 
+    /// <summary>
+    /// Creates a FeedHandler for external feeding (no owned source).
+    /// Use FeedPacket() to push packets from an external loop.
+    /// </summary>
+    public FeedHandler(IFeedEventHandler eventHandler)
+    {
+        _source = null;
+        _eventHandler = eventHandler;
+        _incrementalHandler = new ChannelHandler(eventHandler);
+    }
+
     public Task StartAsync(CancellationToken ct = default)
     {
+        if (_source is null)
+            throw new InvalidOperationException("Cannot start a FeedHandler without a packet source. Use FeedPacket() for externally-fed handlers.");
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
         if (_source is ISyncPacketSource syncSource)
@@ -76,7 +90,7 @@ public sealed class FeedHandler : IDisposable
         {
             try
             {
-                var packet = await _source.ReceiveAsync(ct);
+                var packet = await _source!.ReceiveAsync(ct);
                 _packetCount++;
                 HandlePacket(in packet);
             }
@@ -98,6 +112,15 @@ public sealed class FeedHandler : IDisposable
             _packetCount++;
             HandlePacket(in packet);
         }
+    }
+
+    /// <summary>
+    /// Push a packet from an external loop (used with MultiFeedManager).
+    /// </summary>
+    public void FeedPacket(in UmdfPacket packet)
+    {
+        _packetCount++;
+        HandlePacket(in packet);
     }
 
     private void HandlePacket(in UmdfPacket packet)

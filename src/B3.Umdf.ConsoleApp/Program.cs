@@ -8,6 +8,7 @@ using B3.Umdf.Transport;
 // Parse named arguments
 int? wsPort = null;
 double speed = 0;
+var pcapPrefixes = new List<string>();
 var positionalArgs = new List<string>();
 
 for (int i = 0; i < args.Length; i++)
@@ -29,40 +30,86 @@ for (int i = 0; i < args.Length; i++)
             return 1;
         }
     }
+    else if (args[i] == "--pcap-prefix" && i + 1 < args.Length)
+    {
+        pcapPrefixes.Add(args[++i]);
+    }
     else
     {
         positionalArgs.Add(args[i]);
     }
 }
 
-if (positionalArgs.Count < 1)
+// Build PCAP sources — either from --pcap-prefix or positional args
+var sources = new List<PcapChannelSource>();
+var groupIds = new List<int>();
+
+var channelSuffixes = new[]
 {
-    Console.WriteLine("Usage: B3.Umdf.ConsoleApp <incremental-a.pcap> [incremental-b.pcap] [instrdef.pcap] [snapshot.pcap] [--ws-port <port>]");
+    ("Incremental_FeedA", ChannelType.IncrementalA),
+    ("Incremental_FeedB", ChannelType.IncrementalB),
+    ("InstrumentDefinition", ChannelType.InstrumentDefinition),
+    ("SnapshotRecovery", ChannelType.SnapshotRecovery),
+};
+
+if (pcapPrefixes.Count > 0)
+{
+    // --pcap-prefix mode: auto-discover files by naming convention
+    for (int g = 0; g < pcapPrefixes.Count; g++)
+    {
+        var prefix = pcapPrefixes[g];
+        Console.WriteLine($"  Channel group {g}: {Path.GetFileName(prefix)}");
+        groupIds.Add(g);
+
+        foreach (var (suffix, channelType) in channelSuffixes)
+        {
+            var filePath = $"{prefix}_{suffix}.pcap";
+            if (!File.Exists(filePath))
+            {
+                Console.Error.WriteLine($"  File not found: {filePath}");
+                return 1;
+            }
+            sources.Add(new PcapChannelSource(filePath, channelType, g));
+            Console.WriteLine($"    {channelType,-25} <- {Path.GetFileName(filePath)}");
+        }
+    }
+}
+else if (positionalArgs.Count >= 1)
+{
+    // Legacy positional mode: single channel group
+    var channelTypes = new[] { ChannelType.IncrementalA, ChannelType.IncrementalB, ChannelType.InstrumentDefinition, ChannelType.SnapshotRecovery };
+    groupIds.Add(0);
+
+    for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
+    {
+        if (!File.Exists(positionalArgs[i]))
+        {
+            Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
+            return 1;
+        }
+        sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i], 0));
+        Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
+    }
+}
+else
+{
+    Console.WriteLine("Usage:");
+    Console.WriteLine("  B3.Umdf.ConsoleApp --pcap-prefix <prefix> [--pcap-prefix <prefix2>] [options]");
+    Console.WriteLine("  B3.Umdf.ConsoleApp <incrA.pcap> [incrB.pcap] [instrdef.pcap] [snapshot.pcap] [options]");
     Console.WriteLine();
-    Console.WriteLine("Replays B3 UMDF Binary PCAP files and prints decoded market data.");
-    Console.WriteLine("Files are merged by timestamp for accurate cross-channel ordering.");
+    Console.WriteLine("The --pcap-prefix mode auto-discovers files by naming convention:");
+    Console.WriteLine("  <prefix>_Incremental_FeedA.pcap, <prefix>_Incremental_FeedB.pcap,");
+    Console.WriteLine("  <prefix>_InstrumentDefinition.pcap, <prefix>_SnapshotRecovery.pcap");
     Console.WriteLine();
     Console.WriteLine("Options:");
-    Console.WriteLine("  --ws-port <port>   Start WebSocket subscription server on the given port");
-    Console.WriteLine("  --speed <mult>     Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
+    Console.WriteLine("  --ws-port <port>        Start WebSocket subscription server on the given port");
+    Console.WriteLine("  --speed <mult>          Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
+    Console.WriteLine("  --pcap-prefix <prefix>  Channel group PCAP prefix (repeatable for multi-channel)");
     return 1;
 }
 
-var sources = new List<PcapChannelSource>();
-var channelTypes = new[] { ChannelType.IncrementalA, ChannelType.IncrementalB, ChannelType.InstrumentDefinition, ChannelType.SnapshotRecovery };
-
-for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
-{
-    if (!File.Exists(positionalArgs[i]))
-    {
-        Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
-        return 1;
-    }
-    sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i]));
-    Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
-}
-
 Console.WriteLine($"  Speed: {(speed == 0 ? "max" : $"{speed}x")}");
+Console.WriteLine($"  Channel groups: {groupIds.Count}");
 Console.WriteLine();
 
 var stats = new Stats();
@@ -95,7 +142,21 @@ using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 var composite = new CompositeFeedHandler(bookManager, marketDataManager, symbolRegistry);
-using var feedHandler = new FeedHandler(replayer, composite);
+
+// Use MultiFeedManager for multi-channel, single FeedHandler for single-channel
+MultiFeedManager? multiFeed = null;
+FeedHandler? singleFeed = null;
+
+if (groupIds.Count > 1)
+{
+    multiFeed = new MultiFeedManager(replayer, groupIds, composite);
+    if (subscriptionManager is not null)
+        multiFeed.AllGroupsReady += () => subscriptionManager.SetReady();
+}
+else
+{
+    singleFeed = new FeedHandler(replayer, composite);
+}
 
 if (subscriptionManager is not null)
 {
@@ -106,37 +167,60 @@ if (subscriptionManager is not null)
 
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
-var lastState = FeedState.WaitInstrumentDefinition;
+var lastReady = false;
 using var statsTimer = new Timer(_ =>
 {
-    var state = feedHandler.State;
-    var stateChanged = state != lastState;
-    lastState = state;
+    bool ready;
+    long packets;
+    string stateStr;
 
-    if (stateChanged && state == FeedState.RealTime)
-        subscriptionManager?.SetReady();
+    if (multiFeed is not null)
+    {
+        ready = multiFeed.IsAllReady;
+        packets = multiFeed.TotalPacketCount;
+        var states = string.Join(", ", multiFeed.Handlers.Select(h => $"G{h.Key}:{h.Value.State}"));
+        stateStr = states;
+    }
+    else if (singleFeed is not null)
+    {
+        ready = singleFeed.State == FeedState.RealTime;
+        packets = singleFeed.PacketCount;
+        stateStr = singleFeed.State.ToString();
+    }
+    else return;
+
+    if (ready && !lastReady)
+    {
+        if (singleFeed is not null)
+            subscriptionManager?.SetReady();
+        lastReady = true;
+    }
 
     Console.WriteLine();
-    Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] State: {state} ──");
-    Console.WriteLine($"   Packets: {feedHandler.PacketCount:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}  |  Instruments: {marketDataManager.InstrumentData.Count:N0}");
-    if (state == FeedState.WaitInstrumentDefinition)
-        Console.WriteLine($"   InstrDef: {feedHandler.InstrDefReceived:N0}/{feedHandler.InstrDefTotalExpected:N0} parsed  ({feedHandler.InstrDefPacketCount:N0} packets)");
+    Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
+    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}  |  Instruments: {marketDataManager.InstrumentData.Count:N0}  |  Symbols: {symbolRegistry.Count:N0}");
 
-    if (state == FeedState.RealTime && bookManager.Books.Count > 0)
+    if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
+        Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
+
+    if (ready && bookManager.Books.Count > 0)
         PrintBookSample(bookManager);
 
 }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine("Starting replay...");
-await feedHandler.StartAsync(cts.Token);
 
-try
+if (multiFeed is not null)
 {
-    await feedHandler.WaitForCompletionAsync();
+    await multiFeed.StartAsync(cts.Token);
+    try { await multiFeed.WaitForCompletionAsync(); }
+    catch (OperationCanceledException) { Console.WriteLine("Cancelled."); }
 }
-catch (OperationCanceledException)
+else
 {
-    Console.WriteLine("Cancelled.");
+    await singleFeed!.StartAsync(cts.Token);
+    try { await singleFeed.WaitForCompletionAsync(); }
+    catch (OperationCanceledException) { Console.WriteLine("Cancelled."); }
 }
 
 statsTimer.Change(Timeout.Infinite, Timeout.Infinite);
@@ -147,10 +231,13 @@ if (wsHost is not null)
 if (wsHost is not null)
     await wsHost.DisposeAsync();
 
+multiFeed?.Dispose();
+singleFeed?.Dispose();
+
 Console.WriteLine();
 Console.WriteLine($"═══ Replay complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
-Console.WriteLine($"  Final state:  {feedHandler.State}");
-Console.WriteLine($"  Packets:      {feedHandler.PacketCount:N0}");
+Console.WriteLine($"  Channel groups: {groupIds.Count}");
+Console.WriteLine($"  Packets:      {(multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0):N0}");
 Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");
 Console.WriteLine($"  Trades:       {stats.TradeCount:N0}");
 Console.WriteLine($"  Deletes:      {stats.DeleteCount:N0}");
