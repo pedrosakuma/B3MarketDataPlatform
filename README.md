@@ -17,6 +17,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Unary Get** — one-shot snapshot without subscribing
 - **Web frontend** — single-file SPA for interactive testing
 - **Docker Compose** — one command to run backend + frontend with PCAP replay
+- **Multi-channel support** — process multiple channel groups simultaneously (e.g. EQT + DRV)
 - **Pluggable transport** — `IPacketSource` abstraction with multicast and in-process implementations
 
 ## Architecture
@@ -29,11 +30,17 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
          │  IPacketSource        │
          └──────────┬────────────┘
                     │
-            ┌───────▼───────┐
-            │  FeedHandler   │
-            │  (ChannelHandler, GapDetector)
-            └───────┬───────┘
-                    │  IFeedEventHandler
+          ┌─────────▼──────────┐
+          │  MultiFeedManager   │   ← routes by ChannelGroup
+          │  (multi-channel)    │
+          └──┬──────────────┬──┘
+             │              │
+     ┌───────▼──────┐ ┌────▼─────────┐
+     │ FeedHandler   │ │ FeedHandler   │  ← one per channel group
+     │ (Group 0/EQT) │ │ (Group 1/DRV) │
+     └───────┬──────┘ └────┬─────────┘
+             └──────┬───────┘
+                    │  IFeedEventHandler (shared)
         ┌───────────┼───────────┐
         ▼           ▼           ▼
   BookManager  MarketDataMgr  SymbolRegistry
@@ -85,7 +92,7 @@ B3 provides sample PCAP files for development:
 ./tools/download-pcaps.sh
 ```
 
-### Run with PCAP Replay
+### Run with PCAP Replay (Single Channel)
 
 ```bash
 dotnet run --project src/B3.Umdf.ConsoleApp -- \
@@ -94,6 +101,19 @@ dotnet run --project src/B3.Umdf.ConsoleApp -- \
   pcap/20250331_MBO_084_EQT_InstrumentDefinition.pcap \
   pcap/20250331_MBO_084_EQT_SnapshotRecovery.pcap
 ```
+
+### Run with PCAP Replay (Multi-Channel)
+
+Use `--pcap-prefix` to auto-discover the 4 PCAP files per channel group:
+
+```bash
+dotnet run --project src/B3.Umdf.ConsoleApp -- \
+  --pcap-prefix pcap/20250331_MBO_084_EQT \
+  --pcap-prefix pcap/20250929_MBO_072_DRV \
+  --ws-port 8080 --speed 5
+```
+
+Each prefix expands to `{prefix}_Incremental_FeedA.pcap`, `_Incremental_FeedB.pcap`, `_InstrumentDefinition.pcap`, and `_SnapshotRecovery.pcap`.
 
 ### Run with WebSocket Server
 
@@ -112,8 +132,11 @@ Then open `frontend/index.html` in a browser and connect to `ws://localhost:8080
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--pcap-prefix <path>` | — | PCAP file prefix (repeatable for multi-channel). Auto-discovers 4 files per prefix |
 | `--ws-port <port>` | *(off)* | Start WebSocket subscription server on the given port |
 | `--speed <mult>` | `0` | Replay speed: `0` = max, `1` = real-time, `5` = 5× accelerated |
+
+Positional arguments (4 PCAP file paths) are also supported for single-channel backward compatibility.
 
 ## Docker Compose
 
@@ -132,14 +155,20 @@ Open http://localhost:3000, connect to `ws://localhost:8080/ws`, and subscribe t
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PCAP_PREFIX` | `20250331_MBO_084_EQT` | PCAP file name prefix (files must be in `pcap/`) |
+| `PCAP_PREFIX` | `20250331_MBO_084_EQT` | Comma-separated PCAP prefixes (multi-channel: `EQT,DRV`) |
 | `WS_PORT` | `8080` | WebSocket server port |
 | `REPLAY_SPEED` | `5` | Replay speed multiplier |
 | `FRONTEND_PORT` | `3000` | Frontend HTTP port |
 
 ```bash
-# Use derivatives dataset at real-time speed
+# Both equities and derivatives (default)
+docker compose up --build
+
+# Derivatives only at real-time speed
 PCAP_PREFIX=20250929_MBO_072_DRV REPLAY_SPEED=1 docker compose up --build
+
+# Multi-channel explicit
+PCAP_PREFIX=20250331_MBO_084_EQT,20250929_MBO_072_DRV docker compose up --build
 ```
 
 ## WebSocket Binary Protocol
@@ -225,6 +254,22 @@ The `TimestampMergedReplayer` reads all PCAP files simultaneously and merges pac
 - Packets arrive in the exact chronological order they were captured
 - Cross-channel ordering is preserved (e.g., instrument definition before first incremental)
 - Optional speed control via `--speed` (0 = burst, 1 = real-time, >1 = accelerated)
+
+## Multi-Channel Support
+
+The application supports processing multiple UMDF channel groups simultaneously (e.g. equities + derivatives). B3 uses the same SBE schema for all asset classes — the wire format is identical.
+
+### How It Works
+
+- Each channel group has 4 PCAP files (Incremental A/B, Instrument Definition, Snapshot Recovery)
+- `MultiFeedManager` routes packets by `ChannelGroup` to per-group `FeedHandler` instances
+- Each `FeedHandler` has an independent state machine (WaitInstrDef → WaitSnapshot → CatchUp → RealTime)
+- All groups share `BookManager`, `MarketDataManager`, and `SymbolRegistry` — security IDs are globally unique
+- The WebSocket server activates once **all** channel groups reach RealTime
+
+### Timestamp Ordering Note
+
+When replaying PCAPs from different dates (e.g. EQT 2025-03-31 and DRV 2025-09-29), the timestamp-based merge processes all packets from the earlier date first. This means one group reaches RealTime before the other starts its instrument definition phase. This is by design — the merge preserves chronological fidelity.
 
 ## Performance
 
