@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
 
@@ -88,37 +89,17 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void HandleSubscribe(string clientId, string symbol, DataFlags flags)
     {
-        if (!_clients.TryGetValue(clientId, out var session)) return;
-        if (_symbolRegistry is null) return;
-
-        if (!_ready)
-        {
-            var buf = new byte[64];
-            int len = WireProtocol.WriteSubscribeError(buf, SubscribeErrorCode.NotReady, symbol);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
-        }
-
-        if (!_symbolRegistry.TryResolve(symbol, out var securityId))
-        {
-            var buf = new byte[64];
-            int len = WireProtocol.WriteSubscribeError(buf, SubscribeErrorCode.UnknownSymbol, symbol);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-            return;
-        }
 
         // Send SubscribeOk with the active flags
-        var okBuf = new byte[64];
+        var okBuf = new byte[WireProtocol.FramingHeaderSize + 8 + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
         int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol);
         session.TryEnqueue(new ReadOnlyMemory<byte>(okBuf, 0, okLen));
 
         // Send snapshots BEFORE activating incremental forwarding.
         // Since we're on the feed thread, the book is stable — no concurrent mutations.
-        if (flags.HasFlag(DataFlags.Book) && _bookManager is not null && _bookManager.Books.TryGetValue(securityId, out var book))
-            SendBookSnapshot(session, book);
-
-        if (flags.HasFlag(DataFlags.Info) && _marketDataManager is not null && _marketDataManager.InstrumentData.TryGetValue(securityId, out var info))
-            SendInfoSnapshot(session, securityId, info);
+        SendSnapshots(session, securityId, flags);
 
         // NOW activate subscription — incrementals start flowing after this point
         session.AddSubscription(securityId);
@@ -132,26 +113,44 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void HandleGet(string clientId, string symbol, DataFlags flags)
     {
-        if (!_clients.TryGetValue(clientId, out var session)) return;
-        if (_symbolRegistry is null) return;
+        if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
+            return;
+
+        // Send snapshots only — no subscription activation
+        SendSnapshots(session, securityId, flags);
+    }
+
+    /// <summary>Validate client, readiness, and symbol resolution. Sends error responses on failure.</summary>
+    private bool TryValidateAndResolve(string clientId, string symbol, out ClientSession session, out ulong securityId)
+    {
+        securityId = 0;
+        if (!_clients.TryGetValue(clientId, out session!)) return false;
+        if (_symbolRegistry is null) return false;
 
         if (!_ready)
         {
-            var buf = new byte[64];
-            int len = WireProtocol.WriteSubscribeError(buf, SubscribeErrorCode.NotReady, symbol);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-            return;
+            SendError(session, SubscribeErrorCode.NotReady, symbol);
+            return false;
         }
 
-        if (!_symbolRegistry.TryResolve(symbol, out var securityId))
+        if (!_symbolRegistry.TryResolve(symbol, out securityId))
         {
-            var buf = new byte[64];
-            int len = WireProtocol.WriteSubscribeError(buf, SubscribeErrorCode.UnknownSymbol, symbol);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-            return;
+            SendError(session, SubscribeErrorCode.UnknownSymbol, symbol);
+            return false;
         }
 
-        // Send snapshots only — no subscription activation
+        return true;
+    }
+
+    private static void SendError(ClientSession session, SubscribeErrorCode code, string symbol)
+    {
+        var buf = new byte[WireProtocol.FramingHeaderSize + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
+        int len = WireProtocol.WriteSubscribeError(buf, code, symbol);
+        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
+    private void SendSnapshots(ClientSession session, ulong securityId, DataFlags flags)
+    {
         if (flags.HasFlag(DataFlags.Book) && _bookManager is not null && _bookManager.Books.TryGetValue(securityId, out var book))
             SendBookSnapshot(session, book);
 
@@ -238,19 +237,16 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(book.SecurityId)) return;
 
-        var buf = new byte[21];
+        var buf = ArrayPool<byte>.Shared.Rent(21);
         int len = WireProtocol.WriteOrderDeleted(buf, book.SecurityId, orderId, (byte)side);
         SendToSubscribers(book.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ArrayPool<byte>.Shared.Return(buf);
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
     {
         ProcessPendingRequests();
-        if (!_subscriptions.ContainsKey(securityId)) return;
-
-        var buf = new byte[36];
-        int len = WireProtocol.WriteTrade(buf, securityId, price, quantity, tradeId);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ForwardTradeEvent(securityId, price, quantity, tradeId);
     }
 
     public void OnBookCleared(ulong securityId)
@@ -258,19 +254,16 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = new byte[12];
+        var buf = ArrayPool<byte>.Shared.Rent(12);
         int len = WireProtocol.WriteBookCleared(buf, securityId);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ArrayPool<byte>.Shared.Return(buf);
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
     {
         ProcessPendingRequests();
-        if (!_subscriptions.ContainsKey(securityId)) return;
-
-        var buf = new byte[36];
-        int len = WireProtocol.WriteTrade(buf, securityId, price, quantity, tradeId);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ForwardTradeEvent(securityId, price, quantity, tradeId);
     }
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
@@ -303,10 +296,21 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = new byte[37];
+        var buf = ArrayPool<byte>.Shared.Rent(37);
         int len = WireProtocol.WriteOrderEvent(buf, type, securityId,
             entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ArrayPool<byte>.Shared.Return(buf);
+    }
+
+    private void ForwardTradeEvent(ulong securityId, long price, long quantity, long tradeId)
+    {
+        if (!_subscriptions.ContainsKey(securityId)) return;
+
+        var buf = ArrayPool<byte>.Shared.Rent(36);
+        int len = WireProtocol.WriteTrade(buf, securityId, price, quantity, tradeId);
+        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        ArrayPool<byte>.Shared.Return(buf);
     }
 
     private void SendToSubscribers(ulong securityId, ReadOnlyMemory<byte> message, DataFlags requiredFlag)
@@ -324,9 +328,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
+        var buf = ArrayPool<byte>.Shared.Rent(WireProtocol.InfoSnapshotMaxSize);
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Info);
+        ArrayPool<byte>.Shared.Return(buf);
     }
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>

@@ -42,4 +42,33 @@ public sealed class InstrumentInfo
 
     // Timestamps
     public ulong LastUpdateTimestamp { get; set; }
+
+    /// <summary>Reset all fields to null/default.</summary>
+    public void Reset()
+    {
+        TradingStatus = null;
+        TradingEvent = null;
+        TradSesOpenTime = null;
+        OpeningPrice = null;
+        ClosingPrice = null;
+        HighPrice = null;
+        LowPrice = null;
+        LastTradePrice = null;
+        LastTradeSize = null;
+        SettlementPrice = null;
+        TheoreticalOpeningPrice = null;
+        TheoreticalOpeningSize = null;
+        AuctionImbalanceSize = null;
+        PriceBandLow = null;
+        PriceBandHigh = null;
+        TradingReferencePrice = null;
+        AvgDailyTradedQty = null;
+        MaxTradeVol = null;
+        TradeVolume = null;
+        VwapPrice = null;
+        NetChangeFromPrevDay = null;
+        NumberOfTrades = null;
+        OpenInterest = null;
+        LastUpdateTimestamp = 0;
+    }
 }

@@ -41,9 +41,11 @@ public sealed class MarketDataManager : IFeedEventHandler
         {
             if (_frozenData.TryGetValue(securityId, out var info))
                 return info;
+            // New instrument after freeze — fall back to mutable without re-freezing on hot path
+            if (_mutableData.TryGetValue(securityId, out info))
+                return info;
             info = new InstrumentInfo();
             _mutableData[securityId] = info;
-            _frozenData = _mutableData.ToFrozenDictionary();
             return info;
         }
 
@@ -334,30 +336,7 @@ public sealed class MarketDataManager : IFeedEventHandler
             ? (IEnumerable<KeyValuePair<ulong, InstrumentInfo>>)_frozenData
             : _mutableData)
         {
-            info.TradingStatus = null;
-            info.TradingEvent = null;
-            info.TradSesOpenTime = null;
-            info.OpeningPrice = null;
-            info.ClosingPrice = null;
-            info.HighPrice = null;
-            info.LowPrice = null;
-            info.LastTradePrice = null;
-            info.LastTradeSize = null;
-            info.SettlementPrice = null;
-            info.TheoreticalOpeningPrice = null;
-            info.TheoreticalOpeningSize = null;
-            info.AuctionImbalanceSize = null;
-            info.PriceBandLow = null;
-            info.PriceBandHigh = null;
-            info.TradingReferencePrice = null;
-            info.AvgDailyTradedQty = null;
-            info.MaxTradeVol = null;
-            info.TradeVolume = null;
-            info.VwapPrice = null;
-            info.NetChangeFromPrevDay = null;
-            info.NumberOfTrades = null;
-            info.OpenInterest = null;
-            info.LastUpdateTimestamp = 0;
+            info.Reset();
         }
     }
 }

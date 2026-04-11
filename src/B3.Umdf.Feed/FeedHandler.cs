@@ -14,6 +14,7 @@ public sealed class FeedHandler : IDisposable
 
     private FeedState _state = FeedState.WaitInstrumentDefinition;
     private readonly Queue<UmdfPacket> _incrementalQueue = new();
+    private const int MaxIncrementalQueueSize = 500_000;
     private long _packetCount;
 
     // Instrument Definition tracking
@@ -191,10 +192,12 @@ public sealed class FeedHandler : IDisposable
 
     /// <summary>
     /// Enqueues an incremental packet for later replay during catch-up.
-    /// With mmap-backed readers, packet data remains valid for the replayer's lifetime.
+    /// Drops oldest if the queue exceeds the capacity limit to bound memory usage.
     /// </summary>
     private void EnqueueCopy(in UmdfPacket packet)
     {
+        if (_incrementalQueue.Count >= MaxIncrementalQueueSize)
+            _incrementalQueue.Dequeue();
         _incrementalQueue.Enqueue(packet);
     }
 
@@ -225,7 +228,7 @@ public sealed class FeedHandler : IDisposable
 
             _eventHandler.OnPacket(in packet, sbeSlice, templateId);
 
-            if (templateId == 12) // SecurityDefinition_12
+            if (templateId == SecurityDefinition_12Data.MESSAGE_ID)
             {
                 var body = sbeSlice[MessageDispatcher.SbeHeaderSize..];
                 TrackSecurityDefinition(body);
@@ -294,7 +297,7 @@ public sealed class FeedHandler : IDisposable
 
             _eventHandler.OnPacket(in packet, sbeSlice, templateId);
 
-            if (templateId == 30) // SnapshotFullRefresh_Header_30
+            if (templateId == SnapshotFullRefresh_Header_30Data.MESSAGE_ID)
             {
                 var body = sbeSlice[MessageDispatcher.SbeHeaderSize..];
                 TrackSnapshotHeader(body);

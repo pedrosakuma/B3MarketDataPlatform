@@ -144,7 +144,8 @@ sw.Stop();
 
 if (wsHost is not null)
     await wsHost.StopAsync();
-wsHost?.Dispose();
+if (wsHost is not null)
+    await wsHost.DisposeAsync();
 
 Console.WriteLine();
 Console.WriteLine($"═══ Replay complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");

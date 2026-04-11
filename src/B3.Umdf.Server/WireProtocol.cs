@@ -100,25 +100,23 @@ public static class WireProtocol
     /// <summary>Write SubscribeOk: securityId + flags + symbol.</summary>
     public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, DataFlags flags, string symbol)
     {
-        byte[] symbolBytes = Encoding.UTF8.GetBytes(symbol);
-        ushort totalLen = (ushort)(FramingHeaderSize + 8 + 1 + 1 + symbolBytes.Length);
+        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[14..]);
+        ushort totalLen = (ushort)(FramingHeaderSize + 8 + 1 + 1 + symbolLen);
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeOk);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
         dest[12] = (byte)flags;
-        dest[13] = (byte)symbolBytes.Length;
-        symbolBytes.CopyTo(dest[14..]);
+        dest[13] = (byte)symbolLen;
         return totalLen;
     }
 
     /// <summary>Write SubscribeError: errorCode + symbol.</summary>
     public static int WriteSubscribeError(Span<byte> dest, SubscribeErrorCode errorCode, string symbol)
     {
-        byte[] symbolBytes = Encoding.UTF8.GetBytes(symbol);
-        ushort totalLen = (ushort)(FramingHeaderSize + 1 + 1 + symbolBytes.Length);
+        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[6..]);
+        ushort totalLen = (ushort)(FramingHeaderSize + 1 + 1 + symbolLen);
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeError);
         dest[4] = (byte)errorCode;
-        dest[5] = (byte)symbolBytes.Length;
-        symbolBytes.CopyTo(dest[6..]);
+        dest[5] = (byte)symbolLen;
         return totalLen;
     }
 

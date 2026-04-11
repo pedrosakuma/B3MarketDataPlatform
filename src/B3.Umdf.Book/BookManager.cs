@@ -56,10 +56,11 @@ public sealed class BookManager : IFeedEventHandler
         {
             if (_frozenBooks.TryGetValue(securityId, out var book))
                 return book;
-            // New instrument after freeze — create and re-freeze
+            // New instrument after freeze — fall back to mutable without re-freezing on hot path
+            if (_mutableBooks.TryGetValue(securityId, out book))
+                return book;
             book = new OrderBook(securityId);
             _mutableBooks[securityId] = book;
-            _frozenBooks = _mutableBooks.ToFrozenDictionary();
             return book;
         }
 

@@ -70,11 +70,13 @@ public sealed class ClientSession : IDisposable
 
     /// <summary>
     /// Read loop: reads binary WebSocket frames and yields parsed requests.
+    /// Rejects frames that exceed the max client message size or arrive in fragments.
     /// </summary>
     public async IAsyncEnumerable<(MessageType type, ReadOnlyMemory<byte> payload)> ReadMessagesAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var buffer = new byte[256];
+        // Max client message: header(4) + flags(1) + symbolLen(1) + symbol(255) = 261
+        var buffer = new byte[512];
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
 
         while (true)
@@ -89,6 +91,7 @@ public sealed class ClientSession : IDisposable
             catch (WebSocketException) { yield break; }
 
             if (result.MessageType == WebSocketMessageType.Close) break;
+            if (!result.EndOfMessage) continue; // discard oversized/fragmented frames
             if (result.Count < WireProtocol.FramingHeaderSize) continue;
 
             var span = buffer.AsSpan(0, result.Count);

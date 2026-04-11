@@ -8,7 +8,7 @@ namespace B3.Umdf.Server;
 /// <summary>
 /// Kestrel-based WebSocket server for market data subscriptions.
 /// </summary>
-public sealed class WebSocketHost : IDisposable
+public sealed class WebSocketHost : IAsyncDisposable
 {
     private readonly SubscriptionManager _subscriptionManager;
     private WebApplication? _app;
@@ -25,7 +25,10 @@ public sealed class WebSocketHost : IDisposable
         builder.Logging.ClearProviders();
 
         _app = builder.Build();
-        _app.UseWebSockets();
+        _app.UseWebSockets(new WebSocketOptions
+        {
+            KeepAliveInterval = TimeSpan.FromSeconds(30),
+        });
 
         _app.Map("/ws", async context =>
         {
@@ -91,8 +94,9 @@ public sealed class WebSocketHost : IDisposable
             await _app.StopAsync();
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
-        _app?.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        if (_app is not null)
+            await _app.DisposeAsync();
     }
 }

@@ -39,7 +39,7 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
-        if (templateId != 12) return; // SecurityDefinition_12
+        if (templateId != SecurityDefinition_12Data.MESSAGE_ID) return;
         if (sbePayload.Length < MessageHeader.MESSAGE_SIZE) return;
 
         var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
