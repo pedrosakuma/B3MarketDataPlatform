@@ -199,6 +199,13 @@ var marketDataManager = new MarketDataManager(mdHandler, loggerFactory.CreateLog
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
+// Handle SIGTERM for graceful shutdown in containers
+AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+{
+    if (!cts.IsCancellationRequested)
+        cts.Cancel();
+};
+
 var composite = new CompositeFeedHandler(bookManager, marketDataManager, symbolRegistry);
 
 // Use MultiFeedManager for multi-channel, single FeedHandler for single-channel
@@ -305,10 +312,22 @@ else
 statsTimer.Change(Timeout.Infinite, Timeout.Infinite);
 sw.Stop();
 
+// Graceful shutdown: stop accepting new connections, drain, then stop
+Console.WriteLine("Shutting down gracefully...");
+
+// Stop feed first (stop producing new data)
+if (multiFeed is not null)
+    await multiFeed.StopAsync();
+if (singleFeed is not null)
+    await singleFeed.StopAsync();
+
+// Brief drain period for in-flight WebSocket writes
 if (wsHost is not null)
+{
+    await Task.Delay(TimeSpan.FromSeconds(2));
     await wsHost.StopAsync();
-if (wsHost is not null)
     await wsHost.DisposeAsync();
+}
 
 multiFeed?.Dispose();
 singleFeed?.Dispose();
