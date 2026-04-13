@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -7,12 +9,17 @@ namespace B3.Umdf.Server;
 
 /// <summary>
 /// Kestrel-based WebSocket server for market data subscriptions.
+/// Includes health/readiness endpoints for orchestration compatibility.
 /// </summary>
 public sealed class WebSocketHost : IAsyncDisposable
 {
     private readonly SubscriptionManager _subscriptionManager;
     private readonly ILogger<WebSocketHost> _logger;
+    private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private WebApplication? _app;
+
+    /// <summary>Optional provider for feed group states (set before StartAsync).</summary>
+    public Func<IReadOnlyDictionary<string, string>>? FeedStateProvider { get; set; }
 
     public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null)
     {
@@ -31,6 +38,25 @@ public sealed class WebSocketHost : IAsyncDisposable
         {
             KeepAliveInterval = TimeSpan.FromSeconds(30),
         });
+
+        // Health endpoints
+        _app.MapGet("/health", () =>
+        {
+            var result = new Dictionary<string, object>
+            {
+                ["status"] = _subscriptionManager.IsReady ? "ready" : "initializing",
+                ["uptime"] = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
+                ["slowClientDisconnects"] = _subscriptionManager.SlowClientDisconnects,
+            };
+            if (FeedStateProvider is not null)
+                result["feedGroups"] = FeedStateProvider();
+            return Results.Json(result);
+        });
+
+        _app.MapGet("/ready", () =>
+            _subscriptionManager.IsReady ? Results.Ok("ready") : Results.StatusCode(503));
+
+        _app.MapGet("/live", () => Results.Ok("alive"));
 
         _app.Map("/ws", async context =>
         {

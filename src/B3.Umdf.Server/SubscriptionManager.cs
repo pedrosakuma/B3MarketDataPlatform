@@ -53,6 +53,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     public void RegisterClient(ClientSession session)
     {
         _clients[session.Id] = session;
+        AppMetrics.WsConnectionsActive.Add(1);
     }
 
     /// <summary>Unregister a client and remove all its subscriptions.</summary>
@@ -60,6 +61,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         _clients.TryRemove(clientId, out _);
         _pendingRequests.Enqueue(SubscriptionRequest.UnsubscribeAll(clientId));
+        AppMetrics.WsConnectionsActive.Add(-1);
     }
 
     /// <summary>Called from WebSocket read thread to request a subscription.</summary>
@@ -146,6 +148,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 session.Cancel();
             _slowClientTicks.Remove(clientId);
             Interlocked.Increment(ref _slowClientDisconnects);
+            AppMetrics.WsSlowDisconnects.Add(1);
         }
     }
 
@@ -171,6 +174,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             _subscriptions[securityId] = clients;
         }
         clients[clientId] = flags;
+        AppMetrics.WsSubscriptions.Add(1);
     }
 
     private void HandleGet(string clientId, string symbol, DataFlags flags)
@@ -382,7 +386,12 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         {
             if (!flags.HasFlag(requiredFlag)) continue;
             if (_clients.TryGetValue(clientId, out var session))
-                session.TryEnqueue(message);
+            {
+                if (session.TryEnqueue(message))
+                    AppMetrics.WsMessagesSent.Add(1);
+                else
+                    AppMetrics.WsMessagesDropped.Add(1);
+            }
         }
     }
 
