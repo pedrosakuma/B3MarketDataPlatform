@@ -365,7 +365,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private static void SendSideOrders(ClientSession session, ulong securityId, BookSide side)
     {
-        foreach (var (_, entry) in side.Orders)
+        // Snapshot to avoid "collection modified during enumeration" —
+        // ProcessPendingRequests can trigger this mid-HandleDeleteOrder.
+        foreach (var entry in side.Orders.Values.ToArray())
         {
             var buf = new byte[37];
             int len = WireProtocol.WriteOrderEvent(buf, MessageType.OrderAdded, securityId,
