@@ -8,9 +8,10 @@ export const state = {
   reconnectAttempts: 0,
   reconnectTimer: null,
   healthData: null,
+  logEnabled: true,
 };
 
-// securityId (string) → { symbol, flags, securityId, book, info, trades, orderCount, tradeCount }
+// securityId (string) → { symbol, flags, securityId, book, orders, info, trades, orderCount, tradeCount }
 export const subscriptions = new Map();
 
 export const stats = { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 };

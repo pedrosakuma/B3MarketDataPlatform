@@ -195,30 +195,59 @@ export function renderHealth() {
   el.textContent = parts.join(' │ ');
 }
 
-// ── Event log ──
+// ── Event log (buffered via rAF) ──
 
-const MAX_LOG = 500;
+const MAX_LOG = 200;
 let logCount = 0;
+const logBuffer = [];
+let logFlushScheduled = false;
 
 export function addLog(text, cssClass) {
+  if (!state.logEnabled) return;
+  logBuffer.push({ text, cssClass, time: ts() });
+  if (!logFlushScheduled) {
+    logFlushScheduled = true;
+    requestAnimationFrame(flushLog);
+  }
+}
+
+function flushLog() {
+  logFlushScheduled = false;
   const body = $('logBody');
-  const div = document.createElement('div');
-  div.className = 'log-entry';
-  div.innerHTML = `<span class="log-ts">${ts()}</span> <span class="${cssClass}">${text}</span>`;
-  body.appendChild(div);
-  logCount++;
+  const frag = document.createDocumentFragment();
+  for (const entry of logBuffer) {
+    const div = document.createElement('div');
+    div.className = 'log-entry';
+    div.innerHTML = `<span class="log-ts">${entry.time}</span> <span class="${entry.cssClass}">${entry.text}</span>`;
+    frag.appendChild(div);
+    logCount++;
+  }
+  logBuffer.length = 0;
+  body.appendChild(frag);
   while (logCount > MAX_LOG) { body.removeChild(body.firstChild); logCount--; }
   body.scrollTop = body.scrollHeight;
 }
 
-export function clearLog() { $('logBody').innerHTML = ''; logCount = 0; }
+export function clearLog() { $('logBody').innerHTML = ''; logCount = 0; logBuffer.length = 0; }
 
-// ── Stats bar ──
+export function setLogEnabled(enabled) {
+  state.logEnabled = enabled;
+  if (!enabled) clearLog();
+}
+
+// ── Stats bar (throttled via rAF) ──
+
+let statsScheduled = false;
 
 export function updateStats() {
-  $('statMsgs').textContent = stats.msgs.toLocaleString();
-  $('statBooks').textContent = stats.books.toLocaleString();
-  $('statInfo').textContent = stats.info.toLocaleString();
-  $('statOrders').textContent = stats.orders.toLocaleString();
-  $('statTrades').textContent = stats.trades.toLocaleString();
+  if (statsScheduled) return;
+  statsScheduled = true;
+  requestAnimationFrame(() => {
+    statsScheduled = false;
+    $('statMsgs').textContent = stats.msgs.toLocaleString();
+    $('statBooks').textContent = stats.books.toLocaleString();
+    $('statInfo').textContent = stats.info.toLocaleString();
+    $('statOrders').textContent = stats.orders.toLocaleString();
+    $('statTrades').textContent = stats.trades.toLocaleString();
+  });
 }

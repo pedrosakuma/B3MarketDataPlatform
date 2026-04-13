@@ -5,7 +5,7 @@ import { state, subscriptions, stats } from './state.js';
 import {
   $, secIdStr, formatPrice, formatQty,
   setStatus, renderSubList, renderSelected, renderBook, renderInfo, renderTrades, renderHealth,
-  addLog, clearLog, updateStats, addTrade,
+  addLog, clearLog, setLogEnabled, updateStats, addTrade,
 } from './ui.js';
 
 // ── Throttled book render ──
@@ -330,6 +330,7 @@ window.doGet = doGet;
 window.doUnsubscribe = doUnsubscribe;
 window.selectSubscription = selectSubscription;
 window.clearLog = clearLog;
+window.toggleLog = setLogEnabled;
 
 // ── Init ──
 setStatus('disconnected');

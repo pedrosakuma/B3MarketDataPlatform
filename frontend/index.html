@@ -163,7 +163,8 @@
     <div class="log-area">
       <div class="log-head">
         <span>Event Log</span>
-        <button onclick="clearLog()" style="font-size:.65rem;padding:.1rem .4rem">Clear</button>
+        <label style="font-size:.65rem;margin-left:auto;cursor:pointer"><input type="checkbox" id="logToggle" checked onchange="toggleLog(this.checked)"> Enabled</label>
+        <button onclick="clearLog()" style="font-size:.65rem;padding:.1rem .4rem;margin-left:.4rem">Clear</button>
       </div>
       <div class="log-body" id="logBody"></div>
     </div>
