@@ -79,14 +79,15 @@ public sealed class WebSocketHost : IAsyncDisposable
 
         _app.MapGet("/live", () => Results.Ok("alive"));
 
-        _app.MapGet("/symbols", (string? q) =>
+        _app.MapGet("/symbols", (string? q, int? limit) =>
         {
             var registry = _subscriptionManager.SymbolRegistry;
             if (registry is null) return Results.Json(new { count = 0, symbols = Array.Empty<string>() });
             IEnumerable<string> symbols = registry.BySymbol.Keys.Order();
             if (!string.IsNullOrEmpty(q))
                 symbols = symbols.Where(s => s.Contains(q, StringComparison.OrdinalIgnoreCase));
-            var list = symbols.Take(100).ToArray();
+            var max = Math.Clamp(limit ?? 100, 1, 5000);
+            var list = symbols.Take(max).ToArray();
             return Results.Json(new { count = registry.Count, matched = list.Length, symbols = list });
         });
 
