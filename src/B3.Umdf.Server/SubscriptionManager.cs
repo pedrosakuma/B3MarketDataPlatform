@@ -51,6 +51,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         _symbolRegistry = symbolRegistry;
     }
 
+    /// <summary>Expose symbol registry for diagnostic endpoints.</summary>
+    public SymbolRegistry? SymbolRegistry => _symbolRegistry;
+
     /// <summary>Register a client session.</summary>
     public void RegisterClient(ClientSession session)
     {
