@@ -108,9 +108,7 @@ public sealed class ClientSession : IDisposable
     public void RemoveSubscription(ulong securityId) => _subscriptions.Remove(securityId);
 
     private long _droppedMessages;
-    #pragma warning disable CS0649 // Conflation disabled — field kept for API compatibility
     private long _conflatedMessages;
-    #pragma warning restore CS0649
 
     /// <summary>Number of messages dropped due to slow consumption.</summary>
     public long DroppedMessages => Volatile.Read(ref _droppedMessages);
@@ -203,7 +201,9 @@ public sealed class ClientSession : IDisposable
 
         // Reusable buffers — cleared each drain cycle
         var passthroughList = new List<ReadOnlyMemory<byte>>();
+        var pendingOrders = new Dictionary<ulong, PendingOrder>();
         var pendingInfos = new Dictionary<ulong, ReadOnlyMemory<byte>>();
+        var bookClearList = new List<(ulong SecurityId, byte Side)>();
 
         try
         {
@@ -212,9 +212,11 @@ public sealed class ClientSession : IDisposable
             {
                 if (Socket.State != WebSocketState.Open) break;
 
-                // 1. Drain all available events (no order conflation — send every event faithfully)
+                // 1. Drain all available events with MBO order conflation
                 passthroughList.Clear();
+                pendingOrders.Clear();
                 pendingInfos.Clear();
+                bookClearList.Clear();
 
                 while (reader.TryRead(out var evt))
                 {
@@ -226,15 +228,11 @@ public sealed class ClientSession : IDisposable
                         case OutboundEventKind.OrderAdded:
                         case OutboundEventKind.OrderUpdated:
                         case OutboundEventKind.OrderDeleted:
-                            // Serialize immediately — no conflation
-                            passthroughList.Add(SerializeOrderEvent(evt));
+                            ConflateOrder(pendingOrders, evt);
                             break;
                         case OutboundEventKind.BookCleared:
-                            {
-                                var clearBuf = new byte[13];
-                                WireProtocol.WriteBookCleared(clearBuf, evt.SecurityId, evt.Side);
-                                passthroughList.Add(new ReadOnlyMemory<byte>(clearBuf));
-                            }
+                            PurgeOrdersForClear(pendingOrders, evt.SecurityId, evt.Side);
+                            bookClearList.Add((evt.SecurityId, evt.Side));
                             break;
                         case OutboundEventKind.InfoUpdate:
                             pendingInfos[evt.SecurityId] = evt.RawData;
@@ -242,15 +240,47 @@ public sealed class ClientSession : IDisposable
                     }
                 }
 
+                Interlocked.Add(ref _conflatedMessages,
+                    passthroughList.Count + pendingOrders.Count + bookClearList.Count + pendingInfos.Count);
+
                 // 2. Serialize into coalesced buffer
                 int offset = 0;
 
-                // All messages (passthrough + serialized order events + book clears)
+                // Passthrough (snapshots, etc.)
                 foreach (var raw in passthroughList)
                 {
                     EnsureCapacity(ref coalesceBuf, offset, raw.Length);
                     raw.Span.CopyTo(coalesceBuf.AsSpan(offset));
                     offset += raw.Length;
+                }
+
+                // Book clears before orders
+                foreach (var (secId, side) in bookClearList)
+                {
+                    EnsureCapacity(ref coalesceBuf, offset, 13);
+                    WireProtocol.WriteBookCleared(coalesceBuf.AsSpan(offset), secId, side);
+                    offset += 13;
+                }
+
+                // Conflated orders
+                foreach (var (orderId, pending) in pendingOrders)
+                {
+                    if (pending.Kind == PendingOrderKind.Deleted)
+                    {
+                        EnsureCapacity(ref coalesceBuf, offset, 21);
+                        WireProtocol.WriteOrderDeleted(coalesceBuf.AsSpan(offset),
+                            pending.SecurityId, orderId, pending.Side);
+                        offset += 21;
+                    }
+                    else
+                    {
+                        var msgType = pending.Kind == PendingOrderKind.Added
+                            ? MessageType.OrderAdded : MessageType.OrderUpdated;
+                        EnsureCapacity(ref coalesceBuf, offset, 37);
+                        WireProtocol.WriteOrderEvent(coalesceBuf.AsSpan(offset), msgType,
+                            pending.SecurityId, orderId, pending.Side, pending.Price, pending.Quantity);
+                        offset += 37;
+                    }
                 }
 
                 // Info updates (last-state-wins per securityId)
