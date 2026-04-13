@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -9,58 +10,46 @@ namespace B3.Umdf.Book;
 
 public sealed class MarketDataManager : IFeedEventHandler
 {
-    private Dictionary<ulong, InstrumentInfo> _mutableData = new();
-    private FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
+    private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new();
+    private volatile FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
     private readonly IMarketDataEventHandler? _eventHandler;
+    private long _parseErrors;
 
     /// <summary>
-    /// Returns the mutable dictionary which always has the complete set of instrument data.
-    /// FrozenDictionary is used internally as a lookup optimization only.
+    /// Thread-safe dictionary of all instrument data.
+    /// Safe to read (Count, iterate) from any thread while the feed thread writes.
     /// </summary>
-    public IReadOnlyDictionary<ulong, InstrumentInfo> InstrumentData => _mutableData;
+    public IReadOnlyDictionary<ulong, InstrumentInfo> InstrumentData => _data;
+
+    /// <summary>Number of SBE parse errors encountered.</summary>
+    public long ParseErrors => Volatile.Read(ref _parseErrors);
 
     public MarketDataManager(IMarketDataEventHandler? eventHandler = null)
     {
         _eventHandler = eventHandler;
     }
 
-    public void EnsureCapacity(int instrumentCount)
-    {
-        _mutableData.EnsureCapacity(instrumentCount);
-    }
-
     public void FreezeData()
     {
-        _frozenData = _mutableData.ToFrozenDictionary();
+        _frozenData = _data.ToFrozenDictionary();
     }
 
     public InstrumentInfo GetOrCreateInfo(ulong securityId)
     {
-        if (_frozenData is not null)
+        if (_frozenData is { } frozen)
         {
-            if (_frozenData.TryGetValue(securityId, out var info))
+            if (frozen.TryGetValue(securityId, out var info))
                 return info;
-            // New instrument after freeze — fall back to mutable without re-freezing on hot path
-            if (_mutableData.TryGetValue(securityId, out info))
-                return info;
-            info = new InstrumentInfo();
-            _mutableData[securityId] = info;
-            return info;
         }
 
-        if (!_mutableData.TryGetValue(securityId, out var mInfo))
-        {
-            mInfo = new InstrumentInfo();
-            _mutableData[securityId] = mInfo;
-        }
-        return mInfo;
+        return _data.GetOrAdd(securityId, static _ => new InstrumentInfo());
     }
 
     private bool TryLookupInfo(ulong securityId, out InstrumentInfo info)
     {
-        if (_frozenData is not null)
-            return _frozenData.TryGetValue(securityId, out info!);
-        return _mutableData.TryGetValue(securityId, out info!);
+        if (_frozenData is { } frozen)
+            return frozen.TryGetValue(securityId, out info!);
+        return _data.TryGetValue(securityId, out info!);
     }
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
@@ -70,47 +59,55 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
 
-        switch (templateId)
+        try
         {
-            case SecurityStatus_3Data.MESSAGE_ID:
-                HandleSecurityStatus(body);
-                break;
-            case OpeningPrice_15Data.MESSAGE_ID:
-                HandleOpeningPrice(body);
-                break;
-            case TheoreticalOpeningPrice_16Data.MESSAGE_ID:
-                HandleTheoreticalOpeningPrice(body);
-                break;
-            case ClosingPrice_17Data.MESSAGE_ID:
-                HandleClosingPrice(body);
-                break;
-            case AuctionImbalance_19Data.MESSAGE_ID:
-                HandleAuctionImbalance(body);
-                break;
-            case QuantityBand_21Data.MESSAGE_ID:
-                HandleQuantityBand(body);
-                break;
-            case PriceBand_22Data.MESSAGE_ID:
-                HandlePriceBand(body);
-                break;
-            case HighPrice_24Data.MESSAGE_ID:
-                HandleHighPrice(body);
-                break;
-            case LowPrice_25Data.MESSAGE_ID:
-                HandleLowPrice(body);
-                break;
-            case LastTradePrice_27Data.MESSAGE_ID:
-                HandleLastTradePrice(body);
-                break;
-            case SettlementPrice_28Data.MESSAGE_ID:
-                HandleSettlementPrice(body);
-                break;
-            case OpenInterest_29Data.MESSAGE_ID:
-                HandleOpenInterest(body);
-                break;
-            case ExecutionStatistics_56Data.MESSAGE_ID:
-                HandleExecutionStatistics(body);
-                break;
+            switch (templateId)
+            {
+                case SecurityStatus_3Data.MESSAGE_ID:
+                    HandleSecurityStatus(body);
+                    break;
+                case OpeningPrice_15Data.MESSAGE_ID:
+                    HandleOpeningPrice(body);
+                    break;
+                case TheoreticalOpeningPrice_16Data.MESSAGE_ID:
+                    HandleTheoreticalOpeningPrice(body);
+                    break;
+                case ClosingPrice_17Data.MESSAGE_ID:
+                    HandleClosingPrice(body);
+                    break;
+                case AuctionImbalance_19Data.MESSAGE_ID:
+                    HandleAuctionImbalance(body);
+                    break;
+                case QuantityBand_21Data.MESSAGE_ID:
+                    HandleQuantityBand(body);
+                    break;
+                case PriceBand_22Data.MESSAGE_ID:
+                    HandlePriceBand(body);
+                    break;
+                case HighPrice_24Data.MESSAGE_ID:
+                    HandleHighPrice(body);
+                    break;
+                case LowPrice_25Data.MESSAGE_ID:
+                    HandleLowPrice(body);
+                    break;
+                case LastTradePrice_27Data.MESSAGE_ID:
+                    HandleLastTradePrice(body);
+                    break;
+                case SettlementPrice_28Data.MESSAGE_ID:
+                    HandleSettlementPrice(body);
+                    break;
+                case OpenInterest_29Data.MESSAGE_ID:
+                    HandleOpenInterest(body);
+                    break;
+                case ExecutionStatistics_56Data.MESSAGE_ID:
+                    HandleExecutionStatistics(body);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _parseErrors);
+            Console.Error.WriteLine($"[MarketDataManager] Error processing templateId={templateId}: {ex.Message}");
         }
     }
 
@@ -118,10 +115,7 @@ public sealed class MarketDataManager : IFeedEventHandler
     public void OnSequenceReset() { ClearAllInfo(); }
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeData(); }
-    public void OnInstrumentDefinitionsComplete(int instrumentCount)
-    {
-        EnsureCapacity(instrumentCount);
-    }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
 
     private void HandleSecurityStatus(ReadOnlySpan<byte> body)
     {
@@ -331,7 +325,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     private void ClearAllInfo()
     {
-        foreach (var (_, info) in _mutableData)
+        foreach (var (_, info) in _data)
         {
             info.Reset();
         }

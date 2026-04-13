@@ -12,7 +12,7 @@ public sealed class FeedHandler : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _runTask;
 
-    private FeedState _state = FeedState.WaitInstrumentDefinition;
+    private volatile FeedState _state = FeedState.WaitInstrumentDefinition;
     private readonly Queue<UmdfPacket> _incrementalQueue = new();
     private const int MaxIncrementalQueueSize = 500_000;
     private long _packetCount;

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -15,28 +16,23 @@ namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler
 {
-    private Dictionary<ulong, OrderBook> _mutableBooks = new();
-    private FrozenDictionary<ulong, OrderBook>? _frozenBooks;
+    private readonly ConcurrentDictionary<ulong, OrderBook> _books = new();
+    private volatile FrozenDictionary<ulong, OrderBook>? _frozenBooks;
     private readonly IBookEventHandler? _eventHandler;
+    private long _parseErrors;
 
     /// <summary>
-    /// Returns the mutable dictionary which always has the complete set of books.
-    /// FrozenDictionary is used internally as a lookup optimization only.
+    /// Thread-safe dictionary of all order books.
+    /// Safe to read (Count, iterate) from any thread while the feed thread writes.
     /// </summary>
-    public IReadOnlyDictionary<ulong, OrderBook> Books => _mutableBooks;
+    public IReadOnlyDictionary<ulong, OrderBook> Books => _books;
+
+    /// <summary>Number of SBE parse errors encountered (malformed packets).</summary>
+    public long ParseErrors => Volatile.Read(ref _parseErrors);
 
     public BookManager(IBookEventHandler? eventHandler = null)
     {
         _eventHandler = eventHandler;
-    }
-
-    /// <summary>
-    /// Pre-allocate dictionary capacity after instrument definitions are known.
-    /// Avoids rehashing during the hot path.
-    /// </summary>
-    public void EnsureCapacity(int instrumentCount)
-    {
-        _mutableBooks.EnsureCapacity(instrumentCount);
     }
 
     /// <summary>
@@ -45,31 +41,19 @@ public sealed class BookManager : IFeedEventHandler
     /// </summary>
     public void FreezeBooks()
     {
-        _frozenBooks = _mutableBooks.ToFrozenDictionary();
+        _frozenBooks = _books.ToFrozenDictionary();
     }
 
     public OrderBook GetOrCreateBook(ulong securityId)
     {
         // Fast path: frozen dictionary lookup (optimized hash)
-        if (_frozenBooks is not null)
+        if (_frozenBooks is { } frozen)
         {
-            if (_frozenBooks.TryGetValue(securityId, out var book))
+            if (frozen.TryGetValue(securityId, out var book))
                 return book;
-            // New instrument after freeze — fall back to mutable without re-freezing on hot path
-            if (_mutableBooks.TryGetValue(securityId, out book))
-                return book;
-            book = new OrderBook(securityId);
-            _mutableBooks[securityId] = book;
-            return book;
         }
 
-        // Setup path: mutable dictionary
-        if (!_mutableBooks.TryGetValue(securityId, out var mBook))
-        {
-            mBook = new OrderBook(securityId);
-            _mutableBooks[securityId] = mBook;
-        }
-        return mBook;
+        return _books.GetOrAdd(securityId, static id => new OrderBook(id));
     }
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
@@ -79,38 +63,46 @@ public sealed class BookManager : IFeedEventHandler
 
         var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
 
-        switch (templateId)
+        try
         {
-            case Order_MBO_50Data.MESSAGE_ID:
-                HandleOrder(body);
-                break;
-            case DeleteOrder_MBO_51Data.MESSAGE_ID:
-                HandleDeleteOrder(body);
-                break;
-            case MassDeleteOrders_MBO_52Data.MESSAGE_ID:
-                HandleMassDelete(body);
-                break;
-            case Trade_53Data.MESSAGE_ID:
-                HandleTrade(body);
-                break;
-            case EmptyBook_9Data.MESSAGE_ID:
-                HandleEmptyBook(body);
-                break;
-            case ChannelReset_11Data.MESSAGE_ID:
-                ClearAllBooks();
-                break;
-            case ForwardTrade_54Data.MESSAGE_ID:
-                HandleForwardTrade(body);
-                break;
-            case ExecutionSummary_55Data.MESSAGE_ID:
-                HandleExecutionSummary(body);
-                break;
-            case TradeBust_57Data.MESSAGE_ID:
-                HandleTradeBust(body);
-                break;
-            case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
-                HandleSnapshotOrders(body);
-                break;
+            switch (templateId)
+            {
+                case Order_MBO_50Data.MESSAGE_ID:
+                    HandleOrder(body);
+                    break;
+                case DeleteOrder_MBO_51Data.MESSAGE_ID:
+                    HandleDeleteOrder(body);
+                    break;
+                case MassDeleteOrders_MBO_52Data.MESSAGE_ID:
+                    HandleMassDelete(body);
+                    break;
+                case Trade_53Data.MESSAGE_ID:
+                    HandleTrade(body);
+                    break;
+                case EmptyBook_9Data.MESSAGE_ID:
+                    HandleEmptyBook(body);
+                    break;
+                case ChannelReset_11Data.MESSAGE_ID:
+                    ClearAllBooks();
+                    break;
+                case ForwardTrade_54Data.MESSAGE_ID:
+                    HandleForwardTrade(body);
+                    break;
+                case ExecutionSummary_55Data.MESSAGE_ID:
+                    HandleExecutionSummary(body);
+                    break;
+                case TradeBust_57Data.MESSAGE_ID:
+                    HandleTradeBust(body);
+                    break;
+                case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
+                    HandleSnapshotOrders(body);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _parseErrors);
+            Console.Error.WriteLine($"[BookManager] Error processing templateId={templateId}: {ex.Message}");
         }
     }
 
@@ -118,10 +110,7 @@ public sealed class BookManager : IFeedEventHandler
     public void OnSequenceReset() { ClearAllBooks(); }
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
-    public void OnInstrumentDefinitionsComplete(int instrumentCount)
-    {
-        EnsureCapacity(instrumentCount);
-    }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
 
     private void HandleOrder(ReadOnlySpan<byte> body)
     {
@@ -357,14 +346,14 @@ public sealed class BookManager : IFeedEventHandler
     /// </summary>
     private bool TryLookupBook(ulong securityId, out OrderBook book)
     {
-        if (_frozenBooks is not null)
-            return _frozenBooks.TryGetValue(securityId, out book!);
-        return _mutableBooks.TryGetValue(securityId, out book!);
+        if (_frozenBooks is { } frozen)
+            return frozen.TryGetValue(securityId, out book!);
+        return _books.TryGetValue(securityId, out book!);
     }
 
     private void ClearAllBooks()
     {
-        foreach (var (secId, book) in _mutableBooks)
+        foreach (var (secId, book) in _books)
         {
             book.Clear();
             _eventHandler?.OnBookCleared(secId);

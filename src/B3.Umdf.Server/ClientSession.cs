@@ -39,6 +39,11 @@ public sealed class ClientSession : IDisposable
     /// <summary>Remove a subscription. Called on the feed thread or WS read thread.</summary>
     public void RemoveSubscription(ulong securityId) => _subscriptions.Remove(securityId);
 
+    private long _droppedMessages;
+
+    /// <summary>Number of messages dropped due to slow consumption.</summary>
+    public long DroppedMessages => Volatile.Read(ref _droppedMessages);
+
     /// <summary>
     /// Enqueue a message to be sent to the client.
     /// Non-blocking — drops oldest if channel is full.
@@ -46,7 +51,12 @@ public sealed class ClientSession : IDisposable
     /// </summary>
     public bool TryEnqueue(ReadOnlyMemory<byte> message)
     {
-        return _outbound.Writer.TryWrite(message);
+        if (!_outbound.Writer.TryWrite(message))
+        {
+            Interlocked.Increment(ref _droppedMessages);
+            return false;
+        }
+        return true;
     }
 
     /// <summary>
@@ -65,7 +75,10 @@ public sealed class ClientSession : IDisposable
             }
         }
         catch (OperationCanceledException) { }
-        catch (WebSocketException) { }
+        catch (WebSocketException ex)
+        {
+            Console.Error.WriteLine($"[ClientSession] {Id} write error: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -88,7 +101,11 @@ public sealed class ClientSession : IDisposable
                 result = await Socket.ReceiveAsync(buffer.AsMemory(), linked.Token);
             }
             catch (OperationCanceledException) { yield break; }
-            catch (WebSocketException) { yield break; }
+            catch (WebSocketException ex)
+            {
+                Console.Error.WriteLine($"[ClientSession] {Id} read error: {ex.Message}");
+                yield break;
+            }
 
             if (result.MessageType == WebSocketMessageType.Close) break;
             if (!result.EndOfMessage) continue; // discard oversized/fragmented frames
