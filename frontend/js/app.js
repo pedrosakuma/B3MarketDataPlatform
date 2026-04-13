@@ -8,6 +8,14 @@ import {
   addLog, clearLog, updateStats, addTrade,
 } from './ui.js';
 
+// ── Throttled book render ──
+let bookRenderScheduled = false;
+function scheduleBookRender() {
+  if (bookRenderScheduled) return;
+  bookRenderScheduled = true;
+  requestAnimationFrame(() => { bookRenderScheduled = false; renderBook(); });
+}
+
 // ── Helpers ──
 
 function getFlags() {
@@ -200,7 +208,7 @@ function handleMessage(msg) {
         sub.orderCount++;
         applyOrderAddOrUpdate(sub, msg);
       }
-      if (state.selectedSecurityId === id) renderBook();
+      if (state.selectedSecurityId === id) scheduleBookRender();
       const side = msg.side === 0 ? 'BID' : 'ASK';
       const sym = sub?.symbol || id;
       addLog(`${msg.type} ${sym} ${side} ${formatPrice(msg.price)} x${formatQty(msg.qty)}`, 'log-order');
@@ -214,7 +222,7 @@ function handleMessage(msg) {
         sub.orderCount++;
         applyOrderDelete(sub, msg);
       }
-      if (state.selectedSecurityId === id) renderBook();
+      if (state.selectedSecurityId === id) scheduleBookRender();
       const side = msg.side === 0 ? 'BID' : 'ASK';
       const sym = sub?.symbol || id;
       addLog(`OrderDeleted ${sym} ${side} oid=${msg.orderId}`, 'log-order');

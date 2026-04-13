@@ -16,7 +16,7 @@ export function formatPrice(mantissa) {
   const dec = parseInt($('priceDecimals').value) || 0;
   if (dec === 0) return mantissa.toLocaleString();
   const divisor = Math.pow(10, dec);
-  return (mantissa / divisor).toFixed(Math.min(dec, 4));
+  return (mantissa / divisor).toFixed(dec);
 }
 
 export function formatQty(v) { return v.toLocaleString(); }

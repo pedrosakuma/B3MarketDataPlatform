@@ -228,10 +228,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         if (flags.HasFlag(DataFlags.Book) && _bookManager is not null)
         {
             if (_bookManager.Books.TryGetValue(securityId, out var book))
-                SendBookSnapshot(session, book);
+                SendMboSnapshot(session, book);
             else
             {
-                // Book not yet created — send empty snapshot so client knows book is active
+                // Book not yet created — send empty reset so client initializes an empty book
                 var emptyBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
                 WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
                 session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
@@ -271,28 +271,32 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     // --- Snapshot serialization (runs on feed thread — book is stable) ---
 
-    private static void SendBookSnapshot(ClientSession session, OrderBook book)
+    /// <summary>
+    /// Sends MBO (Market-by-Order) snapshot: a reset marker (empty BookSnapshot)
+    /// followed by individual OrderAdded events for every order in the book.
+    /// This gives the client full MBO state for correct incremental tracking.
+    /// </summary>
+    private static void SendMboSnapshot(ClientSession session, OrderBook book)
     {
-        var bidLevels = new List<(long price, long totalQty, int count)>();
-        var askLevels = new List<(long price, long totalQty, int count)>();
+        // 1. Reset marker — tells client to clear local book state
+        var resetBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
+        WireProtocol.WriteBookSnapshotHeader(resetBuf, book.SecurityId, book.LastRptSeq, 0, 0);
+        session.TryEnqueue(new ReadOnlyMemory<byte>(resetBuf));
 
-        foreach (var kv in book.Bids.PriceLevels)
-            bidLevels.Add((kv.Key, kv.Value.Sum(o => o.Quantity), kv.Value.Count));
+        // 2. Send every individual order as OrderAdded
+        SendSideOrders(session, book.SecurityId, book.Bids);
+        SendSideOrders(session, book.SecurityId, book.Asks);
+    }
 
-        foreach (var kv in book.Asks.PriceLevels)
-            askLevels.Add((kv.Key, kv.Value.Sum(o => o.Quantity), kv.Value.Count));
-
-        int size = WireProtocol.BookSnapshotSize(bidLevels.Count, askLevels.Count);
-        var buf = new byte[size];
-        int offset = WireProtocol.WriteBookSnapshotHeader(buf, book.SecurityId, book.LastRptSeq,
-            (ushort)bidLevels.Count, (ushort)askLevels.Count);
-
-        foreach (var (price, qty, count) in bidLevels)
-            offset = WireProtocol.WritePriceLevel(buf, offset, price, qty, (ushort)count);
-        foreach (var (price, qty, count) in askLevels)
-            offset = WireProtocol.WritePriceLevel(buf, offset, price, qty, (ushort)count);
-
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, size));
+    private static void SendSideOrders(ClientSession session, ulong securityId, BookSide side)
+    {
+        foreach (var (_, entry) in side.Orders)
+        {
+            var buf = new byte[37];
+            int len = WireProtocol.WriteOrderEvent(buf, MessageType.OrderAdded, securityId,
+                entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
+            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        }
     }
 
     private static void SendInfoSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
