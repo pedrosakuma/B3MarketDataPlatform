@@ -145,7 +145,7 @@ function handleMessage(msg) {
       const id = secIdStr(msg.securityId);
       subscriptions.set(id, {
         symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
-        book: null, info: {}, trades: [], orderCount: 0, tradeCount: 0,
+        book: null, orders: new Map(), info: {}, trades: [], orderCount: 0, tradeCount: 0,
       });
       if (!state.selectedSecurityId) selectSubscription(id);
       renderSubList();
@@ -173,7 +173,7 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.book = { rptSeq: msg.rptSeq, bids: msg.bids, asks: msg.asks };
-        sub.orderCount = 0;
+        sub.orders = new Map(); // reset MBO tracking — snapshot is the new baseline
       }
       if (state.selectedSecurityId === id) renderBook();
       const sym = sub?.symbol || id;
@@ -196,7 +196,11 @@ function handleMessage(msg) {
       stats.orders++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) sub.orderCount++;
+      if (sub) {
+        sub.orderCount++;
+        applyOrderAddOrUpdate(sub, msg);
+      }
+      if (state.selectedSecurityId === id) renderBook();
       const side = msg.side === 0 ? 'BID' : 'ASK';
       const sym = sub?.symbol || id;
       addLog(`${msg.type} ${sym} ${side} ${formatPrice(msg.price)} x${formatQty(msg.qty)}`, 'log-order');
@@ -206,7 +210,11 @@ function handleMessage(msg) {
       stats.orders++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) sub.orderCount++;
+      if (sub) {
+        sub.orderCount++;
+        applyOrderDelete(sub, msg);
+      }
+      if (state.selectedSecurityId === id) renderBook();
       const side = msg.side === 0 ? 'BID' : 'ASK';
       const sym = sub?.symbol || id;
       addLog(`OrderDeleted ${sym} ${side} oid=${msg.orderId}`, 'log-order');
@@ -228,13 +236,71 @@ function handleMessage(msg) {
     case 'BookCleared': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) sub.book = null;
+      if (sub) { sub.book = null; sub.orders = new Map(); }
       if (state.selectedSecurityId === id) renderBook();
       const sym = sub?.symbol || id;
       addLog(`BookCleared ${sym}`, 'log-book');
       break;
     }
   }
+}
+
+// ── Incremental book maintenance ──
+
+function ensureBook(sub) {
+  if (!sub.book) sub.book = { rptSeq: 0, bids: [], asks: [] };
+}
+
+function getLevels(sub, side) {
+  return side === 0 ? sub.book.bids : sub.book.asks;
+}
+
+function addToLevel(levels, price, qty, isBid) {
+  const existing = levels.find(l => l.price === price);
+  if (existing) {
+    existing.qty += qty;
+    existing.count++;
+  } else {
+    levels.push({ price, qty, count: 1 });
+    // Keep sorted: bids descending, asks ascending
+    if (isBid) levels.sort((a, b) => b.price - a.price);
+    else levels.sort((a, b) => a.price - b.price);
+  }
+}
+
+function removeFromLevel(levels, price, qty) {
+  const idx = levels.findIndex(l => l.price === price);
+  if (idx === -1) return;
+  const level = levels[idx];
+  level.qty -= qty;
+  level.count--;
+  if (level.count <= 0 || level.qty <= 0) levels.splice(idx, 1);
+}
+
+function applyOrderAddOrUpdate(sub, msg) {
+  ensureBook(sub);
+  const oid = msg.orderId.toString();
+  const old = sub.orders.get(oid);
+  if (old) {
+    // OrderUpdated for a tracked order — remove old contribution first
+    const oldLevels = getLevels(sub, old.side);
+    removeFromLevel(oldLevels, old.price, old.qty);
+  }
+  sub.orders.set(oid, { side: msg.side, price: msg.price, qty: msg.qty });
+  const levels = getLevels(sub, msg.side);
+  addToLevel(levels, msg.price, msg.qty, msg.side === 0);
+}
+
+function applyOrderDelete(sub, msg) {
+  if (!sub.book) return;
+  const oid = msg.orderId.toString();
+  const old = sub.orders.get(oid);
+  if (old) {
+    const levels = getLevels(sub, old.side);
+    removeFromLevel(levels, old.price, old.qty);
+    sub.orders.delete(oid);
+  }
+  // If order was pre-snapshot (not tracked), we can't update MBP accurately — accept drift
 }
 
 // ── Expose to window for HTML onclick handlers ──

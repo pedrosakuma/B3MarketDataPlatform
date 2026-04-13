@@ -308,14 +308,12 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         ProcessPendingRequests();
         ForwardOrderEvent(MessageType.OrderAdded, book.SecurityId, entry);
-        SendBookSnapshotIfSubscribed(book);
     }
 
     public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
     {
         ProcessPendingRequests();
         ForwardOrderEvent(MessageType.OrderUpdated, book.SecurityId, entry);
-        SendBookSnapshotIfSubscribed(book);
     }
 
     public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side)
@@ -326,7 +324,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         var buf = new byte[21];
         int len = WireProtocol.WriteOrderDeleted(buf, book.SecurityId, orderId, (byte)side);
         SendToSubscribers(book.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
-        SendBookSnapshotToSubscribers(book);
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
@@ -376,47 +373,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     }
 
     // --- Helpers ---
-
-    private void SendBookSnapshotIfSubscribed(OrderBook book)
-    {
-        if (!_subscriptions.ContainsKey(book.SecurityId)) return;
-        SendBookSnapshotToSubscribers(book);
-    }
-
-    private void SendBookSnapshotToSubscribers(OrderBook book)
-    {
-        if (!_subscriptions.TryGetValue(book.SecurityId, out var clients)) return;
-
-        var bidLevels = new List<(long price, long totalQty, int count)>();
-        var askLevels = new List<(long price, long totalQty, int count)>();
-
-        foreach (var kv in book.Bids.PriceLevels)
-            bidLevels.Add((kv.Key, kv.Value.Sum(o => o.Quantity), kv.Value.Count));
-        foreach (var kv in book.Asks.PriceLevels)
-            askLevels.Add((kv.Key, kv.Value.Sum(o => o.Quantity), kv.Value.Count));
-
-        int size = WireProtocol.BookSnapshotSize(bidLevels.Count, askLevels.Count);
-        var buf = new byte[size];
-        int offset = WireProtocol.WriteBookSnapshotHeader(buf, book.SecurityId, book.LastRptSeq,
-            (ushort)bidLevels.Count, (ushort)askLevels.Count);
-        foreach (var (price, qty, count) in bidLevels)
-            offset = WireProtocol.WritePriceLevel(buf, offset, price, qty, (ushort)count);
-        foreach (var (price, qty, count) in askLevels)
-            offset = WireProtocol.WritePriceLevel(buf, offset, price, qty, (ushort)count);
-
-        var message = new ReadOnlyMemory<byte>(buf, 0, size);
-        foreach (var (clientId, flags) in clients)
-        {
-            if (!flags.HasFlag(DataFlags.Book)) continue;
-            if (_clients.TryGetValue(clientId, out var session))
-            {
-                if (session.TryEnqueue(message))
-                    AppMetrics.WsMessagesSent.Add(1);
-                else
-                    AppMetrics.WsMessagesDropped.Add(1);
-            }
-        }
-    }
 
     private void ForwardOrderEvent(MessageType type, ulong securityId, OrderBookEntry entry)
     {
