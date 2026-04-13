@@ -129,12 +129,22 @@ public sealed class BookManager : IFeedEventHandler
         var bookSide = book.GetSide(side);
         ulong orderId = (ulong)msg.SecondaryOrderID;
 
-        long price = msg.MDEntryPx is { } px ? (px.Mantissa ?? 0) : 0;
+        long? rawPrice = msg.MDEntryPx is { } px ? px.Mantissa : null;
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
         if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
         {
+            if (rawPrice is null)
+            {
+                // Priced order changed to market — remove from book
+                bookSide.Remove(orderId);
+                if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
+                _eventHandler?.OnOrderDeleted(book, orderId, side);
+                return;
+            }
+
+            long price = rawPrice.Value;
             long oldPrice = existing.Price;
 
             existing.Price = price;
@@ -151,6 +161,10 @@ public sealed class BookManager : IFeedEventHandler
         }
         else
         {
+            if (rawPrice is null)
+                return; // Market order — no price level to add
+
+            long price = rawPrice.Value;
             var entry = new OrderBookEntry
             {
                 OrderId = orderId,
@@ -334,8 +348,12 @@ public sealed class BookManager : IFeedEventHandler
 
         reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
         {
+            long? rawPrice = entry.MDEntryPx.Mantissa;
+            if (rawPrice is null)
+                return; // Market orders have no price — skip
+
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
-            long price = entry.MDEntryPx.Mantissa ?? 0;
+            long price = rawPrice.Value;
             long quantity = (long)entry.MDEntrySize;
             ulong orderId = (ulong)entry.SecondaryOrderID;
             uint enteringFirm = entry.EnteringFirm.Value ?? 0;
