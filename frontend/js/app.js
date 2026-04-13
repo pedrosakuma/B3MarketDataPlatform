@@ -136,7 +136,16 @@ function doUnsubscribe(securityIdStr) {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   const bigint = BigInt(securityIdStr);
   state.ws.send(buildUnsubscribe(bigint));
-  addLog(`→ Unsubscribe id=${securityIdStr}`, '');
+
+  // Optimistic local removal — don't wait for server roundtrip
+  const sub = subscriptions.get(securityIdStr);
+  subscriptions.delete(securityIdStr);
+  if (state.selectedSecurityId === securityIdStr) {
+    state.selectedSecurityId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
+    renderSelected();
+  }
+  renderSubList();
+  addLog(`→ Unsubscribe ${sub?.symbol || securityIdStr}`, '');
 }
 
 function selectSubscription(id) {
@@ -166,12 +175,15 @@ function handleMessage(msg) {
     case 'Unsubscribed': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      subscriptions.delete(id);
-      if (state.selectedSecurityId === id) {
-        state.selectedSecurityId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-        renderSelected();
+      if (sub) {
+        // Server confirmed — remove if not already removed optimistically
+        subscriptions.delete(id);
+        if (state.selectedSecurityId === id) {
+          state.selectedSecurityId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
+          renderSelected();
+        }
+        renderSubList();
       }
-      renderSubList();
       addLog(`Unsubscribed ${sub?.symbol || id}`, 'log-error');
       break;
     }
