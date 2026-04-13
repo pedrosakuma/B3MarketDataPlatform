@@ -20,6 +20,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
     // Per-security: clientId → DataFlags — only accessed on feed thread
     private readonly Dictionary<ulong, Dictionary<string, DataFlags>> _subscriptions = new();
+    // Recent trades per security — circular buffer, only accessed on feed thread
+    private readonly Dictionary<ulong, TradeRingBuffer> _recentTrades = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
     // Slow-client detection: clientId → consecutive high-watermark ticks
@@ -27,6 +29,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private const double SlowClientThreshold = 0.75; // 75% of channel capacity
     private const int SlowClientMaxTicks = 100; // consecutive overloaded ticks before disconnect
+    private const int MaxRecentTrades = 50;
 
     private volatile bool _ready;
     private long _slowClientDisconnects;
@@ -236,6 +239,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
                 session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
             }
+
+            // Send recent trade history
+            if (_recentTrades.TryGetValue(securityId, out var trades))
+                SendTradeHistory(session, securityId, trades);
         }
 
         if (flags.HasFlag(DataFlags.Info) && _marketDataManager is not null && _marketDataManager.InstrumentData.TryGetValue(securityId, out var info))
@@ -390,6 +397,14 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void ForwardTradeEvent(ulong securityId, long price, long quantity, long tradeId)
     {
+        // Always store — even if no subscribers, so late subscribers get history
+        if (!_recentTrades.TryGetValue(securityId, out var ring))
+        {
+            ring = new TradeRingBuffer(MaxRecentTrades);
+            _recentTrades[securityId] = ring;
+        }
+        ring.Add(price, quantity, tradeId);
+
         if (!_subscriptions.ContainsKey(securityId)) return;
 
         var buf = new byte[36];
@@ -463,5 +478,40 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
         public static SubscriptionRequest UnsubscribeAll(string clientId)
             => new(SubscriptionRequestKind.UnsubscribeAll, clientId, null, 0, DataFlags.None);
+    }
+
+    private static void SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
+    {
+        foreach (var (price, qty, tradeId) in ring.AsSpan())
+        {
+            var buf = new byte[36];
+            int len = WireProtocol.WriteTrade(buf, securityId, price, qty, tradeId);
+            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        }
+    }
+
+    /// <summary>Fixed-capacity ring buffer of recent trades for a single security.</summary>
+    internal sealed class TradeRingBuffer
+    {
+        private readonly (long Price, long Qty, long TradeId)[] _buf;
+        private int _head; // next write position
+        private int _count;
+
+        public TradeRingBuffer(int capacity) => _buf = new (long, long, long)[capacity];
+
+        public void Add(long price, long qty, long tradeId)
+        {
+            _buf[_head] = (price, qty, tradeId);
+            _head = (_head + 1) % _buf.Length;
+            if (_count < _buf.Length) _count++;
+        }
+
+        /// <summary>Iterates oldest → newest.</summary>
+        public IEnumerable<(long Price, long Qty, long TradeId)> AsSpan()
+        {
+            int start = _count < _buf.Length ? 0 : _head;
+            for (int i = 0; i < _count; i++)
+                yield return _buf[(start + i) % _buf.Length];
+        }
     }
 }
