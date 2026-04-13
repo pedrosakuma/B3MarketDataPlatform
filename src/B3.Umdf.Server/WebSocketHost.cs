@@ -73,6 +73,7 @@ public sealed class WebSocketHost : IAsyncDisposable
                 Status = _subscriptionManager.IsReady ? "ready" : "initializing",
                 Uptime = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
                 SlowClientDisconnects = _subscriptionManager.SlowClientDisconnects,
+                ResyncCount = _subscriptionManager.ResyncCount,
             };
             if (FeedStateProvider is not null)
                 result.FeedGroups = new Dictionary<string, string>(FeedStateProvider());

@@ -26,13 +26,18 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
     // Slow-client detection: clientId → consecutive high-watermark ticks
     private readonly Dictionary<string, int> _slowClientTicks = new();
+    // Clients needing MBO resync due to dropped events — clientId → set of securityIds
+    private readonly Dictionary<string, HashSet<ulong>> _dirtyClients = new();
+    private int _resyncThrottle;
 
     private const double SlowClientThreshold = 0.75; // 75% of channel capacity
     private const int SlowClientMaxTicks = 100; // consecutive overloaded ticks before disconnect
     private const int MaxRecentTrades = 50;
+    private const int ResyncThrottleInterval = 1000; // check dirty clients every N events
 
     private volatile bool _ready;
     private long _slowClientDisconnects;
+    private long _resyncCount;
 
     public SubscriptionManager(ILogger<SubscriptionManager>? logger = null)
     {
@@ -43,6 +48,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     /// <summary>Count of clients disconnected for being slow.</summary>
     public long SlowClientDisconnects => Volatile.Read(ref _slowClientDisconnects);
+
+    /// <summary>Count of MBO resync snapshots sent due to dropped events.</summary>
+    public long ResyncCount => Volatile.Read(ref _resyncCount);
 
     /// <summary>Current number of connected clients.</summary>
     public int ClientCount => _clients.Count;
@@ -116,7 +124,53 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             }
         }
 
-        DetectSlowClients();
+        // Throttled: resync dirty clients and detect slow clients periodically
+        if (++_resyncThrottle >= ResyncThrottleInterval)
+        {
+            _resyncThrottle = 0;
+            ProcessDirtyClients();
+            DetectSlowClients();
+        }
+    }
+
+    /// <summary>
+    /// Mark a client's subscription as needing MBO resync due to dropped events.
+    /// Called on the feed thread when enqueue fails.
+    /// </summary>
+    private void MarkDirty(string clientId, ulong securityId)
+    {
+        if (!_dirtyClients.TryGetValue(clientId, out var set))
+        {
+            set = new HashSet<ulong>();
+            _dirtyClients[clientId] = set;
+        }
+        set.Add(securityId);
+    }
+
+    /// <summary>
+    /// Sends fresh MBO snapshots to clients with dropped events.
+    /// Runs on the feed thread — book state is stable during this call.
+    /// </summary>
+    private void ProcessDirtyClients()
+    {
+        if (_dirtyClients.Count == 0) return;
+
+        foreach (var (clientId, securityIds) in _dirtyClients)
+        {
+            if (!_clients.TryGetValue(clientId, out var session)) continue;
+
+            foreach (var securityId in securityIds)
+            {
+                if (_bookManager is not null && _bookManager.Books.TryGetValue(securityId, out var book))
+                {
+                    SendMboSnapshot(session, book);
+                    Interlocked.Increment(ref _resyncCount);
+                    var sym = _symbolRegistry is not null && _symbolRegistry.TryGetSymbol(securityId, out var s) ? s : securityId.ToString();
+                    _logger.LogWarning("Resync {Symbol} for {ClientId} due to dropped events", sym, clientId);
+                }
+            }
+        }
+        _dirtyClients.Clear();
     }
 
     /// <summary>
@@ -414,7 +468,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 if (session.TryEnqueue(message))
                     AppMetrics.WsMessagesSent.Add(1);
                 else
+                {
                     AppMetrics.WsMessagesDropped.Add(1);
+                    if (requiredFlag == DataFlags.Book)
+                        MarkDirty(clientId, securityId);
+                }
             }
         }
     }
@@ -431,7 +489,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 if (session.TryEnqueueOrder(type, securityId, orderId, side, price, qty))
                     AppMetrics.WsMessagesSent.Add(1);
                 else
+                {
                     AppMetrics.WsMessagesDropped.Add(1);
+                    MarkDirty(clientId, securityId);
+                }
             }
         }
     }
@@ -465,7 +526,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 if (session.TryEnqueueBookCleared(securityId, clearSide))
                     AppMetrics.WsMessagesSent.Add(1);
                 else
+                {
                     AppMetrics.WsMessagesDropped.Add(1);
+                    MarkDirty(clientId, securityId);
+                }
             }
         }
     }

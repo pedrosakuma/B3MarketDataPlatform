@@ -46,3 +46,8 @@ TestResults/
 coverage/
 dotnet_*.nettrace
 BenchmarkDotNet.Artifacts/
+
+## Node.js (validation tools)
+node_modules/
+package.json
+package-lock.json

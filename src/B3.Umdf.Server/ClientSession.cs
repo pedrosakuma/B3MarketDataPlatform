@@ -85,7 +85,7 @@ public sealed class ClientSession : IDisposable
     public IReadOnlySet<ulong> Subscriptions => _subscriptions;
     public CancellationToken CancellationToken => _cts.Token;
 
-    public ClientSession(WebSocket socket, int channelCapacity = 4096, ILogger? logger = null)
+    public ClientSession(WebSocket socket, int channelCapacity = 65536, ILogger? logger = null)
     {
         Id = $"client-{Interlocked.Increment(ref _nextId)}";
         Socket = socket;
