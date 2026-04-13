@@ -333,9 +333,6 @@ using var statsTimer = new Timer(_ =>
     if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
         Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
 
-    if (ready && bookManager.Books.Count > 0)
-        PrintBookSample(bookManager);
-
 }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(multicastMerger is not null ? "live feed" : "replay")}...");
@@ -396,61 +393,7 @@ Console.WriteLine($"  Books:        {bookManager.Books.Count:N0}");
 Console.WriteLine($"  Instruments:  {marketDataManager.InstrumentData.Count:N0}");
 Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
 
-if (bookManager.Books.Count > 0)
-    PrintBookSample(bookManager);
-
 return 0;
-
-static void PrintBookSample(BookManager bookManager)
-{
-    try
-    {
-        // ConcurrentDictionary provides thread-safe enumeration (snapshot enumerator)
-        OrderBook? best = null;
-        int bestCount = 0;
-        foreach (var book in bookManager.Books.Values)
-        {
-            int count = book.Bids.Orders.Count + book.Asks.Orders.Count;
-            if (count > bestCount)
-            {
-                bestCount = count;
-                best = book;
-            }
-        }
-
-        if (best is null || bestCount == 0)
-            return;
-
-        Console.WriteLine($"   ── Book sample: SecurityId={best.SecurityId} ({best.Bids.Orders.Count} bids, {best.Asks.Orders.Count} asks) ──");
-
-        var topBids = best.Bids.PriceLevels.Take(5)
-            .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
-            .ToList();
-        var topAsks = best.Asks.PriceLevels.Take(5)
-            .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
-            .ToList();
-
-        Console.WriteLine("       BIDS                        ASKS");
-        Console.WriteLine("       Price        Qty  Count     Price        Qty  Count");
-
-        int rows = Math.Max(topBids.Count, topAsks.Count);
-
-        for (int i = 0; i < rows; i++)
-        {
-            string bidStr = i < topBids.Count
-                ? $"  {topBids[i].Price,12:N0} {topBids[i].Qty,10:N0} {topBids[i].Count,5}"
-                : new string(' ', 30);
-            string askStr = i < topAsks.Count
-                ? $"  {topAsks[i].Price,12:N0} {topAsks[i].Qty,10:N0} {topAsks[i].Count,5}"
-                : "";
-            Console.WriteLine($"    {bidStr}  |{askStr}");
-        }
-    }
-    catch (Exception)
-    {
-        // Book modified concurrently — safe to skip display this cycle
-    }
-}
 
 sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 {
