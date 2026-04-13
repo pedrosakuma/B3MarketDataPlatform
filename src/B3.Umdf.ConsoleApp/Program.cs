@@ -278,12 +278,20 @@ if (subscriptionManager is not null)
                 dict[$"G{gid}"] = handler.LastPacketTicks;
             return dict;
         };
+        wsHost.ChannelHandlerProvider = () =>
+        {
+            var dict = new Dictionary<string, ChannelHandler>();
+            foreach (var (gid, handler) in mf.Handlers)
+                dict[$"G{gid}"] = handler.IncrementalHandler;
+            return dict;
+        };
     }
     else if (singleFeed is not null)
     {
         var sf = singleFeed;
         wsHost.FeedStateProvider = () => new Dictionary<string, string> { ["G0"] = sf.State.ToString() };
         wsHost.LastPacketTimestampProvider = () => new Dictionary<string, long> { ["G0"] = sf.LastPacketTicks };
+        wsHost.ChannelHandlerProvider = () => new Dictionary<string, ChannelHandler> { ["G0"] = sf.IncrementalHandler };
     }
 
     await wsHost.StartAsync(wsPort!.Value, cts.Token);

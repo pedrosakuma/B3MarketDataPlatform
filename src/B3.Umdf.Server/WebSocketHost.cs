@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using B3.Umdf.Feed;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -25,6 +26,9 @@ public sealed class WebSocketHost : IAsyncDisposable
 
     /// <summary>Optional provider for last-packet timestamps per group.</summary>
     public Func<IReadOnlyDictionary<string, long>>? LastPacketTimestampProvider { get; set; }
+
+    /// <summary>Optional provider for per-group channel handler stats.</summary>
+    public Func<IReadOnlyDictionary<string, ChannelHandler>>? ChannelHandlerProvider { get; set; }
 
     public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null, int maxConnections = 0)
     {
@@ -158,6 +162,59 @@ public sealed class WebSocketHost : IAsyncDisposable
                 Crossed = crossed,
                 ValidationErrors = errors.Count > 0 ? errors.ToArray() : [],
             }, AppJsonContext.Default.BookDiagResponse);
+        });
+
+        _app.MapGet("/stats", () =>
+        {
+            var books = _subscriptionManager.BookManager;
+            var registry = _subscriptionManager.SymbolRegistry;
+
+            var resp = new FeedStatsResponse();
+
+            if (books is not null)
+            {
+                resp.OrderAdds = books.OrderAdds;
+                resp.OrderUpdates = books.OrderUpdates;
+                resp.OrderDeletes = books.OrderDeletes;
+                resp.DeleteNotFound = books.DeleteNotFound;
+                resp.NullPriceNewSkips = books.NullPriceNewSkips;
+                resp.NullPriceChangeDeletes = books.NullPriceChangeDeletes;
+                resp.ParseErrors = books.ParseErrors;
+                resp.CrossingTransitions = books.CrossingTransitions;
+
+                var crossedList = new List<string>();
+                foreach (var (secId, book) in books.Books)
+                {
+                    long bestBid = book.Bids.BestPrice() is { } bp ? bp.Price : 0;
+                    long bestAsk = book.Asks.BestPrice() is { } ap ? ap.Price : 0;
+                    if (bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk)
+                    {
+                        var sym = registry is not null && registry.TryGetSymbol(secId, out var s) ? s : secId.ToString();
+                        crossedList.Add(sym);
+                    }
+                }
+                resp.CrossedBooks = crossedList.Count;
+                resp.CrossedSymbols = crossedList.ToArray();
+            }
+
+            if (ChannelHandlerProvider is { } chp)
+            {
+                var handlers = chp();
+                var stats = new Dictionary<string, ChannelStats>();
+                foreach (var (name, handler) in handlers)
+                {
+                    stats[name] = new ChannelStats
+                    {
+                        PacketsProcessed = handler.PacketsProcessed,
+                        DuplicatesSkipped = handler.DuplicatesSkipped,
+                        GapsDetected = handler.GapsDetected,
+                        ExpectedSeqNum = handler.ExpectedSequenceNumber,
+                    };
+                }
+                resp.ChannelStats = stats;
+            }
+
+            return Results.Json(resp, AppJsonContext.Default.FeedStatsResponse);
         });
 
         _app.Map("/ws", async context =>

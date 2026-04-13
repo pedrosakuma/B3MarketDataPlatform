@@ -23,6 +23,12 @@ public sealed class BookManager : IFeedEventHandler
     private readonly IBookEventHandler? _eventHandler;
     private readonly ILogger<BookManager> _logger;
     private long _parseErrors;
+    private long _orderAdds;
+    private long _orderUpdates;
+    private long _orderDeletes;
+    private long _deleteNotFound;
+    private long _nullPriceNewSkips;
+    private long _nullPriceChangeDeletes;
 
     /// <summary>
     /// Thread-safe dictionary of all order books.
@@ -32,11 +38,38 @@ public sealed class BookManager : IFeedEventHandler
 
     /// <summary>Number of SBE parse errors encountered (malformed packets).</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
+    public long OrderAdds => Volatile.Read(ref _orderAdds);
+    public long OrderUpdates => Volatile.Read(ref _orderUpdates);
+    public long OrderDeletes => Volatile.Read(ref _orderDeletes);
+    public long DeleteNotFound => Volatile.Read(ref _deleteNotFound);
+    public long NullPriceNewSkips => Volatile.Read(ref _nullPriceNewSkips);
+    public long NullPriceChangeDeletes => Volatile.Read(ref _nullPriceChangeDeletes);
+
+    private long _crossingTransitions;
+    public long CrossingTransitions => Volatile.Read(ref _crossingTransitions);
 
     public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<BookManager>.Instance;
+    }
+
+    private void CheckCrossing(OrderBook book, string operation, ulong orderId, long price, BookSideType side)
+    {
+        var bestBid = book.Bids.BestPrice();
+        var bestAsk = book.Asks.BestPrice();
+        if (bestBid is { } bid && bestAsk is { } ask && bid.Price >= ask.Price)
+        {
+            Interlocked.Increment(ref _crossingTransitions);
+            if (_crossingTransitions <= 20) // Log first 20 crossings
+            {
+                _logger.LogWarning(
+                    "CROSSED: secId={SecurityId} after {Op} orderId={OrderId} price={Price} side={Side} " +
+                    "bestBid={BestBid} bestAsk={BestAsk} rptSeq={RptSeq}",
+                    book.SecurityId, operation, orderId, price, side,
+                    bid.Price, ask.Price, book.LastRptSeq);
+            }
+        }
     }
 
     /// <summary>
@@ -138,12 +171,14 @@ public sealed class BookManager : IFeedEventHandler
             if (rawPrice is null)
             {
                 // Priced order changed to market — remove from book
+                Interlocked.Increment(ref _nullPriceChangeDeletes);
                 bookSide.Remove(orderId);
                 if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
                 _eventHandler?.OnOrderDeleted(book, orderId, side);
                 return;
             }
 
+            Interlocked.Increment(ref _orderUpdates);
             long price = rawPrice.Value;
             long oldPrice = existing.Price;
 
@@ -158,11 +193,15 @@ public sealed class BookManager : IFeedEventHandler
                 book.LastRptSeq = (uint)rptSeq;
 
             _eventHandler?.OnOrderUpdated(book, existing);
+            CheckCrossing(book, "UPDATE", orderId, price, side);
         }
         else
         {
             if (rawPrice is null)
+            {
+                Interlocked.Increment(ref _nullPriceNewSkips);
                 return; // Market order — no price level to add
+            }
 
             long price = rawPrice.Value;
             var entry = new OrderBookEntry
@@ -176,11 +215,13 @@ public sealed class BookManager : IFeedEventHandler
             };
 
             bookSide.Add(entry);
+            Interlocked.Increment(ref _orderAdds);
 
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
 
             _eventHandler?.OnOrderAdded(book, entry);
+            CheckCrossing(book, "ADD", orderId, price, side);
         }
     }
 
@@ -198,7 +239,11 @@ public sealed class BookManager : IFeedEventHandler
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
         ulong orderId = (ulong)msg.SecondaryOrderID;
 
-        book.GetSide(side).Remove(orderId);
+        var removed = book.GetSide(side).Remove(orderId);
+        if (removed)
+            Interlocked.Increment(ref _orderDeletes);
+        else
+            Interlocked.Increment(ref _deleteNotFound);
 
         if (msg.RptSeq is { } rptSeq)
             book.LastRptSeq = (uint)rptSeq;

@@ -25,8 +25,10 @@ public sealed class FeedHandler : IDisposable
     private uint _instrDefTotalExpected;
     private uint _instrDefReceived;
 
-    // Snapshot tracking
-    private uint _snapshotLastSeqNum;
+    // Snapshot tracking — use MIN(LastMsgSeqNumProcessed) across all instruments
+    // so NO instrument loses incrementals that weren't in its snapshot.
+    private uint _snapshotMinSeqNum;
+    private uint _snapshotMaxSeqNum;
     private bool _snapshotCycleStarted;
 
     public FeedState State => _state;
@@ -300,7 +302,7 @@ public sealed class FeedHandler : IDisposable
         // Snapshot stream cycles continuously. SeqNum=1 marks start of a cycle.
         if (pktHeader.SequenceNumber == 1)
         {
-            if (_snapshotCycleStarted && _snapshotLastSeqNum > 0)
+            if (_snapshotCycleStarted && _snapshotMaxSeqNum > 0)
             {
                 CompleteSnapshotCycle();
                 return;
@@ -348,8 +350,11 @@ public sealed class FeedHandler : IDisposable
 
         ref readonly var msg = ref reader.Data;
         uint lastProcessed = (uint)msg.LastMsgSeqNumProcessed;
-        if (lastProcessed > _snapshotLastSeqNum)
-            _snapshotLastSeqNum = lastProcessed;
+
+        if (_snapshotMinSeqNum == 0 || lastProcessed < _snapshotMinSeqNum)
+            _snapshotMinSeqNum = lastProcessed;
+        if (lastProcessed > _snapshotMaxSeqNum)
+            _snapshotMaxSeqNum = lastProcessed;
     }
 
     /// <summary>
@@ -361,8 +366,10 @@ public sealed class FeedHandler : IDisposable
         if (_state is not (FeedState.WaitSnapshot or FeedState.Recovery))
             return;
 
-        uint catchUpFrom = _snapshotLastSeqNum;
-        _logger.LogInformation("Snapshot complete. Catching up from SeqNum > {CatchUpFrom}", catchUpFrom);
+        uint catchUpFrom = _snapshotMinSeqNum;
+        _logger.LogInformation(
+            "Snapshot complete. MinSeq={MinSeq}, MaxSeq={MaxSeq}. Catching up from SeqNum > {CatchUpFrom}",
+            _snapshotMinSeqNum, _snapshotMaxSeqNum, catchUpFrom);
 
         _eventHandler.OnSnapshotComplete(catchUpFrom);
 
@@ -400,7 +407,8 @@ public sealed class FeedHandler : IDisposable
         if (newState == FeedState.Recovery)
         {
             _snapshotCycleStarted = false;
-            _snapshotLastSeqNum = 0;
+            _snapshotMinSeqNum = 0;
+            _snapshotMaxSeqNum = 0;
         }
     }
 
