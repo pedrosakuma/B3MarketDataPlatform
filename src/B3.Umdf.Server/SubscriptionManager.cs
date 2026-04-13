@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
@@ -306,10 +305,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(book.SecurityId)) return;
 
-        var buf = ArrayPool<byte>.Shared.Rent(21);
+        var buf = new byte[21];
         int len = WireProtocol.WriteOrderDeleted(buf, book.SecurityId, orderId, (byte)side);
         SendToSubscribers(book.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
-        ArrayPool<byte>.Shared.Return(buf);
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
@@ -323,10 +321,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = ArrayPool<byte>.Shared.Rent(12);
+        var buf = new byte[12];
         int len = WireProtocol.WriteBookCleared(buf, securityId);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
-        ArrayPool<byte>.Shared.Return(buf);
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
@@ -365,21 +362,19 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = ArrayPool<byte>.Shared.Rent(37);
+        var buf = new byte[37];
         int len = WireProtocol.WriteOrderEvent(buf, type, securityId,
             entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
-        ArrayPool<byte>.Shared.Return(buf);
     }
 
     private void ForwardTradeEvent(ulong securityId, long price, long quantity, long tradeId)
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = ArrayPool<byte>.Shared.Rent(36);
+        var buf = new byte[36];
         int len = WireProtocol.WriteTrade(buf, securityId, price, quantity, tradeId);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
-        ArrayPool<byte>.Shared.Return(buf);
     }
 
     private void SendToSubscribers(ulong securityId, ReadOnlyMemory<byte> message, DataFlags requiredFlag)
@@ -402,10 +397,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = ArrayPool<byte>.Shared.Rent(WireProtocol.InfoSnapshotMaxSize);
+        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
         SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Info);
-        ArrayPool<byte>.Shared.Return(buf);
     }
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>
