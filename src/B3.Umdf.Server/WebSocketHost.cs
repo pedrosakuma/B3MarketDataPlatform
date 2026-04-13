@@ -96,6 +96,33 @@ public sealed class WebSocketHost : IAsyncDisposable
                 AppJsonContext.Default.SymbolsResponse);
         });
 
+        _app.MapGet("/top", (int? n) =>
+        {
+            var books = _subscriptionManager.BookManager;
+            var registry = _subscriptionManager.SymbolRegistry;
+            if (books is null) return Results.Json(new TopResponse(), AppJsonContext.Default.TopResponse);
+
+            var max = Math.Clamp(n ?? 20, 1, 100);
+            var top = books.Books
+                .OrderByDescending(kv => kv.Value.Bids.OrderCount + kv.Value.Asks.OrderCount)
+                .Take(max)
+                .Select(kv =>
+                {
+                    var sym = registry is not null && registry.TryGetSymbol(kv.Key, out var s) ? s : kv.Key.ToString();
+                    return new TopInstrument
+                    {
+                        Symbol = sym,
+                        SecurityId = kv.Key,
+                        BidOrders = kv.Value.Bids.OrderCount,
+                        AskOrders = kv.Value.Asks.OrderCount,
+                        BidLevels = kv.Value.Bids.LevelCount,
+                        AskLevels = kv.Value.Asks.LevelCount,
+                    };
+                }).ToArray();
+            return Results.Json(new TopResponse { TotalBooks = books.Books.Count, Instruments = top },
+                AppJsonContext.Default.TopResponse);
+        });
+
         _app.Map("/ws", async context =>
         {
             if (!context.WebSockets.IsWebSocketRequest)

@@ -18,7 +18,24 @@ public sealed class SymbolsResponse
     public string[] Symbols { get; set; } = [];
 }
 
+public sealed class TopInstrument
+{
+    public string Symbol { get; set; } = "";
+    public ulong SecurityId { get; set; }
+    public int BidOrders { get; set; }
+    public int AskOrders { get; set; }
+    public int BidLevels { get; set; }
+    public int AskLevels { get; set; }
+}
+
+public sealed class TopResponse
+{
+    public int TotalBooks { get; set; }
+    public TopInstrument[] Instruments { get; set; } = [];
+}
+
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(SymbolsResponse))]
+[JsonSerializable(typeof(TopResponse))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public partial class AppJsonContext : JsonSerializerContext;

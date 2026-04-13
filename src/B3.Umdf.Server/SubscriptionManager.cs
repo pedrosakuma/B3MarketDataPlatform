@@ -54,6 +54,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// <summary>Expose symbol registry for diagnostic endpoints.</summary>
     public SymbolRegistry? SymbolRegistry => _symbolRegistry;
 
+    /// <summary>Expose book manager for diagnostic endpoints.</summary>
+    public BookManager? BookManager => _bookManager;
+
     /// <summary>Register a client session.</summary>
     public void RegisterClient(ClientSession session)
     {
@@ -222,8 +225,18 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void SendSnapshots(ClientSession session, ulong securityId, DataFlags flags)
     {
-        if (flags.HasFlag(DataFlags.Book) && _bookManager is not null && _bookManager.Books.TryGetValue(securityId, out var book))
-            SendBookSnapshot(session, book);
+        if (flags.HasFlag(DataFlags.Book) && _bookManager is not null)
+        {
+            if (_bookManager.Books.TryGetValue(securityId, out var book))
+                SendBookSnapshot(session, book);
+            else
+            {
+                // Book not yet created — send empty snapshot so client knows book is active
+                var emptyBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
+                WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
+                session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
+            }
+        }
 
         if (flags.HasFlag(DataFlags.Info) && _marketDataManager is not null && _marketDataManager.InstrumentData.TryGetValue(securityId, out var info))
             SendInfoSnapshot(session, securityId, info);
