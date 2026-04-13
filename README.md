@@ -15,10 +15,17 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **WebSocket subscription server** — binary protocol for real-time data streaming
 - **Data channel filtering** — subscribe to Book, Info, or both via `DataFlags` bitmask
 - **Unary Get** — one-shot snapshot without subscribing
-- **Web frontend** — single-file SPA for interactive testing
+- **Web frontend** — modular SPA for interactive testing
 - **Docker Compose** — one command to run backend + frontend with PCAP replay
 - **Multi-channel support** — process multiple channel groups simultaneously (e.g. EQT + DRV)
 - **Pluggable transport** — `IPacketSource` abstraction with multicast and in-process implementations
+- **Structured logging** — `ILogger<T>` throughout with structured log templates
+- **OpenTelemetry metrics** — `System.Diagnostics.Metrics` counters/gauges (packets, orders, WS connections, drops)
+- **Health endpoints** — `/health`, `/ready`, `/live` for Kubernetes probes
+- **Backpressure** — slow-client detection and auto-disconnect
+- **Graceful shutdown** — SIGTERM handling with ordered drain
+- **Configuration** — JSON + environment variable config (`UMDF_*` prefix)
+- **Docker hardening** — non-root user, HEALTHCHECK, resource limits
 
 ## Architecture
 
@@ -68,8 +75,18 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 | `B3.Umdf.Feed` | Feed handler, gap detection, A/B dedup, message dispatch |
 | `B3.Umdf.Book` | Market-by-Order book: `OrderBook`, `BookSide`, `BookManager`, `MarketDataManager`, `SymbolRegistry` |
 | `B3.Umdf.PcapReplay` | PCAP reader, UDP extractor, timestamp-merged replayer |
-| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `ClientSession`, `WebSocketHost` |
+| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `ClientSession`, `WebSocketHost`, `AppMetrics`, `AppSettings` |
 | `B3.Umdf.ConsoleApp` | CLI application — PCAP replay + optional WebSocket server |
+
+## Tests
+
+| Project | Tests | Description |
+|---------|-------|-------------|
+| `B3.Umdf.Book.Tests` | 18 | Order book operations, book side, concurrency stress |
+| `B3.Umdf.Feed.Tests` | 4 | Channel handler, gap detection |
+| `B3.Umdf.PcapReplay.Tests` | 4 | PCAP reader, timestamp merge |
+| `B3.Umdf.Transport.Tests` | 5 | Packet source, multicast config |
+| `B3.Umdf.Server.Tests` | 7 | Subscription manager, client session, settings |
 
 ## Quick Start
 
@@ -349,6 +366,81 @@ dotnet tool install -g dotnet-trace
 This project uses the [B3 Market Data Messages v2.2.0](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/) SBE XML schema.
 
 The schema's `<!DOCTYPE xml>` declaration is removed because .NET's `XmlReader` prohibits DTD processing by default. This is the only modification to the original B3 schema.
+
+## Production Operations
+
+### Health Endpoints
+
+When the WebSocket server is active (`--ws-port`), HTTP endpoints are available on the same port:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | JSON: status, uptime, feed group states, last packet timestamps |
+| `GET /ready` | `200` when all groups RealTime, `503` otherwise (readiness probe) |
+| `GET /live` | Always `200` (liveness probe) |
+
+```bash
+curl http://localhost:8080/health | jq
+# {"status":"ready","uptime":"00:05:32","feedGroups":{"G0":"RealTime","G1":"RealTime"},...}
+```
+
+### Metrics
+
+OpenTelemetry-compatible metrics via `System.Diagnostics.Metrics` (meter: `B3.Umdf`):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `umdf.packets.received` | Counter | Total UMDF packets processed |
+| `umdf.gaps.detected` | Counter | Sequence gaps detected |
+| `umdf.parse_errors` | Counter | SBE parse failures |
+| `umdf.orders.processed` | Counter | Order add/update/delete events |
+| `umdf.trades.processed` | Counter | Trade events |
+| `umdf.ws.connections.active` | UpDownCounter | Current WebSocket connections |
+| `umdf.ws.messages.sent` | Counter | Messages sent to subscribers |
+| `umdf.ws.messages.dropped` | Counter | Messages dropped (slow clients) |
+| `umdf.ws.slow_disconnects` | Counter | Clients disconnected for being slow |
+
+Collect via [dotnet-counters](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-counters), OTLP exporter, or Prometheus scrape.
+
+### Configuration
+
+Settings can be provided via JSON file, environment variables, or CLI arguments (highest priority wins):
+
+| Environment Variable | CLI | Default | Description |
+|---------------------|-----|---------|-------------|
+| `UMDF_WS_PORT` | `--ws-port` | *(off)* | WebSocket server port |
+| `UMDF_SPEED` | `--speed` | `0` | Replay speed multiplier |
+| `UMDF_MAX_CONNECTIONS` | — | `0` (unlimited) | Max concurrent WebSocket connections |
+| `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size |
+| `UMDF_SHUTDOWN_DRAIN_SECONDS` | — | `5` | Graceful shutdown drain timeout |
+| `UMDF_LOG_LEVEL` | — | `Information` | Minimum log level |
+| `UMDF_MULTICAST_CONFIG` | `--multicast-config` | — | Multicast JSON config path |
+
+### Backpressure & Slow Clients
+
+Each WebSocket client has a bounded outbound queue (default: 4096 messages). When a client can't keep up:
+1. Messages are dropped (newest data replaces oldest)
+2. Queue depth is monitored on every feed event
+3. Clients with queue depth above 75% capacity for 100+ consecutive checks are automatically disconnected
+4. Disconnected clients should reconnect and re-subscribe (will receive fresh snapshots)
+
+### Graceful Shutdown
+
+The application handles `SIGTERM` (containers) and `SIGINT` (Ctrl+C):
+1. Stop accepting new connections
+2. Stop the feed (no new data)
+3. Drain in-flight WebSocket writes (2s)
+4. Stop the server
+
+### TLS (HTTPS / wss://)
+
+Kestrel natively supports HTTPS. Configure via environment variables:
+
+```bash
+ASPNETCORE_URLS=https://0.0.0.0:8443
+ASPNETCORE_Kestrel__Certificates__Default__Path=/certs/cert.pfx
+ASPNETCORE_Kestrel__Certificates__Default__Password=changeit
+```
 
 ## References
 
