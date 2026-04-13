@@ -86,9 +86,19 @@ function connect() {
 
   ws.onmessage = (evt) => {
     if (!(evt.data instanceof ArrayBuffer)) return;
-    stats.msgs++;
-    const msg = parseMessage(evt.data);
-    if (msg) handleMessage(msg);
+    // Coalesced frame: may contain multiple length-prefixed messages
+    const buf = evt.data;
+    let offset = 0;
+    while (offset + 4 <= buf.byteLength) {
+      const v = new DataView(buf, offset);
+      const len = v.getUint16(0, true);
+      if (len < 4 || offset + len > buf.byteLength) break;
+      const msgBuf = buf.slice(offset, offset + len);
+      stats.msgs++;
+      const msg = parseMessage(msgBuf);
+      if (msg) handleMessage(msg);
+      offset += len;
+    }
     updateStats();
   };
 }

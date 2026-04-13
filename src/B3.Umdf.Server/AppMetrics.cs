@@ -26,4 +26,5 @@ public sealed class AppMetrics
     public static readonly Counter<long> WsMessagesDropped = Meter.CreateCounter<long>("umdf.ws.messages.dropped");
     public static readonly Counter<long> WsSlowDisconnects = Meter.CreateCounter<long>("umdf.ws.slow_disconnects");
     public static readonly Counter<long> WsSubscriptions = Meter.CreateCounter<long>("umdf.ws.subscriptions");
+    public static readonly Counter<long> WsMessagesConflated = Meter.CreateCounter<long>("umdf.ws.messages.conflated");
 }

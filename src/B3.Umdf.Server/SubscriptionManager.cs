@@ -331,10 +331,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(book.SecurityId)) return;
-
-        var buf = new byte[21];
-        int len = WireProtocol.WriteOrderDeleted(buf, book.SecurityId, orderId, (byte)side);
-        SendToSubscribers(book.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        SendOrderToSubscribers(MessageType.OrderDeleted, book.SecurityId, orderId, (byte)side, 0, 0);
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
@@ -388,11 +385,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private void ForwardOrderEvent(MessageType type, ulong securityId, OrderBookEntry entry)
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
-
-        var buf = new byte[37];
-        int len = WireProtocol.WriteOrderEvent(buf, type, securityId,
-            entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        SendOrderToSubscribers(type, securityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
     }
 
     private void ForwardTradeEvent(ulong securityId, long price, long quantity, long tradeId)
@@ -428,13 +421,47 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         }
     }
 
+    /// <summary>Send a typed order event to all subscribers for conflation in the write loop.</summary>
+    private void SendOrderToSubscribers(MessageType type, ulong securityId, ulong orderId, byte side, long price, long qty)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, flags) in clients)
+        {
+            if (!flags.HasFlag(DataFlags.Book)) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+            {
+                if (session.TryEnqueueOrder(type, securityId, orderId, side, price, qty))
+                    AppMetrics.WsMessagesSent.Add(1);
+                else
+                    AppMetrics.WsMessagesDropped.Add(1);
+            }
+        }
+    }
+
+    /// <summary>Send a typed info update to all subscribers for last-state-wins conflation.</summary>
+    private void SendInfoToSubscribers(ulong securityId, ReadOnlyMemory<byte> serializedInfo)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, flags) in clients)
+        {
+            if (!flags.HasFlag(DataFlags.Info)) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+            {
+                if (session.TryEnqueueInfo(securityId, serializedInfo))
+                    AppMetrics.WsMessagesSent.Add(1);
+                else
+                    AppMetrics.WsMessagesDropped.Add(1);
+            }
+        }
+    }
+
     private void SendInfoUpdate(ulong securityId, InstrumentInfo info)
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
 
         var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Info);
+        SendInfoToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>
