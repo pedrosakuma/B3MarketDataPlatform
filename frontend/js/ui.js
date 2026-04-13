@@ -65,11 +65,23 @@ export function renderSelected() {
 export function renderBook() {
   const body = $('bookBody');
   const sub = subscriptions.get(state.selectedSecurityId);
-  if (!sub || !sub.book) {
+  if (!sub || sub.orders.size === 0) {
     body.innerHTML = '<div class="empty-msg">No book data</div>';
     return;
   }
-  const { rptSeq, bids, asks } = sub.book;
+
+  // Compute MBP from MBO orders
+  const bidMap = new Map(); // price → {qty, count}
+  const askMap = new Map();
+  for (const [, order] of sub.orders) {
+    const map = order.side === 0 ? bidMap : askMap;
+    const existing = map.get(order.price);
+    if (existing) { existing.qty += order.qty; existing.count++; }
+    else map.set(order.price, { price: order.price, qty: order.qty, count: 1 });
+  }
+  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price);
+  const asks = [...askMap.values()].sort((a, b) => a.price - b.price);
+
   const maxLevels = 15;
 
   // Calculate max qty for depth bars
@@ -85,7 +97,7 @@ export function renderBook() {
     spreadHtml = `<div class="spread-bar">BBO: <span class="bid-price">${formatPrice(bestBid)}</span> / <span class="ask-price">${formatPrice(bestAsk)}</span> &nbsp; Spread: <strong>${formatPrice(spread)}</strong></div>`;
   }
 
-  let html = `<div style="font-size:.7rem;color:var(--muted);margin-bottom:.3rem">rptSeq: ${rptSeq} | ${bids.length}b/${asks.length}a | +${sub.orderCount} events</div>`;
+  let html = `<div style="font-size:.7rem;color:var(--muted);margin-bottom:.3rem">${bids.length}b/${asks.length}a | ${sub.orders.size} orders | +${sub.orderCount} events</div>`;
   html += spreadHtml;
   html += '<div class="book-grid">';
 

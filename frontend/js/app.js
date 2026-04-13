@@ -172,7 +172,7 @@ function handleMessage(msg) {
       const id = secIdStr(msg.securityId);
       subscriptions.set(id, {
         symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
-        book: null, orders: new Map(), info: {}, trades: [], orderCount: 0, tradeCount: 0,
+        orders: new Map(), info: {}, trades: [], orderCount: 0, tradeCount: 0,
       });
       if (!state.selectedSecurityId) selectSubscription(id);
       renderSubList();
@@ -202,8 +202,7 @@ function handleMessage(msg) {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) {
-        sub.book = { rptSeq: msg.rptSeq, bids: msg.bids, asks: msg.asks };
-        sub.orders = new Map(); // reset MBO tracking — snapshot is the new baseline
+        sub.orders = new Map(); // reset MBO — subsequent OrderAdded rebuild it
       }
       if (state.selectedSecurityId === id) renderBook();
       break;
@@ -223,7 +222,7 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
-        applyOrderAddOrUpdate(sub, msg);
+        sub.orders.set(msg.orderId.toString(), { side: msg.side, price: msg.price, qty: msg.qty });
       }
       if (state.selectedSecurityId === id) scheduleBookRender();
       break;
@@ -234,7 +233,7 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
-        applyOrderDelete(sub, msg);
+        sub.orders.delete(msg.orderId.toString());
       }
       if (state.selectedSecurityId === id) scheduleBookRender();
       break;
@@ -256,13 +255,9 @@ function handleMessage(msg) {
       if (sub) {
         const clearSide = msg.side; // 0=Both, 1=Bid, 2=Ask
         if (clearSide === 0) {
-          sub.book = null;
           sub.orders = new Map();
         } else {
-          ensureBook(sub);
           const orderSide = clearSide - 1; // 0=Bid, 1=Ask
-          if (clearSide === 1) sub.book.bids = [];
-          else sub.book.asks = [];
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
@@ -275,64 +270,6 @@ function handleMessage(msg) {
       break;
     }
   }
-}
-
-// ── Incremental book maintenance ──
-
-function ensureBook(sub) {
-  if (!sub.book) sub.book = { rptSeq: 0, bids: [], asks: [] };
-}
-
-function getLevels(sub, side) {
-  return side === 0 ? sub.book.bids : sub.book.asks;
-}
-
-function addToLevel(levels, price, qty, isBid) {
-  const existing = levels.find(l => l.price === price);
-  if (existing) {
-    existing.qty += qty;
-    existing.count++;
-  } else {
-    levels.push({ price, qty, count: 1 });
-    // Keep sorted: bids descending, asks ascending
-    if (isBid) levels.sort((a, b) => b.price - a.price);
-    else levels.sort((a, b) => a.price - b.price);
-  }
-}
-
-function removeFromLevel(levels, price, qty) {
-  const idx = levels.findIndex(l => l.price === price);
-  if (idx === -1) return;
-  const level = levels[idx];
-  level.qty -= qty;
-  level.count--;
-  if (level.count <= 0 || level.qty <= 0) levels.splice(idx, 1);
-}
-
-function applyOrderAddOrUpdate(sub, msg) {
-  ensureBook(sub);
-  const oid = msg.orderId.toString();
-  const old = sub.orders.get(oid);
-  if (old) {
-    // OrderUpdated for a tracked order — remove old contribution first
-    const oldLevels = getLevels(sub, old.side);
-    removeFromLevel(oldLevels, old.price, old.qty);
-  }
-  sub.orders.set(oid, { side: msg.side, price: msg.price, qty: msg.qty });
-  const levels = getLevels(sub, msg.side);
-  addToLevel(levels, msg.price, msg.qty, msg.side === 0);
-}
-
-function applyOrderDelete(sub, msg) {
-  if (!sub.book) return;
-  const oid = msg.orderId.toString();
-  const old = sub.orders.get(oid);
-  if (old) {
-    const levels = getLevels(sub, old.side);
-    removeFromLevel(levels, old.price, old.qty);
-    sub.orders.delete(oid);
-  }
-  // If order was pre-snapshot (not tracked), we can't update MBP accurately — accept drift
 }
 
 // ── Expose to window for HTML onclick handlers ──
