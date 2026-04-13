@@ -347,3 +347,5 @@ window.toggleLog = setLogEnabled;
 // ── Init ──
 setStatus('disconnected');
 startHealthPolling();
+// Auto-connect on page load
+connect();
