@@ -15,6 +15,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     private readonly PriorityQueue<(PcapPacket Packet, int ReaderIndex), long> _pq = new();
     private readonly List<(MmapPcapReader Reader, ChannelType Channel, int Group)> _readers = new();
     private readonly int[] _cachedUdpOffset;
+    private readonly long[] _groupTimeOffset;
     private readonly ReplayOptions _options;
     private long? _firstTimestamp;
     private long _startTicks;
@@ -25,6 +26,11 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
         _options = options ?? new ReplayOptions();
         _startTicks = Environment.TickCount64;
         _cachedUdpOffset = new int[sources.Count];
+        _groupTimeOffset = new long[sources.Count];
+
+        // First pass: read first packet from each reader and find min timestamp per group
+        var firstPackets = new PcapPacket?[sources.Count];
+        var groupMinTimestamp = new Dictionary<int, long>();
 
         for (int i = 0; i < sources.Count; i++)
         {
@@ -34,8 +40,21 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             if (reader.TryReadNext(out var pkt))
             {
                 _cachedUdpOffset[i] = UdpExtractor.ComputeUdpPayloadOffset(pkt.Data.Span, reader.LinkType);
-                _pq.Enqueue((pkt, i), pkt.TimestampMicros);
+                firstPackets[i] = pkt;
+                if (!groupMinTimestamp.TryGetValue(src.Group, out var existing) || pkt.TimestampMicros < existing)
+                    groupMinTimestamp[src.Group] = pkt.TimestampMicros;
             }
+        }
+
+        // Compute per-group offset so all groups start at the same logical time
+        long globalMin = groupMinTimestamp.Count > 0 ? groupMinTimestamp.Values.Min() : 0;
+        for (int i = 0; i < sources.Count; i++)
+        {
+            var group = sources[i].Group;
+            _groupTimeOffset[i] = groupMinTimestamp.TryGetValue(group, out var gmin) ? gmin - globalMin : 0;
+
+            if (firstPackets[i] is { } pkt)
+                _pq.Enqueue((pkt, i), pkt.TimestampMicros - _groupTimeOffset[i]);
         }
     }
 
@@ -46,7 +65,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     /// </summary>
     public bool TryReceive(out UmdfPacket packet)
     {
-        if (!_pq.TryDequeue(out var item, out long timestampMicros))
+        if (!_pq.TryDequeue(out var item, out long normalizedTimestamp))
         {
             packet = default;
             return false;
@@ -54,8 +73,8 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 
         if (_options.SpeedMultiplier > 0)
         {
-            _firstTimestamp ??= timestampMicros;
-            long elapsedTargetMs = (long)((timestampMicros - _firstTimestamp.Value) / 1000.0 / _options.SpeedMultiplier);
+            _firstTimestamp ??= normalizedTimestamp;
+            long elapsedTargetMs = (long)((normalizedTimestamp - _firstTimestamp.Value) / 1000.0 / _options.SpeedMultiplier);
             long elapsedActualMs = Environment.TickCount64 - _startTicks;
             long delayMs = elapsedTargetMs - elapsedActualMs;
             if (delayMs > 1)
@@ -74,7 +93,7 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
         };
 
         if (reader.TryReadNext(out var next))
-            _pq.Enqueue((next, item.ReaderIndex), next.TimestampMicros);
+            _pq.Enqueue((next, item.ReaderIndex), next.TimestampMicros - _groupTimeOffset[item.ReaderIndex]);
 
         return true;
     }
