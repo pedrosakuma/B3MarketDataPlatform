@@ -9,9 +9,12 @@ export const state = {
   reconnectTimer: null,
   healthData: null,
   logEnabled: true,
+  rankingsTab: 'volume', // 'volume' | 'gainers' | 'losers'
 };
 
 // securityId (string) → { symbol, flags, securityId, book, orders, info, trades, orderCount, tradeCount }
 export const subscriptions = new Map();
+
+export const rankings = { volume: [], gainers: [], losers: [] };
 
 export const stats = { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 };

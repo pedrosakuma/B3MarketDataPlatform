@@ -7,6 +7,7 @@ export const MSG = {
   BOOK_SNAPSHOT: 0x0020, INFO_SNAPSHOT: 0x0021,
   ORDER_ADDED: 0x0030, ORDER_UPDATED: 0x0031, ORDER_DELETED: 0x0032,
   TRADE: 0x0033, BOOK_CLEARED: 0x0034,
+  RANKINGS_UPDATE: 0x0040,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -150,6 +151,22 @@ export function parseMessage(data) {
       const securityId = v.getBigUint64(o, true); o += 8;
       const side = o < data.byteLength ? v.getUint8(o) : 0;
       return { type: 'BookCleared', securityId, side };
+    }
+    case MSG.RANKINGS_UPDATE: {
+      const categories = [];
+      for (let c = 0; c < 3; c++) {
+        const count = v.getUint8(o); o += 1;
+        const entries = [];
+        for (let i = 0; i < count; i++) {
+          const securityId = v.getBigUint64(o, true); o += 8;
+          const value = Number(v.getBigInt64(o, true)); o += 8;
+          const sLen = v.getUint8(o); o += 1;
+          const symbol = decoder.decode(new Uint8Array(data, o, sLen)); o += sLen;
+          entries.push({ securityId, value, symbol });
+        }
+        categories.push(entries);
+      }
+      return { type: 'RankingsUpdate', volume: categories[0], gainers: categories[1], losers: categories[2] };
     }
     default:
       return { type: 'Unknown', msgType: type };

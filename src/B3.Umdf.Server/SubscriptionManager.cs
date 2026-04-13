@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -29,6 +30,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     // Clients needing MBO resync due to dropped events — clientId → set of securityIds
     private readonly Dictionary<string, HashSet<ulong>> _dirtyClients = new();
     private int _resyncThrottle;
+    private readonly Stopwatch _rankingsTimer = Stopwatch.StartNew();
+    private const long RankingsIntervalMs = 2000;
+    private const int RankingsTopN = 10;
 
     private const double SlowClientThreshold = 0.75; // 75% of channel capacity
     private const int SlowClientMaxTicks = 100; // consecutive overloaded ticks before disconnect
@@ -67,6 +71,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     /// <summary>Expose book manager for diagnostic endpoints.</summary>
     public BookManager? BookManager => _bookManager;
+
+    /// <summary>Expose market data manager for diagnostic endpoints.</summary>
+    public MarketDataManager? MarketDataManager => _marketDataManager;
 
     /// <summary>Register a client session.</summary>
     public void RegisterClient(ClientSession session)
@@ -130,6 +137,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             _resyncThrottle = 0;
             ProcessDirtyClients();
             DetectSlowClients();
+        }
+
+        // Time-based: push rankings to all clients every ~2s
+        if (_clients.Count > 0 && _rankingsTimer.ElapsedMilliseconds >= RankingsIntervalMs)
+        {
+            _rankingsTimer.Restart();
+            PushRankings();
         }
     }
 
@@ -433,6 +447,58 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     }
 
     // --- Helpers ---
+
+    private void PushRankings()
+    {
+        if (_marketDataManager is null || _symbolRegistry is null) return;
+
+        var data = _marketDataManager.InstrumentData;
+        if (data.Count == 0) return;
+
+        // Compute top N for each category
+        var volumeList = new List<RankingEntry>();
+        var gainerList = new List<RankingEntry>();
+        var loserList = new List<RankingEntry>();
+
+        foreach (var (secId, info) in data)
+        {
+            if (!_symbolRegistry.TryGetSymbol(secId, out var sym)) continue;
+
+            if (info.TradeVolume is { } vol and > 0)
+                volumeList.Add(new RankingEntry(secId, vol, sym));
+
+            if (info.NetChangeFromPrevDay is { } chg)
+            {
+                if (chg > 0) gainerList.Add(new RankingEntry(secId, chg, sym));
+                else if (chg < 0) loserList.Add(new RankingEntry(secId, chg, sym));
+            }
+        }
+
+        volumeList.Sort((a, b) => b.Value.CompareTo(a.Value));
+        gainerList.Sort((a, b) => b.Value.CompareTo(a.Value));
+        loserList.Sort((a, b) => a.Value.CompareTo(b.Value));
+
+        var volume = volumeList.Count > RankingsTopN
+            ? volumeList.GetRange(0, RankingsTopN).ToArray()
+            : volumeList.ToArray();
+        var gainers = gainerList.Count > RankingsTopN
+            ? gainerList.GetRange(0, RankingsTopN).ToArray()
+            : gainerList.ToArray();
+        var losers = loserList.Count > RankingsTopN
+            ? loserList.GetRange(0, RankingsTopN).ToArray()
+            : loserList.ToArray();
+
+        // Serialize
+        var buf = new byte[WireProtocol.RankingsUpdateMaxSize];
+        int len = WireProtocol.WriteRankingsUpdate(buf, volume, gainers, losers);
+        var payload = new ReadOnlyMemory<byte>(buf, 0, len);
+
+        // Broadcast to all connected clients
+        foreach (var (_, client) in _clients)
+        {
+            client.TryEnqueue(payload);
+        }
+    }
 
     private void ForwardOrderEvent(MessageType type, ulong securityId, OrderBookEntry entry)
     {

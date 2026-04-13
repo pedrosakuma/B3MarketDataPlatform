@@ -23,6 +23,7 @@ public enum MessageType : ushort
     OrderDeleted = 0x0032,
     Trade = 0x0033,
     BookCleared = 0x0034,
+    RankingsUpdate = 0x0040,
 }
 
 public enum SubscribeErrorCode : byte
@@ -282,5 +283,59 @@ public static class WireProtocol
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
         BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], orderCount); offset += 2;
         return offset;
+    }
+
+    // --- RankingsUpdate (variable-length, 3 categories) ---
+
+    /// <summary>
+    /// Write RankingsUpdate: 3 categories (volume, gainers, losers), each with N entries.
+    /// Format: [header][volCount:u8][entries...][gainerCount:u8][entries...][loserCount:u8][entries...]
+    /// Each entry: [securityId:u64][value:i64][symLen:u8][symbol bytes]
+    /// </summary>
+    public static int WriteRankingsUpdate(Span<byte> dest,
+        ReadOnlySpan<RankingEntry> volume,
+        ReadOnlySpan<RankingEntry> gainers,
+        ReadOnlySpan<RankingEntry> losers)
+    {
+        int offset = FramingHeaderSize;
+
+        offset = WriteRankingCategory(dest, offset, volume);
+        offset = WriteRankingCategory(dest, offset, gainers);
+        offset = WriteRankingCategory(dest, offset, losers);
+
+        ushort totalLen = (ushort)offset;
+        WriteFramingHeader(dest, totalLen, MessageType.RankingsUpdate);
+        return totalLen;
+    }
+
+    private static int WriteRankingCategory(Span<byte> dest, int offset, ReadOnlySpan<RankingEntry> entries)
+    {
+        dest[offset++] = (byte)entries.Length;
+        foreach (ref readonly var e in entries)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], e.SecurityId); offset += 8;
+            BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], e.Value); offset += 8;
+            int symLen = Encoding.UTF8.GetBytes(e.Symbol, dest[(offset + 1)..]);
+            dest[offset] = (byte)symLen;
+            offset += 1 + symLen;
+        }
+        return offset;
+    }
+
+    /// <summary>Max buffer for rankings: 3 categories × 10 entries × (8+8+1+32) ≈ 1500 bytes + header.</summary>
+    public const int RankingsUpdateMaxSize = FramingHeaderSize + 3 * (1 + 10 * (8 + 8 + 1 + 64));
+}
+
+public readonly struct RankingEntry
+{
+    public readonly ulong SecurityId;
+    public readonly long Value;
+    public readonly string Symbol;
+
+    public RankingEntry(ulong securityId, long value, string symbol)
+    {
+        SecurityId = securityId;
+        Value = value;
+        Symbol = symbol;
     }
 }

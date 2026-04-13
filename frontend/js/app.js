@@ -1,11 +1,11 @@
 // Application entry point — WebSocket connection, message handling, actions.
 
 import { MSG, DATA_FLAGS, buildSubscribeOrGet, buildUnsubscribe, parseMessage, flagsStr } from './protocol.js';
-import { state, subscriptions, stats } from './state.js';
+import { state, subscriptions, rankings, stats } from './state.js';
 import {
   $, secIdStr, formatPrice, formatQty,
   setStatus, renderSubList, renderSelected, renderBook, renderInfo, renderTrades, renderHealth,
-  addLog, clearLog, setLogEnabled, updateStats, addTrade,
+  renderRankings, addLog, clearLog, setLogEnabled, updateStats, addTrade,
 } from './ui.js';
 
 // ── Throttled book render ──
@@ -164,6 +164,22 @@ function selectSubscription(id) {
   renderSelected();
 }
 
+function rankingClick(symbol) {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  // If already subscribed, just select it
+  for (const [id, sub] of subscriptions) {
+    if (sub.symbol === symbol) { selectSubscription(id); return; }
+  }
+  // Otherwise subscribe with ALL flags
+  state.ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, symbol, DATA_FLAGS.ALL));
+  addLog(`→ Subscribe ${symbol} [Book+Info] (from ranking)`, '');
+}
+
+function switchRankingsTab(tab) {
+  state.rankingsTab = tab;
+  renderRankings();
+}
+
 // ── Message handler ──
 
 function handleMessage(msg) {
@@ -269,6 +285,13 @@ function handleMessage(msg) {
       addLog(`BookCleared ${sym} (${sideNames[msg.side] || 'Both'})`, 'log-book');
       break;
     }
+    case 'RankingsUpdate': {
+      rankings.volume = msg.volume;
+      rankings.gainers = msg.gainers;
+      rankings.losers = msg.losers;
+      renderRankings();
+      break;
+    }
   }
 }
 
@@ -278,6 +301,8 @@ window.doSubscribe = doSubscribe;
 window.doGet = doGet;
 window.doUnsubscribe = doUnsubscribe;
 window.selectSubscription = selectSubscription;
+window.rankingClick = rankingClick;
+window.switchRankingsTab = switchRankingsTab;
 window.clearLog = clearLog;
 window.toggleLog = setLogEnabled;
 

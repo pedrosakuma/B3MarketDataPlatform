@@ -80,6 +80,19 @@
 
   /* Subscriptions list */
   .sub-list { list-style: none; }
+
+  /* Rankings */
+  .rank-tabs { display: flex; gap: 2px; margin-bottom: .5rem; }
+  .rank-tab { flex: 1; text-align: center; padding: .3rem .2rem; font-size: .7rem; border-radius: 4px; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
+  .rank-tab.active { background: var(--bg3); color: var(--accent); border-color: var(--accent); }
+  .rank-tab:hover { color: var(--text); }
+  .rank-item { display: flex; align-items: center; gap: .4rem; padding: .25rem .3rem; cursor: pointer;
+    font-size: .75rem; border-radius: 3px; font-family: 'Cascadia Code', monospace; }
+  .rank-item:hover { background: var(--bg3); }
+  .rank-pos { color: var(--muted); width: 1.2em; text-align: right; font-size: .65rem; }
+  .rank-sym { flex: 1; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rank-val { font-size: .7rem; white-space: nowrap; }
   .sub-item { padding: .3rem .4rem; border-radius: 4px; cursor: pointer; font-size: .8rem; display: flex; justify-content: space-between; align-items: center; }
   .sub-item:hover { background: var(--bg3); }
   .sub-item.active { background: var(--bg3); border-left: 2px solid var(--accent); }
@@ -131,6 +144,15 @@
       <h3>Subscriptions</h3>
       <ul id="subList" class="sub-list"></ul>
       <div id="subEmpty" class="empty-msg">No active subscriptions</div>
+    </div>
+    <div>
+      <h3>Rankings</h3>
+      <div class="rank-tabs">
+        <button id="rankTab_volume" class="rank-tab active" onclick="switchRankingsTab('volume')">📊 Volume</button>
+        <button id="rankTab_gainers" class="rank-tab" onclick="switchRankingsTab('gainers')">🔺 Altas</button>
+        <button id="rankTab_losers" class="rank-tab" onclick="switchRankingsTab('losers')">🔻 Baixas</button>
+      </div>
+      <div id="rankList"><div class="empty-msg">Waiting for data...</div></div>
     </div>
   </div>
 

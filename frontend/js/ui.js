@@ -1,7 +1,7 @@
 // DOM helpers, formatting, and rendering.
 
 import { INFO_FIELDS, PRICE_FIELDS, flagsStr } from './protocol.js';
-import { subscriptions, state, stats } from './state.js';
+import { subscriptions, rankings, state, stats } from './state.js';
 
 export const $ = (id) => document.getElementById(id);
 
@@ -48,6 +48,44 @@ export function renderSubList() {
       <button class="sub-unsub" onclick="doUnsubscribe('${id}')" title="Unsubscribe">✕</button>`;
     ul.appendChild(li);
   }
+}
+
+// ── Rankings ──
+
+export function renderRankings() {
+  const tab = state.rankingsTab;
+  // Update tab buttons
+  for (const t of ['volume', 'gainers', 'losers']) {
+    const btn = $('rankTab_' + t);
+    if (btn) btn.className = 'rank-tab' + (t === tab ? ' active' : '');
+  }
+
+  const list = $('rankList');
+  if (!list) return;
+  const entries = rankings[tab] || [];
+
+  if (entries.length === 0) {
+    list.innerHTML = '<div class="empty-msg">Waiting for data...</div>';
+    return;
+  }
+
+  let html = '';
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    let valueStr;
+    if (tab === 'volume') {
+      valueStr = formatQty(e.value);
+    } else {
+      valueStr = formatPrice(e.value);
+    }
+    const colorClass = tab === 'losers' ? 'ask-price' : tab === 'gainers' ? 'bid-price' : '';
+    html += `<div class="rank-item" onclick="rankingClick('${e.symbol}')">
+      <span class="rank-pos">${i + 1}</span>
+      <span class="rank-sym">${e.symbol}</span>
+      <span class="rank-val ${colorClass}">${valueStr}</span>
+    </div>`;
+  }
+  list.innerHTML = html;
 }
 
 // ── Panels ──
