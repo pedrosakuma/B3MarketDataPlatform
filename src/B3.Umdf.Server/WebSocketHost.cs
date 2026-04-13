@@ -11,11 +11,13 @@ namespace B3.Umdf.Server;
 public sealed class WebSocketHost : IAsyncDisposable
 {
     private readonly SubscriptionManager _subscriptionManager;
+    private readonly ILogger<WebSocketHost> _logger;
     private WebApplication? _app;
 
-    public WebSocketHost(SubscriptionManager subscriptionManager)
+    public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null)
     {
         _subscriptionManager = subscriptionManager;
+        _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSocketHost>.Instance;
     }
 
     public async Task StartAsync(int port, CancellationToken ct = default)
@@ -42,7 +44,7 @@ public sealed class WebSocketHost : IAsyncDisposable
             var session = new ClientSession(ws);
             _subscriptionManager.RegisterClient(session);
 
-            Console.WriteLine($"[WS] Client {session.Id} connected");
+            _logger.LogInformation("Client {ClientId} connected", session.Id);
 
             // Start write loop
             var writeTask = Task.Run(() => session.RunWriteLoopAsync());
@@ -77,7 +79,7 @@ public sealed class WebSocketHost : IAsyncDisposable
             }
             finally
             {
-                Console.WriteLine($"[WS] Client {session.Id} disconnected");
+                _logger.LogInformation("Client {ClientId} disconnected", session.Id);
                 _subscriptionManager.UnregisterClient(session.Id);
                 session.Dispose();
                 await writeTask;
@@ -85,7 +87,7 @@ public sealed class WebSocketHost : IAsyncDisposable
         });
 
         await _app.StartAsync(ct);
-        Console.WriteLine($"[WS] WebSocket server listening on port {port}");
+        _logger.LogInformation("WebSocket server listening on port {Port}", port);
     }
 
     public async Task StopAsync()

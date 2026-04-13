@@ -1,5 +1,7 @@
 using System.Net.WebSockets;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Server;
 
@@ -15,14 +17,17 @@ public sealed class ClientSession : IDisposable
     private readonly Channel<ReadOnlyMemory<byte>> _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly ILogger _logger;
 
     public IReadOnlySet<ulong> Subscriptions => _subscriptions;
     public CancellationToken CancellationToken => _cts.Token;
 
-    public ClientSession(WebSocket socket, int channelCapacity = 4096)
+    public ClientSession(WebSocket socket, int channelCapacity = 4096, ILogger? logger = null)
     {
         Id = $"client-{Interlocked.Increment(ref _nextId)}";
         Socket = socket;
+        ChannelCapacity = channelCapacity;
+        _logger = logger ?? NullLogger.Instance;
         _outbound = Channel.CreateBounded<ReadOnlyMemory<byte>>(new BoundedChannelOptions(channelCapacity)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
@@ -44,14 +49,23 @@ public sealed class ClientSession : IDisposable
     /// <summary>Number of messages dropped due to slow consumption.</summary>
     public long DroppedMessages => Volatile.Read(ref _droppedMessages);
 
+    /// <summary>Current outbound queue depth.</summary>
+    public int QueueDepth => _outbound.Reader.CanCount ? _outbound.Reader.Count : 0;
+
+    /// <summary>Channel capacity.</summary>
+    public int ChannelCapacity { get; }
+
     /// <summary>
     /// Enqueue a message to be sent to the client.
-    /// Non-blocking — drops oldest if channel is full.
+    /// Non-blocking — drops oldest if channel is full and increments drop counter.
     /// Called from the feed thread or snapshot thread.
     /// </summary>
     public bool TryEnqueue(ReadOnlyMemory<byte> message)
     {
-        if (!_outbound.Writer.TryWrite(message))
+        // DropOldest means TryWrite always succeeds, but we detect drops via queue depth
+        bool wasFull = QueueDepth >= ChannelCapacity;
+        _outbound.Writer.TryWrite(message);
+        if (wasFull)
         {
             Interlocked.Increment(ref _droppedMessages);
             return false;
@@ -77,7 +91,7 @@ public sealed class ClientSession : IDisposable
         catch (OperationCanceledException) { }
         catch (WebSocketException ex)
         {
-            Console.Error.WriteLine($"[ClientSession] {Id} write error: {ex.Message}");
+            _logger.LogWarning("Write error on {ClientId}: {Error}", Id, ex.Message);
         }
     }
 
@@ -103,7 +117,7 @@ public sealed class ClientSession : IDisposable
             catch (OperationCanceledException) { yield break; }
             catch (WebSocketException ex)
             {
-                Console.Error.WriteLine($"[ClientSession] {Id} read error: {ex.Message}");
+                _logger.LogWarning("Read error on {ClientId}: {Error}", Id, ex.Message);
                 yield break;
             }
 

@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Feed;
 
@@ -9,6 +11,7 @@ public sealed class FeedHandler : IDisposable
     private readonly IPacketSource? _source;
     private readonly ChannelHandler _incrementalHandler;
     private readonly IFeedEventHandler _eventHandler;
+    private readonly ILogger<FeedHandler> _logger;
     private CancellationTokenSource? _cts;
     private Task? _runTask;
 
@@ -32,10 +35,11 @@ public sealed class FeedHandler : IDisposable
     public uint InstrDefTotalExpected => _instrDefTotalExpected;
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
-    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler)
+    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null)
     {
         _source = source;
         _eventHandler = eventHandler;
+        _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
     }
 
@@ -43,10 +47,11 @@ public sealed class FeedHandler : IDisposable
     /// Creates a FeedHandler for external feeding (no owned source).
     /// Use FeedPacket() to push packets from an external loop.
     /// </summary>
-    public FeedHandler(IFeedEventHandler eventHandler)
+    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null)
     {
         _source = null;
         _eventHandler = eventHandler;
+        _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
     }
 
@@ -274,7 +279,7 @@ public sealed class FeedHandler : IDisposable
 
         if (_instrDefReceived >= _instrDefTotalExpected && _instrDefTotalExpected > 0)
         {
-            Console.WriteLine($"[FeedHandler] Instrument definitions complete: {_instrDefReceived}/{_instrDefTotalExpected}");
+            _logger.LogInformation("Instrument definitions complete: {Received}/{Total}", _instrDefReceived, _instrDefTotalExpected);
             _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected);
             TransitionTo(FeedState.WaitSnapshot);
         }
@@ -351,7 +356,7 @@ public sealed class FeedHandler : IDisposable
             return;
 
         uint catchUpFrom = _snapshotLastSeqNum;
-        Console.WriteLine($"[FeedHandler] Snapshot complete. Catching up from SeqNum > {catchUpFrom}");
+        _logger.LogInformation("Snapshot complete. Catching up from SeqNum > {CatchUpFrom}", catchUpFrom);
 
         _eventHandler.OnSnapshotComplete(catchUpFrom);
 
@@ -377,13 +382,13 @@ public sealed class FeedHandler : IDisposable
             applied++;
         }
 
-        Console.WriteLine($"[FeedHandler] Catch-up done: {applied} applied, {discarded} discarded");
+        _logger.LogInformation("Catch-up done: {Applied} applied, {Discarded} discarded", applied, discarded);
         TransitionTo(FeedState.RealTime);
     }
 
     private void TransitionTo(FeedState newState)
     {
-        Console.WriteLine($"[FeedHandler] {_state} → {newState}");
+        _logger.LogInformation("{OldState} → {NewState}", _state, newState);
         _state = newState;
 
         if (newState == FeedState.Recovery)

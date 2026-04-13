@@ -1,4 +1,6 @@
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Feed;
 
@@ -35,21 +37,21 @@ public sealed class MultiFeedManager : IDisposable
         }
     }
 
-    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler)
+    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null)
     {
         _source = source;
         foreach (var gid in groupIds)
-            _handlers[gid] = new FeedHandler(eventHandler);
+            _handlers[gid] = new FeedHandler(eventHandler, feedLogger);
     }
 
     /// <summary>
     /// Creates a MultiFeedManager where each group has its own event handler.
     /// </summary>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null)
     {
         _source = source;
         foreach (var (gid, handler) in groupHandlers)
-            _handlers[gid] = new FeedHandler(handler);
+            _handlers[gid] = new FeedHandler(handler, feedLogger);
     }
 
     public Task StartAsync(CancellationToken ct = default)

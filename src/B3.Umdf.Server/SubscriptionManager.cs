@@ -1,6 +1,8 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Server;
 
@@ -14,16 +16,31 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private BookManager? _bookManager;
     private MarketDataManager? _marketDataManager;
     private SymbolRegistry? _symbolRegistry;
+    private readonly ILogger<SubscriptionManager> _logger;
 
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
     // Per-security: clientId → DataFlags — only accessed on feed thread
     private readonly Dictionary<ulong, Dictionary<string, DataFlags>> _subscriptions = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
+    // Slow-client detection: clientId → consecutive high-watermark ticks
+    private readonly Dictionary<string, int> _slowClientTicks = new();
+
+    private const double SlowClientThreshold = 0.75; // 75% of channel capacity
+    private const int SlowClientMaxTicks = 100; // consecutive overloaded ticks before disconnect
 
     private volatile bool _ready;
+    private long _slowClientDisconnects;
+
+    public SubscriptionManager(ILogger<SubscriptionManager>? logger = null)
+    {
+        _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
+    }
 
     public bool IsReady => _ready;
+
+    /// <summary>Count of clients disconnected for being slow.</summary>
+    public long SlowClientDisconnects => Volatile.Read(ref _slowClientDisconnects);
 
     public void SetDataSources(BookManager bookManager, MarketDataManager marketDataManager, SymbolRegistry symbolRegistry)
     {
@@ -84,6 +101,51 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                     HandleUnsubscribeAll(req.ClientId);
                     break;
             }
+        }
+
+        DetectSlowClients();
+    }
+
+    /// <summary>
+    /// Checks each client's outbound queue depth. Clients that stay above 75% capacity
+    /// for too many consecutive ticks are disconnected to prevent data buildup.
+    /// </summary>
+    private void DetectSlowClients()
+    {
+        List<string>? toDisconnect = null;
+
+        foreach (var (clientId, session) in _clients)
+        {
+            int capacity = session.ChannelCapacity;
+            int depth = session.QueueDepth;
+
+            if (depth > capacity * SlowClientThreshold)
+            {
+                _slowClientTicks.TryGetValue(clientId, out int ticks);
+                _slowClientTicks[clientId] = ticks + 1;
+
+                if (ticks + 1 >= SlowClientMaxTicks)
+                {
+                    toDisconnect ??= new();
+                    toDisconnect.Add(clientId);
+                }
+            }
+            else
+            {
+                _slowClientTicks.Remove(clientId);
+            }
+        }
+
+        if (toDisconnect is null) return;
+
+        foreach (var clientId in toDisconnect)
+        {
+            _logger.LogWarning("Disconnecting slow client {ClientId} (queue full for {Ticks} ticks, dropped: {Dropped})",
+                clientId, SlowClientMaxTicks, _clients.TryGetValue(clientId, out var s) ? s.DroppedMessages : 0);
+            if (_clients.TryGetValue(clientId, out var session))
+                session.Cancel();
+            _slowClientTicks.Remove(clientId);
+            Interlocked.Increment(ref _slowClientDisconnects);
         }
     }
 

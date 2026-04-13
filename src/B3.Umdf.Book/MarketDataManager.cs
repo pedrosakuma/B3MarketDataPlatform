@@ -3,6 +3,8 @@ using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using LastTradePrice_27Data = B3.Umdf.Mbo.Sbe.V16.V6.LastTradePrice_27Data;
 
@@ -13,6 +15,7 @@ public sealed class MarketDataManager : IFeedEventHandler
     private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new();
     private volatile FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
     private readonly IMarketDataEventHandler? _eventHandler;
+    private readonly ILogger<MarketDataManager> _logger;
     private long _parseErrors;
 
     /// <summary>
@@ -24,9 +27,10 @@ public sealed class MarketDataManager : IFeedEventHandler
     /// <summary>Number of SBE parse errors encountered.</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
 
-    public MarketDataManager(IMarketDataEventHandler? eventHandler = null)
+    public MarketDataManager(IMarketDataEventHandler? eventHandler = null, ILogger<MarketDataManager>? logger = null)
     {
         _eventHandler = eventHandler;
+        _logger = logger ?? NullLogger<MarketDataManager>.Instance;
     }
 
     public void FreezeData()
@@ -107,7 +111,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         catch (Exception ex)
         {
             Interlocked.Increment(ref _parseErrors);
-            Console.Error.WriteLine($"[MarketDataManager] Error processing templateId={templateId}: {ex.Message}");
+            _logger.LogWarning(ex, "Error processing templateId={TemplateId}", templateId);
         }
     }
 

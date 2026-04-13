@@ -4,6 +4,7 @@ using B3.Umdf.Feed;
 using B3.Umdf.PcapReplay;
 using B3.Umdf.Server;
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
 
 // Parse named arguments
 int? wsPort = null;
@@ -160,6 +161,16 @@ Console.WriteLine($"  Speed: {(speed == 0 ? "max" : $"{speed}x")}");
 Console.WriteLine($"  Channel groups: {groupIds.Count}");
 Console.WriteLine();
 
+using var loggerFactory = LoggerFactory.Create(builder =>
+{
+    builder.AddSimpleConsole(opts =>
+    {
+        opts.SingleLine = true;
+        opts.TimestampFormat = "HH:mm:ss.fff ";
+    });
+    builder.SetMinimumLevel(LogLevel.Information);
+});
+
 var stats = new Stats();
 
 // Wire up subscription manager if WebSocket port is specified
@@ -172,7 +183,7 @@ IMarketDataEventHandler mdHandler;
 
 if (wsPort is not null)
 {
-    subscriptionManager = new SubscriptionManager();
+    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>());
     bookHandler = new CompositeBookEventHandler(stats, subscriptionManager);
     mdHandler = new CompositeMarketDataEventHandler(stats, subscriptionManager);
 }
@@ -182,8 +193,8 @@ else
     mdHandler = stats;
 }
 
-var bookManager = new BookManager(bookHandler);
-var marketDataManager = new MarketDataManager(mdHandler);
+var bookManager = new BookManager(bookHandler, loggerFactory.CreateLogger<BookManager>());
+var marketDataManager = new MarketDataManager(mdHandler, loggerFactory.CreateLogger<MarketDataManager>());
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -194,21 +205,23 @@ var composite = new CompositeFeedHandler(bookManager, marketDataManager, symbolR
 MultiFeedManager? multiFeed = null;
 FeedHandler? singleFeed = null;
 
+var feedLogger = loggerFactory.CreateLogger<FeedHandler>();
+
 if (groupIds.Count > 1)
 {
-    multiFeed = new MultiFeedManager(packetSource, groupIds, composite);
+    multiFeed = new MultiFeedManager(packetSource, groupIds, composite, feedLogger);
     if (subscriptionManager is not null)
         multiFeed.AllGroupsReady += () => subscriptionManager.SetReady();
 }
 else
 {
-    singleFeed = new FeedHandler(packetSource, composite);
+    singleFeed = new FeedHandler(packetSource, composite, feedLogger);
 }
 
 if (subscriptionManager is not null)
 {
     subscriptionManager.SetDataSources(bookManager, marketDataManager, symbolRegistry);
-    wsHost = new WebSocketHost(subscriptionManager);
+    wsHost = new WebSocketHost(subscriptionManager, loggerFactory.CreateLogger<WebSocketHost>());
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
 }
 

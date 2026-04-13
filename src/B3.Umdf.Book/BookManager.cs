@@ -3,6 +3,8 @@ using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data;
 using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V6.DeleteOrder_MBO_51Data;
@@ -19,6 +21,7 @@ public sealed class BookManager : IFeedEventHandler
     private readonly ConcurrentDictionary<ulong, OrderBook> _books = new();
     private volatile FrozenDictionary<ulong, OrderBook>? _frozenBooks;
     private readonly IBookEventHandler? _eventHandler;
+    private readonly ILogger<BookManager> _logger;
     private long _parseErrors;
 
     /// <summary>
@@ -30,9 +33,10 @@ public sealed class BookManager : IFeedEventHandler
     /// <summary>Number of SBE parse errors encountered (malformed packets).</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
 
-    public BookManager(IBookEventHandler? eventHandler = null)
+    public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null)
     {
         _eventHandler = eventHandler;
+        _logger = logger ?? NullLogger<BookManager>.Instance;
     }
 
     /// <summary>
@@ -102,7 +106,7 @@ public sealed class BookManager : IFeedEventHandler
         catch (Exception ex)
         {
             Interlocked.Increment(ref _parseErrors);
-            Console.Error.WriteLine($"[BookManager] Error processing templateId={templateId}: {ex.Message}");
+            _logger.LogWarning(ex, "Error processing templateId={TemplateId}", templateId);
         }
     }
 
