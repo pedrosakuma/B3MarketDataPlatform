@@ -230,7 +230,7 @@ if (subscriptionManager is not null)
     subscriptionManager.SetDataSources(bookManager, marketDataManager, symbolRegistry);
     wsHost = new WebSocketHost(subscriptionManager, loggerFactory.CreateLogger<WebSocketHost>());
 
-    // Wire up feed state provider for /health endpoint
+    // Wire up feed state and last-packet providers for /health endpoint
     if (multiFeed is not null)
     {
         var mf = multiFeed;
@@ -241,11 +241,19 @@ if (subscriptionManager is not null)
                 dict[$"G{gid}"] = handler.State.ToString();
             return dict;
         };
+        wsHost.LastPacketTimestampProvider = () =>
+        {
+            var dict = new Dictionary<string, long>();
+            foreach (var (gid, handler) in mf.Handlers)
+                dict[$"G{gid}"] = handler.LastPacketTicks;
+            return dict;
+        };
     }
     else if (singleFeed is not null)
     {
         var sf = singleFeed;
         wsHost.FeedStateProvider = () => new Dictionary<string, string> { ["G0"] = sf.State.ToString() };
+        wsHost.LastPacketTimestampProvider = () => new Dictionary<string, long> { ["G0"] = sf.LastPacketTicks };
     }
 
     await wsHost.StartAsync(wsPort!.Value, cts.Token);

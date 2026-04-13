@@ -42,6 +42,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// <summary>Count of clients disconnected for being slow.</summary>
     public long SlowClientDisconnects => Volatile.Read(ref _slowClientDisconnects);
 
+    /// <summary>Current number of connected clients.</summary>
+    public int ClientCount => _clients.Count;
+
     public void SetDataSources(BookManager bookManager, MarketDataManager marketDataManager, SymbolRegistry symbolRegistry)
     {
         _bookManager = bookManager;

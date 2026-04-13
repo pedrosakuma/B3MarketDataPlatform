@@ -15,6 +15,7 @@
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Feed.Tests/B3.Umdf.Feed.Tests.csproj" />
     <Project Path="tests/B3.Umdf.PcapReplay.Tests/B3.Umdf.PcapReplay.Tests.csproj" />
+    <Project Path="tests/B3.Umdf.Server.Tests/B3.Umdf.Server.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Transport.Tests/B3.Umdf.Transport.Tests.csproj" />
   </Folder>
 </Solution>

@@ -19,6 +19,7 @@ public sealed class FeedHandler : IDisposable
     private readonly Queue<UmdfPacket> _incrementalQueue = new();
     private const int MaxIncrementalQueueSize = 500_000;
     private long _packetCount;
+    private long _lastPacketTicks;
 
     // Instrument Definition tracking
     private uint _instrDefTotalExpected;
@@ -34,6 +35,9 @@ public sealed class FeedHandler : IDisposable
     public uint InstrDefReceived => _instrDefReceived;
     public uint InstrDefTotalExpected => _instrDefTotalExpected;
     public ChannelHandler IncrementalHandler => _incrementalHandler;
+
+    /// <summary>Ticks (DateTime.UtcNow.Ticks) of the last packet processed. 0 if none yet.</summary>
+    public long LastPacketTicks => Volatile.Read(ref _lastPacketTicks);
 
     public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null)
     {
@@ -130,6 +134,8 @@ public sealed class FeedHandler : IDisposable
 
     private void HandlePacket(in UmdfPacket packet)
     {
+        Volatile.Write(ref _lastPacketTicks, DateTime.UtcNow.Ticks);
+
         switch (_state)
         {
             case FeedState.WaitInstrumentDefinition:

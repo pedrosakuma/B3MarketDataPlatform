@@ -17,14 +17,19 @@ public sealed class WebSocketHost : IAsyncDisposable
     private readonly ILogger<WebSocketHost> _logger;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private WebApplication? _app;
+    private int _maxConnections;
 
     /// <summary>Optional provider for feed group states (set before StartAsync).</summary>
     public Func<IReadOnlyDictionary<string, string>>? FeedStateProvider { get; set; }
 
-    public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null)
+    /// <summary>Optional provider for last-packet timestamps per group.</summary>
+    public Func<IReadOnlyDictionary<string, long>>? LastPacketTimestampProvider { get; set; }
+
+    public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null, int maxConnections = 0)
     {
         _subscriptionManager = subscriptionManager;
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSocketHost>.Instance;
+        _maxConnections = maxConnections;
     }
 
     public async Task StartAsync(int port, CancellationToken ct = default)
@@ -50,6 +55,8 @@ public sealed class WebSocketHost : IAsyncDisposable
             };
             if (FeedStateProvider is not null)
                 result["feedGroups"] = FeedStateProvider();
+            if (LastPacketTimestampProvider is not null)
+                result["lastPacketTimestamps"] = LastPacketTimestampProvider();
             return Results.Json(result);
         });
 
@@ -63,6 +70,14 @@ public sealed class WebSocketHost : IAsyncDisposable
             if (!context.WebSockets.IsWebSocketRequest)
             {
                 context.Response.StatusCode = 400;
+                return;
+            }
+
+            // Connection limit
+            if (_maxConnections > 0 && _subscriptionManager.ClientCount >= _maxConnections)
+            {
+                _logger.LogWarning("Connection rejected: limit {Max} reached", _maxConnections);
+                context.Response.StatusCode = 503;
                 return;
             }
 
