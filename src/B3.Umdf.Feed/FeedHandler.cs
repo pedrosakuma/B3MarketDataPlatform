@@ -30,6 +30,7 @@ public sealed class FeedHandler : IDisposable
     private uint _snapshotMinSeqNum;
     private uint _snapshotMaxSeqNum;
     private bool _snapshotCycleStarted;
+    private bool _snapshotBoundaryFound;   // true after we've seen at least one seqVer change
     private ushort _snapshotSeqVer;
 
     public FeedState State => _state;
@@ -300,31 +301,48 @@ public sealed class FeedHandler : IDisposable
         if (!PacketHeader.TryParse(span, out var pktHeader, out _))
             return;
 
-        // Snapshot channel uses SequenceVersion for cycle tracking.
-        // Each cycle has incrementing SequenceNumber starting at 1.
-        // A new SequenceVersion means a new cycle has started.
-        if (_snapshotCycleStarted && pktHeader.SequenceVersion != _snapshotSeqVer)
+        // B3 UMDF snapshot uses SequenceVersion to identify cycles.
+        // We must skip the first cycle (potentially partial if we joined mid-stream)
+        // and process the SECOND complete cycle from boundary to boundary.
+
+        if (!_snapshotCycleStarted)
         {
+            // First packet ever — record seqVer and wait for boundary
+            _snapshotCycleStarted = true;
+            _snapshotSeqVer = pktHeader.SequenceVersion;
+            return;
+        }
+
+        if (!_snapshotBoundaryFound)
+        {
+            if (pktHeader.SequenceVersion == _snapshotSeqVer)
+                return; // Still in first (potentially partial) cycle — skip
+
+            // SequenceVersion changed — this is a clean cycle boundary.
+            _snapshotBoundaryFound = true;
+            _snapshotSeqVer = pktHeader.SequenceVersion;
+            _snapshotMinSeqNum = 0;
+            _snapshotMaxSeqNum = 0;
+            _eventHandler.OnSnapshotStart();
+            // Fall through to process this packet (start of new complete cycle)
+        }
+        else if (pktHeader.SequenceVersion != _snapshotSeqVer)
+        {
+            // Processing a cycle and seqVer changed — cycle boundary
             if (_snapshotMaxSeqNum > 0)
             {
-                // Previous cycle had real data — it's complete
+                // Previous cycle had snapshot data — it's complete
                 CompleteSnapshotCycle();
                 return;
             }
-            // Previous cycle was empty (heartbeats only) — reset tracking for new cycle
+            // Empty cycle (heartbeats only) — reset for next cycle
             _snapshotSeqVer = pktHeader.SequenceVersion;
             _snapshotMinSeqNum = 0;
             _snapshotMaxSeqNum = 0;
             _eventHandler.OnSnapshotStart();
         }
 
-        if (!_snapshotCycleStarted)
-        {
-            _snapshotCycleStarted = true;
-            _snapshotSeqVer = pktHeader.SequenceVersion;
-            _eventHandler.OnSnapshotStart();
-        }
-
+        // Process all SBE messages in this packet
         int offset = PacketHeader.MESSAGE_SIZE;
 
         while (offset + FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize <= span.Length)
@@ -418,6 +436,7 @@ public sealed class FeedHandler : IDisposable
         if (newState == FeedState.Recovery)
         {
             _snapshotCycleStarted = false;
+            _snapshotBoundaryFound = false;
             _snapshotMinSeqNum = 0;
             _snapshotMaxSeqNum = 0;
             _snapshotSeqVer = 0;
