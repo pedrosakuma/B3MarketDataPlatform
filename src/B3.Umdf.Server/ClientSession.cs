@@ -18,6 +18,8 @@ public enum OutboundEventKind : byte
     OrderDeleted,
     /// <summary>Instrument info update — last-state-wins per securityId.</summary>
     InfoUpdate,
+    /// <summary>Book cleared event — purges pending orders for that security/side in conflation.</summary>
+    BookCleared,
 }
 
 /// <summary>
@@ -61,6 +63,9 @@ public readonly struct OutboundEvent
 
     public static OutboundEvent Info(ulong securityId, ReadOnlyMemory<byte> data) =>
         new(OutboundEventKind.InfoUpdate, data, securityId, 0, 0, 0, 0);
+
+    public static OutboundEvent BookClear(ulong securityId, byte clearSide) =>
+        new(OutboundEventKind.BookCleared, default, securityId, 0, clearSide, 0, 0);
 }
 
 /// <summary>
@@ -160,6 +165,13 @@ public sealed class ClientSession : IDisposable
     public bool TryEnqueueInfo(ulong securityId, ReadOnlyMemory<byte> serializedInfo) =>
         EnqueueInternal(OutboundEvent.Info(securityId, serializedInfo));
 
+    /// <summary>
+    /// Enqueue a book cleared event. Purges pending order events for the security/side
+    /// in the conflation dictionary to maintain correct ordering.
+    /// </summary>
+    public bool TryEnqueueBookCleared(ulong securityId, byte clearSide) =>
+        EnqueueInternal(OutboundEvent.BookClear(securityId, clearSide));
+
     // --- Write loop with conflation + coalescing ---
 
     private enum PendingOrderKind : byte { Added, Updated, Deleted }
@@ -191,6 +203,7 @@ public sealed class ClientSession : IDisposable
         var passthroughList = new List<ReadOnlyMemory<byte>>();
         var pendingOrders = new Dictionary<ulong, PendingOrder>();
         var pendingInfos = new Dictionary<ulong, ReadOnlyMemory<byte>>();
+        var bookClearList = new List<(ulong SecurityId, byte Side)>();
 
         try
         {
@@ -203,6 +216,7 @@ public sealed class ClientSession : IDisposable
                 passthroughList.Clear();
                 pendingOrders.Clear();
                 pendingInfos.Clear();
+                bookClearList.Clear();
                 int drainedCount = 0;
 
                 while (reader.TryRead(out var evt))
@@ -217,6 +231,11 @@ public sealed class ClientSession : IDisposable
                         case OutboundEventKind.OrderUpdated:
                         case OutboundEventKind.OrderDeleted:
                             ConflateOrder(pendingOrders, evt);
+                            break;
+                        case OutboundEventKind.BookCleared:
+                            // Purge pre-clear orders for this security/side from conflation
+                            PurgeOrdersForClear(pendingOrders, evt.SecurityId, evt.Side);
+                            bookClearList.Add((evt.SecurityId, evt.Side));
                             break;
                         case OutboundEventKind.InfoUpdate:
                             pendingInfos[evt.SecurityId] = evt.RawData;
@@ -235,7 +254,16 @@ public sealed class ClientSession : IDisposable
                     offset += raw.Length;
                 }
 
-                // Order events (post-conflation)
+                // BookCleared events (must come before post-clear orders)
+                foreach (var (secId, side) in bookClearList)
+                {
+                    const int clearLen = 13;
+                    EnsureCapacity(ref coalesceBuf, offset, clearLen);
+                    WireProtocol.WriteBookCleared(coalesceBuf.AsSpan(offset), secId, side);
+                    offset += clearLen;
+                }
+
+                // Order events (post-conflation, only orders that survived purge)
                 foreach (var (orderId, pending) in pendingOrders)
                 {
                     if (pending.Kind == PendingOrderKind.Deleted)
@@ -267,7 +295,7 @@ public sealed class ClientSession : IDisposable
                 }
 
                 // Track conflation
-                int emittedCount = passthroughList.Count + pendingOrders.Count + pendingInfos.Count;
+                int emittedCount = passthroughList.Count + bookClearList.Count + pendingOrders.Count + pendingInfos.Count;
                 int conflated = drainedCount - emittedCount;
                 if (conflated > 0)
                     Interlocked.Add(ref _conflatedMessages, conflated);
@@ -321,6 +349,26 @@ public sealed class ClientSession : IDisposable
             orders[evt.OrderId] = new PendingOrder(kind,
                 evt.SecurityId, evt.Side, evt.Price, evt.Quantity);
         }
+    }
+
+    /// <summary>
+    /// Purges pending order events that would be superseded by a BookCleared.
+    /// clearSide: 0=Both, 1=Bid, 2=Ask. Order side: 0=Bid, 1=Ask.
+    /// </summary>
+    private static void PurgeOrdersForClear(Dictionary<ulong, PendingOrder> orders, ulong securityId, byte clearSide)
+    {
+        List<ulong>? toRemove = null;
+        foreach (var (orderId, pending) in orders)
+        {
+            if (pending.SecurityId != securityId) continue;
+            // clearSide 0=Both, 1=Bid (matches side 0), 2=Ask (matches side 1)
+            if (clearSide != 0 && pending.Side != (clearSide - 1)) continue;
+            toRemove ??= new();
+            toRemove.Add(orderId);
+        }
+        if (toRemove is not null)
+            foreach (var id in toRemove)
+                orders.Remove(id);
     }
 
     private static void EnsureCapacity(ref byte[] buf, int offset, int needed)

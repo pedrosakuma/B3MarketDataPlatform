@@ -340,14 +340,12 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ForwardTradeEvent(securityId, price, quantity, tradeId);
     }
 
-    public void OnBookCleared(ulong securityId)
+    public void OnBookCleared(ulong securityId, BookClearSide side)
     {
         ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(securityId)) return;
 
-        var buf = new byte[12];
-        int len = WireProtocol.WriteBookCleared(buf, securityId);
-        SendToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len), DataFlags.Book);
+        SendBookClearedToSubscribers(securityId, (byte)side);
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
@@ -448,6 +446,23 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (_clients.TryGetValue(clientId, out var session))
             {
                 if (session.TryEnqueueInfo(securityId, serializedInfo))
+                    AppMetrics.WsMessagesSent.Add(1);
+                else
+                    AppMetrics.WsMessagesDropped.Add(1);
+            }
+        }
+    }
+
+    /// <summary>Send a typed BookCleared event for correct conflation ordering.</summary>
+    private void SendBookClearedToSubscribers(ulong securityId, byte clearSide)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, flags) in clients)
+        {
+            if (!flags.HasFlag(DataFlags.Book)) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+            {
+                if (session.TryEnqueueBookCleared(securityId, clearSide))
                     AppMetrics.WsMessagesSent.Add(1);
                 else
                     AppMetrics.WsMessagesDropped.Add(1);

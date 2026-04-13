@@ -29,9 +29,9 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
         foreach (var h in _handlers) h.OnTrade(securityId, price, quantity, tradeId);
     }
 
-    public void OnBookCleared(ulong securityId)
+    public void OnBookCleared(ulong securityId, BookClearSide side)
     {
-        foreach (var h in _handlers) h.OnBookCleared(securityId);
+        foreach (var h in _handlers) h.OnBookCleared(securityId, side);
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)

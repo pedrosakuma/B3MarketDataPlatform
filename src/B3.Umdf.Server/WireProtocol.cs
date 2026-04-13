@@ -168,12 +168,13 @@ public static class WireProtocol
         return totalLen;
     }
 
-    /// <summary>Write BookCleared: securityId.</summary>
-    public static int WriteBookCleared(Span<byte> dest, ulong securityId)
+    /// <summary>Write BookCleared: securityId + clearSide byte.</summary>
+    public static int WriteBookCleared(Span<byte> dest, ulong securityId, byte clearSide)
     {
-        const ushort totalLen = FramingHeaderSize + 8; // 12
+        const ushort totalLen = FramingHeaderSize + 8 + 1; // 13
         WriteFramingHeader(dest, totalLen, MessageType.BookCleared);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
+        dest[12] = clearSide;
         return totalLen;
     }
 

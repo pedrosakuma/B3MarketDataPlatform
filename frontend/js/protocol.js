@@ -147,8 +147,9 @@ export function parseMessage(data) {
       return { type: 'Trade', securityId, price, qty, tradeId };
     }
     case MSG.BOOK_CLEARED: {
-      const securityId = v.getBigUint64(o, true);
-      return { type: 'BookCleared', securityId };
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const side = o < data.byteLength ? v.getUint8(o) : 0;
+      return { type: 'BookCleared', securityId, side };
     }
     default:
       return { type: 'Unknown', msgType: type };

@@ -232,6 +232,8 @@ export function clearLog() { $('logBody').innerHTML = ''; logCount = 0; logBuffe
 
 export function setLogEnabled(enabled) {
   state.logEnabled = enabled;
+  const logArea = document.querySelector('.log-area');
+  if (logArea) logArea.classList.toggle('hidden', !enabled);
   if (!enabled) clearLog();
 }
 

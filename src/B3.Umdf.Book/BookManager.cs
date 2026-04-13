@@ -204,17 +204,27 @@ public sealed class BookManager : IFeedEventHandler
             return;
 
         var entryType = msg.MDEntryType;
+        BookClearSide clearSide;
         if (entryType == MDEntryType.BID)
+        {
             book.Bids.Clear();
+            clearSide = BookClearSide.Bid;
+        }
         else if (entryType == MDEntryType.OFFER)
+        {
             book.Asks.Clear();
+            clearSide = BookClearSide.Ask;
+        }
         else
+        {
             book.Clear();
+            clearSide = BookClearSide.Both;
+        }
 
         if (msg.RptSeq is { } rptSeq)
             book.LastRptSeq = (uint)rptSeq;
 
-        _eventHandler?.OnBookCleared(securityId);
+        _eventHandler?.OnBookCleared(securityId, clearSide);
     }
 
     private void HandleTrade(ReadOnlySpan<byte> body)
@@ -248,7 +258,7 @@ public sealed class BookManager : IFeedEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             book.Clear();
-            _eventHandler?.OnBookCleared(securityId);
+            _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
         }
     }
 
@@ -360,7 +370,7 @@ public sealed class BookManager : IFeedEventHandler
         foreach (var (secId, book) in _books)
         {
             book.Clear();
-            _eventHandler?.OnBookCleared(secId);
+            _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
         }
     }
 }

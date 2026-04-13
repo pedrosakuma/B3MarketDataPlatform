@@ -469,7 +469,7 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
         Interlocked.Increment(ref TradeCount);
     }
 
-    public void OnBookCleared(ulong securityId)
+    public void OnBookCleared(ulong securityId, BookClearSide side)
     {
     }
 

@@ -206,8 +206,6 @@ function handleMessage(msg) {
         sub.orders = new Map(); // reset MBO tracking — snapshot is the new baseline
       }
       if (state.selectedSecurityId === id) renderBook();
-      const sym = sub?.symbol || id;
-      addLog(`BookSnapshot ${sym} seq=${msg.rptSeq} ${msg.bids.length}b/${msg.asks.length}a`, 'log-book');
       break;
     }
     case 'InfoSnapshot': {
@@ -216,9 +214,6 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) Object.assign(sub.info, msg.fields);
       if (state.selectedSecurityId === id) renderInfo();
-      const sym = sub?.symbol || id;
-      const n = Object.keys(msg.fields).length;
-      addLog(`InfoSnapshot ${sym} ${n} fields`, 'log-info');
       break;
     }
     case 'OrderAdded':
@@ -231,9 +226,6 @@ function handleMessage(msg) {
         applyOrderAddOrUpdate(sub, msg);
       }
       if (state.selectedSecurityId === id) scheduleBookRender();
-      const side = msg.side === 0 ? 'BID' : 'ASK';
-      const sym = sub?.symbol || id;
-      addLog(`${msg.type} ${sym} ${side} ${formatPrice(msg.price)} x${formatQty(msg.qty)}`, 'log-order');
       break;
     }
     case 'OrderDeleted': {
@@ -245,9 +237,6 @@ function handleMessage(msg) {
         applyOrderDelete(sub, msg);
       }
       if (state.selectedSecurityId === id) scheduleBookRender();
-      const side = msg.side === 0 ? 'BID' : 'ASK';
-      const sym = sub?.symbol || id;
-      addLog(`OrderDeleted ${sym} ${side} oid=${msg.orderId}`, 'log-order');
       break;
     }
     case 'Trade': {
@@ -259,17 +248,30 @@ function handleMessage(msg) {
         addTrade(sub, msg.price, msg.qty);
       }
       if (state.selectedSecurityId === id) renderTrades();
-      const sym = sub?.symbol || id;
-      addLog(`Trade ${sym} ${formatPrice(msg.price)} x${formatQty(msg.qty)}`, 'log-trade');
       break;
     }
     case 'BookCleared': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) { sub.book = null; sub.orders = new Map(); }
+      if (sub) {
+        const clearSide = msg.side; // 0=Both, 1=Bid, 2=Ask
+        if (clearSide === 0) {
+          sub.book = null;
+          sub.orders = new Map();
+        } else {
+          ensureBook(sub);
+          const orderSide = clearSide - 1; // 0=Bid, 1=Ask
+          if (clearSide === 1) sub.book.bids = [];
+          else sub.book.asks = [];
+          for (const [oid, order] of sub.orders) {
+            if (order.side === orderSide) sub.orders.delete(oid);
+          }
+        }
+      }
       if (state.selectedSecurityId === id) renderBook();
+      const sideNames = ['Both', 'Bid', 'Ask'];
       const sym = sub?.symbol || id;
-      addLog(`BookCleared ${sym}`, 'log-book');
+      addLog(`BookCleared ${sym} (${sideNames[msg.side] || 'Both'})`, 'log-book');
       break;
     }
   }
