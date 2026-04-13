@@ -123,6 +123,43 @@ public sealed class WebSocketHost : IAsyncDisposable
                 AppJsonContext.Default.TopResponse);
         });
 
+        _app.MapGet("/book/{symbol}", (string symbol) =>
+        {
+            var books = _subscriptionManager.BookManager;
+            var registry = _subscriptionManager.SymbolRegistry;
+            if (books is null || registry is null)
+                return Results.NotFound();
+
+            if (!registry.TryResolve(symbol, out ulong securityId))
+                return Results.NotFound();
+
+            if (!books.Books.TryGetValue(securityId, out var book))
+                return Results.NotFound();
+
+            var bids = book.Bids;
+            var asks = book.Asks;
+            long bestBid = bids.BestPrice() is { } bp ? bp.Price : 0;
+            long bestAsk = asks.BestPrice() is { } ap ? ap.Price : 0;
+            bool crossed = bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk;
+
+            var errors = book.Validate();
+
+            return Results.Json(new BookDiagResponse
+            {
+                Symbol = symbol,
+                SecurityId = securityId,
+                BestBid = bestBid,
+                BestAsk = bestAsk,
+                BidOrders = bids.OrderCount,
+                AskOrders = asks.OrderCount,
+                BidLevels = bids.LevelCount,
+                AskLevels = asks.LevelCount,
+                LastRptSeq = book.LastRptSeq,
+                Crossed = crossed,
+                ValidationErrors = errors.Count > 0 ? errors.ToArray() : [],
+            }, AppJsonContext.Default.BookDiagResponse);
+        });
+
         _app.Map("/ws", async context =>
         {
             if (!context.WebSockets.IsWebSocketRequest)

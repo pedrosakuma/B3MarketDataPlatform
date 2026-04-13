@@ -34,8 +34,24 @@ public sealed class TopResponse
     public TopInstrument[] Instruments { get; set; } = [];
 }
 
+public sealed class BookDiagResponse
+{
+    public string Symbol { get; set; } = "";
+    public ulong SecurityId { get; set; }
+    public long BestBid { get; set; }
+    public long BestAsk { get; set; }
+    public int BidOrders { get; set; }
+    public int AskOrders { get; set; }
+    public int BidLevels { get; set; }
+    public int AskLevels { get; set; }
+    public uint LastRptSeq { get; set; }
+    public bool Crossed { get; set; }
+    public string[] ValidationErrors { get; set; } = [];
+}
+
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(SymbolsResponse))]
 [JsonSerializable(typeof(TopResponse))]
+[JsonSerializable(typeof(BookDiagResponse))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public partial class AppJsonContext : JsonSerializerContext;
