@@ -298,36 +298,43 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         foreach (var key in empty) _subscriptions.TryRemove(key, out _);
     }
 
-    // --- Snapshot serialization (runs on feed thread — book is stable) ---
+    // --- Snapshot serialization ---
 
     /// <summary>
-    /// Sends MBO (Market-by-Order) snapshot: a reset marker (empty BookSnapshot)
-    /// followed by individual OrderAdded events for every order in the book.
-    /// This gives the client full MBO state for correct incremental tracking.
+    /// Sends MBO snapshot as a single coalesced buffer: reset header +
+    /// all OrderAdded events. Serialized under book.SyncRoot (fast scan),
+    /// then enqueued as ONE message after releasing the lock.
+    /// This avoids flooding the client channel and minimises lock hold time.
     /// </summary>
     private static void SendMboSnapshot(ClientSession session, OrderBook book)
     {
+        byte[] buf;
+        int offset;
+
         lock (book.SyncRoot)
         {
-            // 1. Reset marker — tells client to clear local book state
-            var resetBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
-            WireProtocol.WriteBookSnapshotHeader(resetBuf, book.SecurityId, book.LastRptSeq, 0, 0);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(resetBuf));
+            int headerSize = WireProtocol.BookSnapshotSize(0, 0);
+            int totalOrders = book.Bids.Orders.Count + book.Asks.Orders.Count;
+            buf = new byte[headerSize + totalOrders * 37];
 
-            // 2. Send every individual order as OrderAdded
-            SendSideOrders(session, book.SecurityId, book.Bids);
-            SendSideOrders(session, book.SecurityId, book.Asks);
+            WireProtocol.WriteBookSnapshotHeader(buf, book.SecurityId, book.LastRptSeq, 0, 0);
+            offset = headerSize;
+
+            SerializeSideOrders(buf, ref offset, book.SecurityId, book.Bids);
+            SerializeSideOrders(buf, ref offset, book.SecurityId, book.Asks);
         }
+
+        // Single enqueue outside the lock — one slot, no flood
+        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, offset));
     }
 
-    private static void SendSideOrders(ClientSession session, ulong securityId, BookSide side)
+    private static void SerializeSideOrders(byte[] buf, ref int offset, ulong securityId, BookSide side)
     {
-        foreach (var entry in side.Orders.Values.ToArray())
+        foreach (var entry in side.Orders.Values)
         {
-            var buf = new byte[37];
-            int len = WireProtocol.WriteOrderEvent(buf, MessageType.OrderAdded, securityId,
-                entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+            int len = WireProtocol.WriteOrderEvent(buf.AsSpan(offset), MessageType.OrderAdded,
+                securityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
+            offset += len;
         }
     }
 
