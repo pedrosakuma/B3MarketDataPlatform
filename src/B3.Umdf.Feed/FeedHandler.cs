@@ -30,6 +30,7 @@ public sealed class FeedHandler : IDisposable
     private uint _snapshotMinSeqNum;
     private uint _snapshotMaxSeqNum;
     private bool _snapshotCycleStarted;
+    private ushort _snapshotSeqVer;
 
     public FeedState State => _state;
     public long PacketCount => _packetCount;
@@ -299,20 +300,30 @@ public sealed class FeedHandler : IDisposable
         if (!PacketHeader.TryParse(span, out var pktHeader, out _))
             return;
 
-        // Snapshot stream cycles continuously. SeqNum=1 marks start of a cycle.
-        if (pktHeader.SequenceNumber == 1)
+        // Snapshot channel uses SequenceVersion for cycle tracking.
+        // Each cycle has incrementing SequenceNumber starting at 1.
+        // A new SequenceVersion means a new cycle has started.
+        if (_snapshotCycleStarted && pktHeader.SequenceVersion != _snapshotSeqVer)
         {
-            if (_snapshotCycleStarted && _snapshotMaxSeqNum > 0)
+            if (_snapshotMaxSeqNum > 0)
             {
+                // Previous cycle had real data — it's complete
                 CompleteSnapshotCycle();
                 return;
             }
-            _snapshotCycleStarted = true;
+            // Previous cycle was empty (heartbeats only) — reset tracking for new cycle
+            _snapshotSeqVer = pktHeader.SequenceVersion;
+            _snapshotMinSeqNum = 0;
+            _snapshotMaxSeqNum = 0;
             _eventHandler.OnSnapshotStart();
         }
 
         if (!_snapshotCycleStarted)
-            return;
+        {
+            _snapshotCycleStarted = true;
+            _snapshotSeqVer = pktHeader.SequenceVersion;
+            _eventHandler.OnSnapshotStart();
+        }
 
         int offset = PacketHeader.MESSAGE_SIZE;
 
@@ -409,6 +420,7 @@ public sealed class FeedHandler : IDisposable
             _snapshotCycleStarted = false;
             _snapshotMinSeqNum = 0;
             _snapshotMaxSeqNum = 0;
+            _snapshotSeqVer = 0;
         }
     }
 

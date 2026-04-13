@@ -48,6 +48,7 @@ public sealed class BookManager : IFeedEventHandler
     private long _crossingTransitions;
     public long CrossingTransitions => Volatile.Read(ref _crossingTransitions);
 
+
     public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null)
     {
         _eventHandler = eventHandler;
@@ -133,6 +134,8 @@ public sealed class BookManager : IFeedEventHandler
                     break;
                 case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
                     HandleSnapshotOrders(body);
+                    break;
+                default:
                     break;
             }
         }
@@ -423,8 +426,8 @@ public sealed class BookManager : IFeedEventHandler
     /// </summary>
     private bool TryLookupBook(ulong securityId, out OrderBook book)
     {
-        if (_frozenBooks is { } frozen)
-            return frozen.TryGetValue(securityId, out book!);
+        if (_frozenBooks is { } frozen && frozen.TryGetValue(securityId, out book!))
+            return true;
         return _books.TryGetValue(securityId, out book!);
     }
 

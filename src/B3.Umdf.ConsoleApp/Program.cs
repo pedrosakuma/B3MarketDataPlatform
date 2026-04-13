@@ -405,45 +405,52 @@ return 0;
 
 static void PrintBookSample(BookManager bookManager)
 {
-    // ConcurrentDictionary provides thread-safe enumeration (snapshot enumerator)
-    OrderBook? best = null;
-    int bestCount = 0;
-    foreach (var book in bookManager.Books.Values)
+    try
     {
-        int count = book.Bids.Orders.Count + book.Asks.Orders.Count;
-        if (count > bestCount)
+        // ConcurrentDictionary provides thread-safe enumeration (snapshot enumerator)
+        OrderBook? best = null;
+        int bestCount = 0;
+        foreach (var book in bookManager.Books.Values)
         {
-            bestCount = count;
-            best = book;
+            int count = book.Bids.Orders.Count + book.Asks.Orders.Count;
+            if (count > bestCount)
+            {
+                bestCount = count;
+                best = book;
+            }
+        }
+
+        if (best is null || bestCount == 0)
+            return;
+
+        Console.WriteLine($"   ── Book sample: SecurityId={best.SecurityId} ({best.Bids.Orders.Count} bids, {best.Asks.Orders.Count} asks) ──");
+
+        var topBids = best.Bids.PriceLevels.Take(5)
+            .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
+            .ToList();
+        var topAsks = best.Asks.PriceLevels.Take(5)
+            .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
+            .ToList();
+
+        Console.WriteLine("       BIDS                        ASKS");
+        Console.WriteLine("       Price        Qty  Count     Price        Qty  Count");
+
+        int rows = Math.Max(topBids.Count, topAsks.Count);
+
+        for (int i = 0; i < rows; i++)
+        {
+            string bidStr = i < topBids.Count
+                ? $"  {topBids[i].Price,12:N0} {topBids[i].Qty,10:N0} {topBids[i].Count,5}"
+                : new string(' ', 30);
+            string askStr = i < topAsks.Count
+                ? $"  {topAsks[i].Price,12:N0} {topAsks[i].Qty,10:N0} {topAsks[i].Count,5}"
+                : "";
+            Console.WriteLine($"    {bidStr}  |{askStr}");
         }
     }
-
-    if (best is null || bestCount == 0)
-        return;
-
-    Console.WriteLine($"   ── Book sample: SecurityId={best.SecurityId} ({best.Bids.Orders.Count} bids, {best.Asks.Orders.Count} asks) ──");
-
-    var topBids = best.Bids.PriceLevels.Take(5)
-        .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
-        .ToList();
-    var topAsks = best.Asks.PriceLevels.Take(5)
-        .Select(kv => (Price: kv.Key, Qty: kv.Value.Sum(o => o.Quantity), Count: kv.Value.Count))
-        .ToList();
-
-    Console.WriteLine("       BIDS                        ASKS");
-    Console.WriteLine("       Price        Qty  Count     Price        Qty  Count");
-
-    int rows = Math.Max(topBids.Count, topAsks.Count);
-
-    for (int i = 0; i < rows; i++)
+    catch (Exception)
     {
-        string bidStr = i < topBids.Count
-            ? $"  {topBids[i].Price,12:N0} {topBids[i].Qty,10:N0} {topBids[i].Count,5}"
-            : new string(' ', 30);
-        string askStr = i < topAsks.Count
-            ? $"  {topAsks[i].Price,12:N0} {topAsks[i].Qty,10:N0} {topAsks[i].Count,5}"
-            : "";
-        Console.WriteLine($"    {bidStr}  |{askStr}");
+        // Book modified concurrently — safe to skip display this cycle
     }
 }
 
