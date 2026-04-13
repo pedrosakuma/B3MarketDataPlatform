@@ -108,7 +108,7 @@
   </div>
   <div class="sep"></div>
   <div class="group">
-    <input id="symbolInput" type="text" placeholder="Symbol (e.g. PETR4)" style="width:140px" onkeydown="if(event.key==='Enter') doSubscribe()">
+    <input id="symbolInput" type="text" placeholder="Symbol (e.g. PETR4)" style="width:140px;text-transform:uppercase" onkeydown="if(event.key==='Enter') doSubscribe()" oninput="this.value=this.value.toUpperCase()">
     <label><input id="flagBook" type="checkbox" checked> Book</label>
     <label><input id="flagInfo" type="checkbox" checked> Info</label>
     <button id="btnSubscribe" onclick="doSubscribe()" disabled>Subscribe</button>
