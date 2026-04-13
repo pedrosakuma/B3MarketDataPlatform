@@ -79,6 +79,9 @@ function connect() {
     $('btnGet').disabled = true;
     $('btnConnect').textContent = 'Connect';
     addLog('Disconnected', 'log-error');
+    // Clear rankings on disconnect
+    rankings.volume = []; rankings.gainers = []; rankings.losers = [];
+    renderRankings();
     scheduleReconnect();
   };
 

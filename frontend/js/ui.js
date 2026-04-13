@@ -62,6 +62,12 @@ export function renderRankings() {
 
   const list = $('rankList');
   if (!list) return;
+
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    list.innerHTML = '<div class="empty-msg">Connect to see rankings</div>';
+    return;
+  }
+
   const entries = rankings[tab] || [];
 
   if (entries.length === 0) {
