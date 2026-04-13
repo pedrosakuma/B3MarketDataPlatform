@@ -91,10 +91,8 @@ public sealed class ClientSession : IDisposable
         Socket = socket;
         ChannelCapacity = channelCapacity;
         _logger = logger ?? NullLogger.Instance;
-        _outbound = Channel.CreateBounded<OutboundEvent>(new BoundedChannelOptions(channelCapacity)
+        _outbound = Channel.CreateUnbounded<OutboundEvent>(new UnboundedChannelOptions
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
             SingleWriter = false,
         });
     }
@@ -107,11 +105,7 @@ public sealed class ClientSession : IDisposable
     /// <summary>Remove a subscription. Called on the feed thread or WS read thread.</summary>
     public void RemoveSubscription(ulong securityId) => _subscriptions.Remove(securityId);
 
-    private long _droppedMessages;
     private long _conflatedMessages;
-
-    /// <summary>Number of messages dropped due to slow consumption.</summary>
-    public long DroppedMessages => Volatile.Read(ref _droppedMessages);
 
     /// <summary>Number of messages eliminated by conflation.</summary>
     public long ConflatedMessages => Volatile.Read(ref _conflatedMessages);
@@ -119,35 +113,23 @@ public sealed class ClientSession : IDisposable
     /// <summary>Current outbound queue depth.</summary>
     public int QueueDepth => _outbound.Reader.CanCount ? _outbound.Reader.Count : 0;
 
-    /// <summary>Channel capacity.</summary>
+    /// <summary>Soft capacity reference for slow-client detection.</summary>
     public int ChannelCapacity { get; }
 
     // --- Enqueue methods (called from the feed thread) ---
 
-    private bool EnqueueInternal(OutboundEvent evt)
-    {
-        bool wasFull = QueueDepth >= ChannelCapacity;
-        _outbound.Writer.TryWrite(evt);
-        if (wasFull)
-        {
-            Interlocked.Increment(ref _droppedMessages);
-            return false;
-        }
-        return true;
-    }
-
     /// <summary>
     /// Enqueue a pre-serialized message (passthrough — control, trades, snapshots).
-    /// Non-blocking — drops oldest if channel is full.
+    /// Unbounded — never drops.
     /// </summary>
-    public bool TryEnqueue(ReadOnlyMemory<byte> message) =>
-        EnqueueInternal(OutboundEvent.Passthrough(message));
+    public void TryEnqueue(ReadOnlyMemory<byte> message) =>
+        _outbound.Writer.TryWrite(OutboundEvent.Passthrough(message));
 
     /// <summary>
     /// Enqueue a typed order event for MBO conflation.
     /// Orders with the same orderId are conflated in the write loop.
     /// </summary>
-    public bool TryEnqueueOrder(MessageType type, ulong securityId, ulong orderId, byte side, long price, long qty)
+    public void TryEnqueueOrder(MessageType type, ulong securityId, ulong orderId, byte side, long price, long qty)
     {
         var evt = type switch
         {
@@ -156,21 +138,21 @@ public sealed class ClientSession : IDisposable
             MessageType.OrderDeleted => OutboundEvent.OrderDelete(securityId, orderId, side),
             _ => throw new ArgumentException($"Invalid order message type: {type}")
         };
-        return EnqueueInternal(evt);
+        _outbound.Writer.TryWrite(evt);
     }
 
     /// <summary>
     /// Enqueue a typed info update. Last-state-wins per securityId in the write loop.
     /// </summary>
-    public bool TryEnqueueInfo(ulong securityId, ReadOnlyMemory<byte> serializedInfo) =>
-        EnqueueInternal(OutboundEvent.Info(securityId, serializedInfo));
+    public void TryEnqueueInfo(ulong securityId, ReadOnlyMemory<byte> serializedInfo) =>
+        _outbound.Writer.TryWrite(OutboundEvent.Info(securityId, serializedInfo));
 
     /// <summary>
     /// Enqueue a book cleared event. Purges pending order events for the security/side
     /// in the conflation dictionary to maintain correct ordering.
     /// </summary>
-    public bool TryEnqueueBookCleared(ulong securityId, byte clearSide) =>
-        EnqueueInternal(OutboundEvent.BookClear(securityId, clearSide));
+    public void TryEnqueueBookCleared(ulong securityId, byte clearSide) =>
+        _outbound.Writer.TryWrite(OutboundEvent.BookClear(securityId, clearSide));
 
     // --- Write loop with conflation + coalescing ---
 
@@ -306,8 +288,8 @@ public sealed class ClientSession : IDisposable
                 {
                     if (++slowTicks >= SlowClientMaxTicks)
                     {
-                        _logger.LogWarning("Self-disconnecting {ClientId}: queue backlog persisted for {Ticks} cycles (depth={Depth}/{Capacity}, dropped={Dropped})",
-                            Id, slowTicks, remaining, ChannelCapacity, DroppedMessages);
+                        _logger.LogWarning("Self-disconnecting {ClientId}: queue backlog persisted for {Ticks} cycles (depth={Depth}/{Capacity})",
+                            Id, slowTicks, remaining, ChannelCapacity);
                         break;
                     }
                 }

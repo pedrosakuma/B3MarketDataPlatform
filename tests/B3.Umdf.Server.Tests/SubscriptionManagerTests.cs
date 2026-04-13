@@ -49,28 +49,27 @@ public class SubscriptionManagerTests
     }
 
     [Fact]
-    public void ClientSession_TryEnqueue_ReturnsTrue_WhenNotFull()
+    public void ClientSession_TryEnqueue_AlwaysSucceeds()
     {
         var ws = new FakeWebSocket();
         var session = new ClientSession(ws, channelCapacity: 10);
         var msg = new byte[] { 1, 2, 3 };
-        Assert.True(session.TryEnqueue(msg));
+        session.TryEnqueue(msg);
         Assert.Equal(1, session.QueueDepth);
     }
 
     [Fact]
-    public void ClientSession_DroppedMessages_IncrementsWhenFull()
+    public void ClientSession_UnboundedChannel_NeverDrops()
     {
         var ws = new FakeWebSocket();
         var session = new ClientSession(ws, channelCapacity: 2);
         var msg = new byte[] { 1, 2, 3 };
 
-        session.TryEnqueue(msg); // 1/2
-        session.TryEnqueue(msg); // 2/2 - full
-        var result = session.TryEnqueue(msg); // drops oldest
+        session.TryEnqueue(msg);
+        session.TryEnqueue(msg);
+        session.TryEnqueue(msg); // exceeds soft capacity — still enqueued
 
-        Assert.False(result);
-        Assert.True(session.DroppedMessages >= 1);
+        Assert.Equal(3, session.QueueDepth);
     }
 
     [Fact]

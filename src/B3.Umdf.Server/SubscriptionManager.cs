@@ -25,20 +25,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ConcurrentDictionary<ulong, TradeRingBuffer> _recentTrades = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
-    // Clients needing MBO resync due to dropped events — clientId → set of securityIds
-    // Accessed from multiple feed threads, guarded by _dirtyLock.
-    private readonly object _dirtyLock = new();
-    private readonly Dictionary<string, HashSet<ulong>> _dirtyClients = new();
-    private int _resyncThrottle;
     private readonly Stopwatch _rankingsTimer = Stopwatch.StartNew();
     private const long RankingsIntervalMs = 2000;
     private const int RankingsTopN = 10;
 
     private const int MaxRecentTrades = 50;
-    private const int ResyncThrottleInterval = 1000; // check dirty clients every N events
 
     private volatile bool _ready;
-    private long _resyncCount;
 
     public SubscriptionManager(ILogger<SubscriptionManager>? logger = null)
     {
@@ -46,9 +39,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     }
 
     public bool IsReady => _ready;
-
-    /// <summary>Count of MBO resync snapshots sent due to dropped events.</summary>
-    public long ResyncCount => Volatile.Read(ref _resyncCount);
 
     /// <summary>Current number of connected clients.</summary>
     public int ClientCount => _clients.Count;
@@ -125,67 +115,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             }
         }
 
-        // Throttled: resync dirty clients periodically
-        if (++_resyncThrottle >= ResyncThrottleInterval)
-        {
-            _resyncThrottle = 0;
-            ProcessDirtyClients();
-        }
-
         // Time-based: push rankings to all clients every ~2s
         if (_clients.Count > 0 && _rankingsTimer.ElapsedMilliseconds >= RankingsIntervalMs)
         {
             _rankingsTimer.Restart();
             PushRankings();
-        }
-    }
-
-    /// <summary>
-    /// Mark a client's subscription as needing MBO resync due to dropped events.
-    /// Called from multiple feed threads when enqueue fails.
-    /// </summary>
-    private void MarkDirty(string clientId, ulong securityId)
-    {
-        lock (_dirtyLock)
-        {
-            if (!_dirtyClients.TryGetValue(clientId, out var set))
-            {
-                set = new HashSet<ulong>();
-                _dirtyClients[clientId] = set;
-            }
-            set.Add(securityId);
-        }
-    }
-
-    /// <summary>
-    /// Sends fresh MBO snapshots to clients with dropped events.
-    /// Snapshots _dirtyClients under lock, then releases lock before
-    /// acquiring book.SyncRoot to avoid deadlock.
-    /// </summary>
-    private void ProcessDirtyClients()
-    {
-        Dictionary<string, HashSet<ulong>>? snapshot = null;
-        lock (_dirtyLock)
-        {
-            if (_dirtyClients.Count == 0) return;
-            snapshot = new Dictionary<string, HashSet<ulong>>(_dirtyClients);
-            _dirtyClients.Clear();
-        }
-
-        foreach (var (clientId, securityIds) in snapshot)
-        {
-            if (!_clients.TryGetValue(clientId, out var session)) continue;
-
-            foreach (var securityId in securityIds)
-            {
-                if (_bookManager is not null && _bookManager.Books.TryGetValue(securityId, out var book))
-                {
-                    SendMboSnapshot(session, book);
-                    Interlocked.Increment(ref _resyncCount);
-                    var sym = _symbolRegistry is not null && _symbolRegistry.TryGetSymbol(securityId, out var s) ? s : securityId.ToString();
-                    _logger.LogWarning("Resync {Symbol} for {ClientId} due to dropped events", sym, clientId);
-                }
-            }
         }
     }
 
@@ -491,14 +425,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (!flags.HasFlag(requiredFlag)) continue;
             if (_clients.TryGetValue(clientId, out var session))
             {
-                if (session.TryEnqueue(message))
-                    AppMetrics.WsMessagesSent.Add(1);
-                else
-                {
-                    AppMetrics.WsMessagesDropped.Add(1);
-                    if (requiredFlag == DataFlags.Book)
-                        MarkDirty(clientId, securityId);
-                }
+                session.TryEnqueue(message);
+                AppMetrics.WsMessagesSent.Add(1);
             }
         }
     }
@@ -512,13 +440,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (!flags.HasFlag(DataFlags.Book)) continue;
             if (_clients.TryGetValue(clientId, out var session))
             {
-                if (session.TryEnqueueOrder(type, securityId, orderId, side, price, qty))
-                    AppMetrics.WsMessagesSent.Add(1);
-                else
-                {
-                    AppMetrics.WsMessagesDropped.Add(1);
-                    MarkDirty(clientId, securityId);
-                }
+                session.TryEnqueueOrder(type, securityId, orderId, side, price, qty);
+                AppMetrics.WsMessagesSent.Add(1);
             }
         }
     }
@@ -532,10 +455,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (!flags.HasFlag(DataFlags.Info)) continue;
             if (_clients.TryGetValue(clientId, out var session))
             {
-                if (session.TryEnqueueInfo(securityId, serializedInfo))
-                    AppMetrics.WsMessagesSent.Add(1);
-                else
-                    AppMetrics.WsMessagesDropped.Add(1);
+                session.TryEnqueueInfo(securityId, serializedInfo);
+                AppMetrics.WsMessagesSent.Add(1);
             }
         }
     }
@@ -549,13 +470,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (!flags.HasFlag(DataFlags.Book)) continue;
             if (_clients.TryGetValue(clientId, out var session))
             {
-                if (session.TryEnqueueBookCleared(securityId, clearSide))
-                    AppMetrics.WsMessagesSent.Add(1);
-                else
-                {
-                    AppMetrics.WsMessagesDropped.Add(1);
-                    MarkDirty(clientId, securityId);
-                }
+                session.TryEnqueueBookCleared(securityId, clearSide);
+                AppMetrics.WsMessagesSent.Add(1);
             }
         }
     }
