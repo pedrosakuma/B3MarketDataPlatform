@@ -17,6 +17,8 @@ const orders = new Map();
 let securityId = null;
 let msgCount = 0, addCount = 0, updateCount = 0, deleteCount = 0, snapshotCount = 0, clearCount = 0;
 let deleteNotInMap = 0;
+let dupAddCount = 0, ghostUpdateCount = 0;
+const dupAddSamples = [], ghostUpdateSamples = [], delNotInMapSamples = [];
 
 function buildSubscribe(symbol) {
   const symBytes = Buffer.from(symbol, 'utf8');
@@ -65,14 +67,28 @@ function processMessage(type, p) {
       const side = p.readUInt8(16);
       const price = Number(p.readBigInt64LE(17));
       const qty = Number(p.readBigInt64LE(25));
+      if (type === MSG.ORDER_ADDED) {
+        addCount++;
+        if (orders.has(oid)) {
+          dupAddCount++;
+          if (dupAddSamples.length < 5) dupAddSamples.push({ oid, existing: orders.get(oid), new: { side, price, qty }, msg: msgCount });
+        }
+      } else {
+        updateCount++;
+        if (!orders.has(oid)) {
+          ghostUpdateCount++;
+          if (ghostUpdateSamples.length < 5) ghostUpdateSamples.push({ oid, side, price, qty, msg: msgCount });
+        }
+      }
       orders.set(oid, { side, price, qty });
-      if (type === MSG.ORDER_ADDED) addCount++;
-      else updateCount++;
       break;
     }
     case MSG.ORDER_DELETED: {
       const oid = p.readBigUInt64LE(8).toString();
-      if (!orders.has(oid)) deleteNotInMap++;
+      if (!orders.has(oid)) {
+        deleteNotInMap++;
+        if (delNotInMapSamples.length < 5) delNotInMapSamples.push({ oid, msg: msgCount });
+      }
       orders.delete(oid);
       deleteCount++;
       break;
@@ -128,7 +144,10 @@ async function checkServer() {
     if (!match) {
       console.log(`  Δ bids=${local.bidOrders - server.bidOrders} asks=${local.askOrders - server.askOrders} totalOrders=${orders.size} vs ${server.bidOrders + server.askOrders}`);
     }
-    console.log(`  msgs=${msgCount} adds=${addCount} upd=${updateCount} dels=${deleteCount} snaps=${snapshotCount} clears=${clearCount} delNotInMap=${deleteNotInMap}`);
+    console.log(`  msgs=${msgCount} adds=${addCount} upd=${updateCount} dels=${deleteCount} snaps=${snapshotCount} clears=${clearCount} delNotInMap=${deleteNotInMap} dupAdd=${dupAddCount} ghostUpd=${ghostUpdateCount}`);
+    if (dupAddSamples.length > 0 && !match) console.log(`  dupAdd samples:`, JSON.stringify(dupAddSamples.slice(0, 3)));
+    if (ghostUpdateSamples.length > 0 && !match) console.log(`  ghostUpd samples:`, JSON.stringify(ghostUpdateSamples.slice(0, 3)));
+    if (delNotInMapSamples.length > 0 && !match) console.log(`  delNotInMap samples:`, JSON.stringify(delNotInMapSamples.slice(0, 3)));
   } catch (e) {
     console.log('Server check failed:', e.message);
   }
