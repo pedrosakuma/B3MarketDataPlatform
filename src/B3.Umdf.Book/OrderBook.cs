@@ -7,6 +7,9 @@ public sealed class OrderBook
     public BookSide Asks { get; }
     public uint LastRptSeq { get; set; }
 
+    /// <summary>Lock for synchronizing book reads (snapshots, HTTP) with feed mutations.</summary>
+    public readonly object SyncRoot = new();
+
     public OrderBook(ulong securityId)
     {
         SecurityId = securityId;

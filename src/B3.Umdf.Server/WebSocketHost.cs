@@ -27,9 +27,6 @@ public sealed class WebSocketHost : IAsyncDisposable
     /// <summary>Optional provider for last-packet timestamps per group.</summary>
     public Func<IReadOnlyDictionary<string, long>>? LastPacketTimestampProvider { get; set; }
 
-    /// <summary>Optional provider for per-group channel handler stats.</summary>
-    public Func<IReadOnlyDictionary<string, ChannelHandler>>? ChannelHandlerProvider { get; set; }
-
     public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null, int maxConnections = 0)
     {
         _subscriptionManager = subscriptionManager;
@@ -95,128 +92,13 @@ public sealed class WebSocketHost : IAsyncDisposable
             IEnumerable<string> symbols = registry.BySymbol.Keys.Order();
             if (!string.IsNullOrEmpty(q))
                 symbols = symbols.Where(s => s.Contains(q, StringComparison.OrdinalIgnoreCase));
-            var max = Math.Clamp(limit ?? 100, 1, 5000);
+            var max = Math.Clamp(limit ?? 20, 1, 100);
             var list = symbols.Take(max).ToArray();
             return Results.Json(new SymbolsResponse { Count = registry.Count, Matched = list.Length, Symbols = list },
                 AppJsonContext.Default.SymbolsResponse);
         });
 
-        _app.MapGet("/top", (int? n) =>
-        {
-            var books = _subscriptionManager.BookManager;
-            var registry = _subscriptionManager.SymbolRegistry;
-            if (books is null) return Results.Json(new TopResponse(), AppJsonContext.Default.TopResponse);
-
-            var max = Math.Clamp(n ?? 20, 1, 100);
-            var top = books.Books
-                .OrderByDescending(kv => kv.Value.Bids.OrderCount + kv.Value.Asks.OrderCount)
-                .Take(max)
-                .Select(kv =>
-                {
-                    var sym = registry is not null && registry.TryGetSymbol(kv.Key, out var s) ? s : kv.Key.ToString();
-                    return new TopInstrument
-                    {
-                        Symbol = sym,
-                        SecurityId = kv.Key,
-                        BidOrders = kv.Value.Bids.OrderCount,
-                        AskOrders = kv.Value.Asks.OrderCount,
-                        BidLevels = kv.Value.Bids.LevelCount,
-                        AskLevels = kv.Value.Asks.LevelCount,
-                    };
-                }).ToArray();
-            return Results.Json(new TopResponse { TotalBooks = books.Books.Count, Instruments = top },
-                AppJsonContext.Default.TopResponse);
-        });
-
-        _app.MapGet("/book/{symbol}", (string symbol) =>
-        {
-            var books = _subscriptionManager.BookManager;
-            var registry = _subscriptionManager.SymbolRegistry;
-            if (books is null || registry is null)
-                return Results.NotFound();
-
-            if (!registry.TryResolve(symbol, out ulong securityId))
-                return Results.NotFound();
-
-            if (!books.Books.TryGetValue(securityId, out var book))
-                return Results.NotFound();
-
-            var bids = book.Bids;
-            var asks = book.Asks;
-            long bestBid = bids.BestPrice() is { } bp ? bp.Price : 0;
-            long bestAsk = asks.BestPrice() is { } ap ? ap.Price : 0;
-            bool crossed = bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk;
-
-            var errors = book.Validate();
-
-            return Results.Json(new BookDiagResponse
-            {
-                Symbol = symbol,
-                SecurityId = securityId,
-                BestBid = bestBid,
-                BestAsk = bestAsk,
-                BidOrders = bids.OrderCount,
-                AskOrders = asks.OrderCount,
-                BidLevels = bids.LevelCount,
-                AskLevels = asks.LevelCount,
-                LastRptSeq = book.LastRptSeq,
-                Crossed = crossed,
-                ValidationErrors = errors.Count > 0 ? errors.ToArray() : [],
-            }, AppJsonContext.Default.BookDiagResponse);
-        });
-
-        _app.MapGet("/stats", () =>
-        {
-            var books = _subscriptionManager.BookManager;
-            var registry = _subscriptionManager.SymbolRegistry;
-
-            var resp = new FeedStatsResponse();
-
-            if (books is not null)
-            {
-                resp.OrderAdds = books.OrderAdds;
-                resp.OrderUpdates = books.OrderUpdates;
-                resp.OrderDeletes = books.OrderDeletes;
-                resp.DeleteNotFound = books.DeleteNotFound;
-                resp.NullPriceNewSkips = books.NullPriceNewSkips;
-                resp.NullPriceChangeDeletes = books.NullPriceChangeDeletes;
-                resp.ParseErrors = books.ParseErrors;
-                resp.CrossingTransitions = books.CrossingTransitions;
-
-                var crossedList = new List<string>();
-                foreach (var (secId, book) in books.Books)
-                {
-                    long bestBid = book.Bids.BestPrice() is { } bp ? bp.Price : 0;
-                    long bestAsk = book.Asks.BestPrice() is { } ap ? ap.Price : 0;
-                    if (bestBid > 0 && bestAsk > 0 && bestBid >= bestAsk)
-                    {
-                        var sym = registry is not null && registry.TryGetSymbol(secId, out var s) ? s : secId.ToString();
-                        crossedList.Add(sym);
-                    }
-                }
-                resp.CrossedBooks = crossedList.Count;
-                resp.CrossedSymbols = crossedList.ToArray();
-            }
-
-            if (ChannelHandlerProvider is { } chp)
-            {
-                var handlers = chp();
-                var stats = new Dictionary<string, ChannelStats>();
-                foreach (var (name, handler) in handlers)
-                {
-                    stats[name] = new ChannelStats
-                    {
-                        PacketsProcessed = handler.PacketsProcessed,
-                        DuplicatesSkipped = handler.DuplicatesSkipped,
-                        GapsDetected = handler.GapsDetected,
-                        ExpectedSeqNum = handler.ExpectedSequenceNumber,
-                    };
-                }
-                resp.ChannelStats = stats;
-            }
-
-            return Results.Json(resp, AppJsonContext.Default.FeedStatsResponse);
-        });
+        // WebSocket endpoint
 
         _app.Map("/ws", async context =>
         {

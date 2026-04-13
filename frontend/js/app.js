@@ -35,11 +35,13 @@ function startHealthPolling() {
   healthInterval = setInterval(pollHealth, 5000);
 }
 
+function httpBase() {
+  return $('wsUrl').value.trim().replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws\/?$/, '');
+}
+
 async function pollHealth() {
   try {
-    const wsUrl = $('wsUrl').value.trim();
-    const httpBase = wsUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws\/?$/, '');
-    const resp = await fetch(httpBase + '/health');
+    const resp = await fetch(httpBase() + '/health');
     if (resp.ok) {
       state.healthData = await resp.json();
     } else {
@@ -49,6 +51,29 @@ async function pollHealth() {
     state.healthData = { status: 'unreachable' };
   }
   renderHealth();
+}
+
+// ── Symbol autocomplete ──
+
+let acTimer = null;
+
+async function symbolAutocomplete(query) {
+  clearTimeout(acTimer);
+  if (query.length < 2) { $('symbolSuggestions').innerHTML = ''; return; }
+  acTimer = setTimeout(async () => {
+    try {
+      const resp = await fetch(httpBase() + '/symbols?q=' + encodeURIComponent(query) + '&limit=20');
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const dl = $('symbolSuggestions');
+      dl.innerHTML = '';
+      for (const sym of data.symbols || []) {
+        const opt = document.createElement('option');
+        opt.value = sym;
+        dl.appendChild(opt);
+      }
+    } catch { /* ignore */ }
+  }, 150);
 }
 
 // ── Connection ──
@@ -306,6 +331,7 @@ window.doUnsubscribe = doUnsubscribe;
 window.selectSubscription = selectSubscription;
 window.rankingClick = rankingClick;
 window.switchRankingsTab = switchRankingsTab;
+window.symbolAutocomplete = symbolAutocomplete;
 window.clearLog = clearLog;
 window.toggleLog = setLogEnabled;
 

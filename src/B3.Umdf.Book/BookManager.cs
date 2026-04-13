@@ -169,62 +169,64 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
-        if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
+        lock (book.SyncRoot)
         {
-            if (rawPrice is null)
+            if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
             {
-                // Priced order changed to market — remove from book
-                Interlocked.Increment(ref _nullPriceChangeDeletes);
-                bookSide.Remove(orderId);
-                if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
-                _eventHandler?.OnOrderDeleted(book, orderId, side);
-                return;
+                if (rawPrice is null)
+                {
+                    Interlocked.Increment(ref _nullPriceChangeDeletes);
+                    bookSide.Remove(orderId);
+                    if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
+                    _eventHandler?.OnOrderDeleted(book, orderId, side);
+                    return;
+                }
+
+                Interlocked.Increment(ref _orderUpdates);
+                long price = rawPrice.Value;
+                long oldPrice = existing.Price;
+
+                existing.Price = price;
+                existing.Quantity = quantity;
+                existing.EnteringFirm = enteringFirm;
+
+                if (oldPrice != price)
+                    bookSide.MoveOrder(existing, oldPrice);
+
+                if (msg.RptSeq is { } rptSeq)
+                    book.LastRptSeq = (uint)rptSeq;
+
+                _eventHandler?.OnOrderUpdated(book, existing);
+                CheckCrossing(book, "UPDATE", orderId, price, side);
             }
-
-            Interlocked.Increment(ref _orderUpdates);
-            long price = rawPrice.Value;
-            long oldPrice = existing.Price;
-
-            existing.Price = price;
-            existing.Quantity = quantity;
-            existing.EnteringFirm = enteringFirm;
-
-            if (oldPrice != price)
-                bookSide.MoveOrder(existing, oldPrice);
-
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
-
-            _eventHandler?.OnOrderUpdated(book, existing);
-            CheckCrossing(book, "UPDATE", orderId, price, side);
-        }
-        else
-        {
-            if (rawPrice is null)
+            else
             {
-                Interlocked.Increment(ref _nullPriceNewSkips);
-                return; // Market order — no price level to add
+                if (rawPrice is null)
+                {
+                    Interlocked.Increment(ref _nullPriceNewSkips);
+                    return;
+                }
+
+                long price = rawPrice.Value;
+                var entry = new OrderBookEntry
+                {
+                    OrderId = orderId,
+                    Price = price,
+                    Quantity = quantity,
+                    EnteringFirm = enteringFirm,
+                    SecurityId = securityId,
+                    Side = side
+                };
+
+                bookSide.Add(entry);
+                Interlocked.Increment(ref _orderAdds);
+
+                if (msg.RptSeq is { } rptSeq)
+                    book.LastRptSeq = (uint)rptSeq;
+
+                _eventHandler?.OnOrderAdded(book, entry);
+                CheckCrossing(book, "ADD", orderId, price, side);
             }
-
-            long price = rawPrice.Value;
-            var entry = new OrderBookEntry
-            {
-                OrderId = orderId,
-                Price = price,
-                Quantity = quantity,
-                EnteringFirm = enteringFirm,
-                SecurityId = securityId,
-                Side = side
-            };
-
-            bookSide.Add(entry);
-            Interlocked.Increment(ref _orderAdds);
-
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
-
-            _eventHandler?.OnOrderAdded(book, entry);
-            CheckCrossing(book, "ADD", orderId, price, side);
         }
     }
 
