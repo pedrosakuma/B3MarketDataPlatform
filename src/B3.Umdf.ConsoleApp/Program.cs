@@ -7,6 +7,19 @@ using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 
 // Parse named arguments
+// Quick health check mode for Docker HEALTHCHECK
+if (args.Length == 1 && args[0] == "--health-check")
+{
+    try
+    {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
+        var port = Environment.GetEnvironmentVariable("WS_PORT") ?? "8080";
+        var resp = await http.GetAsync($"http://localhost:{port}/live");
+        return resp.IsSuccessStatusCode ? 0 : 1;
+    }
+    catch { return 1; }
+}
+
 int? wsPort = null;
 double speed = 0;
 var pcapPrefixes = new List<string>();
@@ -44,6 +57,23 @@ for (int i = 0; i < args.Length; i++)
     {
         positionalArgs.Add(args[i]);
     }
+}
+
+// Fallback to environment variables (for shell-less Docker images)
+if (pcapPrefixes.Count == 0 && positionalArgs.Count == 0 && multicastConfig is null)
+{
+    var envPcapDir = Environment.GetEnvironmentVariable("PCAP_DIR") ?? "/app/pcap";
+    var envPcapPrefix = Environment.GetEnvironmentVariable("PCAP_PREFIX") ?? "";
+    if (!string.IsNullOrEmpty(envPcapPrefix))
+    {
+        foreach (var prefix in envPcapPrefix.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            pcapPrefixes.Add(Path.Combine(envPcapDir, prefix));
+    }
+    if (wsPort is null && int.TryParse(Environment.GetEnvironmentVariable("WS_PORT"), out var envPort))
+        wsPort = envPort;
+    if (speed == 0 && double.TryParse(Environment.GetEnvironmentVariable("REPLAY_SPEED"),
+            System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var envSpeed))
+        speed = envSpeed;
 }
 
 // Build packet source — either from multicast config, --pcap-prefix, or positional args

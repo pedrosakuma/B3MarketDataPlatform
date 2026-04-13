@@ -1,8 +1,8 @@
 using System.Diagnostics;
-using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Umdf.Server;
@@ -10,6 +10,7 @@ namespace B3.Umdf.Server;
 /// <summary>
 /// Kestrel-based WebSocket server for market data subscriptions.
 /// Includes health/readiness endpoints for orchestration compatibility.
+/// AOT-compatible: uses CreateSlimBuilder and source-generated JSON.
 /// </summary>
 public sealed class WebSocketHost : IAsyncDisposable
 {
@@ -34,9 +35,11 @@ public sealed class WebSocketHost : IAsyncDisposable
 
     public async Task StartAsync(int port, CancellationToken ct = default)
     {
-        var builder = WebApplication.CreateBuilder();
+        var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
         builder.Logging.ClearProviders();
+        builder.Services.ConfigureHttpJsonOptions(options =>
+            options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
 
         _app = builder.Build();
         _app.UseWebSockets(new WebSocketOptions
@@ -61,17 +64,17 @@ public sealed class WebSocketHost : IAsyncDisposable
         // Health endpoints
         _app.MapGet("/health", () =>
         {
-            var result = new Dictionary<string, object>
+            var result = new HealthResponse
             {
-                ["status"] = _subscriptionManager.IsReady ? "ready" : "initializing",
-                ["uptime"] = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
-                ["slowClientDisconnects"] = _subscriptionManager.SlowClientDisconnects,
+                Status = _subscriptionManager.IsReady ? "ready" : "initializing",
+                Uptime = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
+                SlowClientDisconnects = _subscriptionManager.SlowClientDisconnects,
             };
             if (FeedStateProvider is not null)
-                result["feedGroups"] = FeedStateProvider();
+                result.FeedGroups = new Dictionary<string, string>(FeedStateProvider());
             if (LastPacketTimestampProvider is not null)
-                result["lastPacketTimestamps"] = LastPacketTimestampProvider();
-            return Results.Json(result);
+                result.LastPacketTimestamps = new Dictionary<string, long>(LastPacketTimestampProvider());
+            return Results.Json(result, AppJsonContext.Default.HealthResponse);
         });
 
         _app.MapGet("/ready", () =>
@@ -82,13 +85,15 @@ public sealed class WebSocketHost : IAsyncDisposable
         _app.MapGet("/symbols", (string? q, int? limit) =>
         {
             var registry = _subscriptionManager.SymbolRegistry;
-            if (registry is null) return Results.Json(new { count = 0, symbols = Array.Empty<string>() });
+            if (registry is null)
+                return Results.Json(new SymbolsResponse(), AppJsonContext.Default.SymbolsResponse);
             IEnumerable<string> symbols = registry.BySymbol.Keys.Order();
             if (!string.IsNullOrEmpty(q))
                 symbols = symbols.Where(s => s.Contains(q, StringComparison.OrdinalIgnoreCase));
             var max = Math.Clamp(limit ?? 100, 1, 5000);
             var list = symbols.Take(max).ToArray();
-            return Results.Json(new { count = registry.Count, matched = list.Length, symbols = list });
+            return Results.Json(new SymbolsResponse { Count = registry.Count, Matched = list.Length, Symbols = list },
+                AppJsonContext.Default.SymbolsResponse);
         });
 
         _app.Map("/ws", async context =>
