@@ -43,6 +43,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// <summary>Current number of connected clients.</summary>
     public int ClientCount => _clients.Count;
 
+    /// <summary>Get queue depth and conflated count for all connected clients.</summary>
+    public IEnumerable<(string Id, int QueueDepth, long Conflated)> GetClientStats()
+    {
+        foreach (var (_, session) in _clients)
+            yield return (session.Id, session.QueueDepth, session.ConflatedMessages);
+    }
+
     public void SetDataSources(BookManager bookManager, MarketDataManager marketDataManager, SymbolRegistry symbolRegistry)
     {
         _bookManager = bookManager;

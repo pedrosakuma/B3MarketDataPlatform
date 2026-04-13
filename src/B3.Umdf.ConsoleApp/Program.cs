@@ -324,6 +324,12 @@ using var statsTimer = new Timer(_ =>
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
     Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}  |  Instruments: {marketDataManager.InstrumentData.Count:N0}  |  Symbols: {symbolRegistry.Count:N0}");
 
+    if (subscriptionManager is not null)
+    {
+        foreach (var (id, depth, conflated) in subscriptionManager.GetClientStats())
+            Console.WriteLine($"   {id}: queue={depth:N0}  conflated={conflated:N0}");
+    }
+
     if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
         Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
 
