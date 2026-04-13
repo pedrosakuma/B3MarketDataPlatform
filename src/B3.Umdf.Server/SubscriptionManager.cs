@@ -353,20 +353,21 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// </summary>
     private static void SendMboSnapshot(ClientSession session, OrderBook book)
     {
-        // 1. Reset marker — tells client to clear local book state
-        var resetBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
-        WireProtocol.WriteBookSnapshotHeader(resetBuf, book.SecurityId, book.LastRptSeq, 0, 0);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(resetBuf));
+        lock (book.SyncRoot)
+        {
+            // 1. Reset marker — tells client to clear local book state
+            var resetBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
+            WireProtocol.WriteBookSnapshotHeader(resetBuf, book.SecurityId, book.LastRptSeq, 0, 0);
+            session.TryEnqueue(new ReadOnlyMemory<byte>(resetBuf));
 
-        // 2. Send every individual order as OrderAdded
-        SendSideOrders(session, book.SecurityId, book.Bids);
-        SendSideOrders(session, book.SecurityId, book.Asks);
+            // 2. Send every individual order as OrderAdded
+            SendSideOrders(session, book.SecurityId, book.Bids);
+            SendSideOrders(session, book.SecurityId, book.Asks);
+        }
     }
 
     private static void SendSideOrders(ClientSession session, ulong securityId, BookSide side)
     {
-        // Snapshot to avoid "collection modified during enumeration" —
-        // ProcessPendingRequests can trigger this mid-HandleDeleteOrder.
         foreach (var entry in side.Orders.Values.ToArray())
         {
             var buf = new byte[37];
