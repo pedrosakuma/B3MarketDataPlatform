@@ -14,6 +14,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 {
     private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new();
     private volatile FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
+    private readonly ConcurrentDictionary<string, int> _groupStatus = new(StringComparer.Ordinal);
     private readonly IMarketDataEventHandler? _eventHandler;
     private readonly ILogger<MarketDataManager> _logger;
     private long _parseErrors;
@@ -67,8 +68,14 @@ public sealed class MarketDataManager : IFeedEventHandler
         {
             switch (templateId)
             {
+                case SecurityDefinition_12Data.MESSAGE_ID:
+                    HandleSecurityDefinition(body);
+                    break;
                 case SecurityStatus_3Data.MESSAGE_ID:
                     HandleSecurityStatus(body);
+                    break;
+                case SecurityGroupPhase_10Data.MESSAGE_ID:
+                    HandleSecurityGroupPhase(body);
                     break;
                 case OpeningPrice_15Data.MESSAGE_ID:
                     HandleOpeningPrice(body);
@@ -121,6 +128,17 @@ public sealed class MarketDataManager : IFeedEventHandler
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeData(); }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
 
+    private void HandleSecurityDefinition(ReadOnlySpan<byte> body)
+    {
+        if (!SecurityDefinition_12Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var info = GetOrCreateInfo(securityId);
+        info.SecurityGroup = msg.SecurityGroup.ToString().Trim();
+    }
+
     private void HandleSecurityStatus(ReadOnlySpan<byte> body)
     {
         if (!SecurityStatus_3Data.TryParse(body, out var reader))
@@ -130,12 +148,54 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
-        info.TradingStatus = (int)msg.SecurityTradingStatus;
-        info.TradingEvent = msg.SecurityTradingEvent is { } evt ? (int)evt : null;
+        int? eventCode = msg.SecurityTradingEvent is { } evt ? (int)evt : null;
+        info.TradingEvent = eventCode;
         info.TradSesOpenTime = msg.TradSesOpenTime.Time;
         info.LastUpdateTimestamp = msg.TransactTime.Time ?? 0;
 
+        if (eventCode == 102) // SECURITY_REJOINS_SECURITY_GROUP_STATUS
+        {
+            info.FollowsGroupStatus = true;
+            // Apply current group status if we already have it
+            if (info.SecurityGroup is { } grp && _groupStatus.TryGetValue(grp, out int grpStatus))
+                info.TradingStatus = grpStatus;
+            else
+                info.TradingStatus = (int)msg.SecurityTradingStatus;
+        }
+        else if (eventCode == 101) // SECURITY_STATUS_CHANGE (separate from group)
+        {
+            info.FollowsGroupStatus = false;
+            info.TradingStatus = (int)msg.SecurityTradingStatus;
+        }
+        else
+        {
+            info.TradingStatus = (int)msg.SecurityTradingStatus;
+        }
+
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
+    }
+
+    private void HandleSecurityGroupPhase(ReadOnlySpan<byte> body)
+    {
+        if (!SecurityGroupPhase_10Data.TryParse(body, out var reader))
+            return;
+
+        ref readonly var msg = ref reader.Data;
+        string group = msg.SecurityGroup.ToString().Trim();
+        int status = (int)msg.TradingSessionSubID;
+
+        _groupStatus[group] = status;
+
+        // Propagate to all instruments following this group
+        foreach (var kvp in _data)
+        {
+            var info = kvp.Value;
+            if (info.FollowsGroupStatus && info.SecurityGroup == group)
+            {
+                info.TradingStatus = status;
+                _eventHandler?.OnMarketDataUpdated(kvp.Key, info);
+            }
+        }
     }
 
     private void HandleOpeningPrice(ReadOnlySpan<byte> body)

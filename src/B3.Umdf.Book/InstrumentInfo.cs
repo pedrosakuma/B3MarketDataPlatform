@@ -12,6 +12,11 @@ public sealed class InstrumentInfo
     public int? TradingEvent { get; set; }
     public ulong? TradSesOpenTime { get; set; }
 
+    // SecurityDefinition / group tracking
+    public string? SecurityGroup { get; set; }
+    /// <summary>When true, this instrument's TradingStatus follows its SecurityGroup phase.</summary>
+    public bool FollowsGroupStatus { get; set; } = true;
+
     // Prices
     public long? OpeningPrice { get; set; }
     public long? ClosingPrice { get; set; }
@@ -49,6 +54,8 @@ public sealed class InstrumentInfo
         TradingStatus = null;
         TradingEvent = null;
         TradSesOpenTime = null;
+        SecurityGroup = null;
+        FollowsGroupStatus = true;
         OpeningPrice = null;
         ClosingPrice = null;
         HighPrice = null;

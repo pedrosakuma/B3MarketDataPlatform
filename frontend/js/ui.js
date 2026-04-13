@@ -116,7 +116,7 @@ export function renderBook() {
 }
 
 function tradingStatusName(v) {
-  const names = { 2: 'Trading', 4: 'Forbidden', 17: 'Auction', 18: 'Closing', 20: 'Open', 21: 'PreClose', 101: 'FinalClosing' };
+  const names = { 2: 'Paused', 4: 'Closed', 17: 'Open', 18: 'Forbidden', 20: 'Unknown', 21: 'Auction', 101: 'FinalClosing' };
   return names[v] || `Status(${v})`;
 }
 
