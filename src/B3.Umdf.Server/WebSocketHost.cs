@@ -44,6 +44,20 @@ public sealed class WebSocketHost : IAsyncDisposable
             KeepAliveInterval = TimeSpan.FromSeconds(30),
         });
 
+        // CORS for cross-origin frontend access
+        _app.Use(async (context, next) =>
+        {
+            context.Response.Headers["Access-Control-Allow-Origin"] = "*";
+            context.Response.Headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+            context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
+            if (context.Request.Method == "OPTIONS")
+            {
+                context.Response.StatusCode = 204;
+                return;
+            }
+            await next();
+        });
+
         // Health endpoints
         _app.MapGet("/health", () =>
         {

@@ -218,7 +218,7 @@ if (groupIds.Count > 1)
 {
     multiFeed = new MultiFeedManager(packetSource, groupIds, composite, feedLogger);
     if (subscriptionManager is not null)
-        multiFeed.AllGroupsReady += () => subscriptionManager.SetReady();
+        multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }
 else
 {

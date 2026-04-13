@@ -19,6 +19,9 @@ public sealed class MultiFeedManager : IDisposable
 
     public event Action? AllGroupsReady;
 
+    /// <summary>Fired when the first group reaches RealTime.</summary>
+    public event Action? AnyGroupReady;
+
     /// <summary>All feed handlers by group index.</summary>
     public IReadOnlyDictionary<int, FeedHandler> Handlers => _handlers;
 
@@ -118,11 +121,15 @@ public sealed class MultiFeedManager : IDisposable
 
     private bool CheckReady()
     {
+        bool anyNew = false;
         foreach (var (gid, handler) in _handlers)
         {
-            if (handler.State == FeedState.RealTime)
-                _readyGroups.Add(gid);
+            if (handler.State == FeedState.RealTime && _readyGroups.Add(gid))
+                anyNew = true;
         }
+
+        if (anyNew && _readyGroups.Count == 1)
+            AnyGroupReady?.Invoke();
 
         if (IsAllReady)
         {
