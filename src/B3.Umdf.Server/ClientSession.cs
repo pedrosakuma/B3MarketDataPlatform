@@ -194,6 +194,9 @@ public sealed class ClientSession : IDisposable
     /// Write loop: drains the outbound channel, conflates MBO order events and info updates,
     /// then serializes and coalesces into a single WebSocket binary frame.
     /// </summary>
+    private const double SlowClientThreshold = 0.75;
+    private const int SlowClientMaxTicks = 100;
+
     public async Task RunWriteLoopAsync()
     {
         var ct = _cts.Token;
@@ -204,6 +207,7 @@ public sealed class ClientSession : IDisposable
         var pendingOrders = new Dictionary<ulong, PendingOrder>();
         var pendingInfos = new Dictionary<ulong, ReadOnlyMemory<byte>>();
         var bookClearList = new List<(ulong SecurityId, byte Side)>();
+        int slowTicks = 0;
 
         try
         {
@@ -294,6 +298,23 @@ public sealed class ClientSession : IDisposable
                 if (offset > 0)
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
+
+                // 3. Slow-client self-detection: if queue stays above threshold
+                // after drain+send, this client can't keep up.
+                int remaining = QueueDepth;
+                if (remaining > ChannelCapacity * SlowClientThreshold)
+                {
+                    if (++slowTicks >= SlowClientMaxTicks)
+                    {
+                        _logger.LogWarning("Self-disconnecting {ClientId}: queue backlog persisted for {Ticks} cycles (depth={Depth}/{Capacity}, dropped={Dropped})",
+                            Id, slowTicks, remaining, ChannelCapacity, DroppedMessages);
+                        break;
+                    }
+                }
+                else
+                {
+                    slowTicks = 0;
+                }
             }
         }
         catch (OperationCanceledException) { }

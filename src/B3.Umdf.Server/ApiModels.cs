@@ -6,7 +6,6 @@ public sealed class HealthResponse
 {
     public string Status { get; set; } = "";
     public string Uptime { get; set; } = "";
-    public long SlowClientDisconnects { get; set; }
     public long ResyncCount { get; set; }
     public Dictionary<string, string>? FeedGroups { get; set; }
     public Dictionary<string, long>? LastPacketTimestamps { get; set; }

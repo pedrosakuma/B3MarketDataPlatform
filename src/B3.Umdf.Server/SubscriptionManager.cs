@@ -19,28 +19,25 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ILogger<SubscriptionManager> _logger;
 
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
-    // Per-security: clientId → DataFlags — only accessed on feed thread
-    private readonly Dictionary<ulong, Dictionary<string, DataFlags>> _subscriptions = new();
-    // Recent trades per security — circular buffer, only accessed on feed thread
-    private readonly Dictionary<ulong, TradeRingBuffer> _recentTrades = new();
+    // Per-security: clientId → DataFlags — accessed from multiple feed threads
+    private readonly ConcurrentDictionary<ulong, ConcurrentDictionary<string, DataFlags>> _subscriptions = new();
+    // Recent trades per security — circular buffer, accessed from multiple feed threads
+    private readonly ConcurrentDictionary<ulong, TradeRingBuffer> _recentTrades = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
-    // Slow-client detection: clientId → consecutive high-watermark ticks
-    private readonly Dictionary<string, int> _slowClientTicks = new();
     // Clients needing MBO resync due to dropped events — clientId → set of securityIds
+    // Accessed from multiple feed threads, guarded by _dirtyLock.
+    private readonly object _dirtyLock = new();
     private readonly Dictionary<string, HashSet<ulong>> _dirtyClients = new();
     private int _resyncThrottle;
     private readonly Stopwatch _rankingsTimer = Stopwatch.StartNew();
     private const long RankingsIntervalMs = 2000;
     private const int RankingsTopN = 10;
 
-    private const double SlowClientThreshold = 0.75; // 75% of channel capacity
-    private const int SlowClientMaxTicks = 100; // consecutive overloaded ticks before disconnect
     private const int MaxRecentTrades = 50;
     private const int ResyncThrottleInterval = 1000; // check dirty clients every N events
 
     private volatile bool _ready;
-    private long _slowClientDisconnects;
     private long _resyncCount;
 
     public SubscriptionManager(ILogger<SubscriptionManager>? logger = null)
@@ -49,9 +46,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     }
 
     public bool IsReady => _ready;
-
-    /// <summary>Count of clients disconnected for being slow.</summary>
-    public long SlowClientDisconnects => Volatile.Read(ref _slowClientDisconnects);
 
     /// <summary>Count of MBO resync snapshots sent due to dropped events.</summary>
     public long ResyncCount => Volatile.Read(ref _resyncCount);
@@ -131,12 +125,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             }
         }
 
-        // Throttled: resync dirty clients and detect slow clients periodically
+        // Throttled: resync dirty clients periodically
         if (++_resyncThrottle >= ResyncThrottleInterval)
         {
             _resyncThrottle = 0;
             ProcessDirtyClients();
-            DetectSlowClients();
         }
 
         // Time-based: push rankings to all clients every ~2s
@@ -149,27 +142,37 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     /// <summary>
     /// Mark a client's subscription as needing MBO resync due to dropped events.
-    /// Called on the feed thread when enqueue fails.
+    /// Called from multiple feed threads when enqueue fails.
     /// </summary>
     private void MarkDirty(string clientId, ulong securityId)
     {
-        if (!_dirtyClients.TryGetValue(clientId, out var set))
+        lock (_dirtyLock)
         {
-            set = new HashSet<ulong>();
-            _dirtyClients[clientId] = set;
+            if (!_dirtyClients.TryGetValue(clientId, out var set))
+            {
+                set = new HashSet<ulong>();
+                _dirtyClients[clientId] = set;
+            }
+            set.Add(securityId);
         }
-        set.Add(securityId);
     }
 
     /// <summary>
     /// Sends fresh MBO snapshots to clients with dropped events.
-    /// Runs on the feed thread — book state is stable during this call.
+    /// Snapshots _dirtyClients under lock, then releases lock before
+    /// acquiring book.SyncRoot to avoid deadlock.
     /// </summary>
     private void ProcessDirtyClients()
     {
-        if (_dirtyClients.Count == 0) return;
+        Dictionary<string, HashSet<ulong>>? snapshot = null;
+        lock (_dirtyLock)
+        {
+            if (_dirtyClients.Count == 0) return;
+            snapshot = new Dictionary<string, HashSet<ulong>>(_dirtyClients);
+            _dirtyClients.Clear();
+        }
 
-        foreach (var (clientId, securityIds) in _dirtyClients)
+        foreach (var (clientId, securityIds) in snapshot)
         {
             if (!_clients.TryGetValue(clientId, out var session)) continue;
 
@@ -183,51 +186,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                     _logger.LogWarning("Resync {Symbol} for {ClientId} due to dropped events", sym, clientId);
                 }
             }
-        }
-        _dirtyClients.Clear();
-    }
-
-    /// <summary>
-    /// Checks each client's outbound queue depth. Clients that stay above 75% capacity
-    /// for too many consecutive ticks are disconnected to prevent data buildup.
-    /// </summary>
-    private void DetectSlowClients()
-    {
-        List<string>? toDisconnect = null;
-
-        foreach (var (clientId, session) in _clients)
-        {
-            int capacity = session.ChannelCapacity;
-            int depth = session.QueueDepth;
-
-            if (depth > capacity * SlowClientThreshold)
-            {
-                _slowClientTicks.TryGetValue(clientId, out int ticks);
-                _slowClientTicks[clientId] = ticks + 1;
-
-                if (ticks + 1 >= SlowClientMaxTicks)
-                {
-                    toDisconnect ??= new();
-                    toDisconnect.Add(clientId);
-                }
-            }
-            else
-            {
-                _slowClientTicks.Remove(clientId);
-            }
-        }
-
-        if (toDisconnect is null) return;
-
-        foreach (var clientId in toDisconnect)
-        {
-            _logger.LogWarning("Disconnecting slow client {ClientId} (queue full for {Ticks} ticks, dropped: {Dropped})",
-                clientId, SlowClientMaxTicks, _clients.TryGetValue(clientId, out var s) ? s.DroppedMessages : 0);
-            if (_clients.TryGetValue(clientId, out var session))
-                session.Cancel();
-            _slowClientTicks.Remove(clientId);
-            Interlocked.Increment(ref _slowClientDisconnects);
-            AppMetrics.WsSlowDisconnects.Add(1);
         }
     }
 
@@ -247,11 +205,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
         // NOW activate subscription — incrementals start flowing after this point
         session.AddSubscription(securityId);
-        if (!_subscriptions.TryGetValue(securityId, out var clients))
-        {
-            clients = new Dictionary<string, DataFlags>();
-            _subscriptions[securityId] = clients;
-        }
+        var clients = _subscriptions.GetOrAdd(securityId, _ => new ConcurrentDictionary<string, DataFlags>());
         clients[clientId] = flags;
         AppMetrics.WsSubscriptions.Add(1);
     }
@@ -324,9 +278,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         session.RemoveSubscription(securityId);
         if (_subscriptions.TryGetValue(securityId, out var clients))
         {
-            clients.Remove(clientId);
-            if (clients.Count == 0)
-                _subscriptions.Remove(securityId);
+            clients.TryRemove(clientId, out _);
+            if (clients.IsEmpty)
+                _subscriptions.TryRemove(securityId, out _);
         }
 
         var buf = new byte[12];
@@ -338,10 +292,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     {
         foreach (var (_, clients) in _subscriptions)
         {
-            clients.Remove(clientId);
+            clients.TryRemove(clientId, out _);
         }
-        var empty = _subscriptions.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key).ToList();
-        foreach (var key in empty) _subscriptions.Remove(key);
+        var empty = _subscriptions.Where(kv => kv.Value.IsEmpty).Select(kv => kv.Key).ToList();
+        foreach (var key in empty) _subscriptions.TryRemove(key, out _);
     }
 
     // --- Snapshot serialization (runs on feed thread — book is stable) ---
@@ -512,11 +466,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private void ForwardTradeEvent(ulong securityId, long price, long quantity, long tradeId)
     {
         // Always store — even if no subscribers, so late subscribers get history
-        if (!_recentTrades.TryGetValue(securityId, out var ring))
-        {
-            ring = new TradeRingBuffer(MaxRecentTrades);
-            _recentTrades[securityId] = ring;
-        }
+        var ring = _recentTrades.GetOrAdd(securityId, _ => new TradeRingBuffer(MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
 
         if (!_subscriptions.ContainsKey(securityId)) return;
@@ -669,8 +619,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     internal sealed class TradeRingBuffer
     {
         private readonly (long Price, long Qty, long TradeId)[] _buf;
-        private int _head; // next write position
-        private int _count;
+        private volatile int _head; // next write position
+        private volatile int _count;
 
         public TradeRingBuffer(int capacity) => _buf = new (long, long, long)[capacity];
 
@@ -681,11 +631,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             if (_count < _buf.Length) _count++;
         }
 
-        /// <summary>Iterates oldest → newest.</summary>
+        /// <summary>Snapshot oldest → newest. Safe for concurrent reads.</summary>
         public IEnumerable<(long Price, long Qty, long TradeId)> AsSpan()
         {
-            int start = _count < _buf.Length ? 0 : _head;
-            for (int i = 0; i < _count; i++)
+            int count = _count;
+            int head = _head;
+            int start = count < _buf.Length ? 0 : head;
+            for (int i = 0; i < count; i++)
                 yield return _buf[(start + i) % _buf.Length];
         }
     }
