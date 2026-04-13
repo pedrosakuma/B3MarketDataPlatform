@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <RootNamespace>B3.Umdf.Server</RootNamespace>
+    <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
   </PropertyGroup>
 
   <ItemGroup>

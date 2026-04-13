@@ -19,7 +19,7 @@ public sealed class MulticastFeedConfig
     public static MulticastFeedConfig Load(string path)
     {
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<MulticastFeedConfig>(json, JsonOptions)
+        return JsonSerializer.Deserialize(json, FeedConfigJsonContext.Default.MulticastFeedConfig)
             ?? throw new InvalidOperationException($"Failed to parse multicast config: {path}");
     }
 
@@ -51,14 +51,6 @@ public sealed class MulticastFeedConfig
     /// </summary>
     public List<int> GetGroupIds() =>
         Enumerable.Range(0, ChannelGroups.Count).ToList();
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true
-    };
 }
 
 public sealed class ChannelGroupConfig
@@ -87,3 +79,11 @@ public sealed class ChannelEntryConfig
     [JsonPropertyName("sourceAddress")]
     public string? SourceAddress { get; set; }
 }
+
+[JsonSerializable(typeof(MulticastFeedConfig))]
+[JsonSourceGenerationOptions(
+    PropertyNameCaseInsensitive = true,
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true,
+    UseStringEnumConverter = true)]
+internal partial class FeedConfigJsonContext : JsonSerializerContext;
