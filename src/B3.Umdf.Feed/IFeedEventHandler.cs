@@ -10,4 +10,10 @@ public interface IFeedEventHandler
     void OnSnapshotStart();
     void OnSnapshotComplete(uint lastRptSeq);
     void OnInstrumentDefinitionsComplete(int instrumentCount);
+
+    /// <summary>
+    /// Called after all SBE messages in a UMDF packet have been dispatched.
+    /// Used as a batch boundary for upstream conflation.
+    /// </summary>
+    void OnPacketProcessed() { }
 }

@@ -326,8 +326,10 @@ using var statsTimer = new Timer(_ =>
 
     if (subscriptionManager is not null)
     {
-        foreach (var (id, depth, conflated) in subscriptionManager.GetClientStats())
-            Console.WriteLine($"   {id}: queue={depth:N0}  conflated={conflated:N0}");
+        foreach (var (id, depth) in subscriptionManager.GetClientStats())
+            Console.WriteLine($"   {id}: queue={depth:N0}");
+        if (subscriptionManager.UpstreamConflated > 0)
+            Console.WriteLine($"   upstream conflated: {subscriptionManager.UpstreamConflated:N0}");
     }
 
     if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)

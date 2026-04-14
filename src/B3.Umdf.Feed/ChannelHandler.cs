@@ -46,6 +46,7 @@ public sealed class ChannelHandler
 
         _packetsProcessed++;
         MessageDispatcher.Dispatch(in packet, span, _eventHandler);
+        _eventHandler.OnPacketProcessed();
         return gapResult;
     }
 

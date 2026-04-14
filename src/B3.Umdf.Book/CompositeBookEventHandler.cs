@@ -48,4 +48,9 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
     {
         foreach (var h in _handlers) h.OnExecutionSummary(securityId, lastPx, fillQty);
     }
+
+    public void OnBatchComplete()
+    {
+        foreach (var h in _handlers) h.OnBatchComplete();
+    }
 }

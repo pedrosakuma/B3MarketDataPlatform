@@ -207,6 +207,7 @@ public sealed class FeedHandler : IDisposable
             case ChannelType.InstrumentDefinition:
                 // Keep processing instrument definitions for symbol/market data updates
                 MessageDispatcher.Dispatch(in packet, _eventHandler);
+                _eventHandler.OnPacketProcessed();
                 break;
 
             // SnapshotRecovery: ignore during RealTime — incremental stream is source of truth

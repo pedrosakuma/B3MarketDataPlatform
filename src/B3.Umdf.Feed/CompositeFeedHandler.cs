@@ -49,4 +49,10 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
         foreach (var handler in _handlers)
             handler.OnInstrumentDefinitionsComplete(instrumentCount);
     }
+
+    public void OnPacketProcessed()
+    {
+        foreach (var handler in _handlers)
+            handler.OnPacketProcessed();
+    }
 }

@@ -7,66 +7,10 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Server;
 
-/// <summary>Discriminator for outbound events in the conflation channel.</summary>
-public enum OutboundEventKind : byte
-{
-    /// <summary>Pre-serialized message sent as-is (control messages, trades, snapshots).</summary>
-    Passthrough,
-    /// <summary>MBO order add — conflatable per orderId.</summary>
-    OrderAdded,
-    /// <summary>MBO order update — conflatable per orderId.</summary>
-    OrderUpdated,
-    /// <summary>MBO order delete — conflatable per orderId.</summary>
-    OrderDeleted,
-    /// <summary>Book cleared event — purges pending orders for that security/side in conflation.</summary>
-    BookCleared,
-}
-
-/// <summary>
-/// Outbound event for the conflation channel.
-/// For Passthrough, RawData carries pre-serialized bytes.
-/// For Order* kinds, the typed fields carry the event data (serialized after conflation).
-/// </summary>
-public readonly struct OutboundEvent
-{
-    public OutboundEventKind Kind { get; }
-    public ReadOnlyMemory<byte> RawData { get; }
-    public ulong SecurityId { get; }
-    public ulong OrderId { get; }
-    public byte Side { get; }
-    public long Price { get; }
-    public long Quantity { get; }
-
-    private OutboundEvent(OutboundEventKind kind, ReadOnlyMemory<byte> rawData,
-        ulong securityId, ulong orderId, byte side, long price, long quantity)
-    {
-        Kind = kind;
-        RawData = rawData;
-        SecurityId = securityId;
-        OrderId = orderId;
-        Side = side;
-        Price = price;
-        Quantity = quantity;
-    }
-
-    public static OutboundEvent Passthrough(ReadOnlyMemory<byte> data) =>
-        new(OutboundEventKind.Passthrough, data, 0, 0, 0, 0, 0);
-
-    public static OutboundEvent OrderAdd(ulong securityId, ulong orderId, byte side, long price, long qty) =>
-        new(OutboundEventKind.OrderAdded, default, securityId, orderId, side, price, qty);
-
-    public static OutboundEvent OrderUpdate(ulong securityId, ulong orderId, byte side, long price, long qty) =>
-        new(OutboundEventKind.OrderUpdated, default, securityId, orderId, side, price, qty);
-
-    public static OutboundEvent OrderDelete(ulong securityId, ulong orderId, byte side) =>
-        new(OutboundEventKind.OrderDeleted, default, securityId, orderId, side, 0, 0);
-
-    public static OutboundEvent BookClear(ulong securityId, byte clearSide) =>
-        new(OutboundEventKind.BookCleared, default, securityId, 0, clearSide, 0, 0);
-}
-
 /// <summary>
 /// Per-WebSocket-connection state. Manages subscriptions and outbound message channel.
+/// All book/trade events arrive pre-serialized from upstream conflation in SubscriptionManager.
+/// The write loop coalesces pre-serialized messages + dirty-flag info into single WebSocket frames.
 /// </summary>
 public sealed class ClientSession : IDisposable
 {
@@ -74,7 +18,7 @@ public sealed class ClientSession : IDisposable
 
     public string Id { get; }
     public WebSocket Socket { get; }
-    private readonly Channel<OutboundEvent> _outbound;
+    private readonly Channel<ReadOnlyMemory<byte>> _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
     private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
     private MarketDataManager? _marketDataManager;
@@ -90,7 +34,7 @@ public sealed class ClientSession : IDisposable
         Socket = socket;
         ChannelCapacity = channelCapacity;
         _logger = logger ?? NullLogger.Instance;
-        _outbound = Channel.CreateUnbounded<OutboundEvent>(new UnboundedChannelOptions
+        _outbound = Channel.CreateUnbounded<ReadOnlyMemory<byte>>(new UnboundedChannelOptions
         {
             SingleWriter = false,
         });
@@ -116,86 +60,37 @@ public sealed class ClientSession : IDisposable
     public void SetMarketDataManager(MarketDataManager mdm) =>
         _marketDataManager = mdm;
 
-    private long _conflatedMessages;
-
-    /// <summary>Number of messages eliminated by conflation.</summary>
-    public long ConflatedMessages => Volatile.Read(ref _conflatedMessages);
-
     /// <summary>Current outbound queue depth.</summary>
     public int QueueDepth => _outbound.Reader.CanCount ? _outbound.Reader.Count : 0;
 
     /// <summary>Soft capacity reference for slow-client detection.</summary>
     public int ChannelCapacity { get; }
 
-    // --- Enqueue methods (called from the feed thread) ---
+    // --- Enqueue methods (called from feed thread / SubscriptionManager) ---
 
     /// <summary>
-    /// Enqueue a pre-serialized message (passthrough — control, trades, snapshots).
-    /// Unbounded — never drops.
+    /// Enqueue a pre-serialized message. All events (orders, trades, clears, control)
+    /// arrive pre-serialized from upstream conflation. Unbounded — never drops.
     /// </summary>
     public void TryEnqueue(ReadOnlyMemory<byte> message) =>
-        _outbound.Writer.TryWrite(OutboundEvent.Passthrough(message));
+        _outbound.Writer.TryWrite(message);
 
-    /// <summary>
-    /// Enqueue a typed order event for MBO conflation.
-    /// Orders with the same orderId are conflated in the write loop.
-    /// </summary>
-    public void TryEnqueueOrder(MessageType type, ulong securityId, ulong orderId, byte side, long price, long qty)
-    {
-        var evt = type switch
-        {
-            MessageType.OrderAdded => OutboundEvent.OrderAdd(securityId, orderId, side, price, qty),
-            MessageType.OrderUpdated => OutboundEvent.OrderUpdate(securityId, orderId, side, price, qty),
-            MessageType.OrderDeleted => OutboundEvent.OrderDelete(securityId, orderId, side),
-            _ => throw new ArgumentException($"Invalid order message type: {type}")
-        };
-        _outbound.Writer.TryWrite(evt);
-    }
+    // --- Write loop: coalesce + dirty-flag info ---
 
-    /// <summary>
-    /// Enqueue a book cleared event. Purges pending order events for the security/side
-    /// in the conflation dictionary to maintain correct ordering.
-    /// </summary>
-    public void TryEnqueueBookCleared(ulong securityId, byte clearSide) =>
-        _outbound.Writer.TryWrite(OutboundEvent.BookClear(securityId, clearSide));
-
-    // --- Write loop with conflation + coalescing ---
-
-    private enum PendingOrderKind : byte { Added, Updated, Deleted }
-
-    private readonly struct PendingOrder
-    {
-        public PendingOrderKind Kind { get; }
-        public ulong SecurityId { get; }
-        public byte Side { get; }
-        public long Price { get; }
-        public long Quantity { get; }
-
-        public PendingOrder(PendingOrderKind kind, ulong securityId, byte side, long price, long qty)
-        {
-            Kind = kind; SecurityId = securityId; Side = side; Price = price; Quantity = qty;
-        }
-    }
-
-    /// <summary>
-    /// Write loop: drains the outbound channel, conflates MBO order events,
-    /// then reads dirty info via version counters, serializes and coalesces
-    /// into a single WebSocket binary frame.
-    /// Drain is bounded per cycle to keep frames small and the loop responsive.
-    /// </summary>
     private const double SlowClientThreshold = 0.75;
     private const int SlowClientMaxTicks = 100;
     private const int MaxDrainPerCycle = 16384;
 
+    /// <summary>
+    /// Write loop: drains the outbound channel (pre-serialized messages),
+    /// reads dirty info via version counters, coalesces everything
+    /// into a single WebSocket binary frame.
+    /// </summary>
     public async Task RunWriteLoopAsync()
     {
         var ct = _cts.Token;
         var coalesceBuf = new byte[65536];
-
-        // Reusable buffers — cleared each drain cycle
-        var passthroughList = new List<ReadOnlyMemory<byte>>();
-        var pendingOrders = new Dictionary<ulong, PendingOrder>();
-        var bookClearList = new List<(ulong SecurityId, byte Side)>();
+        var messages = new List<ReadOnlyMemory<byte>>();
         int slowTicks = 0;
 
         try
@@ -205,74 +100,25 @@ public sealed class ClientSession : IDisposable
             {
                 if (Socket.State != WebSocketState.Open) break;
 
-                // 1. Drain up to MaxDrainPerCycle events with MBO order conflation
-                passthroughList.Clear();
-                pendingOrders.Clear();
-                bookClearList.Clear();
-
+                // 1. Drain up to MaxDrainPerCycle pre-serialized messages
+                messages.Clear();
                 int drained = 0;
-                while (drained < MaxDrainPerCycle && reader.TryRead(out var evt))
+                while (drained < MaxDrainPerCycle && reader.TryRead(out var msg))
                 {
                     drained++;
-                    switch (evt.Kind)
-                    {
-                        case OutboundEventKind.Passthrough:
-                            passthroughList.Add(evt.RawData);
-                            break;
-                        case OutboundEventKind.OrderAdded:
-                        case OutboundEventKind.OrderUpdated:
-                        case OutboundEventKind.OrderDeleted:
-                            ConflateOrder(pendingOrders, evt);
-                            break;
-                        case OutboundEventKind.BookCleared:
-                            PurgeOrdersForClear(pendingOrders, evt.SecurityId, evt.Side);
-                            bookClearList.Add((evt.SecurityId, evt.Side));
-                            break;
-                    }
+                    messages.Add(msg);
                 }
 
-                // 2. Serialize into coalesced buffer
+                // 2. Coalesce into buffer
                 int offset = 0;
-
-                // Passthrough (snapshots, control messages, trades)
-                foreach (var raw in passthroughList)
+                foreach (var raw in messages)
                 {
                     EnsureCapacity(ref coalesceBuf, offset, raw.Length);
                     raw.Span.CopyTo(coalesceBuf.AsSpan(offset));
                     offset += raw.Length;
                 }
 
-                // Book clears before orders
-                foreach (var (secId, side) in bookClearList)
-                {
-                    EnsureCapacity(ref coalesceBuf, offset, 13);
-                    WireProtocol.WriteBookCleared(coalesceBuf.AsSpan(offset), secId, side);
-                    offset += 13;
-                }
-
-                // Conflated orders
-                foreach (var (orderId, pending) in pendingOrders)
-                {
-                    if (pending.Kind == PendingOrderKind.Deleted)
-                    {
-                        EnsureCapacity(ref coalesceBuf, offset, 21);
-                        WireProtocol.WriteOrderDeleted(coalesceBuf.AsSpan(offset),
-                            pending.SecurityId, orderId, pending.Side);
-                        offset += 21;
-                    }
-                    else
-                    {
-                        var msgType = pending.Kind == PendingOrderKind.Added
-                            ? MessageType.OrderAdded : MessageType.OrderUpdated;
-                        EnsureCapacity(ref coalesceBuf, offset, 37);
-                        WireProtocol.WriteOrderEvent(coalesceBuf.AsSpan(offset), msgType,
-                            pending.SecurityId, orderId, pending.Side, pending.Price, pending.Quantity);
-                        offset += 37;
-                    }
-                }
-
                 // 3. Dirty-flag info: read latest from MarketDataManager for changed securities
-                int infoCount = 0;
                 if (_marketDataManager is { } mdm)
                 {
                     foreach (var (secId, lastVer) in _infoVersions)
@@ -285,19 +131,14 @@ public sealed class ClientSession : IDisposable
                         int len = WireProtocol.WriteInfoSnapshot(coalesceBuf.AsSpan(offset), secId, info);
                         offset += len;
                         _infoVersions[secId] = ver;
-                        infoCount++;
                     }
                 }
-
-                Interlocked.Add(ref _conflatedMessages,
-                    passthroughList.Count + pendingOrders.Count + bookClearList.Count + infoCount);
 
                 if (offset > 0)
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
 
-                // 4. Slow-client self-detection: if queue stays above threshold
-                // after drain+send, this client can't keep up.
+                // 4. Slow-client self-detection
                 int remaining = QueueDepth;
                 if (remaining > ChannelCapacity * SlowClientThreshold)
                 {
@@ -319,84 +160,6 @@ public sealed class ClientSession : IDisposable
         {
             _logger.LogWarning("Write error on {ClientId}: {Error}", Id, ex.Message);
         }
-    }
-
-    /// <summary>Serialize a typed order event into a pre-built byte buffer.</summary>
-    private static ReadOnlyMemory<byte> SerializeOrderEvent(OutboundEvent evt)
-    {
-        if (evt.Kind == OutboundEventKind.OrderDeleted)
-        {
-            var buf = new byte[21];
-            WireProtocol.WriteOrderDeleted(buf, evt.SecurityId, evt.OrderId, evt.Side);
-            return buf;
-        }
-        else
-        {
-            var buf = new byte[37];
-            var msgType = evt.Kind == OutboundEventKind.OrderAdded
-                ? MessageType.OrderAdded : MessageType.OrderUpdated;
-            WireProtocol.WriteOrderEvent(buf, msgType, evt.SecurityId, evt.OrderId, evt.Side, evt.Price, evt.Quantity);
-            return buf;
-        }
-    }
-
-    /// <summary>
-    /// MBO order conflation state machine.
-    /// Add+Delete → cancel. Add+Update → Add(new). Update+Update → Update(new).
-    /// Update+Delete → Delete. Delete+Add → Update(new).
-    /// </summary>
-    private static void ConflateOrder(Dictionary<ulong, PendingOrder> orders, OutboundEvent evt)
-    {
-        if (orders.TryGetValue(evt.OrderId, out var existing))
-        {
-            if (evt.Kind == OutboundEventKind.OrderDeleted)
-            {
-                if (existing.Kind == PendingOrderKind.Added)
-                    orders.Remove(evt.OrderId); // Add+Delete → cancel entirely
-                else
-                    orders[evt.OrderId] = new PendingOrder(PendingOrderKind.Deleted,
-                        evt.SecurityId, evt.Side, 0, 0);
-            }
-            else
-            {
-                // Add or Update: preserve Add kind if original was Add
-                var kind = existing.Kind == PendingOrderKind.Added
-                    ? PendingOrderKind.Added : PendingOrderKind.Updated;
-                orders[evt.OrderId] = new PendingOrder(kind,
-                    evt.SecurityId, evt.Side, evt.Price, evt.Quantity);
-            }
-        }
-        else
-        {
-            var kind = evt.Kind switch
-            {
-                OutboundEventKind.OrderAdded => PendingOrderKind.Added,
-                OutboundEventKind.OrderUpdated => PendingOrderKind.Updated,
-                _ => PendingOrderKind.Deleted,
-            };
-            orders[evt.OrderId] = new PendingOrder(kind,
-                evt.SecurityId, evt.Side, evt.Price, evt.Quantity);
-        }
-    }
-
-    /// <summary>
-    /// Purges pending order events that would be superseded by a BookCleared.
-    /// clearSide: 0=Both, 1=Bid, 2=Ask. Order side: 0=Bid, 1=Ask.
-    /// </summary>
-    private static void PurgeOrdersForClear(Dictionary<ulong, PendingOrder> orders, ulong securityId, byte clearSide)
-    {
-        List<ulong>? toRemove = null;
-        foreach (var (orderId, pending) in orders)
-        {
-            if (pending.SecurityId != securityId) continue;
-            // clearSide 0=Both, 1=Bid (matches side 0), 2=Ask (matches side 1)
-            if (clearSide != 0 && pending.Side != (clearSide - 1)) continue;
-            toRemove ??= new();
-            toRemove.Add(orderId);
-        }
-        if (toRemove is not null)
-            foreach (var id in toRemove)
-                orders.Remove(id);
     }
 
     private static void EnsureCapacity(ref byte[] buf, int offset, int needed)

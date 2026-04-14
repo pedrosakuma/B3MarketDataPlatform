@@ -19,4 +19,10 @@ public interface IBookEventHandler
     void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId) { }
     void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
     void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
+
+    /// <summary>
+    /// Called after all messages in a packet batch have been processed.
+    /// Used as flush signal for upstream conflation buffers.
+    /// </summary>
+    void OnBatchComplete() { }
 }

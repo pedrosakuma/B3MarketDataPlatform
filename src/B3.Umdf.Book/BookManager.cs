@@ -151,6 +151,7 @@ public sealed class BookManager : IFeedEventHandler
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
+    public void OnPacketProcessed() { _eventHandler?.OnBatchComplete(); }
 
     // Post-lock action tags for HandleOrder to avoid callbacks under lock.
     private const int ActionNone = 0, ActionAdded = 1, ActionUpdated = 2, ActionDeleted = 3;
