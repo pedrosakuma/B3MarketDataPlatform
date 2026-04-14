@@ -1,17 +1,10 @@
 // DOM helpers, formatting, and rendering with DOM pooling.
-// All hot-path renders update pre-created DOM elements via .textContent — no innerHTML.
+// All render functions are parameterized — no global state imports.
+// Main thread only: receives pre-computed data from worker, updates DOM pools.
 
 import { INFO_FIELDS, PRICE_FIELDS, flagsStr } from './protocol.js';
-import { subscriptions, rankings, state, stats } from './state.js';
 
 export const $ = (id) => document.getElementById(id);
-
-export function secIdStr(bigint) { return bigint.toString(); }
-
-function ts() {
-  const d = new Date();
-  return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
-}
 
 export function formatPrice(mantissa) {
   const dec = parseInt($('priceDecimals').value) || 0;
@@ -38,7 +31,7 @@ const MAX_BOOK_LEVELS = 15;
 const MAX_TRADES = 50;
 const MAX_RANK_ITEMS = 10;
 
-// Book pool: pre-created bid/ask rows + spread bar + summary line
+// Book pool
 let bookPool = null;
 
 function getBookPool() {
@@ -46,12 +39,10 @@ function getBookPool() {
   const body = $('bookBody');
   body.innerHTML = '';
 
-  // Summary line
   const summary = document.createElement('div');
   summary.style.cssText = 'font-size:.7rem;color:var(--muted);margin-bottom:.3rem';
   body.appendChild(summary);
 
-  // Spread bar
   const spread = document.createElement('div');
   spread.className = 'spread-bar';
   spread.style.display = 'none';
@@ -64,12 +55,10 @@ function getBookPool() {
   spread.appendChild(sBid);
   spread.appendChild(document.createTextNode(' / '));
   spread.appendChild(sAsk);
-  const nbsp = document.createTextNode('\u00a0\u00a0Spread: ');
-  spread.appendChild(nbsp);
+  spread.appendChild(document.createTextNode('\u00a0\u00a0Spread: '));
   spread.appendChild(sSpread);
   body.appendChild(spread);
 
-  // Grid
   const grid = document.createElement('div');
   grid.className = 'book-grid';
   body.appendChild(grid);
@@ -88,7 +77,6 @@ function getBookPool() {
       thead.appendChild(el);
     }
     table.appendChild(thead);
-
     const rows = [];
     for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
       const tr = document.createElement('tr');
@@ -102,14 +90,10 @@ function getBookPool() {
       const bar = document.createElement('div');
       bar.className = label === 'Bids' ? 'depth-bar bid-bar' : 'depth-bar ask-bar';
       tdDepth.appendChild(bar);
-      tr.appendChild(tdPrice);
-      tr.appendChild(tdQty);
-      tr.appendChild(tdCount);
-      tr.appendChild(tdDepth);
+      tr.appendChild(tdPrice); tr.appendChild(tdQty); tr.appendChild(tdCount); tr.appendChild(tdDepth);
       table.appendChild(tr);
       rows.push({ tr, tdPrice, tdQty, tdCount, bar });
     }
-    // Empty placeholder row
     const emptyTr = document.createElement('tr');
     emptyTr.style.display = 'none';
     const emptyTd = document.createElement('td');
@@ -118,7 +102,6 @@ function getBookPool() {
     emptyTd.textContent = 'empty';
     emptyTr.appendChild(emptyTd);
     table.appendChild(emptyTr);
-
     side.appendChild(table);
     grid.appendChild(side);
     return { rows, emptyTr };
@@ -127,7 +110,6 @@ function getBookPool() {
   const bidSide = createSide('Bids');
   const askSide = createSide('Asks');
 
-  // Empty state overlay
   const emptyMsg = document.createElement('div');
   emptyMsg.className = 'empty-msg';
   emptyMsg.textContent = 'No book data';
@@ -142,19 +124,17 @@ function getBookPool() {
   return bookPool;
 }
 
-// Trade pool: pre-created table rows
+// Trade pool
 let tradePool = null;
 
 function getTradePool() {
   if (tradePool) return tradePool;
   const body = $('tradeBody');
   body.innerHTML = '';
-
   const emptyMsg = document.createElement('div');
   emptyMsg.className = 'empty-msg';
   emptyMsg.textContent = 'No trades yet';
   body.appendChild(emptyMsg);
-
   const table = document.createElement('table');
   table.className = 'trade-table';
   table.style.display = 'none';
@@ -165,18 +145,14 @@ function getTradePool() {
     thead.appendChild(el);
   }
   table.appendChild(thead);
-
   const rows = [];
   for (let i = 0; i < MAX_TRADES; i++) {
     const tr = document.createElement('tr');
     tr.style.display = 'none';
-    const tdTime = document.createElement('td');
-    tdTime.className = 'trade-time';
+    const tdTime = document.createElement('td'); tdTime.className = 'trade-time';
     const tdPrice = document.createElement('td');
     const tdQty = document.createElement('td');
-    tr.appendChild(tdTime);
-    tr.appendChild(tdPrice);
-    tr.appendChild(tdQty);
+    tr.appendChild(tdTime); tr.appendChild(tdPrice); tr.appendChild(tdQty);
     table.appendChild(tr);
     rows.push({ tr, tdTime, tdPrice, tdQty });
   }
@@ -185,24 +161,21 @@ function getTradePool() {
   return tradePool;
 }
 
-// Info pool: pre-created items for each INFO_FIELDS entry
+// Info pool
 let infoPool = null;
 
 function getInfoPool() {
   if (infoPool) return infoPool;
   const body = $('infoBody');
   body.innerHTML = '';
-
   const emptyMsg = document.createElement('div');
   emptyMsg.className = 'empty-msg';
   emptyMsg.textContent = 'No info data';
   body.appendChild(emptyMsg);
-
   const grid = document.createElement('div');
   grid.className = 'info-grid';
   grid.style.display = 'none';
   body.appendChild(grid);
-
   const items = {};
   for (const field of INFO_FIELDS) {
     const item = document.createElement('div');
@@ -213,8 +186,7 @@ function getInfoPool() {
     label.textContent = field;
     const value = document.createElement('span');
     value.className = 'info-value';
-    item.appendChild(label);
-    item.appendChild(value);
+    item.appendChild(label); item.appendChild(value);
     grid.appendChild(item);
     items[field] = { item, value };
   }
@@ -222,48 +194,37 @@ function getInfoPool() {
   return infoPool;
 }
 
-// Rankings pool: pre-created items with event delegation
+// Rankings pool
 let rankPool = null;
 
 function getRankPool() {
   if (rankPool) return rankPool;
   const list = $('rankList');
   list.innerHTML = '';
-
   const emptyMsg = document.createElement('div');
   emptyMsg.className = 'empty-msg';
   emptyMsg.textContent = 'Waiting for data...';
   list.appendChild(emptyMsg);
-
   const connectMsg = document.createElement('div');
   connectMsg.className = 'empty-msg';
   connectMsg.textContent = 'Connect to see rankings';
   connectMsg.style.display = 'none';
   list.appendChild(connectMsg);
-
-  // Event delegation for clicks
   list.addEventListener('click', (e) => {
     const item = e.target.closest('.rank-item');
     if (item && item.dataset.symbol && window.rankingClick) {
       window.rankingClick(item.dataset.symbol);
     }
   });
-
   const rows = [];
   for (let i = 0; i < MAX_RANK_ITEMS; i++) {
     const div = document.createElement('div');
     div.className = 'rank-item';
     div.style.display = 'none';
-    const pos = document.createElement('span');
-    pos.className = 'rank-pos';
-    pos.textContent = String(i + 1);
-    const sym = document.createElement('span');
-    sym.className = 'rank-sym';
-    const val = document.createElement('span');
-    val.className = 'rank-val';
-    div.appendChild(pos);
-    div.appendChild(sym);
-    div.appendChild(val);
+    const pos = document.createElement('span'); pos.className = 'rank-pos'; pos.textContent = String(i + 1);
+    const sym = document.createElement('span'); sym.className = 'rank-sym';
+    const val = document.createElement('span'); val.className = 'rank-val';
+    div.appendChild(pos); div.appendChild(sym); div.appendChild(val);
     list.appendChild(div);
     rows.push({ div, sym, val });
   }
@@ -279,8 +240,6 @@ function getSubPool() {
   if (subPool) return subPool;
   const ul = $('subList');
   ul.innerHTML = '';
-
-  // Event delegation
   ul.addEventListener('click', (e) => {
     const li = e.target.closest('.sub-item');
     if (!li) return;
@@ -290,7 +249,6 @@ function getSubPool() {
       if (window.selectSubscription) window.selectSubscription(li.dataset.id);
     }
   });
-
   const rows = [];
   for (let i = 0; i < SUB_POOL_SIZE; i++) {
     const li = document.createElement('li');
@@ -309,8 +267,7 @@ function getSubPool() {
     btn.className = 'sub-unsub';
     btn.title = 'Unsubscribe';
     btn.textContent = '\u2715';
-    li.appendChild(span);
-    li.appendChild(btn);
+    li.appendChild(span); li.appendChild(btn);
     ul.appendChild(li);
     rows.push({ li, strong, flags });
   }
@@ -318,68 +275,37 @@ function getSubPool() {
   return subPool;
 }
 
-// ── Render functions (update pre-created DOM, no innerHTML on hot path) ──
+// ── Parameterized render functions ──
 
-export function renderSubList() {
+export function renderSubList(subs, selectedId) {
   const pool = getSubPool();
-  $('subEmpty').style.display = subscriptions.size === 0 ? '' : 'none';
-  let idx = 0;
-  for (const [id, sub] of subscriptions) {
-    if (idx >= pool.rows.length) break;
-    const row = pool.rows[idx];
-    row.li.style.display = '';
-    row.li.dataset.id = id;
-    row.li.className = 'sub-item' + (id === state.selectedSecurityId ? ' active' : '');
-    row.strong.textContent = sub.symbol;
-    row.flags.textContent = '[' + flagsStr(sub.flags) + ']';
-    idx++;
-  }
-  for (let i = idx; i < pool.rows.length; i++) {
-    pool.rows[i].li.style.display = 'none';
-  }
-}
-
-export function renderRankings() {
-  const tab = state.rankingsTab;
-  for (const t of ['volume', 'gainers', 'losers']) {
-    const btn = $('rankTab_' + t);
-    if (btn) btn.className = 'rank-tab' + (t === tab ? ' active' : '');
-  }
-
-  const pool = getRankPool();
-  const connected = state.ws && state.ws.readyState === WebSocket.OPEN;
-  const entries = rankings[tab] || [];
-
-  pool.connectMsg.style.display = !connected ? '' : 'none';
-  pool.emptyMsg.style.display = connected && entries.length === 0 ? '' : 'none';
-
+  $('subEmpty').style.display = (!subs || subs.length === 0) ? '' : 'none';
+  if (!subs) subs = [];
   for (let i = 0; i < pool.rows.length; i++) {
     const row = pool.rows[i];
-    if (i < entries.length) {
-      const e = entries[i];
-      row.div.style.display = '';
-      row.div.dataset.symbol = e.symbol;
-      row.sym.textContent = e.symbol;
-      row.val.textContent = tab === 'volume' ? formatQty(e.value) : formatPrice(e.value);
-      row.val.className = 'rank-val' + (tab === 'losers' ? ' ask-price' : tab === 'gainers' ? ' bid-price' : '');
+    if (i < subs.length) {
+      const s = subs[i];
+      row.li.style.display = '';
+      row.li.dataset.id = s.id;
+      row.li.className = 'sub-item' + (s.id === selectedId ? ' active' : '');
+      row.strong.textContent = s.symbol;
+      row.flags.textContent = '[' + flagsStr(s.flags) + ']';
     } else {
-      row.div.style.display = 'none';
+      row.li.style.display = 'none';
     }
   }
 }
 
-export function updateTitles() {
-  const sub = subscriptions.get(state.selectedSecurityId);
-  $('bookTitle').textContent = sub ? 'Order Book \u2014 ' + sub.symbol : 'Order Book';
-  $('infoTitle').textContent = sub ? 'Instrument Info \u2014 ' + sub.symbol : 'Instrument Info';
-  $('tradeTitle').textContent = sub ? 'Trades \u2014 ' + sub.symbol : 'Recent Trades';
+export function updateTitles(selectedSymbol) {
+  $('bookTitle').textContent = selectedSymbol ? 'Order Book \u2014 ' + selectedSymbol : 'Order Book';
+  $('infoTitle').textContent = selectedSymbol ? 'Instrument Info \u2014 ' + selectedSymbol : 'Instrument Info';
+  $('tradeTitle').textContent = selectedSymbol ? 'Trades \u2014 ' + selectedSymbol : 'Recent Trades';
 }
 
-export function renderBook() {
+export function renderBook(bookData) {
   const pool = getBookPool();
-  const sub = subscriptions.get(state.selectedSecurityId);
 
-  if (!sub || sub.orders.size === 0) {
+  if (!bookData) {
     pool.emptyMsg.style.display = '';
     pool.summary.style.display = 'none';
     pool.spread.style.display = 'none';
@@ -391,29 +317,10 @@ export function renderBook() {
   pool.summary.style.display = '';
   pool.grid.style.display = '';
 
-  // Compute MBP from MBO orders
-  const bidMap = new Map();
-  const askMap = new Map();
-  for (const [, order] of sub.orders) {
-    const map = order.side === 0 ? bidMap : askMap;
-    const existing = map.get(order.price);
-    if (existing) { existing.qty += order.qty; existing.count++; }
-    else map.set(order.price, { price: order.price, qty: order.qty, count: 1 });
-  }
-  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price);
-  const asks = [...askMap.values()].sort((a, b) => a.price - b.price);
+  const { bids, asks, maxQty, totalBids, totalAsks, totalOrders, orderCount } = bookData;
 
-  // Max qty for depth bars
-  let maxQty = 1;
-  const bLen = Math.min(bids.length, MAX_BOOK_LEVELS);
-  const aLen = Math.min(asks.length, MAX_BOOK_LEVELS);
-  for (let i = 0; i < bLen; i++) if (bids[i].qty > maxQty) maxQty = bids[i].qty;
-  for (let i = 0; i < aLen; i++) if (asks[i].qty > maxQty) maxQty = asks[i].qty;
+  pool.summary.textContent = totalBids + 'b/' + totalAsks + 'a | ' + totalOrders + ' orders | +' + orderCount + ' events';
 
-  // Summary
-  pool.summary.textContent = bids.length + 'b/' + asks.length + 'a | ' + sub.orders.size + ' orders | +' + sub.orderCount + ' events';
-
-  // Spread
   if (bids.length > 0 && asks.length > 0) {
     pool.spread.style.display = '';
     pool.sBid.textContent = formatPrice(bids[0].price);
@@ -423,10 +330,9 @@ export function renderBook() {
     pool.spread.style.display = 'none';
   }
 
-  // Update bid rows
   for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
     const row = pool.bids[i];
-    if (i < bLen) {
+    if (i < bids.length) {
       const b = bids[i];
       row.tr.style.display = '';
       row.tdPrice.textContent = formatPrice(b.price);
@@ -439,10 +345,9 @@ export function renderBook() {
   }
   pool.bidEmpty.style.display = bids.length === 0 ? '' : 'none';
 
-  // Update ask rows
   for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
     const row = pool.asks[i];
-    if (i < aLen) {
+    if (i < asks.length) {
       const a = asks[i];
       row.tr.style.display = '';
       row.tdPrice.textContent = formatPrice(a.price);
@@ -466,24 +371,20 @@ function tradingEventName(v) {
   return names[v] || 'Event(' + v + ')';
 }
 
-export function renderInfo() {
+export function renderInfo(infoData) {
   const pool = getInfoPool();
-  const sub = subscriptions.get(state.selectedSecurityId);
-
-  if (!sub || Object.keys(sub.info).length === 0) {
+  if (!infoData) {
     pool.emptyMsg.style.display = '';
     pool.grid.style.display = 'none';
     return;
   }
-
   pool.emptyMsg.style.display = 'none';
   pool.grid.style.display = '';
-
   for (const field of INFO_FIELDS) {
     const item = pool.items[field];
-    if (field in sub.info) {
+    if (field in infoData) {
       item.item.style.display = '';
-      const raw = sub.info[field];
+      const raw = infoData[field];
       let display;
       if (field === 'TradingStatus') display = tradingStatusName(raw);
       else if (field === 'TradingEvent') display = tradingEventName(raw);
@@ -496,31 +397,15 @@ export function renderInfo() {
   }
 }
 
-// ── Trade tape ──
-
-export function addTrade(sub, price, qty) {
-  if (!sub.trades) sub.trades = [];
-  const prevPrice = sub.trades.length > 0 ? sub.trades[sub.trades.length - 1].price : price;
-  const direction = price > prevPrice ? 'up' : price < prevPrice ? 'down' : 'flat';
-  sub.trades.push({ time: ts(), price, qty, direction });
-  if (sub.trades.length > MAX_TRADES) sub.trades.shift();
-}
-
-export function renderTrades() {
+export function renderTrades(trades) {
   const pool = getTradePool();
-  const sub = subscriptions.get(state.selectedSecurityId);
-  const trades = sub && sub.trades ? sub.trades : [];
-
-  if (trades.length === 0) {
+  if (!trades || trades.length === 0) {
     pool.emptyMsg.style.display = '';
     pool.table.style.display = 'none';
     return;
   }
-
   pool.emptyMsg.style.display = 'none';
   pool.table.style.display = '';
-
-  // Newest first: trades[len-1] goes to row 0
   const len = trades.length;
   for (let i = 0; i < MAX_TRADES; i++) {
     const row = pool.rows[i];
@@ -538,19 +423,41 @@ export function renderTrades() {
   }
 }
 
+export function renderRankings(rankingsData, tab, connected) {
+  for (const t of ['volume', 'gainers', 'losers']) {
+    const btn = $('rankTab_' + t);
+    if (btn) btn.className = 'rank-tab' + (t === tab ? ' active' : '');
+  }
+  const pool = getRankPool();
+  const entries = rankingsData ? (rankingsData[tab] || []) : [];
+  pool.connectMsg.style.display = !connected ? '' : 'none';
+  pool.emptyMsg.style.display = connected && entries.length === 0 ? '' : 'none';
+  for (let i = 0; i < pool.rows.length; i++) {
+    const row = pool.rows[i];
+    if (i < entries.length) {
+      const e = entries[i];
+      row.div.style.display = '';
+      row.div.dataset.symbol = e.symbol;
+      row.sym.textContent = e.symbol;
+      row.val.textContent = tab === 'volume' ? formatQty(e.value) : formatPrice(e.value);
+      row.val.className = 'rank-val' + (tab === 'losers' ? ' ask-price' : tab === 'gainers' ? ' bid-price' : '');
+    } else {
+      row.div.style.display = 'none';
+    }
+  }
+}
+
 // ── Health widget ──
 
-export function renderHealth() {
+export function renderHealth(healthData) {
   const el = $('healthInfo');
   if (!el) return;
-  const h = state.healthData;
-  if (!h) { el.textContent = '\u2014'; return; }
-
+  if (!healthData) { el.textContent = '\u2014'; return; }
   let parts = [];
-  parts.push(h.status === 'ready' ? '\ud83d\udfe2 Ready' : '\ud83d\udfe1 ' + (h.status || 'unknown'));
-  if (h.uptime) parts.push('\u23f1 ' + h.uptime);
-  if (h.feedGroups) {
-    const groups = Object.entries(h.feedGroups).map(([k, v]) => k + ':' + v).join(' ');
+  parts.push(healthData.status === 'ready' ? '\ud83d\udfe2 Ready' : '\ud83d\udfe1 ' + (healthData.status || 'unknown'));
+  if (healthData.uptime) parts.push('\u23f1 ' + healthData.uptime);
+  if (healthData.feedGroups) {
+    const groups = Object.entries(healthData.feedGroups).map(([k, v]) => k + ':' + v).join(' ');
     parts.push(groups);
   }
   el.textContent = parts.join(' \u2502 ');
@@ -562,9 +469,15 @@ const MAX_LOG = 200;
 let logCount = 0;
 const logBuffer = [];
 let logFlushScheduled = false;
+let logEnabled = true;
+
+function ts() {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
 
 export function addLog(text, cssClass) {
-  if (!state.logEnabled) return;
+  if (!logEnabled) return;
   logBuffer.push({ text, cssClass, time: ts() });
   if (!logFlushScheduled) {
     logFlushScheduled = true;
@@ -585,8 +498,7 @@ function flushLog() {
     const msgSpan = document.createElement('span');
     msgSpan.className = entry.cssClass || '';
     msgSpan.textContent = ' ' + entry.text;
-    div.appendChild(tsSpan);
-    div.appendChild(msgSpan);
+    div.appendChild(tsSpan); div.appendChild(msgSpan);
     frag.appendChild(div);
     logCount++;
   }
@@ -599,18 +511,19 @@ function flushLog() {
 export function clearLog() { $('logBody').innerHTML = ''; logCount = 0; logBuffer.length = 0; }
 
 export function setLogEnabled(enabled) {
-  state.logEnabled = enabled;
+  logEnabled = enabled;
   const logArea = document.querySelector('.log-area');
   if (logArea) logArea.classList.toggle('hidden', !enabled);
   if (!enabled) clearLog();
 }
 
-// ── Stats bar (called from unified render loop, no separate rAF) ──
+// ── Stats bar ──
 
-export function updateStats() {
-  $('statMsgs').textContent = stats.msgs.toLocaleString();
-  $('statBooks').textContent = stats.books.toLocaleString();
-  $('statInfo').textContent = stats.info.toLocaleString();
-  $('statOrders').textContent = stats.orders.toLocaleString();
-  $('statTrades').textContent = stats.trades.toLocaleString();
+export function updateStats(statsData) {
+  if (!statsData) return;
+  $('statMsgs').textContent = statsData.msgs.toLocaleString();
+  $('statBooks').textContent = statsData.books.toLocaleString();
+  $('statInfo').textContent = statsData.info.toLocaleString();
+  $('statOrders').textContent = statsData.orders.toLocaleString();
+  $('statTrades').textContent = statsData.trades.toLocaleString();
 }

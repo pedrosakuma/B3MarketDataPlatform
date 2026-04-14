@@ -1,20 +1,5 @@
-// Shared application state.
-// Mutable objects — modules import and mutate directly.
+// State is now split:
+// - Data state (subscriptions, orders, trades, rankings, stats) → worker.js
+// - View state (UI selections, health) → app.js local view object
+// - This file kept for backward compatibility but is no longer imported.
 
-export const state = {
-  ws: null,
-  selectedSecurityId: null,
-  autoReconnect: true,
-  reconnectAttempts: 0,
-  reconnectTimer: null,
-  healthData: null,
-  logEnabled: true,
-  rankingsTab: 'volume', // 'volume' | 'gainers' | 'losers'
-};
-
-// securityId (string) → { symbol, flags, securityId, book, orders, info, trades, orderCount, tradeCount }
-export const subscriptions = new Map();
-
-export const rankings = { volume: [], gainers: [], losers: [] };
-
-export const stats = { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 };
