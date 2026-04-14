@@ -25,6 +25,25 @@ public sealed class InstrumentInfo
     /// <summary>When true, this instrument's TradingStatus follows its SecurityGroup phase.</summary>
     public bool FollowsGroupStatus { get; set; } = true;
 
+    // Static instrument metadata (from SecurityDefinition_12)
+    public string? Symbol { get; set; }
+    public string? Asset { get; set; }
+    public string? IsinNumber { get; set; }
+    public string? Currency { get; set; }
+    public string? CfiCode { get; set; }
+    public int? SecurityType { get; set; }
+    public int? SecuritySubType { get; set; }
+    public int? Product { get; set; }
+    public long? MinPriceIncrement { get; set; }
+    public long? PriceDivisor { get; set; }
+    public long? ContractMultiplier { get; set; }
+    public long? StrikePrice { get; set; }
+    public int? MaturityDate { get; set; }
+    public int? PutOrCall { get; set; }
+    public int? ExerciseStyle { get; set; }
+    public int? MarketSegmentID { get; set; }
+    public int? TickSizeDenominator { get; set; }
+
     // Prices
     public long? OpeningPrice { get; set; }
     public long? ClosingPrice { get; set; }
@@ -64,6 +83,23 @@ public sealed class InstrumentInfo
         TradSesOpenTime = null;
         SecurityGroup = null;
         FollowsGroupStatus = true;
+        Symbol = null;
+        Asset = null;
+        IsinNumber = null;
+        Currency = null;
+        CfiCode = null;
+        SecurityType = null;
+        SecuritySubType = null;
+        Product = null;
+        MinPriceIncrement = null;
+        PriceDivisor = null;
+        ContractMultiplier = null;
+        StrikePrice = null;
+        MaturityDate = null;
+        PutOrCall = null;
+        ExerciseStyle = null;
+        MarketSegmentID = null;
+        TickSizeDenominator = null;
         OpeningPrice = null;
         ClosingPrice = null;
         HighPrice = null;

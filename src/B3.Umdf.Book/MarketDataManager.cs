@@ -136,7 +136,27 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
         info.SecurityGroup = msg.SecurityGroup.ToString().Trim();
+        info.Symbol = msg.Symbol.ToString().Trim();
+        info.Asset = msg.Asset.ToString().Trim();
+        info.CfiCode = msg.CfiCode.ToString().Trim();
+        info.Currency = msg.Currency.ToString().Trim();
+        info.IsinNumber = msg.IsinNumber.ToString().Trim();
+
+        info.SecurityType = (int)msg.SecurityType;
+        info.SecuritySubType = msg.SecuritySubType;
+        info.Product = (int)msg.Product;
+        info.MinPriceIncrement = msg.MinPriceIncrement.Mantissa;
+        info.PriceDivisor = msg.PriceDivisor.Mantissa;
+        info.ContractMultiplier = msg.ContractMultiplier.Mantissa;
+        info.StrikePrice = msg.StrikePrice.Mantissa;
+        info.MaturityDate = (int?)msg.MaturityDate;
+        info.PutOrCall = msg.PutOrCall is { } poc ? (int)poc : null;
+        info.ExerciseStyle = msg.ExerciseStyle is { } es ? (int)es : null;
+        info.MarketSegmentID = msg.MarketSegmentID;
+        info.TickSizeDenominator = msg.TickSizeDenominator;
+
         info.BumpVersion();
     }
 

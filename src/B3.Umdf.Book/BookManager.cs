@@ -106,6 +106,9 @@ public sealed class BookManager : IFeedEventHandler
         {
             switch (templateId)
             {
+                case SecurityDefinition_12Data.MESSAGE_ID:
+                    HandleSecurityDefinition(body);
+                    break;
                 case Order_MBO_50Data.MESSAGE_ID:
                     HandleOrder(body);
                     break;
@@ -156,6 +159,15 @@ public sealed class BookManager : IFeedEventHandler
 
     // Feed thread is the sole writer for all book mutations — no locks needed.
     // Callbacks are inline (same thread) so no race condition exists.
+
+    private void HandleSecurityDefinition(ReadOnlySpan<byte> body)
+    {
+        if (!SecurityDefinition_12Data.TryParse(body, out var reader))
+            return;
+
+        ulong securityId = (ulong)reader.Data.SecurityID;
+        GetOrCreateBook(securityId);
+    }
 
     private void HandleOrder(ReadOnlySpan<byte> body)
     {

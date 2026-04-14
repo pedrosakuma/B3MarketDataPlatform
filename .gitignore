@@ -51,3 +51,6 @@ BenchmarkDotNet.Artifacts/
 node_modules/
 package.json
 package-lock.json
+
+# Source generator output (for inspection only)
+src/B3.Umdf.Sbe/generated/
