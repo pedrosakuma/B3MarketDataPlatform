@@ -34,7 +34,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     // --- Upstream conflation buffers (populated per-packet, flushed on OnBatchComplete) ---
     private readonly Dictionary<ulong, BufferedOrder> _orderBuffer = new();
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
-    private readonly Dictionary<ulong, (long Price, long Qty, long TradeId)> _tradeBuffer = new();
+    // Trades aggregated by (securityId, price) — same-price trades sum quantities
+    private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
     private long _eventsReceived;
     private long _eventsFlushed;
 
@@ -346,7 +347,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
         Interlocked.Increment(ref _eventsReceived);
-        _tradeBuffer[securityId] = (price, quantity, tradeId);
+        var key = (securityId, price);
+        if (_tradeBuffer.TryGetValue(key, out var existing))
+            _tradeBuffer[key] = (existing.Qty + quantity, tradeId);
+        else
+            _tradeBuffer[key] = (quantity, tradeId);
     }
 
     public void OnBookCleared(ulong securityId, BookClearSide side)
@@ -364,7 +369,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
         Interlocked.Increment(ref _eventsReceived);
-        _tradeBuffer[securityId] = (price, quantity, tradeId);
+        var key = (securityId, price);
+        if (_tradeBuffer.TryGetValue(key, out var existing))
+            _tradeBuffer[key] = (existing.Qty + quantity, tradeId);
+        else
+            _tradeBuffer[key] = (quantity, tradeId);
     }
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
@@ -511,8 +520,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         }
         _orderBuffer.Clear();
 
-        // 3. Conflated trades (last per security per batch, serialize once)
-        foreach (var (secId, (price, qty, tradeId)) in _tradeBuffer)
+        // 3. Aggregated trades — same-price trades summed, different prices sent individually
+        foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
             var buf = new byte[36];
             WireProtocol.WriteTrade(buf, secId, price, qty, tradeId);
