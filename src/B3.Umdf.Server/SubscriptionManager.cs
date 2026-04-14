@@ -19,10 +19,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ILogger<SubscriptionManager> _logger;
 
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
-    // Per-security: clientId → DataFlags — accessed from multiple feed threads
-    private readonly ConcurrentDictionary<ulong, ConcurrentDictionary<string, DataFlags>> _subscriptions = new();
-    // Recent trades per security — only for subscribed securities
-    private readonly ConcurrentDictionary<ulong, TradeRingBuffer> _recentTrades = new();
+    // Per-security: clientId → DataFlags — feed-thread-only (reads and writes via ProcessPendingRequests)
+    private readonly Dictionary<ulong, Dictionary<string, DataFlags>> _subscriptions = new();
+    // Recent trades per security — feed-thread-only, only for subscribed securities
+    private readonly Dictionary<ulong, TradeRingBuffer> _recentTrades = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
     private const int RankingsTopN = 10;
@@ -154,11 +154,15 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         session.AddSubscription(securityId);
         if (flags.HasFlag(DataFlags.Info))
             session.AddInfoSubscription(securityId);
-        var clients = _subscriptions.GetOrAdd(securityId, _ => new ConcurrentDictionary<string, DataFlags>());
+        if (!_subscriptions.TryGetValue(securityId, out var clients))
+        {
+            clients = new Dictionary<string, DataFlags>();
+            _subscriptions[securityId] = clients;
+        }
         clients[clientId] = flags;
         // Ensure trade ring buffer exists for subscribed security
-        if (flags.HasFlag(DataFlags.Book))
-            _recentTrades.GetOrAdd(securityId, _ => new TradeRingBuffer(MaxRecentTrades));
+        if (flags.HasFlag(DataFlags.Book) && !_recentTrades.ContainsKey(securityId))
+            _recentTrades[securityId] = new TradeRingBuffer(MaxRecentTrades);
         AppMetrics.WsSubscriptions.Add(1);
     }
 
@@ -230,9 +234,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         session.RemoveSubscription(securityId);
         if (_subscriptions.TryGetValue(securityId, out var clients))
         {
-            clients.TryRemove(clientId, out _);
-            if (clients.IsEmpty)
-                _subscriptions.TryRemove(securityId, out _);
+            clients.Remove(clientId);
+            if (clients.Count == 0)
+                _subscriptions.Remove(securityId);
         }
 
         var buf = new byte[12];
@@ -242,12 +246,19 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void HandleUnsubscribeAll(string clientId)
     {
-        foreach (var (_, clients) in _subscriptions)
+        List<ulong>? empty = null;
+        foreach (var (secId, clients) in _subscriptions)
         {
-            clients.TryRemove(clientId, out _);
+            clients.Remove(clientId);
+            if (clients.Count == 0)
+            {
+                empty ??= new();
+                empty.Add(secId);
+            }
         }
-        var empty = _subscriptions.Where(kv => kv.Value.IsEmpty).Select(kv => kv.Key).ToList();
-        foreach (var key in empty) _subscriptions.TryRemove(key, out _);
+        if (empty is not null)
+            foreach (var key in empty)
+                _subscriptions.Remove(key);
     }
 
     // --- Snapshot serialization ---

@@ -57,12 +57,13 @@ public sealed class BookManager : IFeedEventHandler
 
     private void CheckCrossing(OrderBook book, string operation, ulong orderId, long price, BookSideType side)
     {
+        if (_crossingTransitions >= 20) return; // stop checking after log limit
         var bestBid = book.Bids.BestPrice();
         var bestAsk = book.Asks.BestPrice();
         if (bestBid is { } bid && bestAsk is { } ask && bid.Price >= ask.Price)
         {
-            Interlocked.Increment(ref _crossingTransitions);
-            if (_crossingTransitions <= 20) // Log first 20 crossings
+            var count = Interlocked.Increment(ref _crossingTransitions);
+            if (count <= 20)
             {
                 _logger.LogWarning(
                     "CROSSED: secId={SecurityId} after {Op} orderId={OrderId} price={Price} side={Side} " +
