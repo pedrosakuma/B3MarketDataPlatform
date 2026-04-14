@@ -56,13 +56,13 @@ public sealed class MultiFeedManager : IDisposable
         }
     }
 
-    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null)
+    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null)
     {
         _source = source;
         int idx = 0;
         foreach (var gid in groupIds)
         {
-            _handlers[gid] = new FeedHandler(eventHandler, feedLogger);
+            _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler);
             _channels[gid] = CreateGroupChannel();
             _groupIndex[gid] = idx++;
         }
@@ -72,13 +72,13 @@ public sealed class MultiFeedManager : IDisposable
     /// <summary>
     /// Creates a MultiFeedManager where each group has its own event handler.
     /// </summary>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null)
     {
         _source = source;
         int idx = 0;
         foreach (var (gid, handler) in groupHandlers)
         {
-            _handlers[gid] = new FeedHandler(handler, feedLogger);
+            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: marketDataHandler);
             _channels[gid] = CreateGroupChannel();
             _groupIndex[gid] = idx++;
         }

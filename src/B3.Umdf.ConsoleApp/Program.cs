@@ -246,13 +246,13 @@ var feedLogger = loggerFactory.CreateLogger<FeedHandler>();
 
 if (groupIds.Count > 1)
 {
-    multiFeed = new MultiFeedManager(packetSource, groupIds, composite, feedLogger);
+    multiFeed = new MultiFeedManager(packetSource, groupIds, composite, feedLogger, marketDataHandler: marketDataManager);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }
 else
 {
-    singleFeed = new FeedHandler(packetSource, composite, feedLogger);
+    singleFeed = new FeedHandler(packetSource, composite, feedLogger, marketDataHandler: marketDataManager);
 }
 
 if (subscriptionManager is not null)

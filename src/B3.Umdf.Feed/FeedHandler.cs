@@ -11,6 +11,7 @@ public sealed class FeedHandler : IDisposable
     private readonly IPacketSource? _source;
     private readonly ChannelHandler _incrementalHandler;
     private readonly IFeedEventHandler _eventHandler;
+    private readonly IFeedEventHandler? _marketDataHandler;
     private readonly ILogger<FeedHandler> _logger;
     private CancellationTokenSource? _cts;
     private Task? _runTask;
@@ -43,10 +44,11 @@ public sealed class FeedHandler : IDisposable
     /// <summary>Ticks (DateTime.UtcNow.Ticks) of the last packet processed. 0 if none yet.</summary>
     public long LastPacketTicks => Volatile.Read(ref _lastPacketTicks);
 
-    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null)
+    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
     {
         _source = source;
         _eventHandler = eventHandler;
+        _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
     }
@@ -55,10 +57,11 @@ public sealed class FeedHandler : IDisposable
     /// Creates a FeedHandler for external feeding (no owned source).
     /// Use FeedPacket() to push packets from an external loop.
     /// </summary>
-    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null)
+    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
     {
         _source = null;
         _eventHandler = eventHandler;
+        _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
     }
@@ -173,6 +176,7 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
+                DispatchMarketDataPassthrough(in packet);
                 EnqueueCopy(in packet);
                 break;
         }
@@ -188,6 +192,7 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
+                DispatchMarketDataPassthrough(in packet);
                 EnqueueCopy(in packet);
                 break;
         }
@@ -224,12 +229,25 @@ public sealed class FeedHandler : IDisposable
 
             case ChannelType.IncrementalA:
             case ChannelType.IncrementalB:
+                DispatchMarketDataPassthrough(in packet);
                 EnqueueCopy(in packet);
                 break;
         }
     }
 
     private long _instrDefPacketCount;
+
+    /// <summary>
+    /// Dispatches an incremental packet to the market data passthrough handler.
+    /// Used during WaitInstrumentDefinition, WaitSnapshot, and catch-up to preserve
+    /// market statistics (OpeningPrice, TradeVolume, etc.) that the B3 snapshot does not contain.
+    /// </summary>
+    private void DispatchMarketDataPassthrough(in UmdfPacket packet)
+    {
+        if (_marketDataHandler is null)
+            return;
+        MessageDispatcher.Dispatch(in packet, _marketDataHandler);
+    }
 
     /// <summary>
     /// Enqueues an incremental packet for later replay during catch-up.
@@ -419,6 +437,10 @@ public sealed class FeedHandler : IDisposable
 
             if (hdr.SequenceNumber <= catchUpFrom)
             {
+                // Snapshot only contains order book state, not market statistics.
+                // Dispatch discarded packets to market data handler so OpeningPrice,
+                // ExecutionStatistics (TradeVolume), HighPrice etc. are not lost.
+                DispatchMarketDataPassthrough(in queued);
                 discarded++;
                 continue;
             }
