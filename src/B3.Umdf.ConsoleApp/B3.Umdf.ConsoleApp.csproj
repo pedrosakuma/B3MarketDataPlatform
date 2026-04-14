@@ -5,6 +5,9 @@
     <RootNamespace>B3.Umdf.ConsoleApp</RootNamespace>
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- AOT codegen: target modern x64 with AVX2 for vectorized Span/Hash/Copy ops -->
+    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+    <IlcInstructionSet>native</IlcInstructionSet>
   </PropertyGroup>
 
   <ItemGroup>
