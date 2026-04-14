@@ -337,8 +337,14 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        if (_recentTrades.TryGetValue(securityId, out var ring))
-            ring.Add(price, quantity, tradeId);
+        // Always capture trades so history is available when a client subscribes later
+        if (!_recentTrades.TryGetValue(securityId, out var ring))
+        {
+            ring = new TradeRingBuffer(MaxRecentTrades);
+            _recentTrades[securityId] = ring;
+        }
+        ring.Add(price, quantity, tradeId);
+
         if (!_subscriptions.ContainsKey(securityId)) return;
         _eventsReceived++;
         var key = (securityId, price);
@@ -357,8 +363,13 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        if (_recentTrades.TryGetValue(securityId, out var ring))
-            ring.Add(price, quantity, tradeId);
+        if (!_recentTrades.TryGetValue(securityId, out var ring))
+        {
+            ring = new TradeRingBuffer(MaxRecentTrades);
+            _recentTrades[securityId] = ring;
+        }
+        ring.Add(price, quantity, tradeId);
+
         if (!_subscriptions.ContainsKey(securityId)) return;
         _eventsReceived++;
         var key = (securityId, price);
