@@ -86,9 +86,8 @@ public sealed class MultiFeedManager : IDisposable
     }
 
     private static Channel<UmdfPacket> CreateGroupChannel() =>
-        Channel.CreateBounded<UmdfPacket>(new BoundedChannelOptions(8192)
+        Channel.CreateUnbounded<UmdfPacket>(new UnboundedChannelOptions
         {
-            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = true,
         });
@@ -149,7 +148,6 @@ public sealed class MultiFeedManager : IDisposable
                 channel.Writer.TryWrite(packet);
         }
 
-        // Signal completion to all group channels
         foreach (var ch in _channels.Values)
             ch.Writer.TryComplete();
     }
