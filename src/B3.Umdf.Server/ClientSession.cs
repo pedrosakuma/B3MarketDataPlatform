@@ -21,7 +21,7 @@ public sealed class ClientSession : IDisposable
     private readonly Channel<ReadOnlyMemory<byte>> _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
     private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
-    private MarketDataManager? _marketDataManager;
+    private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
 
@@ -56,9 +56,9 @@ public sealed class ClientSession : IDisposable
     public void AddInfoSubscription(ulong securityId) =>
         _infoVersions.TryAdd(securityId, 0);
 
-    /// <summary>Set the MarketDataManager reference for on-demand info reads.</summary>
-    public void SetMarketDataManager(MarketDataManager mdm) =>
-        _marketDataManager = mdm;
+    /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
+    public void SetMarketDataManagers(MarketDataManager[] managers) =>
+        _marketDataManagers = managers;
 
     /// <summary>Current outbound queue depth.</summary>
     public int QueueDepth => _outbound.Reader.CanCount ? _outbound.Reader.Count : 0;
@@ -118,12 +118,18 @@ public sealed class ClientSession : IDisposable
                     offset += raw.Length;
                 }
 
-                // 3. Dirty-flag info: read latest from MarketDataManager for changed securities
-                if (_marketDataManager is { } mdm)
+                // 3. Dirty-flag info: read latest from MarketDataManagers for changed securities
+                if (_marketDataManagers is { } managers)
                 {
                     foreach (var (secId, lastVer) in _infoVersions)
                     {
-                        if (!mdm.InstrumentData.TryGetValue(secId, out var info)) continue;
+                        InstrumentInfo? info = null;
+                        foreach (var mdm in managers)
+                        {
+                            if (mdm.InstrumentData.TryGetValue(secId, out info))
+                                break;
+                        }
+                        if (info is null) continue;
                         long ver = info.Version;
                         if (ver <= lastVer) continue;
 

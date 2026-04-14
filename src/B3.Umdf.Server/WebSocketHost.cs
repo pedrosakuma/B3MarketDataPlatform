@@ -99,14 +99,14 @@ public sealed class WebSocketHost : IAsyncDisposable
         _app.MapGet("/instrument/{symbol}", (string symbol) =>
         {
             var registry = _subscriptionManager.SymbolRegistry;
-            var mdm = _subscriptionManager.MarketDataManager;
-            if (registry is null || mdm is null)
+            if (registry is null)
                 return Results.StatusCode(503);
 
             symbol = symbol.Trim().ToUpperInvariant();
             if (!registry.TryResolve(symbol, out var securityId))
                 return Results.NotFound();
-            if (!mdm.InstrumentData.TryGetValue(securityId, out var info))
+            var info = _subscriptionManager.FindInstrumentInfo(securityId);
+            if (info is null)
                 return Results.NotFound();
 
             var resp = new InstrumentInfoResponse

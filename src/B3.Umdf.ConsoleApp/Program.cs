@@ -208,24 +208,6 @@ SubscriptionManager? subscriptionManager = null;
 WebSocketHost? wsHost = null;
 var symbolRegistry = new SymbolRegistry();
 
-IBookEventHandler bookHandler;
-IMarketDataEventHandler mdHandler;
-
-if (wsPort is not null)
-{
-    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>());
-    bookHandler = new CompositeBookEventHandler(stats, subscriptionManager);
-    mdHandler = new CompositeMarketDataEventHandler(stats, subscriptionManager);
-}
-else
-{
-    bookHandler = stats;
-    mdHandler = stats;
-}
-
-var bookManager = new BookManager(bookHandler, loggerFactory.CreateLogger<BookManager>());
-var marketDataManager = new MarketDataManager(mdHandler, loggerFactory.CreateLogger<MarketDataManager>());
-
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
@@ -236,7 +218,47 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) =>
         cts.Cancel();
 };
 
-var composite = new CompositeFeedHandler(bookManager, marketDataManager, symbolRegistry);
+if (wsPort is not null)
+    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>());
+
+// Create per-group BookManager + MarketDataManager + FeedHandler
+var bookManagers = new List<BookManager>();
+var marketDataManagers = new List<MarketDataManager>();
+var groupEventHandlers = new List<SubscriptionManager.GroupEventHandler>();
+var groupFeedHandlers = new Dictionary<int, IFeedEventHandler>();
+var groupMdHandlers = new Dictionary<int, IFeedEventHandler>();
+
+var bmLogger = loggerFactory.CreateLogger<BookManager>();
+var mdmLogger = loggerFactory.CreateLogger<MarketDataManager>();
+
+foreach (var gid in groupIds)
+{
+    IBookEventHandler bookHandler;
+    IMarketDataEventHandler mdHandler = stats;
+
+    if (subscriptionManager is not null)
+    {
+        var gh = subscriptionManager.CreateGroupHandler();
+        bookHandler = new CompositeBookEventHandler(stats, gh);
+        var bm = new BookManager(bookHandler, bmLogger);
+        gh.SetBookManager(bm);
+        groupEventHandlers.Add(gh);
+        bookManagers.Add(bm);
+    }
+    else
+    {
+        bookHandler = stats;
+        var bm = new BookManager(bookHandler, bmLogger);
+        bookManagers.Add(bm);
+    }
+
+    var mm = new MarketDataManager(mdHandler, mdmLogger);
+    marketDataManagers.Add(mm);
+
+    var composite = new CompositeFeedHandler(bookManagers[^1], mm, symbolRegistry);
+    groupFeedHandlers[gid] = composite;
+    groupMdHandlers[gid] = mm;
+}
 
 // Use MultiFeedManager for multi-channel, single FeedHandler for single-channel
 MultiFeedManager? multiFeed = null;
@@ -246,18 +268,22 @@ var feedLogger = loggerFactory.CreateLogger<FeedHandler>();
 
 if (groupIds.Count > 1)
 {
-    multiFeed = new MultiFeedManager(packetSource, groupIds, composite, feedLogger, marketDataHandler: marketDataManager);
+    multiFeed = new MultiFeedManager(packetSource, groupFeedHandlers, feedLogger, marketDataHandlers: groupMdHandlers);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }
 else
 {
-    singleFeed = new FeedHandler(packetSource, composite, feedLogger, marketDataHandler: marketDataManager);
+    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]]);
 }
 
 if (subscriptionManager is not null)
 {
-    subscriptionManager.SetDataSources(bookManager, marketDataManager, symbolRegistry);
+    subscriptionManager.SetDataSources(
+        bookManagers.ToArray(),
+        marketDataManagers.ToArray(),
+        symbolRegistry,
+        groupEventHandlers.ToArray());
     wsHost = new WebSocketHost(subscriptionManager, loggerFactory.CreateLogger<WebSocketHost>());
 
     // Wire up feed state and last-packet providers for /health endpoint
@@ -322,7 +348,7 @@ using var statsTimer = new Timer(_ =>
 
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
-    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManager.Books.Count:N0}  |  Instruments: {marketDataManager.InstrumentData.Count:N0}  |  Symbols: {symbolRegistry.Count:N0}");
+    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
 
     if (subscriptionManager is not null)
     {
@@ -411,8 +437,8 @@ Console.WriteLine($"  StatusChg:    {stats.StatusChangeCount:N0}");
 Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
 Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
 Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
-Console.WriteLine($"  Books:        {bookManager.Books.Count:N0}");
-Console.WriteLine($"  Instruments:  {marketDataManager.InstrumentData.Count:N0}");
+Console.WriteLine($"  Books:        {bookManagers.Sum(bm => bm.Books.Count):N0}");
+Console.WriteLine($"  Instruments:  {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
 Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
 
 return 0;

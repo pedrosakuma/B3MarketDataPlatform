@@ -71,14 +71,17 @@ public sealed class MultiFeedManager : IDisposable
 
     /// <summary>
     /// Creates a MultiFeedManager where each group has its own event handler.
+    /// Optionally accepts per-group market data handlers for passthrough during non-RealTime states.
     /// </summary>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null)
     {
         _source = source;
         int idx = 0;
         foreach (var (gid, handler) in groupHandlers)
         {
-            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: marketDataHandler);
+            IFeedEventHandler? mdHandler = null;
+            marketDataHandlers?.TryGetValue(gid, out mdHandler);
+            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler);
             _channels[gid] = CreateGroupChannel();
             _groupIndex[gid] = idx++;
         }
