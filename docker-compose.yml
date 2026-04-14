@@ -21,11 +21,10 @@ services:
           cpus: "2"
 
   frontend:
-    image: nginx:alpine
+    build:
+      context: ./frontend
     ports:
       - "${FRONTEND_PORT:-3000}:80"
-    volumes:
-      - ./frontend:/usr/share/nginx/html:ro
     depends_on:
       - backend
     restart: unless-stopped
