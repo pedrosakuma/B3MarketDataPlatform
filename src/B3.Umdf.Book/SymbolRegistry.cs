@@ -27,15 +27,15 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
     public bool TryResolve(string symbol, out ulong securityId)
     {
-        if (_frozenBySymbol is { } frozen)
-            return frozen.TryGetValue(symbol, out securityId);
+        if (_frozenBySymbol is { } frozen && frozen.TryGetValue(symbol, out securityId))
+            return true;
         return _bySymbol.TryGetValue(symbol, out securityId);
     }
 
     public bool TryGetSymbol(ulong securityId, out string symbol)
     {
-        if (_frozenById is { } frozen)
-            return frozen.TryGetValue(securityId, out symbol!);
+        if (_frozenById is { } frozen && frozen.TryGetValue(securityId, out symbol!))
+            return true;
         return _byId.TryGetValue(securityId, out symbol!);
     }
 

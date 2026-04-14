@@ -52,8 +52,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     private bool TryLookupInfo(ulong securityId, out InstrumentInfo info)
     {
-        if (_frozenData is { } frozen)
-            return frozen.TryGetValue(securityId, out info!);
+        if (_frozenData is { } frozen && frozen.TryGetValue(securityId, out info!))
+            return true;
         return _data.TryGetValue(securityId, out info!);
     }
 
