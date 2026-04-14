@@ -186,6 +186,168 @@ window.switchRankingsTab = switchRankingsTab;
 window.symbolAutocomplete = symbolAutocomplete;
 window.clearLog = clearLog;
 window.toggleLog = setLogEnabled;
+window.showInstrumentDetail = showInstrumentDetail;
+window.closeModal = closeModal;
+
+// ── Instrument detail modal ──
+
+const SECURITY_TYPE_NAMES = {
+  1:'CASH (Rights)',2:'CORP',3:'CS (Common Stock)',4:'DTERM (Forward)',5:'ETF',
+  6:'FOPT (Future Opt)',7:'FORWARD',8:'FUT (Futures)',9:'INDEX',10:'INDEXOPT',
+  11:'MLEG (Multileg)',12:'OPT (Option)',13:'OPTEXER',14:'PS (Preferred)',
+  15:'SECLOAN',16:'SOPT (Spot Opt)',17:'SPOT',
+};
+const PRODUCT_NAMES = {
+  2:'Commodity',3:'Corporate',4:'Currency',5:'Equity',6:'Government',
+  7:'Index',15:'Economic Indicator',16:'Multileg',
+};
+const PUT_CALL_NAMES = { 0:'Put', 1:'Call' };
+const EXERCISE_NAMES = { 0:'European', 1:'American' };
+const TRADING_STATUS_NAMES = {
+  2:'Paused',4:'Closed',17:'Open',18:'Forbidden',20:'Unknown',21:'Auction',101:'FinalClosing',
+};
+const TRADING_EVENT_NAMES = { 0:'None',1:'Change',4:'NewStatus',101:'PriceBand' };
+
+function enumLabel(map, val) {
+  if (val == null) return null;
+  return map[val] || String(val);
+}
+
+async function showInstrumentDetail() {
+  if (!view.selectedSymbol) return;
+  const modal = $('instrumentModal');
+  const body = $('modalBody');
+  $('modalTitle').textContent = 'Instrument Detail — ' + view.selectedSymbol;
+  body.innerHTML = '<div class="empty-msg">Loading...</div>';
+  modal.classList.remove('hidden');
+
+  try {
+    const resp = await fetch(httpBase() + '/instrument/' + encodeURIComponent(view.selectedSymbol));
+    if (!resp.ok) { body.innerHTML = '<div class="empty-msg">Not available (HTTP ' + resp.status + ')</div>'; return; }
+    const data = await resp.json();
+    renderModal(body, data);
+  } catch (e) {
+    body.innerHTML = '<div class="empty-msg">Error: ' + e.message + '</div>';
+  }
+}
+
+function renderModal(body, d) {
+  const dec = parseInt($('priceDecimals').value) || 0;
+  const divisor = Math.pow(10, dec);
+  const fmtP = (v) => v == null ? null : (v / divisor).toFixed(dec);
+  const fmtQ = (v) => v == null ? null : v.toLocaleString();
+  const fmtDate = (v) => {
+    if (v == null) return null;
+    const s = String(v);
+    if (s.length === 8) return s.slice(0,4)+'-'+s.slice(4,6)+'-'+s.slice(6,8);
+    return s;
+  };
+
+  const sections = [
+    { title: 'Identity', fields: [
+      ['Security ID', d.securityId],
+      ['Symbol', d.symbol],
+      ['Asset', d.asset],
+      ['ISIN', d.isinNumber],
+      ['Currency', d.currency],
+      ['CFI Code', d.cfiCode],
+      ['Security Group', d.securityGroup],
+      ['Market Segment', d.marketSegmentID],
+    ]},
+    { title: 'Classification', fields: [
+      ['Security Type', enumLabel(SECURITY_TYPE_NAMES, d.securityType)],
+      ['Security SubType', d.securitySubType],
+      ['Product', enumLabel(PRODUCT_NAMES, d.product)],
+      ['Put/Call', enumLabel(PUT_CALL_NAMES, d.putOrCall)],
+      ['Exercise Style', enumLabel(EXERCISE_NAMES, d.exerciseStyle)],
+      ['Maturity Date', fmtDate(d.maturityDate)],
+    ]},
+    { title: 'Tick & Lot', fields: [
+      ['Min Price Increment', fmtP(d.minPriceIncrement)],
+      ['Price Divisor', d.priceDivisor],
+      ['Contract Multiplier', d.contractMultiplier],
+      ['Strike Price', fmtP(d.strikePrice)],
+      ['Tick Size Denominator', d.tickSizeDenominator],
+    ]},
+    { title: 'Trading Status', fields: [
+      ['Status', enumLabel(TRADING_STATUS_NAMES, d.tradingStatus)],
+      ['Event', enumLabel(TRADING_EVENT_NAMES, d.tradingEvent)],
+    ]},
+    { title: 'Prices', fields: [
+      ['Opening', fmtP(d.openingPrice)],
+      ['Closing', fmtP(d.closingPrice)],
+      ['High', fmtP(d.highPrice)],
+      ['Low', fmtP(d.lowPrice)],
+      ['Last Trade', fmtP(d.lastTradePrice)],
+      ['Last Trade Size', fmtQ(d.lastTradeSize)],
+      ['Settlement', fmtP(d.settlementPrice)],
+      ['VWAP', fmtP(d.vwapPrice)],
+    ]},
+    { title: 'Auction & Bands', fields: [
+      ['Theoretical Opening', fmtP(d.theoreticalOpeningPrice)],
+      ['Theoretical Open Size', fmtQ(d.theoreticalOpeningSize)],
+      ['Auction Imbalance', fmtQ(d.auctionImbalanceSize)],
+      ['Band Low', fmtP(d.priceBandLow)],
+      ['Band High', fmtP(d.priceBandHigh)],
+      ['Trading Reference', fmtP(d.tradingReferencePrice)],
+    ]},
+    { title: 'Statistics', fields: [
+      ['Trade Volume', fmtQ(d.tradeVolume)],
+      ['Net Change', fmtP(d.netChangeFromPrevDay)],
+      ['Number of Trades', fmtQ(d.numberOfTrades)],
+      ['Open Interest', fmtQ(d.openInterest)],
+      ['Avg Daily Traded Qty', fmtQ(d.avgDailyTradedQty)],
+      ['Max Trade Vol', fmtQ(d.maxTradeVol)],
+    ]},
+  ];
+
+  let html = '';
+  for (const sec of sections) {
+    const visible = sec.fields.some(([,v]) => v != null);
+    if (!visible) continue;
+    html += '<div class="modal-section"><h4>' + sec.title + '</h4><div class="modal-grid">';
+    for (const [label, val] of sec.fields) {
+      const cls = val == null ? 'val null' : 'val';
+      const display = val == null ? '—' : val;
+      html += '<div class="modal-field"><span class="lbl">' + label + '</span><span class="' + cls + '">' + display + '</span></div>';
+    }
+    html += '</div></div>';
+  }
+  body.innerHTML = html;
+}
+
+function closeModal() {
+  $('instrumentModal').classList.add('hidden');
+}
+
+// ── Keyboard shortcuts ──
+
+function navigateSubscription(delta) {
+  if (view.subs.length === 0) return;
+  const currentIdx = view.subs.findIndex(s => s.id === view.selectedId);
+  let next = currentIdx + delta;
+  if (next < 0) next = view.subs.length - 1;
+  if (next >= view.subs.length) next = 0;
+  selectSubscription(view.subs[next].id);
+}
+
+document.addEventListener('keydown', (e) => {
+  // Escape closes modal
+  if (e.key === 'Escape') { closeModal(); return; }
+
+  // Ctrl+I toggles instrument detail
+  if (e.ctrlKey && e.key === 'i') {
+    e.preventDefault();
+    const modal = $('instrumentModal');
+    if (modal.classList.contains('hidden')) showInstrumentDetail();
+    else closeModal();
+    return;
+  }
+
+  // Alt+↑/↓ navigate subscriptions
+  if (e.altKey && e.key === 'ArrowUp') { e.preventDefault(); navigateSubscription(-1); return; }
+  if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); navigateSubscription(1); return; }
+});
 
 // ── Init ──
 setStatus('disconnected');

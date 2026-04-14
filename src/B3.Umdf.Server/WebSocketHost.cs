@@ -96,6 +96,67 @@ public sealed class WebSocketHost : IAsyncDisposable
                 AppJsonContext.Default.SymbolsResponse);
         });
 
+        _app.MapGet("/instrument/{symbol}", (string symbol) =>
+        {
+            var registry = _subscriptionManager.SymbolRegistry;
+            var mdm = _subscriptionManager.MarketDataManager;
+            if (registry is null || mdm is null)
+                return Results.StatusCode(503);
+
+            symbol = symbol.Trim().ToUpperInvariant();
+            if (!registry.TryResolve(symbol, out var securityId))
+                return Results.NotFound();
+            if (!mdm.InstrumentData.TryGetValue(securityId, out var info))
+                return Results.NotFound();
+
+            var resp = new InstrumentInfoResponse
+            {
+                SecurityId = securityId,
+                Symbol = info.Symbol,
+                Asset = info.Asset,
+                IsinNumber = info.IsinNumber,
+                Currency = info.Currency,
+                CfiCode = info.CfiCode,
+                SecurityGroup = info.SecurityGroup,
+                SecurityType = info.SecurityType,
+                SecuritySubType = info.SecuritySubType,
+                Product = info.Product,
+                MinPriceIncrement = info.MinPriceIncrement,
+                PriceDivisor = info.PriceDivisor,
+                ContractMultiplier = info.ContractMultiplier,
+                StrikePrice = info.StrikePrice,
+                MaturityDate = info.MaturityDate,
+                PutOrCall = info.PutOrCall,
+                ExerciseStyle = info.ExerciseStyle,
+                MarketSegmentID = info.MarketSegmentID,
+                TickSizeDenominator = info.TickSizeDenominator,
+                TradingStatus = info.TradingStatus,
+                TradingEvent = info.TradingEvent,
+                OpeningPrice = info.OpeningPrice,
+                ClosingPrice = info.ClosingPrice,
+                HighPrice = info.HighPrice,
+                LowPrice = info.LowPrice,
+                LastTradePrice = info.LastTradePrice,
+                LastTradeSize = info.LastTradeSize,
+                SettlementPrice = info.SettlementPrice,
+                TheoreticalOpeningPrice = info.TheoreticalOpeningPrice,
+                TheoreticalOpeningSize = info.TheoreticalOpeningSize,
+                AuctionImbalanceSize = info.AuctionImbalanceSize,
+                PriceBandLow = info.PriceBandLow,
+                PriceBandHigh = info.PriceBandHigh,
+                TradingReferencePrice = info.TradingReferencePrice,
+                AvgDailyTradedQty = info.AvgDailyTradedQty,
+                MaxTradeVol = info.MaxTradeVol,
+                TradeVolume = info.TradeVolume,
+                VwapPrice = info.VwapPrice,
+                NetChangeFromPrevDay = info.NetChangeFromPrevDay,
+                NumberOfTrades = info.NumberOfTrades,
+                OpenInterest = info.OpenInterest,
+                LastUpdateTimestamp = info.LastUpdateTimestamp,
+            };
+            return Results.Json(resp, AppJsonContext.Default.InstrumentInfoResponse);
+        });
+
         // WebSocket endpoint
 
         _app.Map("/ws", async context =>
