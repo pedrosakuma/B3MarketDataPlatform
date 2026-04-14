@@ -16,6 +16,7 @@ public sealed class SymbolRegistry : IFeedEventHandler
     private readonly ConcurrentDictionary<ulong, string> _byId = new();
     private volatile FrozenDictionary<string, ulong>? _frozenBySymbol;
     private volatile FrozenDictionary<ulong, string>? _frozenById;
+    private int _lastFrozenCount;
 
     public IReadOnlyDictionary<string, ulong> BySymbol =>
         (IReadOnlyDictionary<string, ulong>?)_frozenBySymbol ?? _bySymbol;
@@ -37,6 +38,24 @@ public sealed class SymbolRegistry : IFeedEventHandler
         if (_frozenById is { } frozen && frozen.TryGetValue(securityId, out symbol!))
             return true;
         return _byId.TryGetValue(securityId, out symbol!);
+    }
+
+    /// <summary>
+    /// Promotes live ConcurrentDictionary entries to FrozenDictionary if new symbols
+    /// have been added since the last freeze. Lock-free: the volatile reference swap
+    /// is atomic. Safe to call from any thread (e.g. a background timer).
+    /// </summary>
+    /// <returns>True if a new snapshot was created.</returns>
+    public bool TryPromote()
+    {
+        int liveCount = _byId.Count;
+        if (liveCount <= _lastFrozenCount)
+            return false;
+
+        _frozenBySymbol = _bySymbol.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+        _frozenById = _byId.ToFrozenDictionary();
+        _lastFrozenCount = liveCount;
+        return true;
     }
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
@@ -66,7 +85,6 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
     public void OnInstrumentDefinitionsComplete(int instrumentCount)
     {
-        _frozenBySymbol = _bySymbol.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
-        _frozenById = _byId.ToFrozenDictionary();
+        TryPromote();
     }
 }

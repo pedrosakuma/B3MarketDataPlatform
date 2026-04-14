@@ -682,11 +682,16 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private Timer? _rankingsTimer;
     private const long RankingsIntervalMs = 300;
+    private int _rankingsTick;
+    private const int PromoteEveryNTicks = 100; // ~30s at 300ms interval
 
     private void StartRankingsTimer()
     {
         _rankingsTimer = new Timer(_ =>
         {
+            if (++_rankingsTick % PromoteEveryNTicks == 0)
+                _symbolRegistry?.TryPromote();
+
             if (_clients.Count > 0)
                 PushRankings();
         }, null, RankingsIntervalMs, RankingsIntervalMs);
