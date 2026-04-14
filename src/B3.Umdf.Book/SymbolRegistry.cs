@@ -44,6 +44,12 @@ public sealed class SymbolRegistry : IFeedEventHandler
     /// Promotes live ConcurrentDictionary entries to FrozenDictionary if new symbols
     /// have been added since the last freeze. Lock-free: the volatile reference swap
     /// is atomic. Safe to call from any thread (e.g. a background timer).
+    ///
+    /// Thread-safety note: symbols added concurrently during ToFrozenDictionary() may
+    /// or may not be included in the new frozen snapshot. This is safe because
+    /// TryGetSymbol/TryResolve always fall through to the live ConcurrentDictionary
+    /// when the frozen dict misses — the frozen layer is a performance optimization,
+    /// not a correctness barrier. Missed symbols will be captured on the next promote.
     /// </summary>
     /// <returns>True if a new snapshot was created.</returns>
     public bool TryPromote()
