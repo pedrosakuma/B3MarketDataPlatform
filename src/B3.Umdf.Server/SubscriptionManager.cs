@@ -26,7 +26,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
     private readonly Stopwatch _rankingsTimer = Stopwatch.StartNew();
-    private const long RankingsIntervalMs = 2000;
+    private const long RankingsIntervalMs = 300;
     private const int RankingsTopN = 10;
 
     private const int MaxRecentTrades = 50;
