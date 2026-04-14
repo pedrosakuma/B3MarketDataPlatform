@@ -12,8 +12,8 @@ public sealed class InstrumentInfo
     /// <summary>Monotonic version counter. Bumped by the feed thread on every mutation.</summary>
     public long Version => Volatile.Read(ref _version);
 
-    /// <summary>Increment the version counter after updating fields.</summary>
-    internal void BumpVersion() => Interlocked.Increment(ref _version);
+    /// <summary>Increment the version counter after updating fields. Feed-thread-only.</summary>
+    internal void BumpVersion() => ++_version;
 
     // SecurityStatus (3)
     public int? TradingStatus { get; set; }

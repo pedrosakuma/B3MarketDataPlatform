@@ -271,21 +271,12 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// </summary>
     private static void SendMboSnapshot(ClientSession session, OrderBook book)
     {
-        // Copy minimal data under lock, serialize outside.
-        // Snapshots are rare (once per subscription), but hold the lock long enough
-        // to cause feed-thread contention on large books.
-        ulong securityId;
-        uint lastRptSeq;
-        (ulong OrderId, byte Side, long Price, long Quantity)[] bidOrders;
-        (ulong OrderId, byte Side, long Price, long Quantity)[] askOrders;
-
-        lock (book.SyncRoot)
-        {
-            securityId = book.SecurityId;
-            lastRptSeq = book.LastRptSeq;
-            bidOrders = CopyOrderData(book.Bids);
-            askOrders = CopyOrderData(book.Asks);
-        }
+        // Feed-thread-only: no concurrent mutations possible.
+        // Copy order data, then serialize outside the hot path.
+        ulong securityId = book.SecurityId;
+        uint lastRptSeq = book.LastRptSeq;
+        var bidOrders = CopyOrderData(book.Bids);
+        var askOrders = CopyOrderData(book.Asks);
 
         int headerSize = WireProtocol.BookSnapshotSize(0, 0);
         int totalOrders = bidOrders.Length + askOrders.Length;
@@ -349,7 +340,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         if (_recentTrades.TryGetValue(securityId, out var ring))
             ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
-        Interlocked.Increment(ref _eventsReceived);
+        _eventsReceived++;
         var key = (securityId, price);
         if (_tradeBuffer.TryGetValue(key, out var existing))
             _tradeBuffer[key] = (existing.Qty + quantity, tradeId);
@@ -369,7 +360,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         if (_recentTrades.TryGetValue(securityId, out var ring))
             ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
-        Interlocked.Increment(ref _eventsReceived);
+        _eventsReceived++;
         var key = (securityId, price);
         if (_tradeBuffer.TryGetValue(key, out var existing))
             _tradeBuffer[key] = (existing.Qty + quantity, tradeId);
@@ -427,7 +418,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private void BufferOrder(PendingOrderKind kind, ulong securityId, ulong orderId, byte side, long price, long qty)
     {
         if (!_subscriptions.ContainsKey(securityId)) return;
-        Interlocked.Increment(ref _eventsReceived);
+        _eventsReceived++;
 
         if (_orderBuffer.TryGetValue(orderId, out var existing))
         {
@@ -452,7 +443,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     private void BufferOrderDelete(ulong securityId, ulong orderId, byte side)
     {
-        Interlocked.Increment(ref _eventsReceived);
+        _eventsReceived++;
         if (_orderBuffer.TryGetValue(orderId, out var existing))
         {
             if (existing.Kind == PendingOrderKind.Added)
@@ -508,7 +499,7 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         if (_tradeBuffer.Count > 0)
             flushed += FlushTradeBuffer();
 
-        Interlocked.Add(ref _eventsFlushed, flushed);
+        _eventsFlushed += flushed;
     }
 
     private int FlushOrderBuffer()

@@ -7,7 +7,11 @@ public sealed class OrderBook
     public BookSide Asks { get; }
     public uint LastRptSeq { get; set; }
 
-    /// <summary>Lock for synchronizing book reads (snapshots, HTTP) with feed mutations.</summary>
+    /// <summary>
+    /// Lock for external readers (HTTP endpoints) that may access the book concurrently.
+    /// Not used on the feed thread hot path — all book mutations and snapshot reads
+    /// happen on the feed thread, so no synchronization is needed there.
+    /// </summary>
     public readonly object SyncRoot = new();
 
     public OrderBook(ulong securityId)

@@ -419,7 +419,7 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 
     public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
     {
-        Interlocked.Increment(ref OrderCount);
+        OrderCount++;
     }
 
     public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
@@ -428,12 +428,12 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 
     public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side)
     {
-        Interlocked.Increment(ref DeleteCount);
+        DeleteCount++;
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        Interlocked.Increment(ref TradeCount);
+        TradeCount++;
     }
 
     public void OnBookCleared(ulong securityId, BookClearSide side)
@@ -442,26 +442,26 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 
     public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
     {
-        Interlocked.Increment(ref StatusChangeCount);
+        StatusChangeCount++;
     }
 
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
-        Interlocked.Increment(ref MarketDataCount);
+        MarketDataCount++;
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        Interlocked.Increment(ref ForwardTradeCount);
+        ForwardTradeCount++;
     }
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
     {
-        Interlocked.Increment(ref TradeBustCount);
+        TradeBustCount++;
     }
 
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty)
     {
-        Interlocked.Increment(ref ExecSummaryCount);
+        ExecSummaryCount++;
     }
 }

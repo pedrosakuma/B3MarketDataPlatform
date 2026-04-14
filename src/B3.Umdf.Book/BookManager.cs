@@ -62,7 +62,7 @@ public sealed class BookManager : IFeedEventHandler
         var bestAsk = book.Asks.BestPrice();
         if (bestBid is { } bid && bestAsk is { } ask && bid.Price >= ask.Price)
         {
-            var count = Interlocked.Increment(ref _crossingTransitions);
+            var count = ++_crossingTransitions;
             if (count <= 20)
             {
                 _logger.LogWarning(
@@ -142,7 +142,7 @@ public sealed class BookManager : IFeedEventHandler
         }
         catch (Exception ex)
         {
-            Interlocked.Increment(ref _parseErrors);
+            _parseErrors++;
             _logger.LogWarning(ex, "Error processing templateId={TemplateId}", templateId);
         }
     }
@@ -154,8 +154,8 @@ public sealed class BookManager : IFeedEventHandler
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
     public void OnPacketProcessed() { _eventHandler?.OnBatchComplete(); }
 
-    // Post-lock action tags for HandleOrder to avoid callbacks under lock.
-    private const int ActionNone = 0, ActionAdded = 1, ActionUpdated = 2, ActionDeleted = 3;
+    // Feed thread is the sole writer for all book mutations — no locks needed.
+    // Callbacks are inline (same thread) so no race condition exists.
 
     private void HandleOrder(ReadOnlySpan<byte> body)
     {
@@ -174,88 +174,62 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
-        int action = ActionNone;
-        OrderBookEntry? callbackEntry = null;
-        long callbackPrice = 0;
-
-        lock (book.SyncRoot)
+        if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
         {
-            if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
+            if (rawPrice is null)
             {
-                if (rawPrice is null)
-                {
-                    Interlocked.Increment(ref _nullPriceChangeDeletes);
-                    bookSide.Remove(orderId);
-                    if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
-                    action = ActionDeleted;
-                }
-                else
-                {
-                    Interlocked.Increment(ref _orderUpdates);
-                    long price = rawPrice.Value;
-                    long oldPrice = existing.Price;
-
-                    existing.Price = price;
-                    existing.Quantity = quantity;
-                    existing.EnteringFirm = enteringFirm;
-
-                    if (oldPrice != price)
-                        bookSide.MoveOrder(existing, oldPrice);
-
-                    if (msg.RptSeq is { } rptSeq)
-                        book.LastRptSeq = (uint)rptSeq;
-
-                    action = ActionUpdated;
-                    callbackEntry = existing;
-                    callbackPrice = price;
-                }
+                _nullPriceChangeDeletes++;
+                bookSide.Remove(orderId);
+                if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
+                _eventHandler?.OnOrderDeleted(book, orderId, side);
             }
             else
             {
-                if (rawPrice is null)
-                {
-                    Interlocked.Increment(ref _nullPriceNewSkips);
-                    return;
-                }
-
+                _orderUpdates++;
                 long price = rawPrice.Value;
-                var entry = new OrderBookEntry
-                {
-                    OrderId = orderId,
-                    Price = price,
-                    Quantity = quantity,
-                    EnteringFirm = enteringFirm,
-                    SecurityId = securityId,
-                    Side = side
-                };
+                long oldPrice = existing.Price;
 
-                bookSide.Add(entry);
-                Interlocked.Increment(ref _orderAdds);
+                existing.Price = price;
+                existing.Quantity = quantity;
+                existing.EnteringFirm = enteringFirm;
+
+                if (oldPrice != price)
+                    bookSide.MoveOrder(existing, oldPrice);
 
                 if (msg.RptSeq is { } rptSeq)
                     book.LastRptSeq = (uint)rptSeq;
 
-                action = ActionAdded;
-                callbackEntry = entry;
-                callbackPrice = price;
+                _eventHandler?.OnOrderUpdated(book, existing);
+                CheckCrossing(book, "UPDATE", orderId, price, side);
             }
         }
-
-        // Callbacks outside lock — feed thread is the only writer,
-        // so no mutation race after releasing the lock.
-        switch (action)
+        else
         {
-            case ActionAdded:
-                _eventHandler?.OnOrderAdded(book, callbackEntry!);
-                CheckCrossing(book, "ADD", orderId, callbackPrice, side);
-                break;
-            case ActionUpdated:
-                _eventHandler?.OnOrderUpdated(book, callbackEntry!);
-                CheckCrossing(book, "UPDATE", orderId, callbackPrice, side);
-                break;
-            case ActionDeleted:
-                _eventHandler?.OnOrderDeleted(book, orderId, side);
-                break;
+            if (rawPrice is null)
+            {
+                _nullPriceNewSkips++;
+                return;
+            }
+
+            long price = rawPrice.Value;
+            var entry = new OrderBookEntry
+            {
+                OrderId = orderId,
+                Price = price,
+                Quantity = quantity,
+                EnteringFirm = enteringFirm,
+                SecurityId = securityId,
+                Side = side
+            };
+
+            bookSide.Add(entry);
+            _orderAdds++;
+
+            if (msg.RptSeq is { } rptSeq)
+                book.LastRptSeq = (uint)rptSeq;
+
+            _eventHandler?.OnOrderAdded(book, entry);
+            CheckCrossing(book, "ADD", orderId, price, side);
         }
     }
 
@@ -273,17 +247,14 @@ public sealed class BookManager : IFeedEventHandler
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
         ulong orderId = (ulong)msg.SecondaryOrderID;
 
-        lock (book.SyncRoot)
-        {
-            var removed = book.GetSide(side).Remove(orderId);
-            if (removed)
-                Interlocked.Increment(ref _orderDeletes);
-            else
-                Interlocked.Increment(ref _deleteNotFound);
+        var removed = book.GetSide(side).Remove(orderId);
+        if (removed)
+            _orderDeletes++;
+        else
+            _deleteNotFound++;
 
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
-        }
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
 
         _eventHandler?.OnOrderDeleted(book, orderId, side);
     }
@@ -300,28 +271,25 @@ public sealed class BookManager : IFeedEventHandler
             return;
 
         BookClearSide clearSide;
-        lock (book.SyncRoot)
+        var entryType = msg.MDEntryType;
+        if (entryType == MDEntryType.BID)
         {
-            var entryType = msg.MDEntryType;
-            if (entryType == MDEntryType.BID)
-            {
-                book.Bids.Clear();
-                clearSide = BookClearSide.Bid;
-            }
-            else if (entryType == MDEntryType.OFFER)
-            {
-                book.Asks.Clear();
-                clearSide = BookClearSide.Ask;
-            }
-            else
-            {
-                book.Clear();
-                clearSide = BookClearSide.Both;
-            }
-
-            if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+            book.Bids.Clear();
+            clearSide = BookClearSide.Bid;
         }
+        else if (entryType == MDEntryType.OFFER)
+        {
+            book.Asks.Clear();
+            clearSide = BookClearSide.Ask;
+        }
+        else
+        {
+            book.Clear();
+            clearSide = BookClearSide.Both;
+        }
+
+        if (msg.RptSeq is { } rptSeq)
+            book.LastRptSeq = (uint)rptSeq;
 
         _eventHandler?.OnBookCleared(securityId, clearSide);
     }
@@ -356,10 +324,7 @@ public sealed class BookManager : IFeedEventHandler
 
         if (TryLookupBook(securityId, out var book))
         {
-            lock (book.SyncRoot)
-            {
-                book.Clear();
-            }
+            book.Clear();
             _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
         }
     }
@@ -432,35 +397,32 @@ public sealed class BookManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var book = GetOrCreateBook(securityId);
 
-        lock (book.SyncRoot)
+        book.Clear();
+
+        reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
         {
-            book.Clear();
+            long? rawPrice = entry.MDEntryPx.Mantissa;
+            if (rawPrice is null)
+                return; // Market orders have no price — skip
 
-            reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
+            var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
+            long price = rawPrice.Value;
+            long quantity = (long)entry.MDEntrySize;
+            ulong orderId = (ulong)entry.SecondaryOrderID;
+            uint enteringFirm = entry.EnteringFirm.Value ?? 0;
+
+            var bookEntry = new OrderBookEntry
             {
-                long? rawPrice = entry.MDEntryPx.Mantissa;
-                if (rawPrice is null)
-                    return; // Market orders have no price — skip
+                OrderId = orderId,
+                Price = price,
+                Quantity = quantity,
+                EnteringFirm = enteringFirm,
+                SecurityId = securityId,
+                Side = side
+            };
 
-                var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
-                long price = rawPrice.Value;
-                long quantity = (long)entry.MDEntrySize;
-                ulong orderId = (ulong)entry.SecondaryOrderID;
-                uint enteringFirm = entry.EnteringFirm.Value ?? 0;
-
-                var bookEntry = new OrderBookEntry
-                {
-                    OrderId = orderId,
-                    Price = price,
-                    Quantity = quantity,
-                    EnteringFirm = enteringFirm,
-                    SecurityId = securityId,
-                    Side = side
-                };
-
-                book.GetSide(side).Add(bookEntry);
-            });
-        }
+            book.GetSide(side).Add(bookEntry);
+        });
     }
 
     /// <summary>
@@ -478,10 +440,7 @@ public sealed class BookManager : IFeedEventHandler
     {
         foreach (var (secId, book) in _books)
         {
-            lock (book.SyncRoot)
-            {
-                book.Clear();
-            }
+            book.Clear();
             _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
         }
     }
