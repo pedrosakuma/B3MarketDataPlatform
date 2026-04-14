@@ -329,7 +329,18 @@ using var statsTimer = new Timer(_ =>
         foreach (var (id, depth) in subscriptionManager.GetClientStats())
             Console.WriteLine($"   {id}: queue={depth:N0}");
         if (subscriptionManager.UpstreamConflated > 0)
-            Console.WriteLine($"   upstream conflated: {subscriptionManager.UpstreamConflated:N0}");
+            Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
+    }
+
+    // Feed channel depths (multi-group only)
+    if (multiFeed is not null)
+    {
+        var depths = multiFeed.GetChannelDepths().Where(d => d.Depth > 0).ToList();
+        if (depths.Count > 0)
+        {
+            var parts = depths.Select(d => $"G{d.GroupId}={d.Depth:N0}");
+            Console.WriteLine($"   feed queue: {string.Join("  ", parts)}");
+        }
     }
 
     if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)

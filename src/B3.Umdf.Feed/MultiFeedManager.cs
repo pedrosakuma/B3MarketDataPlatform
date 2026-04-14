@@ -197,6 +197,13 @@ public sealed class MultiFeedManager : IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 
+    /// <summary>Returns pending packet count per group channel.</summary>
+    public IEnumerable<(int GroupId, int Depth)> GetChannelDepths()
+    {
+        foreach (var (gid, ch) in _channels)
+            yield return (gid, ch.Reader.Count);
+    }
+
     public void Dispose()
     {
         _cts?.Cancel();
