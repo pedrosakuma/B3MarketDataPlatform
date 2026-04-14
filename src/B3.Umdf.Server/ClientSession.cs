@@ -175,14 +175,16 @@ public sealed class ClientSession : IDisposable
     /// <summary>
     /// Write loop: drains the outbound channel, conflates MBO order events and info updates,
     /// then serializes and coalesces into a single WebSocket binary frame.
+    /// Drain is bounded per cycle to keep frames small and the loop responsive.
     /// </summary>
     private const double SlowClientThreshold = 0.75;
     private const int SlowClientMaxTicks = 100;
+    private const int MaxDrainPerCycle = 16384;
 
     public async Task RunWriteLoopAsync()
     {
         var ct = _cts.Token;
-        var coalesceBuf = new byte[4096];
+        var coalesceBuf = new byte[65536];
 
         // Reusable buffers — cleared each drain cycle
         var passthroughList = new List<ReadOnlyMemory<byte>>();
@@ -198,14 +200,16 @@ public sealed class ClientSession : IDisposable
             {
                 if (Socket.State != WebSocketState.Open) break;
 
-                // 1. Drain all available events with MBO order conflation
+                // 1. Drain up to MaxDrainPerCycle events with MBO order conflation
                 passthroughList.Clear();
                 pendingOrders.Clear();
                 pendingInfos.Clear();
                 bookClearList.Clear();
 
-                while (reader.TryRead(out var evt))
+                int drained = 0;
+                while (drained < MaxDrainPerCycle && reader.TryRead(out var evt))
                 {
+                    drained++;
                     switch (evt.Kind)
                     {
                         case OutboundEventKind.Passthrough:
