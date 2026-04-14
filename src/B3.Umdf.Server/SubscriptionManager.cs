@@ -21,12 +21,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
     // Per-security: clientId → DataFlags — accessed from multiple feed threads
     private readonly ConcurrentDictionary<ulong, ConcurrentDictionary<string, DataFlags>> _subscriptions = new();
-    // Recent trades per security — circular buffer, accessed from multiple feed threads
+    // Recent trades per security — only for subscribed securities
     private readonly ConcurrentDictionary<ulong, TradeRingBuffer> _recentTrades = new();
     // Pending subscription requests from WebSocket threads
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingRequests = new();
-    private readonly Stopwatch _rankingsTimer = Stopwatch.StartNew();
-    private const long RankingsIntervalMs = 300;
     private const int RankingsTopN = 10;
 
     private const int MaxRecentTrades = 50;
@@ -36,6 +34,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
     // Trades aggregated by (securityId, price) — same-price trades sum quantities
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
+    // Pre-allocated flush buffer to avoid per-event byte[] allocations
+    private byte[] _flushBuf = new byte[4096];
     private long _eventsReceived;
     private long _eventsFlushed;
 
@@ -134,13 +134,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                     break;
             }
         }
-
-        // Time-based: push rankings to all clients every ~2s
-        if (_clients.Count > 0 && _rankingsTimer.ElapsedMilliseconds >= RankingsIntervalMs)
-        {
-            _rankingsTimer.Restart();
-            PushRankings();
-        }
     }
 
     private void HandleSubscribe(string clientId, string symbol, DataFlags flags)
@@ -163,6 +156,9 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
             session.AddInfoSubscription(securityId);
         var clients = _subscriptions.GetOrAdd(securityId, _ => new ConcurrentDictionary<string, DataFlags>());
         clients[clientId] = flags;
+        // Ensure trade ring buffer exists for subscribed security
+        if (flags.HasFlag(DataFlags.Book))
+            _recentTrades.GetOrAdd(securityId, _ => new TradeRingBuffer(MaxRecentTrades));
         AppMetrics.WsSubscriptions.Add(1);
     }
 
@@ -323,28 +319,24 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
     {
-        ProcessPendingRequests();
         BufferOrder(PendingOrderKind.Added, book.SecurityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
     }
 
     public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
     {
-        ProcessPendingRequests();
         BufferOrder(PendingOrderKind.Updated, book.SecurityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
     }
 
     public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side)
     {
-        ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(book.SecurityId)) return;
         BufferOrderDelete(book.SecurityId, orderId, (byte)side);
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        ProcessPendingRequests();
-        var ring = _recentTrades.GetOrAdd(securityId, _ => new TradeRingBuffer(MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
+        if (_recentTrades.TryGetValue(securityId, out var ring))
+            ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
         Interlocked.Increment(ref _eventsReceived);
         var key = (securityId, price);
@@ -356,7 +348,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnBookCleared(ulong securityId, BookClearSide side)
     {
-        ProcessPendingRequests();
         if (!_subscriptions.ContainsKey(securityId)) return;
         PurgeBufferedOrders(securityId, (byte)side);
         _clearBuffer.Add((securityId, (byte)side));
@@ -364,9 +355,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        ProcessPendingRequests();
-        var ring = _recentTrades.GetOrAdd(securityId, _ => new TradeRingBuffer(MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
+        if (_recentTrades.TryGetValue(securityId, out var ring))
+            ring.Add(price, quantity, tradeId);
         if (!_subscriptions.ContainsKey(securityId)) return;
         Interlocked.Increment(ref _eventsReceived);
         var key = (securityId, price);
@@ -378,20 +368,20 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
     {
-        ProcessPendingRequests();
     }
 
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty)
     {
-        ProcessPendingRequests();
     }
 
     /// <summary>
     /// Flush upstream conflation buffers. Called after each packet is fully processed.
-    /// Serializes each surviving event once, shares the same bytes across all subscribers.
+    /// Also drains pending subscription requests — batched here instead of per-event
+    /// to avoid ~500K/s redundant ConcurrentQueue checks.
     /// </summary>
     public void OnBatchComplete()
     {
+        ProcessPendingRequests();
         if (_orderBuffer.Count == 0 && _clearBuffer.Count == 0 && _tradeBuffer.Count == 0)
             return;
         FlushBuffers();
@@ -401,12 +391,10 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
     public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
     {
-        ProcessPendingRequests();
     }
 
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
-        ProcessPendingRequests();
     }
 
     // --- Upstream conflation: buffer + flush ---
@@ -483,61 +471,141 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     }
 
     /// <summary>
-    /// Serialize each surviving event once, broadcast pre-serialized bytes to subscribers.
-    /// Same ReadOnlyMemory&lt;byte&gt; is shared by all N subscribers — zero per-subscriber allocation.
+    /// Serialize each surviving event once into a shared buffer, broadcast ReadOnlyMemory slices.
+    /// Groups events by security so each security gets one contiguous allocation.
     /// </summary>
     private void FlushBuffers()
     {
         int flushed = 0;
 
-        // 1. Book clears (serialize once each, broadcast)
+        // 1. Book clears — one small message each (rare), send individually
         foreach (var (secId, side) in _clearBuffer)
         {
+            if (!_subscriptions.TryGetValue(secId, out _)) continue;
             var buf = new byte[13];
             WireProtocol.WriteBookCleared(buf, secId, side);
-            SendPreSerialized(secId, buf);
+            BroadcastToSubscribers(secId, buf);
             flushed++;
         }
         _clearBuffer.Clear();
 
-        // 2. Conflated orders (serialize once each, broadcast)
-        foreach (var (orderId, order) in _orderBuffer)
-        {
-            byte[] buf;
-            if (order.Kind == PendingOrderKind.Deleted)
-            {
-                buf = new byte[21];
-                WireProtocol.WriteOrderDeleted(buf, order.SecurityId, orderId, order.Side);
-            }
-            else
-            {
-                var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
-                buf = new byte[37];
-                WireProtocol.WriteOrderEvent(buf, msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
-            }
-            SendPreSerialized(order.SecurityId, buf);
-            flushed++;
-        }
-        _orderBuffer.Clear();
+        // 2. Conflated orders — group by security to minimize allocations
+        if (_orderBuffer.Count > 0)
+            flushed += FlushOrderBuffer();
 
-        // 3. Aggregated trades — same-price trades summed, different prices sent individually
-        foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
-        {
-            var buf = new byte[36];
-            WireProtocol.WriteTrade(buf, secId, price, qty, tradeId);
-            SendPreSerialized(secId, buf);
-            flushed++;
-        }
-        _tradeBuffer.Clear();
+        // 3. Aggregated trades — group by security
+        if (_tradeBuffer.Count > 0)
+            flushed += FlushTradeBuffer();
 
         Interlocked.Add(ref _eventsFlushed, flushed);
     }
 
-    /// <summary>Send pre-serialized bytes to all Book subscribers for a security.</summary>
-    private void SendPreSerialized(ulong securityId, byte[] data)
+    private int FlushOrderBuffer()
+    {
+        int flushed = 0;
+
+        // When few events, serialize individually to avoid grouping overhead
+        if (_orderBuffer.Count <= 4)
+        {
+            foreach (var (orderId, order) in _orderBuffer)
+            {
+                if (!_subscriptions.TryGetValue(order.SecurityId, out _)) { flushed++; continue; }
+                byte[] buf;
+                int len;
+                if (order.Kind == PendingOrderKind.Deleted)
+                {
+                    buf = new byte[21];
+                    len = WireProtocol.WriteOrderDeleted(buf, order.SecurityId, orderId, order.Side);
+                }
+                else
+                {
+                    var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
+                    buf = new byte[37];
+                    len = WireProtocol.WriteOrderEvent(buf, msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
+                }
+                BroadcastToSubscribers(order.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len));
+                flushed++;
+            }
+        }
+        else
+        {
+            // Group by security — serialize all orders for one security into single buffer
+            // Worst case: all are adds (37 bytes each)
+            int maxPerEvent = 37;
+            int totalBufSize = _orderBuffer.Count * maxPerEvent;
+            if (_flushBuf.Length < totalBufSize)
+                _flushBuf = new byte[Math.Max(totalBufSize, _flushBuf.Length * 2)];
+
+            ulong currentSecId = 0;
+            int segmentStart = 0;
+            int offset = 0;
+
+            // Sort orders by security ID so we can group them
+            Span<(ulong OrderId, BufferedOrder Order)> sorted = _orderBuffer.Count <= 256
+                ? stackalloc (ulong, BufferedOrder)[_orderBuffer.Count]
+                : new (ulong, BufferedOrder)[_orderBuffer.Count];
+            int idx = 0;
+            foreach (var kv in _orderBuffer)
+                sorted[idx++] = (kv.Key, kv.Value);
+            sorted.Sort((a, b) => a.Order.SecurityId.CompareTo(b.Order.SecurityId));
+
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                var (orderId, order) = sorted[i];
+                if (order.SecurityId != currentSecId && offset > segmentStart)
+                {
+                    // Flush previous security's segment
+                    if (_subscriptions.ContainsKey(currentSecId))
+                    {
+                        var copy = new byte[offset - segmentStart];
+                        _flushBuf.AsSpan(segmentStart, offset - segmentStart).CopyTo(copy);
+                        BroadcastToSubscribers(currentSecId, copy);
+                    }
+                    segmentStart = offset;
+                }
+                currentSecId = order.SecurityId;
+
+                if (order.Kind == PendingOrderKind.Deleted)
+                    offset += WireProtocol.WriteOrderDeleted(_flushBuf.AsSpan(offset), order.SecurityId, orderId, order.Side);
+                else
+                {
+                    var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
+                    offset += WireProtocol.WriteOrderEvent(_flushBuf.AsSpan(offset), msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
+                }
+                flushed++;
+            }
+            // Flush last segment
+            if (offset > segmentStart && _subscriptions.ContainsKey(currentSecId))
+            {
+                var copy = new byte[offset - segmentStart];
+                _flushBuf.AsSpan(segmentStart, offset - segmentStart).CopyTo(copy);
+                BroadcastToSubscribers(currentSecId, copy);
+            }
+        }
+
+        _orderBuffer.Clear();
+        return flushed;
+    }
+
+    private int FlushTradeBuffer()
+    {
+        int flushed = 0;
+        foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
+        {
+            if (!_subscriptions.TryGetValue(secId, out _)) { flushed++; continue; }
+            var buf = new byte[36];
+            int len = WireProtocol.WriteTrade(buf, secId, price, qty, tradeId);
+            BroadcastToSubscribers(secId, new ReadOnlyMemory<byte>(buf, 0, len));
+            flushed++;
+        }
+        _tradeBuffer.Clear();
+        return flushed;
+    }
+
+    /// <summary>Broadcast pre-serialized bytes to all Book subscribers for a security.</summary>
+    private void BroadcastToSubscribers(ulong securityId, ReadOnlyMemory<byte> payload)
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-        var payload = new ReadOnlyMemory<byte>(data);
         foreach (var (clientId, flags) in clients)
         {
             if (!flags.HasFlag(DataFlags.Book)) continue;
@@ -603,8 +671,27 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         }
     }
 
-    /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>
-    public void SetReady() => _ready = true;
+    /// <summary>Called when feed enters RealTime state. Enables subscriptions and starts background rankings.</summary>
+    public void SetReady()
+    {
+        _ready = true;
+        StartRankingsTimer();
+    }
+
+    private Timer? _rankingsTimer;
+    private const long RankingsIntervalMs = 300;
+
+    private void StartRankingsTimer()
+    {
+        _rankingsTimer = new Timer(_ =>
+        {
+            if (_clients.Count > 0)
+                PushRankings();
+        }, null, RankingsIntervalMs, RankingsIntervalMs);
+    }
+
+    /// <summary>Stop the background rankings timer.</summary>
+    public void StopRankingsTimer() => _rankingsTimer?.Dispose();
 
     // --- Internal types ---
 
