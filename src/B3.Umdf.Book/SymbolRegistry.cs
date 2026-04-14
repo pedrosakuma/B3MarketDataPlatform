@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -7,34 +8,35 @@ namespace B3.Umdf.Book;
 
 /// <summary>
 /// Bidirectional symbol↔securityId mapping built from SecurityDefinition messages.
+/// Thread-safe: multiple group workers may call OnPacket concurrently.
 /// </summary>
 public sealed class SymbolRegistry : IFeedEventHandler
 {
-    private Dictionary<string, ulong> _mutableBySymbol = new(StringComparer.OrdinalIgnoreCase);
-    private Dictionary<ulong, string> _mutableById = new();
-    private FrozenDictionary<string, ulong>? _frozenBySymbol;
-    private FrozenDictionary<ulong, string>? _frozenById;
+    private readonly ConcurrentDictionary<string, ulong> _bySymbol = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<ulong, string> _byId = new();
+    private volatile FrozenDictionary<string, ulong>? _frozenBySymbol;
+    private volatile FrozenDictionary<ulong, string>? _frozenById;
 
     public IReadOnlyDictionary<string, ulong> BySymbol =>
-        (IReadOnlyDictionary<string, ulong>?)_frozenBySymbol ?? _mutableBySymbol;
+        (IReadOnlyDictionary<string, ulong>?)_frozenBySymbol ?? _bySymbol;
 
     public IReadOnlyDictionary<ulong, string> ById =>
-        (IReadOnlyDictionary<ulong, string>?)_frozenById ?? _mutableById;
+        (IReadOnlyDictionary<ulong, string>?)_frozenById ?? _byId;
 
-    public int Count => _frozenBySymbol?.Count ?? _mutableBySymbol.Count;
+    public int Count => _frozenBySymbol?.Count ?? _bySymbol.Count;
 
     public bool TryResolve(string symbol, out ulong securityId)
     {
-        if (_frozenBySymbol is not null)
-            return _frozenBySymbol.TryGetValue(symbol, out securityId);
-        return _mutableBySymbol.TryGetValue(symbol, out securityId);
+        if (_frozenBySymbol is { } frozen)
+            return frozen.TryGetValue(symbol, out securityId);
+        return _bySymbol.TryGetValue(symbol, out securityId);
     }
 
     public bool TryGetSymbol(ulong securityId, out string symbol)
     {
-        if (_frozenById is not null)
-            return _frozenById.TryGetValue(securityId, out symbol!);
-        return _mutableById.TryGetValue(securityId, out symbol!);
+        if (_frozenById is { } frozen)
+            return frozen.TryGetValue(securityId, out symbol!);
+        return _byId.TryGetValue(securityId, out symbol!);
     }
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
@@ -51,8 +53,8 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
         if (!string.IsNullOrEmpty(symbol))
         {
-            _mutableBySymbol[symbol] = securityId;
-            _mutableById[securityId] = symbol;
+            _bySymbol[symbol] = securityId;
+            _byId[securityId] = symbol;
         }
     }
 
@@ -64,7 +66,7 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
     public void OnInstrumentDefinitionsComplete(int instrumentCount)
     {
-        _frozenBySymbol = _mutableBySymbol.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
-        _frozenById = _mutableById.ToFrozenDictionary();
+        _frozenBySymbol = _bySymbol.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
+        _frozenById = _byId.ToFrozenDictionary();
     }
 }

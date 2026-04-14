@@ -333,6 +333,15 @@ using var statsTimer = new Timer(_ =>
     if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
         Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
 
+    if (!ready && multiFeed is not null)
+    {
+        foreach (var (gid, h) in multiFeed.Handlers)
+        {
+            if (h.State == FeedState.WaitInstrumentDefinition)
+                Console.WriteLine($"   G{gid} InstrDef: {h.InstrDefReceived:N0}/{h.InstrDefTotalExpected:N0} parsed  ({h.InstrDefPacketCount:N0} idef pkts, {h.PacketCount:N0} total pkts)");
+        }
+    }
+
 }, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(multicastMerger is not null ? "live feed" : "replay")}...");
