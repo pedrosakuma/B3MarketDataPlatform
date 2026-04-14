@@ -70,6 +70,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     public void RegisterClient(ClientSession session)
     {
         _clients[session.Id] = session;
+        if (_marketDataManager is not null)
+            session.SetMarketDataManager(_marketDataManager);
         AppMetrics.WsConnectionsActive.Add(1);
     }
 
@@ -146,6 +148,8 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
 
         // NOW activate subscription — incrementals start flowing after this point
         session.AddSubscription(securityId);
+        if (flags.HasFlag(DataFlags.Info))
+            session.AddInfoSubscription(securityId);
         var clients = _subscriptions.GetOrAdd(securityId, _ => new ConcurrentDictionary<string, DataFlags>());
         clients[clientId] = flags;
         AppMetrics.WsSubscriptions.Add(1);
@@ -306,8 +310,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
-    // --- IBookEventHandler (called on feed thread) ---
-
     public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
     {
         ProcessPendingRequests();
@@ -362,13 +364,11 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
     {
         ProcessPendingRequests();
-        SendInfoUpdate(securityId, info);
     }
 
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
         ProcessPendingRequests();
-        SendInfoUpdate(securityId, info);
     }
 
     // --- Helpers ---
@@ -473,21 +473,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
         }
     }
 
-    /// <summary>Send a typed info update to all subscribers for last-state-wins conflation.</summary>
-    private void SendInfoToSubscribers(ulong securityId, ReadOnlyMemory<byte> serializedInfo)
-    {
-        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-        foreach (var (clientId, flags) in clients)
-        {
-            if (!flags.HasFlag(DataFlags.Info)) continue;
-            if (_clients.TryGetValue(clientId, out var session))
-            {
-                session.TryEnqueueInfo(securityId, serializedInfo);
-                AppMetrics.WsMessagesSent.Add(1);
-            }
-        }
-    }
-
     /// <summary>Send a typed BookCleared event for correct conflation ordering.</summary>
     private void SendBookClearedToSubscribers(ulong securityId, byte clearSide)
     {
@@ -501,15 +486,6 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
                 AppMetrics.WsMessagesSent.Add(1);
             }
         }
-    }
-
-    private void SendInfoUpdate(ulong securityId, InstrumentInfo info)
-    {
-        if (!_subscriptions.ContainsKey(securityId)) return;
-
-        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
-        int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
-        SendInfoToSubscribers(securityId, new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions.</summary>

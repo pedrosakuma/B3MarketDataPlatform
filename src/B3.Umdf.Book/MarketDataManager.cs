@@ -137,6 +137,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
         info.SecurityGroup = msg.SecurityGroup.ToString().Trim();
+        info.BumpVersion();
     }
 
     private void HandleSecurityStatus(ReadOnlySpan<byte> body)
@@ -172,6 +173,7 @@ public sealed class MarketDataManager : IFeedEventHandler
             info.TradingStatus = (int)msg.SecurityTradingStatus;
         }
 
+        info.BumpVersion();
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
     }
 
@@ -193,6 +195,7 @@ public sealed class MarketDataManager : IFeedEventHandler
             if (info.FollowsGroupStatus && info.SecurityGroup == group)
             {
                 info.TradingStatus = status;
+                info.BumpVersion();
                 _eventHandler?.OnMarketDataUpdated(kvp.Key, info);
             }
         }
@@ -210,6 +213,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.OpeningPrice = msg.MDEntryPx.Mantissa;
         info.NetChangeFromPrevDay = msg.NetChgPrevDay.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -226,6 +230,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.TheoreticalOpeningPrice = msg.MDEntryPx.Mantissa;
         info.TheoreticalOpeningSize = msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -241,6 +246,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.ClosingPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -256,6 +262,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.AuctionImbalanceSize = msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -272,6 +279,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.AvgDailyTradedQty = msg.AvgDailyTradedQty;
         info.MaxTradeVol = msg.MaxTradeVol;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -289,6 +297,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.PriceBandHigh = msg.HighLimitPrice.Mantissa;
         info.TradingReferencePrice = msg.TradingReferencePrice.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -304,6 +313,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.HighPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -319,6 +329,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.LowPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -335,6 +346,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.LastTradePrice = msg.MDEntryPx.Mantissa;
         info.LastTradeSize = (long)msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -350,6 +362,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.SettlementPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -365,6 +378,7 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.OpenInterest = (long)msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
@@ -383,6 +397,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.NetChangeFromPrevDay = msg.NetChgPrevDay.Mantissa;
         info.NumberOfTrades = (long)(uint)msg.NumberOfTrades;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }

@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading.Channels;
+using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -16,15 +18,13 @@ public enum OutboundEventKind : byte
     OrderUpdated,
     /// <summary>MBO order delete — conflatable per orderId.</summary>
     OrderDeleted,
-    /// <summary>Instrument info update — last-state-wins per securityId.</summary>
-    InfoUpdate,
     /// <summary>Book cleared event — purges pending orders for that security/side in conflation.</summary>
     BookCleared,
 }
 
 /// <summary>
 /// Outbound event for the conflation channel.
-/// For Passthrough/InfoUpdate, RawData carries pre-serialized bytes.
+/// For Passthrough, RawData carries pre-serialized bytes.
 /// For Order* kinds, the typed fields carry the event data (serialized after conflation).
 /// </summary>
 public readonly struct OutboundEvent
@@ -61,9 +61,6 @@ public readonly struct OutboundEvent
     public static OutboundEvent OrderDelete(ulong securityId, ulong orderId, byte side) =>
         new(OutboundEventKind.OrderDeleted, default, securityId, orderId, side, 0, 0);
 
-    public static OutboundEvent Info(ulong securityId, ReadOnlyMemory<byte> data) =>
-        new(OutboundEventKind.InfoUpdate, data, securityId, 0, 0, 0, 0);
-
     public static OutboundEvent BookClear(ulong securityId, byte clearSide) =>
         new(OutboundEventKind.BookCleared, default, securityId, 0, clearSide, 0, 0);
 }
@@ -79,6 +76,8 @@ public sealed class ClientSession : IDisposable
     public WebSocket Socket { get; }
     private readonly Channel<OutboundEvent> _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
+    private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
+    private MarketDataManager? _marketDataManager;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
 
@@ -103,7 +102,19 @@ public sealed class ClientSession : IDisposable
     public void AddSubscription(ulong securityId) => _subscriptions.Add(securityId);
 
     /// <summary>Remove a subscription. Called on the feed thread or WS read thread.</summary>
-    public void RemoveSubscription(ulong securityId) => _subscriptions.Remove(securityId);
+    public void RemoveSubscription(ulong securityId)
+    {
+        _subscriptions.Remove(securityId);
+        _infoVersions.TryRemove(securityId, out _);
+    }
+
+    /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.</summary>
+    public void AddInfoSubscription(ulong securityId) =>
+        _infoVersions.TryAdd(securityId, 0);
+
+    /// <summary>Set the MarketDataManager reference for on-demand info reads.</summary>
+    public void SetMarketDataManager(MarketDataManager mdm) =>
+        _marketDataManager = mdm;
 
     private long _conflatedMessages;
 
@@ -142,12 +153,6 @@ public sealed class ClientSession : IDisposable
     }
 
     /// <summary>
-    /// Enqueue a typed info update. Last-state-wins per securityId in the write loop.
-    /// </summary>
-    public void TryEnqueueInfo(ulong securityId, ReadOnlyMemory<byte> serializedInfo) =>
-        _outbound.Writer.TryWrite(OutboundEvent.Info(securityId, serializedInfo));
-
-    /// <summary>
     /// Enqueue a book cleared event. Purges pending order events for the security/side
     /// in the conflation dictionary to maintain correct ordering.
     /// </summary>
@@ -173,8 +178,9 @@ public sealed class ClientSession : IDisposable
     }
 
     /// <summary>
-    /// Write loop: drains the outbound channel, conflates MBO order events and info updates,
-    /// then serializes and coalesces into a single WebSocket binary frame.
+    /// Write loop: drains the outbound channel, conflates MBO order events,
+    /// then reads dirty info via version counters, serializes and coalesces
+    /// into a single WebSocket binary frame.
     /// Drain is bounded per cycle to keep frames small and the loop responsive.
     /// </summary>
     private const double SlowClientThreshold = 0.75;
@@ -189,7 +195,6 @@ public sealed class ClientSession : IDisposable
         // Reusable buffers — cleared each drain cycle
         var passthroughList = new List<ReadOnlyMemory<byte>>();
         var pendingOrders = new Dictionary<ulong, PendingOrder>();
-        var pendingInfos = new Dictionary<ulong, ReadOnlyMemory<byte>>();
         var bookClearList = new List<(ulong SecurityId, byte Side)>();
         int slowTicks = 0;
 
@@ -203,7 +208,6 @@ public sealed class ClientSession : IDisposable
                 // 1. Drain up to MaxDrainPerCycle events with MBO order conflation
                 passthroughList.Clear();
                 pendingOrders.Clear();
-                pendingInfos.Clear();
                 bookClearList.Clear();
 
                 int drained = 0;
@@ -224,19 +228,13 @@ public sealed class ClientSession : IDisposable
                             PurgeOrdersForClear(pendingOrders, evt.SecurityId, evt.Side);
                             bookClearList.Add((evt.SecurityId, evt.Side));
                             break;
-                        case OutboundEventKind.InfoUpdate:
-                            pendingInfos[evt.SecurityId] = evt.RawData;
-                            break;
                     }
                 }
-
-                Interlocked.Add(ref _conflatedMessages,
-                    passthroughList.Count + pendingOrders.Count + bookClearList.Count + pendingInfos.Count);
 
                 // 2. Serialize into coalesced buffer
                 int offset = 0;
 
-                // Passthrough (snapshots, etc.)
+                // Passthrough (snapshots, control messages, trades)
                 foreach (var raw in passthroughList)
                 {
                     EnsureCapacity(ref coalesceBuf, offset, raw.Length);
@@ -273,19 +271,32 @@ public sealed class ClientSession : IDisposable
                     }
                 }
 
-                // Info updates (last-state-wins per securityId)
-                foreach (var (_, infoData) in pendingInfos)
+                // 3. Dirty-flag info: read latest from MarketDataManager for changed securities
+                int infoCount = 0;
+                if (_marketDataManager is { } mdm)
                 {
-                    EnsureCapacity(ref coalesceBuf, offset, infoData.Length);
-                    infoData.Span.CopyTo(coalesceBuf.AsSpan(offset));
-                    offset += infoData.Length;
+                    foreach (var (secId, lastVer) in _infoVersions)
+                    {
+                        if (!mdm.InstrumentData.TryGetValue(secId, out var info)) continue;
+                        long ver = info.Version;
+                        if (ver <= lastVer) continue;
+
+                        EnsureCapacity(ref coalesceBuf, offset, WireProtocol.InfoSnapshotMaxSize);
+                        int len = WireProtocol.WriteInfoSnapshot(coalesceBuf.AsSpan(offset), secId, info);
+                        offset += len;
+                        _infoVersions[secId] = ver;
+                        infoCount++;
+                    }
                 }
+
+                Interlocked.Add(ref _conflatedMessages,
+                    passthroughList.Count + pendingOrders.Count + bookClearList.Count + infoCount);
 
                 if (offset > 0)
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
 
-                // 3. Slow-client self-detection: if queue stays above threshold
+                // 4. Slow-client self-detection: if queue stays above threshold
                 // after drain+send, this client can't keep up.
                 int remaining = QueueDepth;
                 if (remaining > ChannelCapacity * SlowClientThreshold)

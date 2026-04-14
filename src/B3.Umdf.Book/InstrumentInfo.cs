@@ -7,6 +7,14 @@ namespace B3.Umdf.Book;
 /// </summary>
 public sealed class InstrumentInfo
 {
+    private long _version;
+
+    /// <summary>Monotonic version counter. Bumped by the feed thread on every mutation.</summary>
+    public long Version => Volatile.Read(ref _version);
+
+    /// <summary>Increment the version counter after updating fields.</summary>
+    internal void BumpVersion() => Interlocked.Increment(ref _version);
+
     // SecurityStatus (3)
     public int? TradingStatus { get; set; }
     public int? TradingEvent { get; set; }
@@ -77,5 +85,6 @@ public sealed class InstrumentInfo
         NumberOfTrades = null;
         OpenInterest = null;
         LastUpdateTimestamp = 0;
+        BumpVersion();
     }
 }
