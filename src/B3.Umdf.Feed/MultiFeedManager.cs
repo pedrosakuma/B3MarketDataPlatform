@@ -201,7 +201,10 @@ public sealed class MultiFeedManager : IDisposable
     public IEnumerable<(int GroupId, int Depth)> GetChannelDepths()
     {
         foreach (var (gid, ch) in _channels)
-            yield return (gid, ch.Reader.Count);
+        {
+            int depth = ch.Reader.CanCount ? ch.Reader.Count : 0;
+            yield return (gid, depth);
+        }
     }
 
     public void Dispose()
