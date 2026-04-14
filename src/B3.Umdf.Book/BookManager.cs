@@ -18,7 +18,7 @@ namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler
 {
-    private readonly ConcurrentDictionary<ulong, OrderBook> _books = new();
+    private readonly ConcurrentDictionary<ulong, OrderBook> _books = new(Environment.ProcessorCount, 4096);
     private volatile FrozenDictionary<ulong, OrderBook>? _frozenBooks;
     private readonly IBookEventHandler? _eventHandler;
     private readonly ILogger<BookManager> _logger;
@@ -152,6 +152,9 @@ public sealed class BookManager : IFeedEventHandler
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
 
+    // Post-lock action tags for HandleOrder to avoid callbacks under lock.
+    private const int ActionNone = 0, ActionAdded = 1, ActionUpdated = 2, ActionDeleted = 3;
+
     private void HandleOrder(ReadOnlySpan<byte> body)
     {
         if (!Order_MBO_50Data.TryParse(body, out var reader))
@@ -169,6 +172,10 @@ public sealed class BookManager : IFeedEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
+        int action = ActionNone;
+        OrderBookEntry? callbackEntry = null;
+        long callbackPrice = 0;
+
         lock (book.SyncRoot)
         {
             if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
@@ -178,26 +185,28 @@ public sealed class BookManager : IFeedEventHandler
                     Interlocked.Increment(ref _nullPriceChangeDeletes);
                     bookSide.Remove(orderId);
                     if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
-                    _eventHandler?.OnOrderDeleted(book, orderId, side);
-                    return;
+                    action = ActionDeleted;
                 }
+                else
+                {
+                    Interlocked.Increment(ref _orderUpdates);
+                    long price = rawPrice.Value;
+                    long oldPrice = existing.Price;
 
-                Interlocked.Increment(ref _orderUpdates);
-                long price = rawPrice.Value;
-                long oldPrice = existing.Price;
+                    existing.Price = price;
+                    existing.Quantity = quantity;
+                    existing.EnteringFirm = enteringFirm;
 
-                existing.Price = price;
-                existing.Quantity = quantity;
-                existing.EnteringFirm = enteringFirm;
+                    if (oldPrice != price)
+                        bookSide.MoveOrder(existing, oldPrice);
 
-                if (oldPrice != price)
-                    bookSide.MoveOrder(existing, oldPrice);
+                    if (msg.RptSeq is { } rptSeq)
+                        book.LastRptSeq = (uint)rptSeq;
 
-                if (msg.RptSeq is { } rptSeq)
-                    book.LastRptSeq = (uint)rptSeq;
-
-                _eventHandler?.OnOrderUpdated(book, existing);
-                CheckCrossing(book, "UPDATE", orderId, price, side);
+                    action = ActionUpdated;
+                    callbackEntry = existing;
+                    callbackPrice = price;
+                }
             }
             else
             {
@@ -224,9 +233,27 @@ public sealed class BookManager : IFeedEventHandler
                 if (msg.RptSeq is { } rptSeq)
                     book.LastRptSeq = (uint)rptSeq;
 
-                _eventHandler?.OnOrderAdded(book, entry);
-                CheckCrossing(book, "ADD", orderId, price, side);
+                action = ActionAdded;
+                callbackEntry = entry;
+                callbackPrice = price;
             }
+        }
+
+        // Callbacks outside lock — feed thread is the only writer,
+        // so no mutation race after releasing the lock.
+        switch (action)
+        {
+            case ActionAdded:
+                _eventHandler?.OnOrderAdded(book, callbackEntry!);
+                CheckCrossing(book, "ADD", orderId, callbackPrice, side);
+                break;
+            case ActionUpdated:
+                _eventHandler?.OnOrderUpdated(book, callbackEntry!);
+                CheckCrossing(book, "UPDATE", orderId, callbackPrice, side);
+                break;
+            case ActionDeleted:
+                _eventHandler?.OnOrderDeleted(book, orderId, side);
+                break;
         }
     }
 
@@ -254,9 +281,9 @@ public sealed class BookManager : IFeedEventHandler
 
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
-
-            _eventHandler?.OnOrderDeleted(book, orderId, side);
         }
+
+        _eventHandler?.OnOrderDeleted(book, orderId, side);
     }
 
     private void HandleMassDelete(ReadOnlySpan<byte> body)
@@ -270,10 +297,10 @@ public sealed class BookManager : IFeedEventHandler
         if (!TryLookupBook(securityId, out var book))
             return;
 
+        BookClearSide clearSide;
         lock (book.SyncRoot)
         {
             var entryType = msg.MDEntryType;
-            BookClearSide clearSide;
             if (entryType == MDEntryType.BID)
             {
                 book.Bids.Clear();
@@ -292,9 +319,9 @@ public sealed class BookManager : IFeedEventHandler
 
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
-
-            _eventHandler?.OnBookCleared(securityId, clearSide);
         }
+
+        _eventHandler?.OnBookCleared(securityId, clearSide);
     }
 
     private void HandleTrade(ReadOnlySpan<byte> body)
@@ -327,7 +354,10 @@ public sealed class BookManager : IFeedEventHandler
 
         if (TryLookupBook(securityId, out var book))
         {
-            book.Clear();
+            lock (book.SyncRoot)
+            {
+                book.Clear();
+            }
             _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
         }
     }
@@ -449,8 +479,8 @@ public sealed class BookManager : IFeedEventHandler
             lock (book.SyncRoot)
             {
                 book.Clear();
-                _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
             }
+            _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
         }
     }
 }

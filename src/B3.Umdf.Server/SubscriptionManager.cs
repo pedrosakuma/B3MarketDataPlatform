@@ -249,32 +249,52 @@ public sealed class SubscriptionManager : IBookEventHandler, IMarketDataEventHan
     /// </summary>
     private static void SendMboSnapshot(ClientSession session, OrderBook book)
     {
-        byte[] buf;
-        int offset;
+        // Copy minimal data under lock, serialize outside.
+        // Snapshots are rare (once per subscription), but hold the lock long enough
+        // to cause feed-thread contention on large books.
+        ulong securityId;
+        uint lastRptSeq;
+        (ulong OrderId, byte Side, long Price, long Quantity)[] bidOrders;
+        (ulong OrderId, byte Side, long Price, long Quantity)[] askOrders;
 
         lock (book.SyncRoot)
         {
-            int headerSize = WireProtocol.BookSnapshotSize(0, 0);
-            int totalOrders = book.Bids.Orders.Count + book.Asks.Orders.Count;
-            buf = new byte[headerSize + totalOrders * 37];
-
-            WireProtocol.WriteBookSnapshotHeader(buf, book.SecurityId, book.LastRptSeq, 0, 0);
-            offset = headerSize;
-
-            SerializeSideOrders(buf, ref offset, book.SecurityId, book.Bids);
-            SerializeSideOrders(buf, ref offset, book.SecurityId, book.Asks);
+            securityId = book.SecurityId;
+            lastRptSeq = book.LastRptSeq;
+            bidOrders = CopyOrderData(book.Bids);
+            askOrders = CopyOrderData(book.Asks);
         }
 
-        // Single enqueue outside the lock — one slot, no flood
+        int headerSize = WireProtocol.BookSnapshotSize(0, 0);
+        int totalOrders = bidOrders.Length + askOrders.Length;
+        var buf = new byte[headerSize + totalOrders * 37];
+
+        WireProtocol.WriteBookSnapshotHeader(buf, securityId, lastRptSeq, 0, 0);
+        int offset = headerSize;
+
+        SerializeOrderArray(buf, ref offset, securityId, bidOrders);
+        SerializeOrderArray(buf, ref offset, securityId, askOrders);
+
         session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, offset));
     }
 
-    private static void SerializeSideOrders(byte[] buf, ref int offset, ulong securityId, BookSide side)
+    private static (ulong OrderId, byte Side, long Price, long Quantity)[] CopyOrderData(BookSide side)
     {
-        foreach (var entry in side.Orders.Values)
+        var orders = side.Orders;
+        var result = new (ulong, byte, long, long)[orders.Count];
+        int i = 0;
+        foreach (var entry in orders.Values)
+            result[i++] = (entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
+        return result;
+    }
+
+    private static void SerializeOrderArray(byte[] buf, ref int offset, ulong securityId,
+        (ulong OrderId, byte Side, long Price, long Quantity)[] orders)
+    {
+        foreach (var (orderId, side, price, quantity) in orders)
         {
             int len = WireProtocol.WriteOrderEvent(buf.AsSpan(offset), MessageType.OrderAdded,
-                securityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
+                securityId, orderId, side, price, quantity);
             offset += len;
         }
     }

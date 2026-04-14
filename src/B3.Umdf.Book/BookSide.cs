@@ -6,15 +6,15 @@ namespace B3.Umdf.Book;
 public sealed class BookSide
 {
     private readonly BookSideType _side;
-    private readonly Dictionary<ulong, OrderBookEntry> _orders = new();
+    private readonly Dictionary<ulong, OrderBookEntry> _orders = new(128);
 
     // Price levels sorted with BEST at the END of the list.
     // Bids: ascending (lowest→highest, best=highest at end)
     // Asks: descending (highest→lowest, best=lowest at end)
     // Most activity is near top-of-book → inserts/removes near the end = O(1) amortized.
-    private readonly List<(long Price, List<OrderBookEntry> Orders)> _levels = new();
+    private readonly List<(long Price, List<OrderBookEntry> Orders)> _levels = new(64);
     private readonly bool _ascending;
-    private readonly Stack<List<OrderBookEntry>> _listPool = new();
+    private readonly Stack<List<OrderBookEntry>> _listPool = new(32);
 
     public BookSideType Side => _side;
     public int OrderCount => _orders.Count;

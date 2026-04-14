@@ -12,7 +12,7 @@ namespace B3.Umdf.Book;
 
 public sealed class MarketDataManager : IFeedEventHandler
 {
-    private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new();
+    private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new(Environment.ProcessorCount, 4096);
     private volatile FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
     private readonly ConcurrentDictionary<string, int> _groupStatus = new(StringComparer.Ordinal);
     private readonly IMarketDataEventHandler? _eventHandler;
