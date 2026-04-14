@@ -63,13 +63,13 @@ export function buildUnsubscribe(securityId) {
 }
 
 // ── Message parser (server → client) ──
+// Zero-copy: parses directly from coalesced ArrayBuffer at given offset.
 
 const decoder = new TextDecoder();
 
-export function parseMessage(data) {
-  const v = new DataView(data);
-  if (data.byteLength < 4) return null;
-  const length = v.getUint16(0, true);
+export function parseMessage(buf, baseOffset, msgLen) {
+  if (msgLen < 4) return null;
+  const v = new DataView(buf, baseOffset, msgLen);
   const type = v.getUint16(2, true);
   let o = 4;
 
@@ -78,39 +78,23 @@ export function parseMessage(data) {
       const securityId = v.getBigUint64(o, true); o += 8;
       const flags = v.getUint8(o); o += 1;
       const sLen = v.getUint8(o); o += 1;
-      const symbol = decoder.decode(new Uint8Array(data, o, sLen));
+      const symbol = decoder.decode(new Uint8Array(buf, baseOffset + o, sLen));
       return { type: 'SubscribeOk', securityId, flags, symbol };
     }
     case MSG.SUBSCRIBE_ERROR: {
       const errorCode = v.getUint8(o); o += 1;
       const sLen = v.getUint8(o); o += 1;
-      const symbol = decoder.decode(new Uint8Array(data, o, sLen));
+      const symbol = decoder.decode(new Uint8Array(buf, baseOffset + o, sLen));
       const errorNames = { 1: 'UnknownSymbol', 2: 'NotReady' };
-      return { type: 'SubscribeError', errorCode, errorName: errorNames[errorCode] || `Code ${errorCode}`, symbol };
+      return { type: 'SubscribeError', errorCode, errorName: errorNames[errorCode] || "Code " + errorCode, symbol };
     }
     case MSG.UNSUBSCRIBED: {
       const securityId = v.getBigUint64(o, true);
       return { type: 'Unsubscribed', securityId };
     }
     case MSG.BOOK_SNAPSHOT: {
-      const securityId = v.getBigUint64(o, true); o += 8;
-      const rptSeq = v.getUint32(o, true); o += 4;
-      const bidCount = v.getUint16(o, true); o += 2;
-      const askCount = v.getUint16(o, true); o += 2;
-      const bids = [], asks = [];
-      for (let i = 0; i < bidCount; i++) {
-        const price = Number(v.getBigInt64(o, true)); o += 8;
-        const qty = Number(v.getBigInt64(o, true)); o += 8;
-        const count = v.getUint16(o, true); o += 2;
-        bids.push({ price, qty, count });
-      }
-      for (let i = 0; i < askCount; i++) {
-        const price = Number(v.getBigInt64(o, true)); o += 8;
-        const qty = Number(v.getBigInt64(o, true)); o += 8;
-        const count = v.getUint16(o, true); o += 2;
-        asks.push({ price, qty, count });
-      }
-      return { type: 'BookSnapshot', securityId, rptSeq, bids, asks };
+      const securityId = v.getBigUint64(o, true);
+      return { type: 'BookSnapshot', securityId };
     }
     case MSG.INFO_SNAPSHOT: {
       const securityId = v.getBigUint64(o, true); o += 8;
@@ -149,7 +133,7 @@ export function parseMessage(data) {
     }
     case MSG.BOOK_CLEARED: {
       const securityId = v.getBigUint64(o, true); o += 8;
-      const side = o < data.byteLength ? v.getUint8(o) : 0;
+      const side = o < msgLen ? v.getUint8(o) : 0;
       return { type: 'BookCleared', securityId, side };
     }
     case MSG.RANKINGS_UPDATE: {
@@ -161,7 +145,7 @@ export function parseMessage(data) {
           const securityId = v.getBigUint64(o, true); o += 8;
           const value = Number(v.getBigInt64(o, true)); o += 8;
           const sLen = v.getUint8(o); o += 1;
-          const symbol = decoder.decode(new Uint8Array(data, o, sLen)); o += sLen;
+          const symbol = decoder.decode(new Uint8Array(buf, baseOffset + o, sLen)); o += sLen;
           entries.push({ securityId, value, symbol });
         }
         categories.push(entries);
@@ -169,6 +153,6 @@ export function parseMessage(data) {
       return { type: 'RankingsUpdate', volume: categories[0], gainers: categories[1], losers: categories[2] };
     }
     default:
-      return { type: 'Unknown', msgType: type };
+      return null;
   }
 }

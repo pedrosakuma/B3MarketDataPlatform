@@ -1,19 +1,43 @@
 // Application entry point — WebSocket connection, message handling, actions.
+// Uses a single rAF dirty-flag render loop for all UI regions.
 
 import { MSG, DATA_FLAGS, buildSubscribeOrGet, buildUnsubscribe, parseMessage, flagsStr } from './protocol.js';
 import { state, subscriptions, rankings, stats } from './state.js';
 import {
-  $, secIdStr, formatPrice, formatQty,
-  setStatus, renderSubList, renderSelected, renderBook, renderInfo, renderTrades, renderHealth,
-  renderRankings, addLog, clearLog, setLogEnabled, updateStats, addTrade,
+  $, secIdStr, setStatus, renderSubList, updateTitles, renderBook, renderInfo, renderTrades,
+  renderHealth, renderRankings, addLog, clearLog, setLogEnabled, updateStats, addTrade,
 } from './ui.js';
 
-// ── Throttled book render ──
-let bookRenderScheduled = false;
-function scheduleBookRender() {
-  if (bookRenderScheduled) return;
-  bookRenderScheduled = true;
-  requestAnimationFrame(() => { bookRenderScheduled = false; renderBook(); });
+// ── Dirty-flag render loop (single rAF for all UI regions) ──
+let _dirty = 0;
+let _rafPending = false;
+const D_BOOK     = 0x01;
+const D_INFO     = 0x02;
+const D_TRADES   = 0x04;
+const D_STATS    = 0x08;
+const D_SUBLIST  = 0x10;
+const D_RANKINGS = 0x20;
+const D_TITLES   = 0x40;
+
+function markDirty(flags) {
+  _dirty |= flags;
+  if (!_rafPending) {
+    _rafPending = true;
+    requestAnimationFrame(flushRender);
+  }
+}
+
+function flushRender() {
+  _rafPending = false;
+  const d = _dirty;
+  _dirty = 0;
+  if (d & D_SUBLIST) renderSubList();
+  if (d & D_TITLES) updateTitles();
+  if (d & D_BOOK) renderBook();
+  if (d & D_INFO) renderInfo();
+  if (d & D_TRADES) renderTrades();
+  if (d & D_STATS) updateStats();
+  if (d & D_RANKINGS) renderRankings();
 }
 
 // ── Helpers ──
@@ -104,30 +128,29 @@ function connect() {
     $('btnGet').disabled = true;
     $('btnConnect').textContent = 'Connect';
     addLog('Disconnected', 'log-error');
-    // Clear rankings on disconnect
     rankings.volume = []; rankings.gainers = []; rankings.losers = [];
-    renderRankings();
+    markDirty(D_RANKINGS);
     scheduleReconnect();
   };
 
   ws.onerror = () => addLog('WebSocket error', 'log-error');
 
+  // Zero-copy message parsing: single DataView over the coalesced frame,
+  // parseMessage reads directly at offset — no buf.slice().
   ws.onmessage = (evt) => {
     if (!(evt.data instanceof ArrayBuffer)) return;
-    // Coalesced frame: may contain multiple length-prefixed messages
     const buf = evt.data;
+    const view = new DataView(buf);
     let offset = 0;
     while (offset + 4 <= buf.byteLength) {
-      const v = new DataView(buf, offset);
-      const len = v.getUint16(0, true);
+      const len = view.getUint16(offset, true);
       if (len < 4 || offset + len > buf.byteLength) break;
-      const msgBuf = buf.slice(offset, offset + len);
       stats.msgs++;
-      const msg = parseMessage(msgBuf);
+      const msg = parseMessage(buf, offset, len);
       if (msg) handleMessage(msg);
       offset += len;
     }
-    updateStats();
+    markDirty(D_STATS);
   };
 }
 
@@ -135,7 +158,7 @@ function scheduleReconnect() {
   if (!state.autoReconnect || !$('autoReconnect').checked) return;
   state.reconnectAttempts++;
   const delay = Math.min(1000 * Math.pow(1.5, state.reconnectAttempts - 1), MAX_RECONNECT_DELAY);
-  addLog(`Reconnecting in ${(delay / 1000).toFixed(1)}s (attempt ${state.reconnectAttempts})...`, 'log-info');
+  addLog('Reconnecting in ' + (delay / 1000).toFixed(1) + 's (attempt ' + state.reconnectAttempts + ')...', 'log-info');
   state.reconnectTimer = setTimeout(() => {
     if (!state.ws || state.ws.readyState >= WebSocket.CLOSING) {
       connect();
@@ -160,14 +183,14 @@ function doSubscribe() {
   const sym = $('symbolInput').value.trim().toUpperCase();
   if (!sym || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   state.ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, sym, getFlags()));
-  addLog(`→ Subscribe ${sym} [${flagsStr(getFlags())}]`, '');
+  addLog('\u2192 Subscribe ' + sym + ' [' + flagsStr(getFlags()) + ']', '');
 }
 
 function doGet() {
   const sym = $('symbolInput').value.trim().toUpperCase();
   if (!sym || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   state.ws.send(buildSubscribeOrGet(MSG.GET, sym, getFlags()));
-  addLog(`→ Get ${sym} [${flagsStr(getFlags())}]`, '');
+  addLog('\u2192 Get ' + sym + ' [' + flagsStr(getFlags()) + ']', '');
 }
 
 function doUnsubscribe(securityIdStr) {
@@ -175,42 +198,39 @@ function doUnsubscribe(securityIdStr) {
   const bigint = BigInt(securityIdStr);
   state.ws.send(buildUnsubscribe(bigint));
 
-  // Optimistic local removal — don't wait for server roundtrip
   const sub = subscriptions.get(securityIdStr);
   subscriptions.delete(securityIdStr);
   if (state.selectedSecurityId === securityIdStr) {
     state.selectedSecurityId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-    renderSelected();
   }
-  renderSubList();
-  addLog(`→ Unsubscribe ${sub?.symbol || securityIdStr}`, '');
+  markDirty(D_SUBLIST | D_BOOK | D_INFO | D_TRADES | D_TITLES);
+  addLog('\u2192 Unsubscribe ' + (sub ? sub.symbol : securityIdStr), '');
 }
 
 function selectSubscription(id) {
   state.selectedSecurityId = id;
-  renderSubList();
-  renderSelected();
+  markDirty(D_SUBLIST | D_BOOK | D_INFO | D_TRADES | D_TITLES);
 }
 
 function rankingClick(symbol) {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
-  // If already subscribed, just select it
   for (const [id, sub] of subscriptions) {
     if (sub.symbol === symbol) { selectSubscription(id); return; }
   }
-  // Otherwise subscribe with ALL flags
   state.ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, symbol, DATA_FLAGS.ALL));
-  addLog(`→ Subscribe ${symbol} [Book+Info] (from ranking)`, '');
+  addLog('\u2192 Subscribe ' + symbol + ' [Book+Info] (from ranking)', '');
 }
 
 function switchRankingsTab(tab) {
   state.rankingsTab = tab;
-  renderRankings();
+  markDirty(D_RANKINGS);
 }
 
-// ── Message handler ──
+// ── Message handler (state mutations only — rendering deferred to rAF) ──
 
 function handleMessage(msg) {
+  const sel = state.selectedSecurityId;
+
   switch (msg.type) {
     case 'SubscribeOk': {
       const id = secIdStr(msg.securityId);
@@ -218,37 +238,39 @@ function handleMessage(msg) {
         symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
         orders: new Map(), info: {}, trades: [], orderCount: 0, tradeCount: 0,
       });
-      if (!state.selectedSecurityId) selectSubscription(id);
-      renderSubList();
-      addLog(`SubscribeOk ${msg.symbol} id=${id} [${flagsStr(msg.flags)}]`, 'log-sub-ok');
+      let d = D_SUBLIST;
+      if (!sel) {
+        state.selectedSecurityId = id;
+        d |= D_BOOK | D_INFO | D_TRADES | D_TITLES;
+      }
+      markDirty(d);
+      addLog('SubscribeOk ' + msg.symbol + ' id=' + id + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
       break;
     }
     case 'SubscribeError':
-      addLog(`SubscribeError ${msg.symbol}: ${msg.errorName}`, 'log-error');
+      addLog('SubscribeError ' + msg.symbol + ': ' + msg.errorName, 'log-error');
       break;
     case 'Unsubscribed': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) {
-        // Server confirmed — remove if not already removed optimistically
         subscriptions.delete(id);
-        if (state.selectedSecurityId === id) {
+        let d = D_SUBLIST;
+        if (sel === id) {
           state.selectedSecurityId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-          renderSelected();
+          d |= D_BOOK | D_INFO | D_TRADES | D_TITLES;
         }
-        renderSubList();
+        markDirty(d);
       }
-      addLog(`Unsubscribed ${sub?.symbol || id}`, 'log-error');
+      addLog('Unsubscribed ' + (sub ? sub.symbol : id), 'log-error');
       break;
     }
     case 'BookSnapshot': {
       stats.books++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) {
-        sub.orders = new Map(); // reset MBO — subsequent OrderAdded rebuild it
-      }
-      if (state.selectedSecurityId === id) renderBook();
+      if (sub) sub.orders = new Map();
+      if (sel === id) markDirty(D_BOOK);
       break;
     }
     case 'InfoSnapshot': {
@@ -256,7 +278,7 @@ function handleMessage(msg) {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) Object.assign(sub.info, msg.fields);
-      if (state.selectedSecurityId === id) renderInfo();
+      if (sel === id) markDirty(D_INFO);
       break;
     }
     case 'OrderAdded':
@@ -266,9 +288,10 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
-        sub.orders.set(msg.orderId.toString(), { side: msg.side, price: msg.price, qty: msg.qty });
+        // BigInt key avoids toString() allocation per order event
+        sub.orders.set(msg.orderId, { side: msg.side, price: msg.price, qty: msg.qty });
       }
-      if (state.selectedSecurityId === id) scheduleBookRender();
+      if (sel === id) markDirty(D_BOOK);
       break;
     }
     case 'OrderDeleted': {
@@ -277,9 +300,9 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
-        sub.orders.delete(msg.orderId.toString());
+        sub.orders.delete(msg.orderId);
       }
-      if (state.selectedSecurityId === id) scheduleBookRender();
+      if (sel === id) markDirty(D_BOOK);
       break;
     }
     case 'Trade': {
@@ -290,34 +313,32 @@ function handleMessage(msg) {
         sub.tradeCount++;
         addTrade(sub, msg.price, msg.qty);
       }
-      if (state.selectedSecurityId === id) renderTrades();
+      if (sel === id) markDirty(D_TRADES);
       break;
     }
     case 'BookCleared': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) {
-        const clearSide = msg.side; // 0=Both, 1=Bid, 2=Ask
-        if (clearSide === 0) {
+        if (msg.side === 0) {
           sub.orders = new Map();
         } else {
-          const orderSide = clearSide - 1; // 0=Bid, 1=Ask
+          const orderSide = msg.side - 1;
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
         }
       }
-      if (state.selectedSecurityId === id) renderBook();
+      if (sel === id) markDirty(D_BOOK);
       const sideNames = ['Both', 'Bid', 'Ask'];
-      const sym = sub?.symbol || id;
-      addLog(`BookCleared ${sym} (${sideNames[msg.side] || 'Both'})`, 'log-book');
+      addLog('BookCleared ' + (sub ? sub.symbol : id) + ' (' + (sideNames[msg.side] || 'Both') + ')', 'log-book');
       break;
     }
     case 'RankingsUpdate': {
       rankings.volume = msg.volume;
       rankings.gainers = msg.gainers;
       rankings.losers = msg.losers;
-      renderRankings();
+      markDirty(D_RANKINGS);
       break;
     }
   }
@@ -338,5 +359,4 @@ window.toggleLog = setLogEnabled;
 // ── Init ──
 setStatus('disconnected');
 startHealthPolling();
-// Auto-connect on page load
 connect();
