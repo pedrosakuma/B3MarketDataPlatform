@@ -15,7 +15,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Feed A/B deduplication** — automatic duplicate packet filtering
 - **Gap detection & snapshot recovery** — detects missing packets, transitions to snapshot recovery, catch-up and back to real-time
 - **Market-by-Order (MBO) book** — full order book maintenance per instrument
-- **Market data aggregation** — instrument info with 22 fields (prices, volumes, bands, status)
+- **Market data aggregation** — instrument info with 22+ fields (prices, volumes, bands, status) plus SecurityDefinition repeating groups (underlyings, legs, attributes) and SecurityDesc
 - **Symbol registry with periodic freeze** — `ConcurrentDictionary` for real-time writes, periodically promoted to `FrozenDictionary` for fast lookups; supports mid-session instrument listings (e.g. new options series)
 
 ### WebSocket Server
@@ -23,7 +23,8 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Data channel filtering** — subscribe to Book, Info, or both via `DataFlags` bitmask
 - **Unary Get** — one-shot snapshot without subscribing
 - **Upstream conflation** — order add+delete within the same packet are cancelled; same-price trades aggregate quantities
-- **Rankings** — top 10 by volume, gainers, and losers pushed every 300ms
+- **Rankings** — top 10 by volume, gainers, and losers pushed every 2s
+- **Server status broadcast** — sends ready state on connect; auto-resubscribes all instruments on reconnect
 - **Backpressure** — bounded per-client outbound queue, slow-client detection and auto-disconnect
 
 ### Web Frontend
@@ -35,15 +36,15 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Trade log** — 50 most recent trades with time, price, and quantity
 - **Rankings panel** — volume, gainers, and losers tabs with click-to-subscribe
 - **Instrument info grid** — 22 market data fields with configurable price decimal display
-- **Instrument detail modal** — full instrument metadata via REST endpoint, keyboard shortcuts (Ctrl+I, Alt+↑/↓)
+- **Instrument detail modal** — full instrument metadata via REST endpoint, including repeating groups (underlyings, legs, attributes), SecurityDesc, CFI Code interpretation (ISO 10962); keyboard shortcuts (Ctrl+I, Alt+↑/↓)
 - **Event log** — subscription events, connection status, errors
-- **Auto-reconnect** — exponential backoff with configurable toggle
+- **Auto-reconnect** — exponential backoff with configurable toggle; automatic resubscription of all instruments when feed is ready
 
 ### Operations
 - **Docker Compose** — one command to run backend + frontend with PCAP replay
 - **Health endpoints** — `/health`, `/ready`, `/live` for Kubernetes probes
 - **Feed queue monitoring** — per-group channel depth exposed in console output
-- **OpenTelemetry metrics** — `System.Diagnostics.Metrics` counters/gauges (packets, orders, WS connections, drops)
+- **OpenTelemetry metrics** — `System.Diagnostics.Metrics` with 26 observable instruments (counters/gauges) covering feed, book, market data, and server subsystems; zero dependencies, fully AOT-safe
 - **Structured logging** — `ILogger<T>` throughout with structured log templates
 - **Graceful shutdown** — SIGTERM handling with ordered drain
 - **Configuration** — JSON + environment variable config (`UMDF_*` prefix)
@@ -125,8 +126,8 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 | `B3.Umdf.Feed` | Feed handler, gap detection, A/B dedup, message dispatch |
 | `B3.Umdf.Book` | Market-by-Order book: `OrderBook`, `BookSide`, `BookManager`, `MarketDataManager`, `SymbolRegistry` |
 | `B3.Umdf.PcapReplay` | PCAP reader, UDP extractor, timestamp-merged replayer |
-| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `ClientSession`, `WebSocketHost`, `AppMetrics`, `AppSettings` |
-| `B3.Umdf.ConsoleApp` | CLI application — PCAP replay + optional WebSocket server |
+| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `ClientSession`, `WebSocketHost`, `AppSettings` |
+| `B3.Umdf.ConsoleApp` | CLI application — PCAP replay + optional WebSocket server + `AppMetrics` (OTEL instruments) |
 
 ## Tests
 
@@ -282,6 +283,7 @@ All messages use a 4-byte framing header: `[u16 messageLength][u16 messageType]`
 | **OrderDeleted** | `0x0032` | `[securityId u64][orderId u64][side u8]` |
 | **Trade** | `0x0033` | `[securityId u64][price i64][qty i64][tradeId i64]` |
 | **BookCleared** | `0x0034` | `[securityId u64]` |
+| **ServerStatus** | `0x0050` | `[ready u8]` |
 
 **BookSnapshot levels**: each level is `[price i64][totalQty i64][orderCount u16]` (18 bytes).
 
@@ -430,6 +432,8 @@ When the WebSocket server is active (`--ws-port`), HTTP endpoints are available 
 | `GET /health` | JSON: status, uptime, feed group states, last packet timestamps |
 | `GET /ready` | `200` when all groups RealTime, `503` otherwise (readiness probe) |
 | `GET /live` | Always `200` (liveness probe) |
+| `GET /symbols` | JSON: list of all known symbols |
+| `GET /instrument/{symbol}` | JSON: full instrument metadata including SecurityDefinition groups |
 
 ```bash
 curl http://localhost:8080/health | jq
@@ -438,21 +442,76 @@ curl http://localhost:8080/health | jq
 
 ### Metrics
 
-OpenTelemetry-compatible metrics via `System.Diagnostics.Metrics` (meter: `B3.Umdf`):
+OTEL-compatible metrics via `System.Diagnostics.Metrics` (zero NuGet dependencies, fully AOT-safe).
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `umdf.packets.received` | Counter | Total UMDF packets processed |
-| `umdf.gaps.detected` | Counter | Sequence gaps detected |
-| `umdf.parse_errors` | Counter | SBE parse failures |
-| `umdf.orders.processed` | Counter | Order add/update/delete events |
-| `umdf.trades.processed` | Counter | Trade events |
-| `umdf.ws.connections.active` | UpDownCounter | Current WebSocket connections |
-| `umdf.ws.messages.sent` | Counter | Messages sent to subscribers |
-| `umdf.ws.messages.dropped` | Counter | Messages dropped (slow clients) |
-| `umdf.ws.slow_disconnects` | Counter | Clients disconnected for being slow |
+**Meter name:** `B3.Umdf.Consumer`
 
-Collect via [dotnet-counters](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-counters), OTLP exporter, or Prometheus scrape.
+```bash
+# Install dotnet-counters (one time)
+dotnet tool install -g dotnet-counters
+
+# Monitor all metrics
+dotnet-counters monitor --counters B3.Umdf.Consumer --process-id <PID>
+
+# Monitor specific metrics
+dotnet-counters monitor --counters B3.Umdf.Consumer[b3.umdf.feed.packets,b3.umdf.book.trades] --process-id <PID>
+```
+
+#### Feed Instruments
+
+| Metric | Type | Tags | Description |
+|--------|------|------|-------------|
+| `b3.umdf.feed.packets` | Counter | `group` | Packets received from feed |
+| `b3.umdf.feed.duplicates` | Counter | `group` | Duplicate packets skipped |
+| `b3.umdf.feed.gaps` | Counter | `group` | Sequence gaps detected |
+| `b3.umdf.feed.instrument_definitions` | Counter | `group` | Instrument definitions received |
+| `b3.umdf.feed.state` | Gauge | `group` | Feed state (0=WaitInstrDef, 1=WaitSnapshot, 2=CatchUp, 3=RealTime, 4=Recovery) |
+| `b3.umdf.feed.last_packet_age` | Gauge | `group` | Milliseconds since last packet (stale feed detection) |
+| `b3.umdf.feed.queue_depth` | Gauge | `group` | Pending packets in feed queue (multi-channel only) |
+
+#### Book Instruments
+
+| Metric | Type | Tags | Description |
+|--------|------|------|-------------|
+| `b3.umdf.book.orders_added` | Counter | `group` | Orders added to books |
+| `b3.umdf.book.orders_updated` | Counter | `group` | Order updates applied |
+| `b3.umdf.book.orders_deleted` | Counter | `group` | Orders deleted from books |
+| `b3.umdf.book.trades` | Counter | — | Trades processed |
+| `b3.umdf.book.parse_errors` | Counter | `group` | Book SBE parse errors |
+| `b3.umdf.book.crossings` | Counter | `group` | Bid/ask crossing transitions |
+| `b3.umdf.book.delete_not_found` | Counter | `group` | Delete operations on non-existent orders |
+| `b3.umdf.book.null_price_skips` | Counter | `group` | New orders skipped due to null price |
+| `b3.umdf.book.null_price_deletes` | Counter | `group` | Updates with null price converted to deletes |
+| `b3.umdf.book.active` | Gauge | `group` | Active order books |
+
+#### Market Data Instruments
+
+| Metric | Type | Tags | Description |
+|--------|------|------|-------------|
+| `b3.umdf.market_data.updates` | Counter | — | Market data updates |
+| `b3.umdf.market_data.status_changes` | Counter | — | Security status changes |
+| `b3.umdf.market_data.forward_trades` | Counter | — | Forward trades |
+| `b3.umdf.market_data.trade_busts` | Counter | — | Trade busts |
+| `b3.umdf.market_data.execution_summaries` | Counter | — | Execution summaries |
+| `b3.umdf.market_data.parse_errors` | Counter | `group` | Market data SBE parse errors |
+| `b3.umdf.instruments.active` | Gauge | `group` | Active instruments |
+| `b3.umdf.symbols.registered` | Gauge | — | Total registered symbols |
+
+#### Server Instruments
+
+| Metric | Type | Tags | Description |
+|--------|------|------|-------------|
+| `b3.umdf.server.clients` | Gauge | — | Connected WebSocket clients |
+| `b3.umdf.server.upstream_conflated` | Gauge | — | Pending events in conflation buffers |
+| `b3.umdf.server.client_queue_depth` | Gauge | `client` | Per-client outbound queue depth |
+| `b3.umdf.server.messages_sent` | Counter | `client` | Messages sent to WebSocket clients |
+| `b3.umdf.server.bytes_sent` | Counter | `client` | Bytes sent to WebSocket clients |
+| `b3.umdf.server.events_received` | Counter | `group` | Events received into conflation |
+| `b3.umdf.server.events_flushed` | Counter | `group` | Events flushed from conflation to clients |
+
+All instruments are **pull-based** (ObservableCounter/ObservableGauge) — zero overhead on the hot path. `dotnet-counters` computes rates automatically from Counter instruments.
+
+Later, adding a Prometheus `/metrics` endpoint or OTLP exporter requires only the corresponding NuGet package — no instrumentation changes.
 
 ### Configuration
 
