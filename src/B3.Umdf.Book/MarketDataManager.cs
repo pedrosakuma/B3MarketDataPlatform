@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
+using System.Text;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
@@ -156,6 +157,55 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.ExerciseStyle = msg.ExerciseStyle is { } es ? (int)es : null;
         info.MarketSegmentID = msg.MarketSegmentID;
         info.TickSizeDenominator = msg.TickSizeDenominator;
+
+        // Read repeating groups (underlyings, legs, attribs) and SecurityDesc varData
+        List<UnderlyingInfo>? underlyings = null;
+        List<LegInfo>? legs = null;
+        List<InstrAttribInfo>? attribs = null;
+        string? secDesc = null;
+
+        reader.ReadGroups(
+            (in SecurityDefinition_12Data.NoUnderlyingsData u) =>
+            {
+                underlyings ??= new();
+                underlyings.Add(new UnderlyingInfo
+                {
+                    SecurityId = (ulong)u.UnderlyingSecurityID,
+                    Symbol = u.UnderlyingSymbol.ToString().Trim(),
+                });
+            },
+            (in SecurityDefinition_12Data.NoLegsData leg) =>
+            {
+                legs ??= new();
+                legs.Add(new LegInfo
+                {
+                    SecurityId = (ulong)leg.LegSecurityID,
+                    Symbol = leg.LegSymbol.ToString().Trim(),
+                    RatioQty = leg.LegRatioQty.Mantissa,
+                    SecurityType = (int)leg.LegSecurityType,
+                    Side = (int)leg.LegSide,
+                });
+            },
+            (in SecurityDefinition_12Data.NoInstrAttribsData a) =>
+            {
+                attribs ??= new();
+                attribs.Add(new InstrAttribInfo
+                {
+                    Type = (int)a.InstrAttribType,
+                    Value = (int)a.InstrAttribValue,
+                });
+            },
+            (TextEncoding desc) =>
+            {
+                if (desc.Length > 0)
+                    secDesc = Encoding.UTF8.GetString(desc.VarData);
+            }
+        );
+
+        info.Underlyings = underlyings;
+        info.Legs = legs;
+        info.InstrAttribs = attribs;
+        info.SecurityDescription = secDesc;
 
         info.BumpVersion();
     }

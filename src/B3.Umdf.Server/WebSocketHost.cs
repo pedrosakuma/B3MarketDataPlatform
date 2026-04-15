@@ -118,6 +118,7 @@ public sealed class WebSocketHost : IAsyncDisposable
                 Currency = info.Currency,
                 CfiCode = info.CfiCode,
                 SecurityGroup = info.SecurityGroup,
+                SecurityDescription = info.SecurityDescription,
                 SecurityType = info.SecurityType,
                 SecuritySubType = info.SecuritySubType,
                 Product = info.Product,
@@ -153,6 +154,24 @@ public sealed class WebSocketHost : IAsyncDisposable
                 NumberOfTrades = info.NumberOfTrades,
                 OpenInterest = info.OpenInterest,
                 LastUpdateTimestamp = info.LastUpdateTimestamp,
+                Underlyings = info.Underlyings?.Select(u => new UnderlyingResponse
+                {
+                    SecurityId = u.SecurityId,
+                    Symbol = u.Symbol,
+                }).ToList(),
+                Legs = info.Legs?.Select(l => new LegResponse
+                {
+                    SecurityId = l.SecurityId,
+                    Symbol = l.Symbol,
+                    RatioQty = l.RatioQty,
+                    SecurityType = l.SecurityType,
+                    Side = l.Side,
+                }).ToList(),
+                InstrAttribs = info.InstrAttribs?.Select(a => new InstrAttribResponse
+                {
+                    Type = a.Type,
+                    Value = a.Value,
+                }).ToList(),
             };
             return Results.Json(resp, AppJsonContext.Default.InstrumentInfoResponse);
         });

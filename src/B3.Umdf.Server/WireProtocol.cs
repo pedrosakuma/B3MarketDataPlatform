@@ -24,6 +24,9 @@ public enum MessageType : ushort
     Trade = 0x0033,
     BookCleared = 0x0034,
     RankingsUpdate = 0x0040,
+
+    /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
+    ServerStatus = 0x0050,
 }
 
 public enum SubscribeErrorCode : byte
@@ -97,6 +100,15 @@ public static class WireProtocol
     }
 
     // --- Server → Client ---
+
+    /// <summary>Write ServerStatus: 1-byte ready flag. Total: 5 bytes.</summary>
+    public static int WriteServerStatus(Span<byte> dest, bool ready)
+    {
+        const ushort totalLen = FramingHeaderSize + 1;
+        WriteFramingHeader(dest, totalLen, MessageType.ServerStatus);
+        dest[4] = ready ? (byte)1 : (byte)0;
+        return totalLen;
+    }
 
     /// <summary>Write SubscribeOk: securityId + flags + symbol.</summary>
     public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, DataFlags flags, string symbol)

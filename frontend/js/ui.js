@@ -21,6 +21,7 @@ export function setStatus(s) {
   const dot = $('statusDot');
   const text = $('statusText');
   if (s === 'connected')       { dot.className = 'dot on';  text.textContent = 'Connected'; }
+  else if (s === 'waiting')    { dot.className = 'dot wait'; text.textContent = 'Waiting for feed...'; }
   else if (s === 'connecting') { dot.className = 'dot off'; text.textContent = 'Connecting...'; }
   else                         { dot.className = 'dot off'; text.textContent = 'Disconnected'; }
 }

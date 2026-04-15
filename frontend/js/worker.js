@@ -18,6 +18,7 @@ let ws = null;
 let autoReconnect = true;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let serverReady = false;
 
 // ── Dirty tracking ──
 let dirty = 0;
@@ -152,6 +153,7 @@ function connect(url) {
 
   ws.onclose = () => {
     clearTimeout(connectTimeout);
+    serverReady = false;
     postMessage({ type: 'status', status: 'disconnected' });
     log('Disconnected', 'log-error');
     rankings.volume = []; rankings.gainers = []; rankings.losers = [];
@@ -186,6 +188,15 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     if (!ws || ws.readyState >= WebSocket.CLOSING) connect();
   }, delay);
+}
+
+function resubscribeAll() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || subscriptions.size === 0) return;
+  log('Resubscribing ' + subscriptions.size + ' symbol(s)...', 'log-info');
+  for (const [, sub] of subscriptions) {
+    ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, sub.symbol, sub.flags));
+    log('\u2192 Resubscribe ' + sub.symbol + ' [' + flagsStr(sub.flags) + ']', '');
+  }
 }
 
 // ── Message handler ──
@@ -295,6 +306,15 @@ function handleMessage(msg) {
       rankings.gainers = msg.gainers;
       rankings.losers = msg.losers;
       mark(D_RANKINGS);
+      break;
+    }
+    case 'ServerStatus': {
+      const wasReady = serverReady;
+      serverReady = msg.ready;
+      postMessage({ type: 'serverReady', ready: msg.ready });
+      log('Server status: ' + (msg.ready ? 'ready' : 'initializing'), msg.ready ? 'log-sub-ok' : 'log-info');
+      if (msg.ready && !wasReady)
+        resubscribeAll();
       break;
     }
   }

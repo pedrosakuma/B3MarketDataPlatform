@@ -21,6 +21,7 @@ const view = {
   rankings: { volume: [], gainers: [], losers: [] },
   stats: { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 },
   connected: false,
+  serverReady: false,
   rankingsTab: 'volume',
   healthData: null,
 };
@@ -43,11 +44,15 @@ worker.onmessage = (evt) => {
       break;
     case 'status':
       view.connected = msg.status === 'connected';
-      setStatus(msg.status);
-      $('btnSubscribe').disabled = !view.connected;
-      $('btnGet').disabled = !view.connected;
+      setStatus(view.serverReady ? msg.status : msg.status === 'connected' ? 'waiting' : msg.status);
+      updateActionButtons();
       $('btnConnect').textContent = view.connected ? 'Disconnect' : 'Connect';
       if (view.connected) startHealthPolling();
+      break;
+    case 'serverReady':
+      view.serverReady = msg.ready;
+      setStatus(view.connected ? (msg.ready ? 'connected' : 'waiting') : 'disconnected');
+      updateActionButtons();
       break;
     case 'log':
       addLog(msg.text, msg.cssClass);
@@ -150,6 +155,12 @@ function doGet() {
   worker.postMessage({ cmd: 'get', symbol: sym, flags: getFlags() });
 }
 
+function updateActionButtons() {
+  const canSubscribe = view.connected && view.serverReady;
+  $('btnSubscribe').disabled = !canSubscribe;
+  $('btnGet').disabled = !canSubscribe;
+}
+
 function doUnsubscribe(securityId) {
   if (!view.connected) return;
   worker.postMessage({ cmd: 'unsubscribe', securityId });
@@ -216,6 +227,21 @@ const TRADING_STATUS_NAMES = {
 };
 const TRADING_EVENT_NAMES = { 0:'None',1:'Change',4:'NewStatus',101:'PriceBand' };
 
+const CFI_CATEGORY = { E:'Equity',D:'Debt',R:'Right/Warrant',O:'Option',F:'Future',M:'Others(Multileg)',S:'Swap' };
+const CFI_EQUITY_GROUP = { S:'Common/Ordinary',P:'Preferred',C:'Convertible',F:'Preference',L:'Limited Partnership',D:'Depositary Receipt',Y:'Structured Instrument',M:'Others' };
+const LEG_SIDE_NAMES = { 1:'Buy', 2:'Sell' };
+const INSTR_ATTRIB_TYPE_NAMES = { 24:'Trade Type Eligibility', 34:'GTD/GTC Eligibility' };
+const INSTR_ATTRIB_VALUE_NAMES = { 1:'Electronic Match / GTD-GTC', 2:'Order Cross', 3:'Block Trade', 14:'RFQ for Cross', 17:'Negotiated Quote' };
+
+function decodeCfi(code) {
+  if (!code || code.length < 2) return null;
+  const cat = CFI_CATEGORY[code[0]];
+  if (!cat) return code;
+  let group = null;
+  if (code[0] === 'E') group = CFI_EQUITY_GROUP[code[1]];
+  return group ? cat + ' / ' + group : cat;
+}
+
 function enumLabel(map, val) {
   if (val == null) return null;
   return map[val] || String(val);
@@ -259,8 +285,10 @@ function renderModal(body, d) {
       ['ISIN', d.isinNumber],
       ['Currency', d.currency],
       ['CFI Code', d.cfiCode],
+      ['CFI Interpretation', decodeCfi(d.cfiCode)],
       ['Security Group', d.securityGroup],
       ['Market Segment', d.marketSegmentID],
+      ['Description', d.securityDescription],
     ]},
     { title: 'Classification', fields: [
       ['Security Type', enumLabel(SECURITY_TYPE_NAMES, d.securityType)],
@@ -321,6 +349,35 @@ function renderModal(body, d) {
     }
     html += '</div></div>';
   }
+
+  // Underlyings table
+  if (d.underlyings && d.underlyings.length > 0) {
+    html += '<div class="modal-section"><h4>Underlyings</h4><table class="modal-table"><thead><tr><th>Security ID</th><th>Symbol</th></tr></thead><tbody>';
+    for (const u of d.underlyings) {
+      html += '<tr><td>' + u.securityId + '</td><td>' + (u.symbol || '—') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // Legs table
+  if (d.legs && d.legs.length > 0) {
+    html += '<div class="modal-section"><h4>Legs</h4><table class="modal-table"><thead><tr><th>Security ID</th><th>Symbol</th><th>Ratio Qty</th><th>Security Type</th><th>Side</th></tr></thead><tbody>';
+    for (const l of d.legs) {
+      const ratioDisplay = l.ratioQty != null ? (l.ratioQty / 1e7).toFixed(7).replace(/0+$/, '').replace(/\.$/, '') : '—';
+      html += '<tr><td>' + l.securityId + '</td><td>' + (l.symbol || '—') + '</td><td>' + ratioDisplay + '</td><td>' + enumLabel(SECURITY_TYPE_NAMES, l.securityType) + '</td><td>' + (enumLabel(LEG_SIDE_NAMES, l.side) || '—') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  // Instrument Attributes
+  if (d.instrAttribs && d.instrAttribs.length > 0) {
+    html += '<div class="modal-section"><h4>Attributes</h4><table class="modal-table"><thead><tr><th>Type</th><th>Value</th></tr></thead><tbody>';
+    for (const a of d.instrAttribs) {
+      html += '<tr><td>' + (INSTR_ATTRIB_TYPE_NAMES[a.type] || a.type) + '</td><td>' + (INSTR_ATTRIB_VALUE_NAMES[a.value] || a.value) + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
   body.innerHTML = html;
 }
 

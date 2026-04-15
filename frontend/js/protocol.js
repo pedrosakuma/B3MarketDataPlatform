@@ -8,6 +8,7 @@ export const MSG = {
   ORDER_ADDED: 0x0030, ORDER_UPDATED: 0x0031, ORDER_DELETED: 0x0032,
   TRADE: 0x0033, BOOK_CLEARED: 0x0034,
   RANKINGS_UPDATE: 0x0040,
+  SERVER_STATUS: 0x0050,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -151,6 +152,10 @@ export function parseMessage(buf, baseOffset, msgLen) {
         categories.push(entries);
       }
       return { type: 'RankingsUpdate', volume: categories[0], gainers: categories[1], losers: categories[2] };
+    }
+    case MSG.SERVER_STATUS: {
+      const ready = v.getUint8(o) === 1;
+      return { type: 'ServerStatus', ready };
     }
     default:
       return null;

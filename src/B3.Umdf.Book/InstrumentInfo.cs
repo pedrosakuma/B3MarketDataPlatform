@@ -75,6 +75,12 @@ public sealed class InstrumentInfo
     // Timestamps
     public ulong LastUpdateTimestamp { get; set; }
 
+    // SecurityDefinition repeating groups
+    public string? SecurityDescription { get; set; }
+    public List<UnderlyingInfo>? Underlyings { get; set; }
+    public List<LegInfo>? Legs { get; set; }
+    public List<InstrAttribInfo>? InstrAttribs { get; set; }
+
     /// <summary>Reset all fields to null/default.</summary>
     public void Reset()
     {
@@ -121,6 +127,31 @@ public sealed class InstrumentInfo
         NumberOfTrades = null;
         OpenInterest = null;
         LastUpdateTimestamp = 0;
+        SecurityDescription = null;
+        Underlyings = null;
+        Legs = null;
+        InstrAttribs = null;
         BumpVersion();
     }
+}
+
+public sealed class UnderlyingInfo
+{
+    public ulong SecurityId { get; set; }
+    public string? Symbol { get; set; }
+}
+
+public sealed class LegInfo
+{
+    public ulong SecurityId { get; set; }
+    public string? Symbol { get; set; }
+    public long? RatioQty { get; set; }
+    public int? SecurityType { get; set; }
+    public int? Side { get; set; }
+}
+
+public sealed class InstrAttribInfo
+{
+    public int Type { get; set; }
+    public int Value { get; set; }
 }

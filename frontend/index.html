@@ -29,7 +29,7 @@
   .toolbar .sep { width: 1px; height: 24px; background: var(--border); }
   .status { display: inline-flex; align-items: center; gap: .3rem; font-size: .8rem; }
   .status .dot { width: 8px; height: 8px; border-radius: 50%; }
-  .dot.off { background: #666; } .dot.on { background: var(--green); } .dot.err { background: var(--red); }
+  .dot.off { background: #666; } .dot.on { background: var(--green); } .dot.wait { background: #f0a030; } .dot.err { background: var(--red); }
 
   .main { flex: 1; display: grid; grid-template-columns: 220px 1fr; overflow: hidden; }
   .sidebar { background: var(--bg2); border-right: 1px solid var(--border); padding: .75rem; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; }
@@ -117,6 +117,9 @@
   .modal-field .lbl { color: var(--muted); }
   .modal-field .val { font-family: monospace; font-weight: 600; }
   .modal-field .val.null { color: var(--muted); font-style: italic; font-weight: 400; }
+  .modal-table { width: 100%; border-collapse: collapse; font-size: .7rem; margin-top: .25rem; }
+  .modal-table th { text-align: left; color: var(--muted); font-weight: 600; padding: .2rem .4rem; border-bottom: 1px solid var(--border); }
+  .modal-table td { padding: .2rem .4rem; font-family: monospace; border-bottom: 1px solid var(--bg3); }
   .modal-kbd { font-size: .65rem; color: var(--muted); padding: .5rem 1rem; border-top: 1px solid var(--border); text-align: right; }
 
   /* Health bar */

@@ -111,6 +111,9 @@ public sealed class SubscriptionManager
         if (_marketDataManagers is { Length: > 0 } managers)
             session.SetMarketDataManagers(managers);
         AppMetrics.WsConnectionsActive.Add(1);
+
+        // Immediately tell the client whether the server is ready
+        SendServerStatus(session, _ready);
     }
 
     /// <summary>Unregister a client and remove all its subscriptions.</summary>
@@ -492,13 +495,14 @@ public sealed class SubscriptionManager
     public void SetReady()
     {
         _ready = true;
+        BroadcastServerStatus(true);
         StartRankingsTimer();
     }
 
     private Timer? _rankingsTimer;
-    private const long RankingsIntervalMs = 300;
+    private const long RankingsIntervalMs = 2000;
     private int _rankingsTick;
-    private const int PromoteEveryNTicks = 100; // ~30s at 300ms interval
+    private const int PromoteEveryNTicks = 15; // ~30s at 2000ms interval
 
     private void StartRankingsTimer()
     {
@@ -523,6 +527,22 @@ public sealed class SubscriptionManager
             if (mdm.InstrumentData.TryGetValue(securityId, out var info))
                 return info;
         return null;
+    }
+
+    private static void SendServerStatus(ClientSession session, bool ready)
+    {
+        var buf = new byte[5];
+        WireProtocol.WriteServerStatus(buf, ready);
+        session.TryEnqueue(buf);
+    }
+
+    private void BroadcastServerStatus(bool ready)
+    {
+        var buf = new byte[5];
+        WireProtocol.WriteServerStatus(buf, ready);
+        var payload = new ReadOnlyMemory<byte>(buf);
+        foreach (var (_, client) in _clients)
+            client.TryEnqueue(payload);
     }
 
     private static void SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
