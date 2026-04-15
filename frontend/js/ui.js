@@ -166,7 +166,14 @@ function getRankPool() {
 
 export function updateTitles(selectedSymbol) {
   $('bookTitle').textContent = selectedSymbol ? 'Order Book \u2014 ' + selectedSymbol : 'Order Book';
-  $('chartTitle').textContent = selectedSymbol ? 'Chart \u2014 ' + selectedSymbol : 'Chart';
+  const chartText = $('chartTitleText');
+  if (chartText) {
+    // Update only the leading text node, preserving the chartResolution span
+    const label = selectedSymbol ? 'Chart \u2014 ' + selectedSymbol + ' ' : 'Chart ';
+    if (chartText.firstChild && chartText.firstChild.nodeType === Node.TEXT_NODE) {
+      chartText.firstChild.textContent = label;
+    }
+  }
 }
 
 // ── Render functions ──
