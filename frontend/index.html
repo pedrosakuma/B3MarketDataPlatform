@@ -86,7 +86,7 @@
 
   /* Chart resolution */
   .chart-res-label { font-size: .65rem; color: var(--green); font-weight: 400; margin-left: .4rem; }
-  #chartResSelect { font-size: .65rem; padding: .1rem .3rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+  #chartResSelect, #bookDepthSelect { font-size: .65rem; padding: .1rem .3rem; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
 
   /* Rankings */
   .rank-tabs { display: flex; gap: 2px; margin-bottom: .5rem; }
@@ -233,7 +233,17 @@
     <div class="panels">
       <!-- Book panel -->
       <div class="panel">
-        <div class="panel-head" id="bookTitle">Order Book</div>
+        <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
+          <span id="bookTitle">Order Book</span>
+          <select id="bookDepthSelect" onchange="setBookDepth(this.value)" title="Book depth (levels)">
+            <option value="5">5 levels</option>
+            <option value="10">10 levels</option>
+            <option value="15" selected>15 levels</option>
+            <option value="20">20 levels</option>
+            <option value="25">25 levels</option>
+            <option value="50">50 levels</option>
+          </select>
+        </div>
         <div class="panel-body" id="bookBody">
           <div class="empty-msg">Subscribe to see order book</div>
         </div>

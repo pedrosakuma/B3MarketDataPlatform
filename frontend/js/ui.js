@@ -28,7 +28,7 @@ export function setStatus(s) {
 
 // ── DOM Pool infrastructure ──
 
-const MAX_BOOK_LEVELS = 15;
+const MAX_BOOK_POOL = 50;
 const MAX_RANK_ITEMS = 10;
 
 // Book pool
@@ -78,7 +78,7 @@ function getBookPool() {
     }
     table.appendChild(thead);
     const rows = [];
-    for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
+    for (let i = 0; i < MAX_BOOK_POOL; i++) {
       const tr = document.createElement('tr');
       tr.style.display = 'none';
       const tdPrice = document.createElement('td');
@@ -199,7 +199,7 @@ export function renderBook(bookData) {
     pool.spread.style.display = 'none';
   }
 
-  for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
+  for (let i = 0; i < pool.bids.length; i++) {
     const row = pool.bids[i];
     if (i < bids.length) {
       const b = bids[i];
@@ -214,7 +214,7 @@ export function renderBook(bookData) {
   }
   pool.bidEmpty.style.display = bids.length === 0 ? '' : 'none';
 
-  for (let i = 0; i < MAX_BOOK_LEVELS; i++) {
+  for (let i = 0; i < pool.asks.length; i++) {
     const row = pool.asks[i];
     if (i < asks.length) {
       const a = asks[i];

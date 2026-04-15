@@ -5,7 +5,7 @@ import { MSG, DATA_FLAGS, buildSubscribeOrGet, buildUnsubscribe, parseMessage, f
 
 // ── Configuration ──
 const FRAME_INTERVAL_MS = 16;
-const MAX_BOOK_LEVELS = 15;
+let bookDepth = 15;
 const MAX_RECONNECT_DELAY = 10000;
 const ALLINFO_THROTTLE_MS = 200;
 
@@ -77,7 +77,8 @@ function aggregateCandles(candles1s, resolution) {
       cur.volume += c.volume;
     } else {
       if (cur) result.push(cur);
-      cur = { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+      const newOpen = cur ? cur.close : c.open;
+      cur = { time: bucket, open: newOpen, high: Math.max(newOpen, c.high), low: Math.min(newOpen, c.low), close: c.close, volume: c.volume };
     }
   }
   if (cur) result.push(cur);
@@ -165,8 +166,8 @@ function computeBook() {
     else map.set(order.price, { price: order.price, qty: order.qty, count: 1 });
   }
 
-  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price).slice(0, MAX_BOOK_LEVELS);
-  const asks = [...askMap.values()].sort((a, b) => a.price - b.price).slice(0, MAX_BOOK_LEVELS);
+  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price).slice(0, bookDepth);
+  const asks = [...askMap.values()].sort((a, b) => a.price - b.price).slice(0, bookDepth);
 
   let maxQty = 1;
   for (const b of bids) if (b.qty > maxQty) maxQty = b.qty;
@@ -453,6 +454,10 @@ self.onmessage = (evt) => {
     case 'setResolution':
       displayResolution = msg.value;
       if (selectedId) { chartFullSwap = true; mark(D_CHART); }
+      break;
+    case 'setBookDepth':
+      bookDepth = msg.value;
+      mark(D_BOOK);
       break;
   }
 };

@@ -328,6 +328,10 @@ function setChartResolution(value) {
   worker.postMessage({ cmd: 'setResolution', value: parseInt(value) || 0 });
 }
 
+function setBookDepth(value) {
+  worker.postMessage({ cmd: 'setBookDepth', value: parseInt(value) || 15 });
+}
+
 // ── Expose to window for HTML onclick handlers ──
 window.toggleConnection = toggleConnection;
 window.doSubscribe = doSubscribe;
@@ -335,6 +339,7 @@ window.doGet = doGet;
 window.rankingClick = rankingClick;
 window.switchRankingsTab = switchRankingsTab;
 window.setChartResolution = setChartResolution;
+window.setBookDepth = setBookDepth;
 window.symbolAutocomplete = symbolAutocomplete;
 window.showInstrumentDetail = showInstrumentDetail;
 window.closeModal = closeModal;
