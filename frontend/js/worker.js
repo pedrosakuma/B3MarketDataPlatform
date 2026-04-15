@@ -136,13 +136,22 @@ function connect(url) {
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
 
+  const connectTimeout = setTimeout(() => {
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+      log('Connection timeout', 'log-error');
+    }
+  }, 5000);
+
   ws.onopen = () => {
+    clearTimeout(connectTimeout);
     reconnectAttempts = 0;
     postMessage({ type: 'status', status: 'connected' });
     log('Connected to ' + wsUrl, 'log-sub-ok');
   };
 
   ws.onclose = () => {
+    clearTimeout(connectTimeout);
     postMessage({ type: 'status', status: 'disconnected' });
     log('Disconnected', 'log-error');
     rankings.volume = []; rankings.gainers = []; rankings.losers = [];

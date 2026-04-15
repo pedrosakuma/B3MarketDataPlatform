@@ -19,8 +19,10 @@ internal sealed class TradeRingBuffer
     /// <summary>Snapshot oldest → newest. Safe for concurrent reads.</summary>
     public IEnumerable<(long Price, long Qty, long TradeId)> AsSpan()
     {
-        int count = _count;
+        // Read head before count: head advances first during Add(),
+        // so we may undercount but never read uninitialized slots.
         int head = _head;
+        int count = _count;
         int start = count < _buf.Length ? 0 : head;
         for (int i = 0; i < count; i++)
             yield return _buf[(start + i) % _buf.Length];
