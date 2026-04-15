@@ -158,53 +158,66 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.MarketSegmentID = msg.MarketSegmentID;
         info.TickSizeDenominator = msg.TickSizeDenominator;
 
-        // Read repeating groups (underlyings, legs, attribs) and SecurityDesc varData
+        // Read repeating groups (underlyings, legs, attribs) and SecurityDesc varData.
+        // Wrapped in try-catch: the generated TextEncoding.Create() crashes on truncated
+        // buffers (empty remaining span). Fixed fields above are preserved regardless.
         List<UnderlyingInfo>? underlyings = null;
         List<LegInfo>? legs = null;
         List<InstrAttribInfo>? attribs = null;
         string? secDesc = null;
 
-        reader.ReadGroups(
-            (in SecurityDefinition_12Data.NoUnderlyingsData u) =>
-            {
-                ulong uid = (ulong)u.UnderlyingSecurityID;
-                if (uid == 0) return; // skip empty entries
-                underlyings ??= new();
-                underlyings.Add(new UnderlyingInfo
+        try
+        {
+            reader.ReadGroups(
+                (in SecurityDefinition_12Data.NoUnderlyingsData u) =>
                 {
-                    SecurityId = uid,
-                    Symbol = u.UnderlyingSymbol.ToString().Trim(),
-                });
-            },
-            (in SecurityDefinition_12Data.NoLegsData leg) =>
-            {
-                ulong lid = (ulong)leg.LegSecurityID;
-                if (lid == 0) return; // skip empty entries
-                legs ??= new();
-                legs.Add(new LegInfo
+                    ulong uid = (ulong)u.UnderlyingSecurityID;
+                    if (uid == 0) return; // skip empty entries
+                    underlyings ??= new();
+                    underlyings.Add(new UnderlyingInfo
+                    {
+                        SecurityId = uid,
+                        Symbol = u.UnderlyingSymbol.ToString().Trim(),
+                    });
+                },
+                (in SecurityDefinition_12Data.NoLegsData leg) =>
                 {
-                    SecurityId = lid,
-                    Symbol = leg.LegSymbol.ToString().Trim(),
-                    RatioQty = leg.LegRatioQty.Mantissa,
-                    SecurityType = (int)leg.LegSecurityType,
-                    Side = (int)leg.LegSide,
-                });
-            },
-            (in SecurityDefinition_12Data.NoInstrAttribsData a) =>
-            {
-                attribs ??= new();
-                attribs.Add(new InstrAttribInfo
+                    ulong lid = (ulong)leg.LegSecurityID;
+                    if (lid == 0) return; // skip empty entries
+                    legs ??= new();
+                    legs.Add(new LegInfo
+                    {
+                        SecurityId = lid,
+                        Symbol = leg.LegSymbol.ToString().Trim(),
+                        RatioQty = leg.LegRatioQty.Mantissa,
+                        SecurityType = (int)leg.LegSecurityType,
+                        Side = (int)leg.LegSide,
+                    });
+                },
+                (in SecurityDefinition_12Data.NoInstrAttribsData a) =>
                 {
-                    Type = (int)a.InstrAttribType,
-                    Value = (int)a.InstrAttribValue,
-                });
-            },
-            (TextEncoding desc) =>
-            {
-                if (desc.Length > 0)
-                    secDesc = Encoding.UTF8.GetString(desc.VarData);
-            }
-        );
+                    attribs ??= new();
+                    attribs.Add(new InstrAttribInfo
+                    {
+                        Type = (int)a.InstrAttribType,
+                        Value = (int)a.InstrAttribValue,
+                    });
+                },
+                (TextEncoding desc) =>
+                {
+                    if (desc.Length > 0)
+                        secDesc = Encoding.UTF8.GetString(desc.VarData);
+                }
+            );
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            // Generated TextEncoding.Create() throws when the SecurityDesc varData
+            // field is missing (truncated buffer). Groups parsed before the crash
+            // are still captured in the local variables above.
+            Interlocked.Increment(ref _parseErrors);
+            _logger.LogDebug("SecurityDefinition {SecurityId}: SecurityDesc varData truncated, groups partially parsed", securityId);
+        }
 
         info.Underlyings = underlyings;
         info.Legs = legs;
