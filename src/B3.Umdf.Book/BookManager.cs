@@ -97,7 +97,7 @@ public sealed class BookManager : IFeedEventHandler
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
-        if (sbePayload.Length < MessageHeader.MESSAGE_SIZE)
+        if (!MessageHeader.TryParse(sbePayload, out var header, out _))
             return;
 
         var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
@@ -107,7 +107,7 @@ public sealed class BookManager : IFeedEventHandler
             switch (templateId)
             {
                 case SecurityDefinition_12Data.MESSAGE_ID:
-                    HandleSecurityDefinition(body);
+                    HandleSecurityDefinition(body, header.BlockLength);
                     break;
                 case Order_MBO_50Data.MESSAGE_ID:
                     HandleOrder(body);
@@ -160,9 +160,9 @@ public sealed class BookManager : IFeedEventHandler
     // Feed thread is the sole writer for all book mutations — no locks needed.
     // Callbacks are inline (same thread) so no race condition exists.
 
-    private void HandleSecurityDefinition(ReadOnlySpan<byte> body)
+    private void HandleSecurityDefinition(ReadOnlySpan<byte> body, int blockLength)
     {
-        if (!SecurityDefinition_12Data.TryParse(body, out var reader))
+        if (!SecurityDefinition_12Data.TryParse(body, blockLength, out var reader))
             return;
 
         ulong securityId = (ulong)reader.Data.SecurityID;

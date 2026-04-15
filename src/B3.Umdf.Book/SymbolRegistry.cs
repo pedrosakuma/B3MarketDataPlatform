@@ -67,10 +67,10 @@ public sealed class SymbolRegistry : IFeedEventHandler
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
         if (templateId != SecurityDefinition_12Data.MESSAGE_ID) return;
-        if (sbePayload.Length < MessageHeader.MESSAGE_SIZE) return;
+        if (!MessageHeader.TryParse(sbePayload, out var header, out _)) return;
 
         var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
-        if (!SecurityDefinition_12Data.TryParse(body, out var reader)) return;
+        if (!SecurityDefinition_12Data.TryParse(body, header.BlockLength, out var reader)) return;
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
