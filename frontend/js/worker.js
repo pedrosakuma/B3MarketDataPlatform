@@ -49,6 +49,7 @@ function log(text, cssClass) {
 
 // ── Display resolution for chart (user-configurable, default auto) ──
 let displayResolution = 0; // 0 = auto, otherwise seconds (1, 5, 15, 60, ...)
+let lastSentResolution = 0; // tracks resolution sent to chart for detecting changes
 
 const AUTO_RES_THRESHOLDS = [
   { maxCandles: 600, resolution: 1 },
@@ -92,6 +93,34 @@ function getChartCandles(sub) {
   return { candles: aggregateCandles(raw, res), resolution: res };
 }
 
+/// Compute just the last aggregated candle by scanning 1s candles in the current bucket.
+/// Returns null if no candles exist.
+function getLastAggregatedCandle(sub, resolution) {
+  const raw = sub.candles;
+  if (raw.length === 0) return null;
+  if (resolution <= 1) return { ...raw[raw.length - 1] };
+
+  const lastTime = raw[raw.length - 1].time;
+  const bucket = Math.floor(lastTime / resolution) * resolution;
+
+  // Find the first 1s candle in this bucket
+  let i = raw.length - 1;
+  while (i > 0 && Math.floor(raw[i - 1].time / resolution) * resolution === bucket) i--;
+
+  // For the open: we need the close of the previous bucket's last candle
+  const prevClose = i > 0 ? raw[i - 1].close : raw[i].open;
+
+  let high = prevClose, low = prevClose, close = prevClose, volume = 0;
+  for (let j = i; j < raw.length; j++) {
+    const c = raw[j];
+    if (c.high > high) high = c.high;
+    if (c.low < low) low = c.low;
+    close = c.close;
+    volume += c.volume;
+  }
+  return { time: bucket, open: prevClose, high, low, close, volume };
+}
+
 // ── Frame sending (interval-based, only when dirty) ──
 setInterval(() => {
   if (!dirty) return;
@@ -116,17 +145,25 @@ setInterval(() => {
     const sub = selectedId ? subscriptions.get(selectedId) : null;
     if (!sub || sub.candles.length === 0) {
       frame.chart = null;
-    } else if (fullSwap) {
-      const { candles, resolution } = getChartCandles(sub);
-      frame.chart = { full: true, candles, resolution };
+      lastSentResolution = 0;
     } else {
-      // Incremental: re-aggregate full set only if resolution > 1s (aggregation may shift bucket boundaries)
       const res = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles.length);
-      if (res <= 1 && sub.currentCandle) {
+      const resChanged = res !== lastSentResolution;
+
+      if (fullSwap || resChanged) {
+        // Full swap: snapshot arrival, symbol change, or resolution change
+        const { candles, resolution } = getChartCandles(sub);
+        frame.chart = { full: true, scroll: true, candles, resolution };
+        lastSentResolution = resolution;
+      } else if (res <= 1 && sub.currentCandle) {
+        // 1s incremental update
         frame.chart = { full: false, update: { ...sub.currentCandle }, resolution: res };
       } else {
-        const { candles, resolution } = getChartCandles(sub);
-        frame.chart = { full: true, candles, resolution };
+        // Aggregated resolution: send incremental update for just the last bucket
+        const lastCandle = getLastAggregatedCandle(sub, res);
+        if (lastCandle) {
+          frame.chart = { full: false, update: lastCandle, resolution: res };
+        }
       }
     }
   }

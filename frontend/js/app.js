@@ -54,7 +54,7 @@ function handleChartData(chartData) {
 
   if (chartData.full) {
     candleSeries.setData(chartData.candles);
-    chart.timeScale().scrollToRealTime();
+    if (chartData.scroll) chart.timeScale().scrollToRealTime();
   } else if (chartData.update) {
     candleSeries.update(chartData.update);
   }
