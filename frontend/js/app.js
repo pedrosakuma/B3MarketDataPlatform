@@ -157,16 +157,24 @@ function doUnsubscribe(securityId) {
 
 function selectSubscription(id) {
   worker.postMessage({ cmd: 'select', securityId: id });
+  closeSidebarIfMobile();
 }
 
 function rankingClick(symbol) {
   if (!view.connected) return;
-  // Check if already subscribed locally
   const existing = view.subs.find(s => s.symbol === symbol);
   if (existing) {
     selectSubscription(existing.id);
   } else {
     worker.postMessage({ cmd: 'rankingSubscribe', symbol });
+  }
+  closeSidebarIfMobile();
+}
+
+function closeSidebarIfMobile() {
+  if (window.innerWidth <= 900) {
+    document.getElementById('sidebar')?.classList.remove('open');
+    document.getElementById('sidebarBackdrop')?.classList.remove('open');
   }
 }
 
@@ -175,8 +183,18 @@ function switchRankingsTab(tab) {
   scheduleRender();
 }
 
+// ── Sidebar toggle (responsive) ──
+
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  const backdrop = document.getElementById('sidebarBackdrop');
+  const isOpen = sidebar.classList.toggle('open');
+  backdrop.classList.toggle('open', isOpen);
+}
+
 // ── Expose to window for HTML onclick handlers ──
 window.toggleConnection = toggleConnection;
+window.toggleSidebar = toggleSidebar;
 window.doSubscribe = doSubscribe;
 window.doGet = doGet;
 window.doUnsubscribe = doUnsubscribe;

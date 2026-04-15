@@ -123,23 +123,64 @@
   .health-bar { background: var(--bg3); padding: .25rem .7rem; font-size: .7rem; color: var(--muted); border-bottom: 1px solid var(--border); font-family: monospace; }
 
   /* Stats bar */
-  .stats-bar { background: var(--bg2); border-top: 1px solid var(--border); padding: .3rem 1rem; font-size: .7rem; color: var(--muted); display: flex; gap: 1.5rem; }
+  .stats-bar { background: var(--bg2); border-top: 1px solid var(--border); padding: .3rem 1rem; font-size: .7rem; color: var(--muted); display: flex; gap: 1.5rem; flex-wrap: wrap; }
+
+  /* Sidebar toggle (hidden on desktop) */
+  .sidebar-toggle { display: none; background: none; border: none; color: var(--accent); font-size: 1.3rem; padding: .2rem .5rem; cursor: pointer; line-height: 1; }
+  .sidebar-toggle:hover { background: none; color: var(--text); }
+
+  /* Responsive input widths */
+  .input-ws { width: 240px; min-width: 0; }
+  .input-symbol { width: 140px; min-width: 0; text-transform: uppercase; }
+  .input-decimals { width: 50px; min-width: 0; }
+
+  /* ── Responsive: Tablet (≤ 900px) ── */
+  @media (max-width: 900px) {
+    .sidebar-toggle { display: inline-flex; }
+    .main { grid-template-columns: 1fr; }
+    .sidebar { position: fixed; left: 0; top: 0; bottom: 0; width: 260px; z-index: 50;
+      transform: translateX(-100%); transition: transform .25s ease; }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 49; }
+    .sidebar-backdrop.open { display: block; }
+    .panels { grid-template-columns: 1fr; grid-template-rows: auto; }
+    .panel.wide { grid-column: auto; }
+    .toolbar .sep { display: none; }
+    .input-ws { width: 180px; }
+    .modal-grid { grid-template-columns: 1fr; }
+  }
+
+  /* ── Responsive: Mobile (≤ 600px) ── */
+  @media (max-width: 600px) {
+    .toolbar { padding: .4rem .5rem; gap: .5rem; }
+    .toolbar .title { font-size: .85rem; margin-right: .5rem; }
+    .toolbar .group { flex-wrap: wrap; gap: .4rem; }
+    .input-ws { width: 100%; }
+    .input-symbol { width: 100px; }
+    .log-area { flex: 0 0 120px; }
+    .health-bar { font-size: .6rem; padding: .2rem .5rem; overflow-x: auto; white-space: nowrap; }
+    .stats-bar { padding: .25rem .5rem; gap: .75rem; font-size: .6rem; }
+    .info-grid { grid-template-columns: 1fr; }
+    .depth-cell { width: 40px; }
+    .rank-tabs { flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
 
 <!-- Toolbar -->
 <div class="toolbar">
+  <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
   <span class="title">B3 UMDF Viewer</span>
   <div class="group">
-    <input id="wsUrl" type="text" value="ws://localhost:8080/ws" style="width:240px" placeholder="WebSocket URL">
+    <input id="wsUrl" type="text" value="ws://localhost:8080/ws" class="input-ws" placeholder="WebSocket URL">
     <button id="btnConnect" onclick="toggleConnection()">Connect</button>
     <span class="status"><span id="statusDot" class="dot off"></span><span id="statusText">Disconnected</span></span>
     <label><input id="autoReconnect" type="checkbox" checked> Auto-reconnect</label>
   </div>
   <div class="sep"></div>
   <div class="group">
-    <input id="symbolInput" type="text" placeholder="Symbol (e.g. PETR4)" list="symbolSuggestions" style="width:140px;text-transform:uppercase" onkeydown="if(event.key==='Enter') doSubscribe()" oninput="this.value=this.value.toUpperCase(); symbolAutocomplete(this.value)" autocomplete="off">
+    <input id="symbolInput" type="text" placeholder="Symbol (e.g. PETR4)" list="symbolSuggestions" class="input-symbol" onkeydown="if(event.key==='Enter') doSubscribe()" oninput="this.value=this.value.toUpperCase(); symbolAutocomplete(this.value)" autocomplete="off">
     <datalist id="symbolSuggestions"></datalist>
     <label><input id="flagBook" type="checkbox" checked> Book</label>
     <label><input id="flagInfo" type="checkbox" checked> Info</label>
@@ -148,7 +189,7 @@
   </div>
   <div class="sep"></div>
   <div class="group">
-    <label>Price decimals: <input id="priceDecimals" type="number" value="8" min="0" max="12" style="width:50px"></label>
+    <label>Price decimals: <input id="priceDecimals" type="number" value="8" min="0" max="12" class="input-decimals"></label>
   </div>
 </div>
 
@@ -157,8 +198,9 @@
 
 <!-- Main -->
 <div class="main">
+  <div id="sidebarBackdrop" class="sidebar-backdrop" onclick="toggleSidebar()"></div>
   <!-- Sidebar: subscriptions -->
-  <div class="sidebar">
+  <div id="sidebar" class="sidebar">
     <div>
       <h3>Subscriptions</h3>
       <ul id="subList" class="sub-list"></ul>
