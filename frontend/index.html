@@ -84,6 +84,10 @@
   .col-selector-dropdown label { font-size: .7rem; padding: .15rem .3rem; cursor: pointer; white-space: nowrap; }
   .col-selector-dropdown label:hover { background: var(--bg3); border-radius: 3px; }
 
+  /* Chart resolution */
+  .chart-res-label { font-size: .65rem; color: var(--green); font-weight: 400; margin-left: .4rem; }
+  #chartResSelect { font-size: .65rem; padding: .1rem .3rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+
   /* Rankings */
   .rank-tabs { display: flex; gap: 2px; margin-bottom: .5rem; }
   .rank-tab { flex: 1; text-align: center; padding: .3rem .2rem; font-size: .7rem; border-radius: 4px; cursor: pointer;
@@ -236,7 +240,17 @@
       </div>
       <!-- Chart panel -->
       <div class="panel">
-        <div class="panel-head" id="chartTitle">Chart</div>
+        <div class="panel-head" id="chartTitle" style="display:flex;justify-content:space-between;align-items:center">
+          <span>Chart <span id="chartResolution" class="chart-res-label"></span></span>
+          <select id="chartResSelect" onchange="setChartResolution(this.value)" title="Candle resolution">
+            <option value="0" selected>Auto</option>
+            <option value="1">1s</option>
+            <option value="5">5s</option>
+            <option value="15">15s</option>
+            <option value="60">1m</option>
+            <option value="300">5m</option>
+          </select>
+        </div>
         <div class="panel-body no-pad" id="chartBody">
           <div class="empty-msg" id="chartEmpty">Subscribe to see chart</div>
           <div id="chartContainer" style="width:100%;height:100%;display:none"></div>

@@ -28,6 +28,9 @@ public sealed class GroupConflationHandler : IBookEventHandler
     // via SendSnapshots, while OnTrade writes on the owning thread.
     internal readonly ConcurrentDictionary<ulong, TradeRingBuffer> RecentTrades = new();
 
+    // Per-security candle aggregators (read via GetCandles from subscribe thread)
+    internal readonly ConcurrentDictionary<ulong, CandleAggregator> Candles = new();
+
     // Subscribe/Get requests routed to this group by the SubscriptionManager
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
 
@@ -74,6 +77,10 @@ public sealed class GroupConflationHandler : IBookEventHandler
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
 
+        // Aggregate into candles (always, so history is available on subscribe)
+        var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
+        candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
         _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
@@ -92,6 +99,9 @@ public sealed class GroupConflationHandler : IBookEventHandler
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
+
+        var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
+        candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
@@ -343,6 +353,17 @@ public sealed class GroupConflationHandler : IBookEventHandler
     private int FlushTradeBuffer()
     {
         int flushed = 0;
+
+        // Collect securities that need candle broadcasts (deduplicated)
+        HashSet<ulong>? candleSecIds = null;
+        foreach (var ((secId, _), _) in _tradeBuffer)
+        {
+            if (!_parent.IsSubscribed(secId)) continue;
+            candleSecIds ??= new();
+            candleSecIds.Add(secId);
+        }
+
+        // Flush trades
         foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
             if (!_parent.IsSubscribed(secId)) { flushed++; continue; }
@@ -352,6 +373,23 @@ public sealed class GroupConflationHandler : IBookEventHandler
             flushed++;
         }
         _tradeBuffer.Clear();
+
+        // Broadcast candle updates (one per security, after all trades)
+        if (candleSecIds is not null)
+        {
+            foreach (var secId in candleSecIds)
+            {
+                if (!Candles.TryGetValue(secId, out var agg)) continue;
+                var latest = agg.GetLatest();
+                if (latest is { } c)
+                {
+                    var cbuf = new byte[62]; // CandleUpdate size
+                    int clen = WireProtocol.WriteCandleUpdate(cbuf, secId, agg.Resolution, c);
+                    _parent.BroadcastToSubscribers(secId, new ReadOnlyMemory<byte>(cbuf, 0, clen));
+                }
+            }
+        }
+
         return flushed;
     }
 }

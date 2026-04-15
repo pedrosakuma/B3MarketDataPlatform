@@ -47,26 +47,48 @@ function log(text, cssClass) {
   postMessage({ type: 'log', text, cssClass });
 }
 
-// ── Candle aggregation (1-second bars) ──
-function addTradeToCandles(sub, price, qty) {
-  const candleTime = Math.floor(Date.now() / 1000);
-  const current = sub.currentCandle;
-  if (current) {
-    if (candleTime <= current.time) {
-      if (price > current.high) current.high = price;
-      if (price < current.low) current.low = price;
-      current.close = price;
-      current.volume += qty;
-    } else {
-      const candle = { time: candleTime, open: price, high: price, low: price, close: price, volume: qty };
-      sub.candles.push(candle);
-      sub.currentCandle = candle;
-    }
-  } else {
-    const candle = { time: candleTime, open: price, high: price, low: price, close: price, volume: qty };
-    sub.candles.push(candle);
-    sub.currentCandle = candle;
+// ── Display resolution for chart (user-configurable, default auto) ──
+let displayResolution = 0; // 0 = auto, otherwise seconds (1, 5, 15, 60, ...)
+
+const AUTO_RES_THRESHOLDS = [
+  { maxCandles: 600, resolution: 1 },
+  { maxCandles: 1200, resolution: 5 },
+  { maxCandles: 2400, resolution: 15 },
+  { maxCandles: 4800, resolution: 60 },
+];
+
+function pickAutoResolution(candleCount) {
+  for (const t of AUTO_RES_THRESHOLDS) {
+    if (candleCount <= t.maxCandles) return t.resolution;
   }
+  return 300; // 5 min fallback
+}
+
+function aggregateCandles(candles1s, resolution) {
+  if (resolution <= 1 || candles1s.length === 0) return candles1s;
+  const result = [];
+  let cur = null;
+  for (const c of candles1s) {
+    const bucket = Math.floor(c.time / resolution) * resolution;
+    if (cur && cur.time === bucket) {
+      if (c.high > cur.high) cur.high = c.high;
+      if (c.low < cur.low) cur.low = c.low;
+      cur.close = c.close;
+      cur.volume += c.volume;
+    } else {
+      if (cur) result.push(cur);
+      cur = { time: bucket, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume };
+    }
+  }
+  if (cur) result.push(cur);
+  return result;
+}
+
+function getChartCandles(sub) {
+  const raw = sub.candles;
+  if (raw.length === 0) return { candles: [], resolution: 1 };
+  const res = displayResolution > 0 ? displayResolution : pickAutoResolution(raw.length);
+  return { candles: aggregateCandles(raw, res), resolution: res };
 }
 
 // ── Frame sending (interval-based, only when dirty) ──
@@ -94,9 +116,17 @@ setInterval(() => {
     if (!sub || sub.candles.length === 0) {
       frame.chart = null;
     } else if (fullSwap) {
-      frame.chart = { full: true, candles: sub.candles.slice() };
+      const { candles, resolution } = getChartCandles(sub);
+      frame.chart = { full: true, candles, resolution };
     } else {
-      frame.chart = { full: false, update: { ...sub.currentCandle } };
+      // Incremental: re-aggregate full set only if resolution > 1s (aggregation may shift bucket boundaries)
+      const res = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles.length);
+      if (res <= 1 && sub.currentCandle) {
+        frame.chart = { full: false, update: { ...sub.currentCandle }, resolution: res };
+      } else {
+        const { candles, resolution } = getChartCandles(sub);
+        frame.chart = { full: true, candles, resolution };
+      }
     }
   }
 
@@ -231,7 +261,7 @@ function handleMessage(msg) {
       subscriptions.set(id, {
         symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
         orders: new Map(), info: {}, candles: [], currentCandle: null,
-        orderCount: 0, tradeCount: 0,
+        orderCount: 0, tradeCount: 0, candleResolution: 1,
       });
       let d = D_SUBS | D_ALLINFO;
       if (!sel) { selectedId = id; d |= D_BOOK | D_CHART | D_TITLES; chartFullSwap = true; }
@@ -301,11 +331,7 @@ function handleMessage(msg) {
       stats.trades++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) {
-        sub.tradeCount++;
-        addTradeToCandles(sub, msg.price, msg.qty);
-      }
-      if (sel === id) mark(D_CHART);
+      if (sub) sub.tradeCount++;
       break;
     }
     case 'BookCleared': {
@@ -321,6 +347,41 @@ function handleMessage(msg) {
         }
       }
       if (sel === id) mark(D_BOOK);
+      break;
+    }
+    case 'CandleSnapshot': {
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        if (msg.isFirst) {
+          sub.candles = msg.candles;
+        } else {
+          // Continuation batch — append
+          for (const c of msg.candles) sub.candles.push(c);
+        }
+        sub.currentCandle = sub.candles.length > 0 ? sub.candles[sub.candles.length - 1] : null;
+        sub.candleResolution = msg.resolution;
+      }
+      if (sel === id) { chartFullSwap = true; mark(D_CHART); }
+      break;
+    }
+    case 'CandleUpdate': {
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        const c = msg.candle;
+        const last = sub.currentCandle;
+        if (last && last.time === c.time) {
+          // Update existing candle in place
+          last.open = c.open; last.high = c.high;
+          last.low = c.low; last.close = c.close; last.volume = c.volume;
+        } else {
+          sub.candles.push(c);
+          sub.currentCandle = c;
+        }
+        sub.candleResolution = msg.resolution;
+      }
+      if (sel === id) mark(D_CHART);
       break;
     }
     case 'RankingsUpdate': {
@@ -388,6 +449,10 @@ self.onmessage = (evt) => {
       break;
     case 'setAutoReconnect':
       autoReconnect = msg.value;
+      break;
+    case 'setResolution':
+      displayResolution = msg.value;
+      if (selectedId) { chartFullSwap = true; mark(D_CHART); }
       break;
   }
 };

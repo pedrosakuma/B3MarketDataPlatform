@@ -42,6 +42,7 @@ function handleChartData(chartData) {
     $('chartEmpty').style.display = '';
     $('chartContainer').style.display = 'none';
     if (candleSeries) candleSeries.setData([]);
+    updateResolutionLabel(null);
     return;
   }
 
@@ -57,6 +58,16 @@ function handleChartData(chartData) {
   } else if (chartData.update) {
     candleSeries.update(chartData.update);
   }
+  updateResolutionLabel(chartData.resolution);
+}
+
+function updateResolutionLabel(resolution) {
+  const el = $('chartResolution');
+  if (!el) return;
+  if (!resolution) { el.textContent = ''; return; }
+  if (resolution < 60) el.textContent = resolution + 's';
+  else if (resolution < 3600) el.textContent = (resolution / 60) + 'm';
+  else el.textContent = (resolution / 3600) + 'h';
 }
 
 // ── Column selector ──
@@ -313,12 +324,17 @@ function switchRankingsTab(tab) {
   scheduleRender();
 }
 
+function setChartResolution(value) {
+  worker.postMessage({ cmd: 'setResolution', value: parseInt(value) || 0 });
+}
+
 // ── Expose to window for HTML onclick handlers ──
 window.toggleConnection = toggleConnection;
 window.doSubscribe = doSubscribe;
 window.doGet = doGet;
 window.rankingClick = rankingClick;
 window.switchRankingsTab = switchRankingsTab;
+window.setChartResolution = setChartResolution;
 window.symbolAutocomplete = symbolAutocomplete;
 window.showInstrumentDetail = showInstrumentDetail;
 window.closeModal = closeModal;

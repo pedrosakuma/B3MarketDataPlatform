@@ -310,6 +310,10 @@ public sealed class SubscriptionManager
             // Send recent trade history from the owning group's ring buffer
             if (group.RecentTrades.TryGetValue(securityId, out var trades))
                 SendTradeHistory(session, securityId, trades);
+
+            // Send candle history from the owning group's aggregator
+            if (group.Candles.TryGetValue(securityId, out var agg))
+                SendCandleHistory(session, securityId, agg);
         }
 
         if (flags.HasFlag(DataFlags.Info))
@@ -571,6 +575,23 @@ public sealed class SubscriptionManager
         {
             var buf = new byte[36];
             int len = WireProtocol.WriteTrade(buf, securityId, price, qty, tradeId);
+            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        }
+    }
+
+    private static void SendCandleHistory(ClientSession session, ulong securityId, CandleAggregator agg)
+    {
+        var candles = agg.GetCandles();
+        if (candles.Length == 0) return;
+
+        int maxPerBatch = WireProtocol.MaxCandlesPerSnapshot;
+        for (int i = 0; i < candles.Length; i += maxPerBatch)
+        {
+            int count = Math.Min(maxPerBatch, candles.Length - i);
+            byte flags = i == 0 ? WireProtocol.CandleFlagFirst : (byte)0;
+            var batch = candles.AsSpan(i, count);
+            var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2 + count * WireProtocol.CandleSize];
+            int len = WireProtocol.WriteCandleSnapshot(buf, securityId, agg.Resolution, flags, batch);
             session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
         }
     }

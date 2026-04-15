@@ -27,6 +27,12 @@ public enum MessageType : ushort
 
     /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
     ServerStatus = 0x0050,
+
+    /// <summary>Server → Client: full candle history for a security on subscribe.</summary>
+    CandleSnapshot = 0x0060,
+
+    /// <summary>Server → Client: single candle update (latest candle changed or new candle).</summary>
+    CandleUpdate = 0x0061,
 }
 
 public enum SubscribeErrorCode : byte
@@ -336,6 +342,66 @@ public static class WireProtocol
 
     /// <summary>Max buffer for rankings: 3 categories × 10 entries × (8+8+1+32) ≈ 1500 bytes + header.</summary>
     public const int RankingsUpdateMaxSize = FramingHeaderSize + 3 * (1 + 10 * (8 + 8 + 1 + 64));
+
+    // --- CandleSnapshot / CandleUpdate ---
+
+    /// <summary>Candle wire size: time(8) + open(8) + high(8) + low(8) + close(8) + volume(8) = 48 bytes.</summary>
+    public const int CandleSize = 48;
+
+    /// <summary>CandleSnapshot header overhead: framing(4) + secId(8) + resolution(2) + flags(1) + count(2) = 17.</summary>
+    private const int CandleSnapshotHeaderSize = FramingHeaderSize + 8 + 2 + 1 + 2;
+
+    /// <summary>Max candles per CandleSnapshot message, limited by u16 framing length.</summary>
+    public const int MaxCandlesPerSnapshot = (ushort.MaxValue - CandleSnapshotHeaderSize) / CandleSize; // 1364
+
+    /// <summary>CandleSnapshot flags.</summary>
+    internal const byte CandleFlagFirst = 0x01; // first batch (replace), subsequent batches = 0 (append)
+
+    /// <summary>
+    /// Write CandleSnapshot batch: securityId + resolution + flags + count + candle data.
+    /// Format: [header][u64 secId][u16 resolution][u8 flags][u16 count][candle × N]
+    /// Caller must ensure candles.Length &lt;= MaxCandlesPerSnapshot.
+    /// </summary>
+    internal static int WriteCandleSnapshot(Span<byte> dest, ulong securityId, int resolution, byte flags, ReadOnlySpan<Candle> candles)
+    {
+        ushort totalLen = (ushort)(CandleSnapshotHeaderSize + candles.Length * CandleSize);
+        WriteFramingHeader(dest, totalLen, MessageType.CandleSnapshot);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], (ushort)resolution); offset += 2;
+        dest[offset++] = flags;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], (ushort)candles.Length); offset += 2;
+        foreach (ref readonly var c in candles)
+            offset = WriteCandle(dest, offset, c);
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Write CandleUpdate: securityId + resolution + single candle.
+    /// Format: [header][u64 secId][u16 resolution][candle]
+    /// </summary>
+    internal static int WriteCandleUpdate(Span<byte> dest, ulong securityId, int resolution, in Candle candle)
+    {
+        const ushort totalLen = (ushort)(FramingHeaderSize + 8 + 2 + CandleSize); // 62
+        WriteFramingHeader(dest, totalLen, MessageType.CandleUpdate);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], (ushort)resolution); offset += 2;
+        WriteCandle(dest, offset, candle);
+        return totalLen;
+    }
+
+    private static int WriteCandle(Span<byte> dest, int offset, in Candle c)
+    {
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Time); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Open); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.High); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Low); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Close); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Volume); offset += 8;
+        return offset;
+    }
+
 }
 
 public readonly struct RankingEntry

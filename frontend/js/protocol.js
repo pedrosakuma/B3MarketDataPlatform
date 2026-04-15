@@ -9,6 +9,8 @@ export const MSG = {
   TRADE: 0x0033, BOOK_CLEARED: 0x0034,
   RANKINGS_UPDATE: 0x0040,
   SERVER_STATUS: 0x0050,
+  CANDLE_SNAPSHOT: 0x0060,
+  CANDLE_UPDATE: 0x0061,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -156,6 +158,35 @@ export function parseMessage(buf, baseOffset, msgLen) {
     case MSG.SERVER_STATUS: {
       const ready = v.getUint8(o) === 1;
       return { type: 'ServerStatus', ready };
+    }
+    case MSG.CANDLE_SNAPSHOT: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const resolution = v.getUint16(o, true); o += 2;
+      const flags = v.getUint8(o); o += 1;
+      const count = v.getUint16(o, true); o += 2;
+      const candles = [];
+      for (let i = 0; i < count; i++) {
+        const time = Number(v.getBigInt64(o, true)); o += 8;
+        const open = Number(v.getBigInt64(o, true)); o += 8;
+        const high = Number(v.getBigInt64(o, true)); o += 8;
+        const low = Number(v.getBigInt64(o, true)); o += 8;
+        const close = Number(v.getBigInt64(o, true)); o += 8;
+        const volume = Number(v.getBigInt64(o, true)); o += 8;
+        candles.push({ time, open, high, low, close, volume });
+      }
+      const isFirst = !!(flags & 0x01);
+      return { type: 'CandleSnapshot', securityId, resolution, candles, isFirst };
+    }
+    case MSG.CANDLE_UPDATE: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const resolution = v.getUint16(o, true); o += 2;
+      const time = Number(v.getBigInt64(o, true)); o += 8;
+      const open = Number(v.getBigInt64(o, true)); o += 8;
+      const high = Number(v.getBigInt64(o, true)); o += 8;
+      const low = Number(v.getBigInt64(o, true)); o += 8;
+      const close = Number(v.getBigInt64(o, true)); o += 8;
+      const volume = Number(v.getBigInt64(o, true));
+      return { type: 'CandleUpdate', securityId, resolution, candle: { time, open, high, low, close, volume } };
     }
     default:
       return null;
