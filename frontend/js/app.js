@@ -129,6 +129,7 @@ const view = {
   selectedId: null,
   selectedSymbol: null,
   book: null,
+  chartDirty: false,
   chartData: null,
   allInfo: null,
   rankings: { volume: [], gainers: [], losers: [] },
@@ -148,7 +149,7 @@ worker.onmessage = (evt) => {
       if (msg.selectedId !== undefined) view.selectedId = msg.selectedId;
       if (msg.selectedSymbol !== undefined) view.selectedSymbol = msg.selectedSymbol;
       if (msg.book !== undefined) view.book = msg.book;
-      if (msg.chart !== undefined) view.chartData = msg.chart;
+      if (msg.chart !== undefined) { view.chartData = msg.chart; view.chartDirty = true; }
       if (msg.allInfo !== undefined) view.allInfo = msg.allInfo;
       if (msg.rankings !== undefined) view.rankings = msg.rankings;
       if (msg.stats !== undefined) view.stats = msg.stats;
@@ -185,7 +186,10 @@ function doRender() {
   renderPending = false;
   updateTitles(view.selectedSymbol);
   renderBook(view.book);
-  handleChartData(view.chartData);
+  if (view.chartDirty) {
+    view.chartDirty = false;
+    handleChartData(view.chartData);
+  }
   renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
   updateStats(view.stats);
   renderRankings(view.rankings, view.rankingsTab, view.connected);
