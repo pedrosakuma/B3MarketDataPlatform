@@ -1,23 +1,127 @@
 // Main thread: UI events + rendering only.
 // All WebSocket I/O, parsing, and state live in worker.js.
 
-import { DATA_FLAGS } from './protocol.js';
+import { DATA_FLAGS, INFO_FIELDS } from './protocol.js';
 import {
-  $, setStatus, renderSubList, updateTitles, renderBook, renderInfo, renderTrades,
-  renderHealth, renderRankings, addLog, clearLog, setLogEnabled, updateStats,
+  $, setStatus, updateTitles, renderBook, renderSubsTable,
+  renderHealth, renderRankings, showToast, updateStats, formatPrice,
 } from './ui.js';
 
 // ── Worker ──
 const worker = new Worker('./js/worker.js', { type: 'module' });
 
-// ── View state (populated by worker frames, read by render functions) ──
+// ── Chart (TradingView Lightweight Charts) ──
+const LWC = globalThis.LightweightCharts;
+let chart = null;
+let candleSeries = null;
+
+function initChart() {
+  const container = $('chartContainer');
+  if (!LWC) {
+    container.textContent = 'Chart library not loaded';
+    return;
+  }
+  chart = LWC.createChart(container, {
+    autoSize: true,
+    layout: { background: { type: 'solid', color: '#1a1a2e' }, textColor: '#8899aa', fontSize: 11 },
+    grid: { vertLines: { color: '#2a3a5e' }, horzLines: { color: '#2a3a5e' } },
+    timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#2a3a5e' },
+    rightPriceScale: { borderColor: '#2a3a5e' },
+    crosshair: { mode: LWC.CrosshairMode.Normal },
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#00c853', downColor: '#ff1744',
+    borderUpColor: '#00c853', borderDownColor: '#ff1744',
+    wickUpColor: '#00c853', wickDownColor: '#ff1744',
+    priceFormat: { type: 'custom', formatter: (p) => formatPrice(p), minMove: 1 },
+  });
+}
+
+function handleChartData(chartData) {
+  if (!chartData) {
+    $('chartEmpty').style.display = '';
+    $('chartContainer').style.display = 'none';
+    if (candleSeries) candleSeries.setData([]);
+    return;
+  }
+
+  $('chartEmpty').style.display = 'none';
+  $('chartContainer').style.display = '';
+
+  if (!chart) initChart();
+  if (!candleSeries) return;
+
+  if (chartData.full) {
+    candleSeries.setData(chartData.candles);
+    chart.timeScale().scrollToRealTime();
+  } else if (chartData.update) {
+    candleSeries.update(chartData.update);
+  }
+}
+
+// ── Column selector ──
+const DEFAULT_COLUMNS = ['LastTradePrice', 'HighPrice', 'LowPrice', 'TradeVolume', 'NetChange', 'TradingStatus'];
+const STORAGE_KEY = 'subsTableColumns';
+let visibleColumns = loadColumns() || [...DEFAULT_COLUMNS];
+
+function loadColumns() {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function saveColumns() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(visibleColumns)); } catch { /* ignore */ }
+}
+
+function initColumnSelector() {
+  const dropdown = $('colSelectorDropdown');
+  if (!dropdown) return;
+  dropdown.innerHTML = '';
+  for (const field of INFO_FIELDS) {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = visibleColumns.includes(field);
+    cb.dataset.field = field;
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        if (!visibleColumns.includes(field)) visibleColumns.push(field);
+      } else {
+        visibleColumns = visibleColumns.filter(c => c !== field);
+      }
+      saveColumns();
+      scheduleRender();
+    });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + field));
+    dropdown.appendChild(label);
+  }
+}
+
+function toggleColumnSelector() {
+  $('colSelectorDropdown').classList.toggle('open');
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.col-selector')) {
+    const dd = $('colSelectorDropdown');
+    if (dd) dd.classList.remove('open');
+  }
+});
+
+// ── View state (populated by worker frames) ──
 const view = {
-  subs: [],
   selectedId: null,
   selectedSymbol: null,
   book: null,
-  info: null,
-  trades: null,
+  chartData: null,
+  allInfo: null,
   rankings: { volume: [], gainers: [], losers: [] },
   stats: { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 },
   connected: false,
@@ -32,12 +136,11 @@ worker.onmessage = (evt) => {
 
   switch (msg.type) {
     case 'frame':
-      if (msg.subs !== undefined) view.subs = msg.subs;
       if (msg.selectedId !== undefined) view.selectedId = msg.selectedId;
       if (msg.selectedSymbol !== undefined) view.selectedSymbol = msg.selectedSymbol;
       if (msg.book !== undefined) view.book = msg.book;
-      if (msg.info !== undefined) view.info = msg.info;
-      if (msg.trades !== undefined) view.trades = msg.trades;
+      if (msg.chart !== undefined) view.chartData = msg.chart;
+      if (msg.allInfo !== undefined) view.allInfo = msg.allInfo;
       if (msg.rankings !== undefined) view.rankings = msg.rankings;
       if (msg.stats !== undefined) view.stats = msg.stats;
       scheduleRender();
@@ -55,7 +158,7 @@ worker.onmessage = (evt) => {
       updateActionButtons();
       break;
     case 'log':
-      addLog(msg.text, msg.cssClass);
+      showToast(msg.text, msg.cssClass);
       break;
   }
 };
@@ -71,14 +174,30 @@ function scheduleRender() {
 
 function doRender() {
   renderPending = false;
-  renderSubList(view.subs, view.selectedId);
   updateTitles(view.selectedSymbol);
   renderBook(view.book);
-  renderInfo(view.info);
-  renderTrades(view.trades);
+  handleChartData(view.chartData);
+  renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
   updateStats(view.stats);
   renderRankings(view.rankings, view.rankingsTab, view.connected);
 }
+
+// ── Subscriptions table event delegation ──
+$('subsTable').addEventListener('click', (e) => {
+  const detailBtn = e.target.closest('.detail-btn');
+  if (detailBtn) {
+    const sym = detailBtn.dataset.symbol;
+    if (sym) showInstrumentDetail(sym);
+    return;
+  }
+  const unsubBtn = e.target.closest('.unsub-btn');
+  if (unsubBtn) {
+    doUnsubscribe(unsubBtn.dataset.id);
+    return;
+  }
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) selectSubscription(tr.dataset.id);
+});
 
 // ── Helpers ──
 function getFlags() {
@@ -173,7 +292,7 @@ function selectSubscription(id) {
 
 function rankingClick(symbol) {
   if (!view.connected) return;
-  const existing = view.subs.find(s => s.symbol === symbol);
+  const existing = view.allInfo ? view.allInfo.find(s => s.symbol === symbol) : null;
   if (existing) {
     selectSubscription(existing.id);
   } else {
@@ -198,15 +317,12 @@ function switchRankingsTab(tab) {
 window.toggleConnection = toggleConnection;
 window.doSubscribe = doSubscribe;
 window.doGet = doGet;
-window.doUnsubscribe = doUnsubscribe;
-window.selectSubscription = selectSubscription;
 window.rankingClick = rankingClick;
 window.switchRankingsTab = switchRankingsTab;
 window.symbolAutocomplete = symbolAutocomplete;
-window.clearLog = clearLog;
-window.toggleLog = setLogEnabled;
 window.showInstrumentDetail = showInstrumentDetail;
 window.closeModal = closeModal;
+window.toggleColumnSelector = toggleColumnSelector;
 
 // ── Instrument detail modal ──
 
@@ -247,16 +363,17 @@ function enumLabel(map, val) {
   return map[val] || String(val);
 }
 
-async function showInstrumentDetail() {
-  if (!view.selectedSymbol) return;
+async function showInstrumentDetail(symbol) {
+  symbol = symbol || view.selectedSymbol;
+  if (!symbol) return;
   const modal = $('instrumentModal');
   const body = $('modalBody');
-  $('modalTitle').textContent = 'Instrument Detail — ' + view.selectedSymbol;
+  $('modalTitle').textContent = 'Instrument Detail \u2014 ' + symbol;
   body.innerHTML = '<div class="empty-msg">Loading...</div>';
   modal.classList.remove('hidden');
 
   try {
-    const resp = await fetch(httpBase() + '/instrument/' + encodeURIComponent(view.selectedSymbol));
+    const resp = await fetch(httpBase() + '/instrument/' + encodeURIComponent(symbol));
     if (!resp.ok) { body.innerHTML = '<div class="empty-msg">Not available (HTTP ' + resp.status + ')</div>'; return; }
     const data = await resp.json();
     renderModal(body, data);
@@ -344,32 +461,29 @@ function renderModal(body, d) {
     html += '<div class="modal-section"><h4>' + sec.title + '</h4><div class="modal-grid">';
     for (const [label, val] of sec.fields) {
       const cls = val == null ? 'val null' : 'val';
-      const display = val == null ? '—' : val;
+      const display = val == null ? '\u2014' : val;
       html += '<div class="modal-field"><span class="lbl">' + label + '</span><span class="' + cls + '">' + display + '</span></div>';
     }
     html += '</div></div>';
   }
 
-  // Underlyings table
   if (d.underlyings && d.underlyings.length > 0) {
     html += '<div class="modal-section"><h4>Underlyings</h4><table class="modal-table"><thead><tr><th>Security ID</th><th>Symbol</th></tr></thead><tbody>';
     for (const u of d.underlyings) {
-      html += '<tr><td>' + u.securityId + '</td><td>' + (u.symbol || '—') + '</td></tr>';
+      html += '<tr><td>' + u.securityId + '</td><td>' + (u.symbol || '\u2014') + '</td></tr>';
     }
     html += '</tbody></table></div>';
   }
 
-  // Legs table
   if (d.legs && d.legs.length > 0) {
     html += '<div class="modal-section"><h4>Legs</h4><table class="modal-table"><thead><tr><th>Security ID</th><th>Symbol</th><th>Ratio Qty</th><th>Security Type</th><th>Side</th></tr></thead><tbody>';
     for (const l of d.legs) {
-      const ratioDisplay = l.ratioQty != null ? (l.ratioQty / 1e7).toFixed(7).replace(/0+$/, '').replace(/\.$/, '') : '—';
-      html += '<tr><td>' + l.securityId + '</td><td>' + (l.symbol || '—') + '</td><td>' + ratioDisplay + '</td><td>' + enumLabel(SECURITY_TYPE_NAMES, l.securityType) + '</td><td>' + (enumLabel(LEG_SIDE_NAMES, l.side) || '—') + '</td></tr>';
+      const ratioDisplay = l.ratioQty != null ? (l.ratioQty / 1e7).toFixed(7).replace(/0+$/, '').replace(/\.$/, '') : '\u2014';
+      html += '<tr><td>' + l.securityId + '</td><td>' + (l.symbol || '\u2014') + '</td><td>' + ratioDisplay + '</td><td>' + enumLabel(SECURITY_TYPE_NAMES, l.securityType) + '</td><td>' + (enumLabel(LEG_SIDE_NAMES, l.side) || '\u2014') + '</td></tr>';
     }
     html += '</tbody></table></div>';
   }
 
-  // Instrument Attributes
   if (d.instrAttribs && d.instrAttribs.length > 0) {
     html += '<div class="modal-section"><h4>Attributes</h4><table class="modal-table"><thead><tr><th>Type</th><th>Value</th></tr></thead><tbody>';
     for (const a of d.instrAttribs) {
@@ -388,19 +502,17 @@ function closeModal() {
 // ── Keyboard shortcuts ──
 
 function navigateSubscription(delta) {
-  if (view.subs.length === 0) return;
-  const currentIdx = view.subs.findIndex(s => s.id === view.selectedId);
+  if (!view.allInfo || view.allInfo.length === 0) return;
+  const currentIdx = view.allInfo.findIndex(s => s.id === view.selectedId);
   let next = currentIdx + delta;
-  if (next < 0) next = view.subs.length - 1;
-  if (next >= view.subs.length) next = 0;
-  selectSubscription(view.subs[next].id);
+  if (next < 0) next = view.allInfo.length - 1;
+  if (next >= view.allInfo.length) next = 0;
+  selectSubscription(view.allInfo[next].id);
 }
 
 document.addEventListener('keydown', (e) => {
-  // Escape closes modal
   if (e.key === 'Escape') { closeModal(); return; }
 
-  // Ctrl+I toggles instrument detail
   if (e.ctrlKey && e.key === 'i') {
     e.preventDefault();
     const modal = $('instrumentModal');
@@ -409,12 +521,12 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Alt+↑/↓ navigate subscriptions
   if (e.altKey && e.key === 'ArrowUp') { e.preventDefault(); navigateSubscription(-1); return; }
   if (e.altKey && e.key === 'ArrowDown') { e.preventDefault(); navigateSubscription(1); return; }
 });
 
 // ── Init ──
 setStatus('disconnected');
+initColumnSelector();
 startHealthPolling();
 worker.postMessage({ cmd: 'connect', url: $('wsUrl').value.trim() });

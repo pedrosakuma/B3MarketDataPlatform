@@ -34,11 +34,12 @@
   .main { flex: 1; display: grid; grid-template-columns: 220px 1fr; overflow: hidden; }
   .sidebar { background: var(--bg2); border-right: 1px solid var(--border); padding: .75rem; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; }
   .content { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
-  .panels { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 3fr 1fr; gap: 0; overflow: hidden; min-height: 0; }
+  .panels { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 3fr 2fr; gap: 0; overflow: hidden; min-height: 0; }
   .panel { border: 1px solid var(--border); margin: .5rem; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; }
   .panel.wide { grid-column: 1 / -1; }
   .panel-head { background: var(--bg3); padding: .4rem .7rem; font-size: .75rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
   .panel-body { flex: 1; padding: .5rem; overflow-y: auto; font-size: .8rem; }
+  .panel-body.no-pad { padding: 0; }
 
   /* Book table */
   .book-grid { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
@@ -57,29 +58,31 @@
   /* Spread bar */
   .spread-bar { text-align: center; font-size: .75rem; padding: .3rem; margin-bottom: .3rem; background: rgba(0,210,255,.08); border-radius: 4px; font-family: monospace; }
 
-  /* Info grid */
-  .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .25rem .75rem; }
-  .info-item { display: flex; justify-content: space-between; font-size: .75rem; padding: .15rem 0; border-bottom: 1px solid rgba(255,255,255,.05); }
-  .info-label { color: var(--muted); } .info-value { font-family: monospace; font-weight: 600; }
+  /* Subscriptions table */
+  .subs-table-wrap { overflow-x: auto; overflow-y: auto; flex: 1; }
+  .subs-table { width: 100%; border-collapse: collapse; font-size: .72rem; font-family: 'Cascadia Code', monospace; }
+  .subs-table th { position: sticky; top: 0; background: var(--bg3); color: var(--muted); font-weight: 600; padding: .3rem .4rem; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; cursor: default; z-index: 2; }
+  .subs-table th:first-child, .subs-table td:first-child { text-align: left; position: sticky; left: 0; background: var(--bg2); z-index: 1; }
+  .subs-table th:first-child { z-index: 3; background: var(--bg3); }
+  .subs-table th:last-child, .subs-table td:last-child { text-align: center; }
+  .subs-table td { padding: .25rem .4rem; border-bottom: 1px solid rgba(255,255,255,.04); white-space: nowrap; text-align: right; }
+  .subs-table tr { cursor: pointer; }
+  .subs-table tr:hover td { background: rgba(0,210,255,.06); }
+  .subs-table tr.active td { background: rgba(0,210,255,.12); }
+  .subs-table tr.active td:first-child { border-left: 2px solid var(--accent); }
+  .subs-table .sym-cell { font-weight: 700; color: var(--text); }
+  .subs-table .detail-btn { background: none; border: none; color: var(--muted); font-size: .7rem; cursor: pointer; padding: .1rem .3rem; }
+  .subs-table .detail-btn:hover { color: var(--accent); background: none; }
+  .subs-table .unsub-btn { background: none; border: none; color: var(--red); font-size: .65rem; cursor: pointer; padding: .1rem .3rem; }
+  .subs-table .unsub-btn:hover { background: none; }
 
-  /* Trade tape */
-  .trade-table { width: 100%; border-collapse: collapse; }
-  .trade-table th, .trade-table td { padding: .15rem .4rem; font-size: .75rem; font-family: 'Cascadia Code', monospace; text-align: right; }
-  .trade-table th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
-  .trade-time { color: var(--muted); font-size: .65rem; }
-
-  /* Log */
-  .log-area { flex: 0 0 180px; min-height: 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
-  .log-area.hidden { display: none; }
-  .log-head { background: var(--bg3); padding: .4rem .7rem; font-size: .75rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
-  .log-body { flex: 1; overflow-y: auto; padding: .25rem .5rem; font-family: monospace; font-size: .7rem; line-height: 1.6; }
-  .log-entry { white-space: nowrap; }
-  .log-ts { color: var(--muted); } .log-type { font-weight: 600; }
-  .log-sub-ok { color: var(--green); } .log-error { color: var(--red); } .log-book { color: var(--accent); }
-  .log-info { color: var(--yellow); } .log-order { color: #b388ff; } .log-trade { color: #ff9100; }
-
-  /* Subscriptions list */
-  .sub-list { list-style: none; }
+  /* Column selector */
+  .col-selector { position: relative; display: inline-block; }
+  .col-selector-btn { font-size: .65rem; padding: .15rem .4rem; }
+  .col-selector-dropdown { display: none; position: absolute; right: 0; top: 100%; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: .4rem; z-index: 200; max-height: 300px; overflow-y: auto; min-width: 200px; }
+  .col-selector-dropdown.open { display: block; }
+  .col-selector-dropdown label { font-size: .7rem; padding: .15rem .3rem; cursor: pointer; white-space: nowrap; }
+  .col-selector-dropdown label:hover { background: var(--bg3); border-radius: 3px; }
 
   /* Rankings */
   .rank-tabs { display: flex; gap: 2px; margin-bottom: .5rem; }
@@ -93,13 +96,18 @@
   .rank-pos { color: var(--muted); width: 1.2em; text-align: right; font-size: .65rem; }
   .rank-sym { flex: 1; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rank-val { font-size: .7rem; white-space: nowrap; }
-  .sub-item { padding: .3rem .4rem; border-radius: 4px; cursor: pointer; font-size: .8rem; display: flex; justify-content: space-between; align-items: center; }
-  .sub-item:hover { background: var(--bg3); }
-  .sub-item.active { background: var(--bg3); border-left: 2px solid var(--accent); }
-  .sub-item .flags { font-size: .65rem; color: var(--muted); }
-  .sub-unsub { background: none; border: none; color: var(--red); font-size: .7rem; padding: .1rem .3rem; cursor: pointer; }
 
   .empty-msg { color: var(--muted); font-style: italic; font-size: .8rem; text-align: center; padding: 2rem; }
+
+  /* Toast notifications */
+  .toast-container { position: fixed; top: 60px; right: 16px; z-index: 300; display: flex; flex-direction: column; gap: .3rem; pointer-events: none; max-width: 380px; }
+  .toast { padding: .4rem .8rem; border-radius: 5px; font-size: .72rem; font-family: monospace; background: var(--bg3); border: 1px solid var(--border); color: var(--text); opacity: 0; transform: translateX(30px); transition: opacity .25s, transform .25s; pointer-events: auto; }
+  .toast.show { opacity: 1; transform: translateX(0); }
+  .toast.fade-out { opacity: 0; transform: translateX(30px); }
+  .toast.toast-ok { border-left: 3px solid var(--green); }
+  .toast.toast-error { border-left: 3px solid var(--red); }
+  .toast.toast-info { border-left: 3px solid var(--yellow); }
+  .toast.toast-default { border-left: 3px solid var(--muted); }
 
   /* Modal overlay */
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center; }
@@ -152,6 +160,7 @@
     .toolbar .sep { display: none; }
     .input-ws { width: 180px; }
     .modal-grid { grid-template-columns: 1fr; }
+    .toast-container { right: 8px; max-width: 90vw; }
   }
 
   /* ── Responsive: Mobile (≤ 600px) ── */
@@ -161,12 +170,11 @@
     .toolbar .group { flex-wrap: wrap; gap: .4rem; }
     .input-ws { width: 100%; }
     .input-symbol { width: 100px; }
-    .log-area { flex: 0 0 120px; }
     .health-bar { font-size: .6rem; padding: .2rem .5rem; overflow-x: auto; white-space: nowrap; }
     .stats-bar { padding: .25rem .5rem; gap: .75rem; font-size: .6rem; }
-    .info-grid { grid-template-columns: 1fr; }
     .depth-cell { width: 40px; }
     .rank-tabs { flex-wrap: wrap; }
+    .toast-container { right: 4px; left: 4px; max-width: none; }
   }
 </style>
 </head>
@@ -203,13 +211,8 @@
 <!-- Main -->
 <div class="main">
   <div id="sidebarBackdrop" class="sidebar-backdrop" onclick="toggleSidebar()"></div>
-  <!-- Sidebar: subscriptions -->
+  <!-- Sidebar: rankings -->
   <div id="sidebar" class="sidebar">
-    <div>
-      <h3>Subscriptions</h3>
-      <ul id="subList" class="sub-list"></ul>
-      <div id="subEmpty" class="empty-msg">No active subscriptions</div>
-    </div>
     <div>
       <h3>Rankings</h3>
       <div class="rank-tabs">
@@ -231,33 +234,33 @@
           <div class="empty-msg">Subscribe to see order book</div>
         </div>
       </div>
-      <!-- Trades panel -->
+      <!-- Chart panel -->
       <div class="panel">
-        <div class="panel-head" id="tradeTitle">Recent Trades</div>
-        <div class="panel-body" id="tradeBody">
-          <div class="empty-msg">No trades yet</div>
+        <div class="panel-head" id="chartTitle">Chart</div>
+        <div class="panel-body no-pad" id="chartBody">
+          <div class="empty-msg" id="chartEmpty">Subscribe to see chart</div>
+          <div id="chartContainer" style="width:100%;height:100%;display:none"></div>
         </div>
       </div>
-      <!-- Info panel -->
+      <!-- Subscriptions table panel -->
       <div class="panel wide">
         <div class="panel-head" style="display:flex;justify-content:space-between;align-items:center">
-          <span id="infoTitle">Instrument Info</span>
-          <button id="btnDetail" onclick="showInstrumentDetail()" style="font-size:.65rem;padding:.1rem .5rem" title="Show full instrument details (Ctrl+I)">📋 Detail</button>
+          <span>Subscriptions</span>
+          <div class="col-selector">
+            <button class="col-selector-btn" onclick="toggleColumnSelector()" title="Select columns">⚙ Columns</button>
+            <div id="colSelectorDropdown" class="col-selector-dropdown"></div>
+          </div>
         </div>
-        <div class="panel-body" id="infoBody">
-          <div class="empty-msg">Subscribe to see instrument info</div>
+        <div class="panel-body no-pad" id="subsTableBody" style="padding:0">
+          <div class="empty-msg" id="subsEmpty">No active subscriptions</div>
+          <div class="subs-table-wrap" id="subsTableWrap" style="display:none">
+            <table class="subs-table" id="subsTable">
+              <thead id="subsTableHead"></thead>
+              <tbody id="subsTableRows"></tbody>
+            </table>
+          </div>
         </div>
       </div>
-    </div>
-
-    <!-- Event log -->
-    <div class="log-area">
-      <div class="log-head">
-        <span>Event Log</span>
-        <label style="font-size:.65rem;margin-left:auto;cursor:pointer"><input type="checkbox" id="logToggle" checked onchange="toggleLog(this.checked)"> Enabled</label>
-        <button onclick="clearLog()" style="font-size:.65rem;padding:.1rem .4rem;margin-left:.4rem">Clear</button>
-      </div>
-      <div class="log-body" id="logBody"></div>
     </div>
   </div>
 </div>
@@ -271,6 +274,9 @@
   <span>Trades: <strong id="statTrades">0</strong></span>
 </div>
 
+<!-- Toast container -->
+<div id="toastContainer" class="toast-container"></div>
+
 <!-- Instrument detail modal -->
 <div id="instrumentModal" class="modal-overlay hidden" onclick="if(event.target===this)closeModal()">
   <div class="modal">
@@ -283,6 +289,7 @@
   </div>
 </div>
 
+<script src="https://unpkg.com/lightweight-charts@4.2.2/dist/lightweight-charts.standalone.production.js"></script>
 <script type="module" src="js/app.js"></script>
 <script>
 // Sidebar toggle must be global before module loads (module scripts are deferred)

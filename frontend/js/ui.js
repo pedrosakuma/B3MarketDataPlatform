@@ -2,7 +2,7 @@
 // All render functions are parameterized — no global state imports.
 // Main thread only: receives pre-computed data from worker, updates DOM pools.
 
-import { INFO_FIELDS, PRICE_FIELDS, flagsStr } from './protocol.js';
+import { PRICE_FIELDS } from './protocol.js';
 
 export const $ = (id) => document.getElementById(id);
 
@@ -29,7 +29,6 @@ export function setStatus(s) {
 // ── DOM Pool infrastructure ──
 
 const MAX_BOOK_LEVELS = 15;
-const MAX_TRADES = 50;
 const MAX_RANK_ITEMS = 10;
 
 // Book pool
@@ -125,76 +124,6 @@ function getBookPool() {
   return bookPool;
 }
 
-// Trade pool
-let tradePool = null;
-
-function getTradePool() {
-  if (tradePool) return tradePool;
-  const body = $('tradeBody');
-  body.innerHTML = '';
-  const emptyMsg = document.createElement('div');
-  emptyMsg.className = 'empty-msg';
-  emptyMsg.textContent = 'No trades yet';
-  body.appendChild(emptyMsg);
-  const table = document.createElement('table');
-  table.className = 'trade-table';
-  table.style.display = 'none';
-  const thead = document.createElement('tr');
-  for (const th of ['Time', 'Price', 'Qty']) {
-    const el = document.createElement('th');
-    el.textContent = th;
-    thead.appendChild(el);
-  }
-  table.appendChild(thead);
-  const rows = [];
-  for (let i = 0; i < MAX_TRADES; i++) {
-    const tr = document.createElement('tr');
-    tr.style.display = 'none';
-    const tdTime = document.createElement('td'); tdTime.className = 'trade-time';
-    const tdPrice = document.createElement('td');
-    const tdQty = document.createElement('td');
-    tr.appendChild(tdTime); tr.appendChild(tdPrice); tr.appendChild(tdQty);
-    table.appendChild(tr);
-    rows.push({ tr, tdTime, tdPrice, tdQty });
-  }
-  body.appendChild(table);
-  tradePool = { table, rows, emptyMsg };
-  return tradePool;
-}
-
-// Info pool
-let infoPool = null;
-
-function getInfoPool() {
-  if (infoPool) return infoPool;
-  const body = $('infoBody');
-  body.innerHTML = '';
-  const emptyMsg = document.createElement('div');
-  emptyMsg.className = 'empty-msg';
-  emptyMsg.textContent = 'No info data';
-  body.appendChild(emptyMsg);
-  const grid = document.createElement('div');
-  grid.className = 'info-grid';
-  grid.style.display = 'none';
-  body.appendChild(grid);
-  const items = {};
-  for (const field of INFO_FIELDS) {
-    const item = document.createElement('div');
-    item.className = 'info-item';
-    item.style.display = 'none';
-    const label = document.createElement('span');
-    label.className = 'info-label';
-    label.textContent = field;
-    const value = document.createElement('span');
-    value.className = 'info-value';
-    item.appendChild(label); item.appendChild(value);
-    grid.appendChild(item);
-    items[field] = { item, value };
-  }
-  infoPool = { grid, items, emptyMsg };
-  return infoPool;
-}
-
 // Rankings pool
 let rankPool = null;
 
@@ -233,75 +162,14 @@ function getRankPool() {
   return rankPool;
 }
 
-// Subscription list pool
-let subPool = null;
-const SUB_POOL_SIZE = 30;
-
-function getSubPool() {
-  if (subPool) return subPool;
-  const ul = $('subList');
-  ul.innerHTML = '';
-  ul.addEventListener('click', (e) => {
-    const li = e.target.closest('.sub-item');
-    if (!li) return;
-    if (e.target.closest('.sub-unsub')) {
-      if (window.doUnsubscribe) window.doUnsubscribe(li.dataset.id);
-    } else {
-      if (window.selectSubscription) window.selectSubscription(li.dataset.id);
-    }
-  });
-  const rows = [];
-  for (let i = 0; i < SUB_POOL_SIZE; i++) {
-    const li = document.createElement('li');
-    li.className = 'sub-item';
-    li.style.display = 'none';
-    li.style.cursor = 'pointer';
-    const span = document.createElement('span');
-    span.style.cssText = 'flex:1;cursor:pointer';
-    const strong = document.createElement('strong');
-    const flags = document.createElement('span');
-    flags.className = 'flags';
-    span.appendChild(strong);
-    span.appendChild(document.createTextNode(' '));
-    span.appendChild(flags);
-    const btn = document.createElement('button');
-    btn.className = 'sub-unsub';
-    btn.title = 'Unsubscribe';
-    btn.textContent = '\u2715';
-    li.appendChild(span); li.appendChild(btn);
-    ul.appendChild(li);
-    rows.push({ li, strong, flags });
-  }
-  subPool = { rows };
-  return subPool;
-}
-
-// ── Parameterized render functions ──
-
-export function renderSubList(subs, selectedId) {
-  const pool = getSubPool();
-  $('subEmpty').style.display = (!subs || subs.length === 0) ? '' : 'none';
-  if (!subs) subs = [];
-  for (let i = 0; i < pool.rows.length; i++) {
-    const row = pool.rows[i];
-    if (i < subs.length) {
-      const s = subs[i];
-      row.li.style.display = '';
-      row.li.dataset.id = s.id;
-      row.li.className = 'sub-item' + (s.id === selectedId ? ' active' : '');
-      row.strong.textContent = s.symbol;
-      row.flags.textContent = '[' + flagsStr(s.flags) + ']';
-    } else {
-      row.li.style.display = 'none';
-    }
-  }
-}
+// ── Titles ──
 
 export function updateTitles(selectedSymbol) {
   $('bookTitle').textContent = selectedSymbol ? 'Order Book \u2014 ' + selectedSymbol : 'Order Book';
-  $('infoTitle').textContent = selectedSymbol ? 'Instrument Info \u2014 ' + selectedSymbol : 'Instrument Info';
-  $('tradeTitle').textContent = selectedSymbol ? 'Trades \u2014 ' + selectedSymbol : 'Recent Trades';
+  $('chartTitle').textContent = selectedSymbol ? 'Chart \u2014 ' + selectedSymbol : 'Chart';
 }
+
+// ── Render functions ──
 
 export function renderBook(bookData) {
   const pool = getBookPool();
@@ -362,68 +230,6 @@ export function renderBook(bookData) {
   pool.askEmpty.style.display = asks.length === 0 ? '' : 'none';
 }
 
-function tradingStatusName(v) {
-  const names = { 2: 'Paused', 4: 'Closed', 17: 'Open', 18: 'Forbidden', 20: 'Unknown', 21: 'Auction', 101: 'FinalClosing' };
-  return names[v] || 'Status(' + v + ')';
-}
-
-function tradingEventName(v) {
-  const names = { 0: 'None', 1: 'Change', 4: 'NewStatus', 101: 'PriceBand' };
-  return names[v] || 'Event(' + v + ')';
-}
-
-export function renderInfo(infoData) {
-  const pool = getInfoPool();
-  if (!infoData) {
-    pool.emptyMsg.style.display = '';
-    pool.grid.style.display = 'none';
-    return;
-  }
-  pool.emptyMsg.style.display = 'none';
-  pool.grid.style.display = '';
-  for (const field of INFO_FIELDS) {
-    const item = pool.items[field];
-    if (field in infoData) {
-      item.item.style.display = '';
-      const raw = infoData[field];
-      let display;
-      if (field === 'TradingStatus') display = tradingStatusName(raw);
-      else if (field === 'TradingEvent') display = tradingEventName(raw);
-      else if (PRICE_FIELDS.has(field)) display = formatPrice(raw);
-      else display = formatQty(raw);
-      item.value.textContent = display;
-    } else {
-      item.item.style.display = 'none';
-    }
-  }
-}
-
-export function renderTrades(trades) {
-  const pool = getTradePool();
-  if (!trades || trades.length === 0) {
-    pool.emptyMsg.style.display = '';
-    pool.table.style.display = 'none';
-    return;
-  }
-  pool.emptyMsg.style.display = 'none';
-  pool.table.style.display = '';
-  const len = trades.length;
-  for (let i = 0; i < MAX_TRADES; i++) {
-    const row = pool.rows[i];
-    const ti = len - 1 - i;
-    if (ti >= 0) {
-      const t = trades[ti];
-      row.tr.style.display = '';
-      row.tdTime.textContent = t.time;
-      row.tdPrice.textContent = formatPrice(t.price);
-      row.tdPrice.className = t.direction === 'up' ? 'bid-price' : t.direction === 'down' ? 'ask-price' : '';
-      row.tdQty.textContent = formatQty(t.qty);
-    } else {
-      row.tr.style.display = 'none';
-    }
-  }
-}
-
 export function renderRankings(rankingsData, tab, connected) {
   for (const t of ['volume', 'gainers', 'losers']) {
     const btn = $('rankTab_' + t);
@@ -464,60 +270,6 @@ export function renderHealth(healthData) {
   el.textContent = parts.join(' \u2502 ');
 }
 
-// ── Event log (buffered via rAF) ──
-
-const MAX_LOG = 200;
-let logCount = 0;
-const logBuffer = [];
-let logFlushScheduled = false;
-let logEnabled = true;
-
-function ts() {
-  const d = new Date();
-  return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
-}
-
-export function addLog(text, cssClass) {
-  if (!logEnabled) return;
-  logBuffer.push({ text, cssClass, time: ts() });
-  if (!logFlushScheduled) {
-    logFlushScheduled = true;
-    requestAnimationFrame(flushLog);
-  }
-}
-
-function flushLog() {
-  logFlushScheduled = false;
-  const body = $('logBody');
-  const frag = document.createDocumentFragment();
-  for (const entry of logBuffer) {
-    const div = document.createElement('div');
-    div.className = 'log-entry';
-    const tsSpan = document.createElement('span');
-    tsSpan.className = 'log-ts';
-    tsSpan.textContent = entry.time;
-    const msgSpan = document.createElement('span');
-    msgSpan.className = entry.cssClass || '';
-    msgSpan.textContent = ' ' + entry.text;
-    div.appendChild(tsSpan); div.appendChild(msgSpan);
-    frag.appendChild(div);
-    logCount++;
-  }
-  logBuffer.length = 0;
-  body.appendChild(frag);
-  while (logCount > MAX_LOG) { body.removeChild(body.firstChild); logCount--; }
-  body.scrollTop = body.scrollHeight;
-}
-
-export function clearLog() { $('logBody').innerHTML = ''; logCount = 0; logBuffer.length = 0; }
-
-export function setLogEnabled(enabled) {
-  logEnabled = enabled;
-  const logArea = document.querySelector('.log-area');
-  if (logArea) logArea.classList.toggle('hidden', !enabled);
-  if (!enabled) clearLog();
-}
-
 // ── Stats bar ──
 
 export function updateStats(statsData) {
@@ -527,4 +279,158 @@ export function updateStats(statsData) {
   $('statInfo').textContent = statsData.info.toLocaleString();
   $('statOrders').textContent = statsData.orders.toLocaleString();
   $('statTrades').textContent = statsData.trades.toLocaleString();
+}
+
+// ── Toast notifications ──
+
+const MAX_TOASTS = 5;
+const TOAST_DURATION = 4000;
+
+const TOAST_CLASS_MAP = {
+  'log-sub-ok': 'toast-ok',
+  'log-error': 'toast-error',
+  'log-info': 'toast-info',
+  'log-book': 'toast-info',
+};
+
+export function showToast(text, cssClass) {
+  const container = $('toastContainer');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + (TOAST_CLASS_MAP[cssClass] || 'toast-default');
+  toast.textContent = text;
+  container.appendChild(toast);
+
+  // Trigger reflow then animate in
+  void toast.offsetHeight;
+  toast.classList.add('show');
+
+  // Limit visible toasts
+  while (container.children.length > MAX_TOASTS) {
+    container.removeChild(container.firstChild);
+  }
+
+  setTimeout(() => {
+    toast.classList.remove('show');
+    toast.classList.add('fade-out');
+    setTimeout(() => { if (toast.parentNode) toast.remove(); }, 300);
+  }, TOAST_DURATION);
+}
+
+// ── Subscriptions table (DOM-pooled) ──
+
+const subsState = { rows: new Map(), columnsKey: '' };
+
+function tradingStatusName(v) {
+  const names = { 2: 'Paused', 4: 'Closed', 17: 'Open', 18: 'Forbidden', 20: 'Unknown', 21: 'Auction', 101: 'FinalClosing' };
+  return names[v] || ('(' + v + ')');
+}
+
+function tradingEventName(v) {
+  const names = { 0: 'None', 1: 'Change', 4: 'NewStatus', 101: 'PriceBand' };
+  return names[v] || ('(' + v + ')');
+}
+
+function formatField(field, value) {
+  if (value == null || value === undefined) return '\u2014';
+  if (field === 'TradingStatus') return tradingStatusName(value);
+  if (field === 'TradingEvent') return tradingEventName(value);
+  if (PRICE_FIELDS.has(field)) return formatPrice(value);
+  return formatQty(value);
+}
+
+export function renderSubsTable(allInfo, columns, selectedId) {
+  const empty = $('subsEmpty');
+  const wrap = $('subsTableWrap');
+
+  if (!allInfo || allInfo.length === 0) {
+    empty.style.display = '';
+    wrap.style.display = 'none';
+    return;
+  }
+
+  empty.style.display = 'none';
+  wrap.style.display = '';
+
+  const thead = $('subsTableHead');
+  const tbody = $('subsTableRows');
+  const colsKey = columns.join(',');
+
+  // Rebuild header + clear row cache when columns change
+  if (subsState.columnsKey !== colsKey) {
+    subsState.columnsKey = colsKey;
+    thead.innerHTML = '';
+    const tr = document.createElement('tr');
+    const thSym = document.createElement('th'); thSym.textContent = 'Symbol'; tr.appendChild(thSym);
+    for (const col of columns) {
+      const th = document.createElement('th'); th.textContent = col; tr.appendChild(th);
+    }
+    const thAct = document.createElement('th'); tr.appendChild(thAct);
+    thead.appendChild(tr);
+    for (const [, row] of subsState.rows) row.tr.remove();
+    subsState.rows.clear();
+  }
+
+  const currentIds = new Set();
+
+  for (const item of allInfo) {
+    currentIds.add(item.id);
+    let row = subsState.rows.get(item.id);
+
+    if (!row) {
+      const tr = document.createElement('tr');
+      tr.dataset.id = item.id;
+      const tdSym = document.createElement('td');
+      tdSym.className = 'sym-cell';
+      tr.appendChild(tdSym);
+
+      const cells = {};
+      for (const col of columns) {
+        const td = document.createElement('td');
+        tr.appendChild(td);
+        cells[col] = td;
+      }
+
+      const tdAct = document.createElement('td');
+      const btnDetail = document.createElement('button');
+      btnDetail.className = 'detail-btn';
+      btnDetail.textContent = '\uD83D\uDD0D';
+      btnDetail.title = 'Detail';
+      const btnUnsub = document.createElement('button');
+      btnUnsub.className = 'unsub-btn';
+      btnUnsub.textContent = '\u2715';
+      btnUnsub.title = 'Unsubscribe';
+      tdAct.appendChild(btnDetail);
+      tdAct.appendChild(btnUnsub);
+      tr.appendChild(tdAct);
+
+      tbody.appendChild(tr);
+      row = { tr, tdSym, cells, btnDetail, btnUnsub };
+      subsState.rows.set(item.id, row);
+    }
+
+    row.tdSym.textContent = item.symbol;
+    row.btnDetail.dataset.symbol = item.symbol;
+    row.btnUnsub.dataset.id = item.id;
+    row.tr.className = item.id === selectedId ? 'active' : '';
+
+    for (const col of columns) {
+      const td = row.cells[col];
+      if (!td) continue;
+      const val = item.info[col];
+      td.textContent = formatField(col, val);
+      if (col === 'NetChange' && val != null) {
+        td.className = val > 0 ? 'bid-price' : val < 0 ? 'ask-price' : '';
+      }
+    }
+  }
+
+  // Remove stale rows
+  for (const [id, row] of subsState.rows) {
+    if (!currentIds.has(id)) {
+      row.tr.remove();
+      subsState.rows.delete(id);
+    }
+  }
 }
