@@ -11,6 +11,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **PCAP replay with cross-channel sync** — timestamp-based priority queue merge across all UMDF channels (Incremental A/B, Instrument Definition, Snapshot Recovery)
 - **Live multicast transport** — UDP multicast with source-specific multicast (SSM) support
 - **Multi-channel support** — process multiple channel groups simultaneously (e.g. EQT + DRV)
+- **Per-group architecture** — each channel group owns its `BookManager`, `MarketDataManager`, and conflation buffers; single-threaded hot path with zero locks
 - **Feed A/B deduplication** — automatic duplicate packet filtering
 - **Gap detection & snapshot recovery** — detects missing packets, transitions to snapshot recovery, catch-up and back to real-time
 - **Market-by-Order (MBO) book** — full order book maintenance per instrument
@@ -29,10 +30,12 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Web Worker architecture** — worker thread owns WebSocket connection, message parsing, state management, and MBP computation; main thread only renders DOM
 - **DOM pooling** — pre-allocated DOM elements for book, trades, info, rankings, and subscriptions; updates via `.textContent` only, no `innerHTML` on hot paths
 - **Dirty-flag render loop** — bitfield tracking which panels changed, single `requestAnimationFrame` per frame
+- **Responsive layout** — CSS media queries for tablet (≤900px) and mobile (≤600px); sidebar collapses to slide-out drawer with hamburger toggle; panels stack to single column
 - **Order book with depth bars** — 15 bid/ask levels with quantity visualization
 - **Trade log** — 50 most recent trades with time, price, and quantity
 - **Rankings panel** — volume, gainers, and losers tabs with click-to-subscribe
 - **Instrument info grid** — 22 market data fields with configurable price decimal display
+- **Instrument detail modal** — full instrument metadata via REST endpoint, keyboard shortcuts (Ctrl+I, Alt+↑/↓)
 - **Event log** — subscription events, connection status, errors
 - **Auto-reconnect** — exponential backoff with configurable toggle
 
@@ -67,25 +70,25 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
      │ FeedHandler   │ │ FeedHandler   │  ← one per channel group
      │ (Group 0/EQT) │ │ (Group 1/DRV) │
      └───────┬──────┘ └────┬─────────┘
+             │              │
+     ┌───────▼──────┐ ┌────▼─────────┐   ← per-group, single-threaded
+     │ BookManager   │ │ BookManager   │
+     │ MarketDataMgr │ │ MarketDataMgr │
+     │ GroupHandler   │ │ GroupHandler   │   (conflation buffers)
+     └───────┬──────┘ └────┬─────────┘
              └──────┬───────┘
-                    │  IFeedEventHandler (shared)
-        ┌───────────┼───────────┐
-        ▼           ▼           ▼
-  BookManager  MarketDataMgr  SymbolRegistry
-  (OrderBook)  (InstrumentInfo) (symbol↔id)
-        │           │
-        └─────┬─────┘
-              ▼
-    SubscriptionManager ◄── ConcurrentQueue ── WebSocket clients
-     (feed thread)           (subscribe/get/unsub requests)
-              │
-              ├── upstream conflation (per-packet order/trade buffering)
-              ├── rankings timer (300ms, top N volume/gainers/losers)
-              └── symbol registry promote (periodic FrozenDictionary rebuild)
-              │
-              ▼
-        WebSocketHost
-        (Kestrel, binary frames)
+                    │
+          SymbolRegistry (shared, FrozenDictionary)
+                    │
+      SubscriptionManager (central registry)
+       ├── ConcurrentDictionary + copy-on-write subscriptions
+       ├── subscribe/get routed to owning group's queue
+       ├── rankings aggregated across all groups
+       └── symbol registry promote (periodic FrozenDictionary rebuild)
+                    │
+                    ▼
+              WebSocketHost
+              (Kestrel, binary frames)
 ```
 
 ### Frontend (Web Worker)
@@ -341,7 +344,9 @@ The application supports processing multiple UMDF channel groups simultaneously 
 - Each channel group has 4 channels (Incremental A/B, Instrument Definition, Snapshot Recovery)
 - `MultiFeedManager` routes packets by `ChannelGroup` to per-group `FeedHandler` instances
 - Each `FeedHandler` has an independent state machine (WaitInstrDef → WaitSnapshot → CatchUp → RealTime)
-- All groups share `BookManager`, `MarketDataManager`, and `SymbolRegistry` — security IDs are globally unique
+- **Per-group architecture**: each group owns its own `BookManager`, `MarketDataManager`, and `GroupEventHandler` — single-threaded, zero locks on the hot path
+- `SymbolRegistry` is shared across groups (security IDs are globally unique)
+- `SubscriptionManager` aggregates across groups: subscribe/get requests are routed to the owning group's queue; rankings merge data from all per-group `MarketDataManager` instances
 - The WebSocket server activates once **all** channel groups reach RealTime
 
 ### Transport Modes
