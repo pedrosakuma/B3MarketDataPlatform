@@ -224,7 +224,7 @@ if (wsPort is not null)
 // Create per-group BookManager + MarketDataManager + FeedHandler
 var bookManagers = new List<BookManager>();
 var marketDataManagers = new List<MarketDataManager>();
-var groupEventHandlers = new List<SubscriptionManager.GroupEventHandler>();
+var groupHandlers = new List<GroupConflationHandler>();
 var groupFeedHandlers = new Dictionary<int, IFeedEventHandler>();
 var groupMdHandlers = new Dictionary<int, IFeedEventHandler>();
 
@@ -242,7 +242,7 @@ foreach (var gid in groupIds)
         bookHandler = new CompositeBookEventHandler(stats, gh);
         var bm = new BookManager(bookHandler, bmLogger);
         gh.SetBookManager(bm);
-        groupEventHandlers.Add(gh);
+        groupHandlers.Add(gh);
         bookManagers.Add(bm);
     }
     else
@@ -283,7 +283,7 @@ if (subscriptionManager is not null)
         bookManagers.ToArray(),
         marketDataManagers.ToArray(),
         symbolRegistry,
-        groupEventHandlers.ToArray());
+        groupHandlers.ToArray());
     wsHost = new WebSocketHost(subscriptionManager, loggerFactory.CreateLogger<WebSocketHost>());
 
     // Wire up feed state and last-packet providers for /health endpoint
@@ -318,70 +318,7 @@ if (subscriptionManager is not null)
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
 var lastReady = false;
-using var statsTimer = new Timer(_ =>
-{
-    bool ready;
-    long packets;
-    string stateStr;
-
-    if (multiFeed is not null)
-    {
-        ready = multiFeed.IsAllReady;
-        packets = multiFeed.TotalPacketCount;
-        var states = string.Join(", ", multiFeed.Handlers.Select(h => $"G{h.Key}:{h.Value.State}"));
-        stateStr = states;
-    }
-    else if (singleFeed is not null)
-    {
-        ready = singleFeed.State == FeedState.RealTime;
-        packets = singleFeed.PacketCount;
-        stateStr = singleFeed.State.ToString();
-    }
-    else return;
-
-    if (ready && !lastReady)
-    {
-        if (singleFeed is not null)
-            subscriptionManager?.SetReady();
-        lastReady = true;
-    }
-
-    Console.WriteLine();
-    Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
-    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
-
-    if (subscriptionManager is not null)
-    {
-        foreach (var (id, depth) in subscriptionManager.GetClientStats())
-            Console.WriteLine($"   {id}: queue={depth:N0}");
-        if (subscriptionManager.UpstreamConflated > 0)
-            Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
-    }
-
-    // Feed channel depths (multi-group only)
-    if (multiFeed is not null)
-    {
-        var depths = multiFeed.GetChannelDepths().Where(d => d.Depth > 0).ToList();
-        if (depths.Count > 0)
-        {
-            var parts = depths.Select(d => $"G{d.GroupId}={d.Depth:N0}");
-            Console.WriteLine($"   feed queue: {string.Join("  ", parts)}");
-        }
-    }
-
-    if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
-        Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
-
-    if (!ready && multiFeed is not null)
-    {
-        foreach (var (gid, h) in multiFeed.Handlers)
-        {
-            if (h.State == FeedState.WaitInstrumentDefinition)
-                Console.WriteLine($"   G{gid} InstrDef: {h.InstrDefReceived:N0}/{h.InstrDefTotalExpected:N0} parsed  ({h.InstrDefPacketCount:N0} idef pkts, {h.PacketCount:N0} total pkts)");
-        }
-    }
-
-}, null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
+using var statsTimer = new Timer(_ => PrintPeriodicStats(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(multicastMerger is not null ? "live feed" : "replay")}...");
 
@@ -426,22 +363,92 @@ else
     packetSource.Dispose();
 
 Console.WriteLine();
-Console.WriteLine($"═══ Complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
-Console.WriteLine($"  Channel groups: {groupIds.Count}");
-Console.WriteLine($"  Packets:      {(multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0):N0}");
-Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");
-Console.WriteLine($"  Trades:       {stats.TradeCount:N0}");
-Console.WriteLine($"  Deletes:      {stats.DeleteCount:N0}");
-Console.WriteLine($"  MarketData:   {stats.MarketDataCount:N0}");
-Console.WriteLine($"  StatusChg:    {stats.StatusChangeCount:N0}");
-Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
-Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
-Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
-Console.WriteLine($"  Books:        {bookManagers.Sum(bm => bm.Books.Count):N0}");
-Console.WriteLine($"  Instruments:  {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
-Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
+PrintFinalSummary();
 
 return 0;
+
+// ── Local functions ──
+
+void PrintPeriodicStats()
+{
+    bool ready;
+    long packets;
+    string stateStr;
+
+    if (multiFeed is not null)
+    {
+        ready = multiFeed.IsAllReady;
+        packets = multiFeed.TotalPacketCount;
+        var states = string.Join(", ", multiFeed.Handlers.Select(h => $"G{h.Key}:{h.Value.State}"));
+        stateStr = states;
+    }
+    else if (singleFeed is not null)
+    {
+        ready = singleFeed.State == FeedState.RealTime;
+        packets = singleFeed.PacketCount;
+        stateStr = singleFeed.State.ToString();
+    }
+    else return;
+
+    if (ready && !lastReady)
+    {
+        if (singleFeed is not null)
+            subscriptionManager?.SetReady();
+        lastReady = true;
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
+    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
+
+    if (subscriptionManager is not null)
+    {
+        foreach (var (id, depth) in subscriptionManager.GetClientStats())
+            Console.WriteLine($"   {id}: queue={depth:N0}");
+        if (subscriptionManager.UpstreamConflated > 0)
+            Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
+    }
+
+    if (multiFeed is not null)
+    {
+        var depths = multiFeed.GetChannelDepths().Where(d => d.Depth > 0).ToList();
+        if (depths.Count > 0)
+        {
+            var parts = depths.Select(d => $"G{d.GroupId}={d.Depth:N0}");
+            Console.WriteLine($"   feed queue: {string.Join("  ", parts)}");
+        }
+    }
+
+    if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
+        Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
+
+    if (!ready && multiFeed is not null)
+    {
+        foreach (var (gid, h) in multiFeed.Handlers)
+        {
+            if (h.State == FeedState.WaitInstrumentDefinition)
+                Console.WriteLine($"   G{gid} InstrDef: {h.InstrDefReceived:N0}/{h.InstrDefTotalExpected:N0} parsed  ({h.InstrDefPacketCount:N0} idef pkts, {h.PacketCount:N0} total pkts)");
+        }
+    }
+}
+
+void PrintFinalSummary()
+{
+    Console.WriteLine($"═══ Complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
+    Console.WriteLine($"  Channel groups: {groupIds.Count}");
+    Console.WriteLine($"  Packets:      {(multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0):N0}");
+    Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");
+    Console.WriteLine($"  Trades:       {stats.TradeCount:N0}");
+    Console.WriteLine($"  Deletes:      {stats.DeleteCount:N0}");
+    Console.WriteLine($"  MarketData:   {stats.MarketDataCount:N0}");
+    Console.WriteLine($"  StatusChg:    {stats.StatusChangeCount:N0}");
+    Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
+    Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
+    Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
+    Console.WriteLine($"  Books:        {bookManagers.Sum(bm => bm.Books.Count):N0}");
+    Console.WriteLine($"  Instruments:  {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
+    Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
+}
 
 sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 {
