@@ -183,26 +183,8 @@ function switchRankingsTab(tab) {
   scheduleRender();
 }
 
-// ── Sidebar toggle (responsive) ──
-
-function updateHeaderHeight() {
-  const toolbar = document.querySelector('.toolbar');
-  const health = document.querySelector('.health-bar');
-  const h = (toolbar?.offsetHeight || 0) + (health?.offsetHeight || 0);
-  document.documentElement.style.setProperty('--header-h', h + 'px');
-}
-
-function toggleSidebar() {
-  updateHeaderHeight();
-  const sidebar = document.getElementById('sidebar');
-  const backdrop = document.getElementById('sidebarBackdrop');
-  const isOpen = sidebar.classList.toggle('open');
-  backdrop.classList.toggle('open', isOpen);
-}
-
 // ── Expose to window for HTML onclick handlers ──
 window.toggleConnection = toggleConnection;
-window.toggleSidebar = toggleSidebar;
 window.doSubscribe = doSubscribe;
 window.doGet = doGet;
 window.doUnsubscribe = doUnsubscribe;
