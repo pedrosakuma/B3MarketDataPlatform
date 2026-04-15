@@ -318,6 +318,13 @@ if (subscriptionManager is not null)
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
 var lastReady = false;
+long prevPackets = 0, prevTotalEvents = 0;
+long prevStatsTicks = 0;
+
+// Register OTEL-compatible metrics (System.Diagnostics.Metrics)
+AppMetrics.Register(stats, bookManagers, marketDataManagers, groupIds,
+    multiFeed, singleFeed, subscriptionManager, groupHandlers, symbolRegistry);
+
 using var statsTimer = new Timer(_ => PrintPeriodicStats(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(multicastMerger is not null ? "live feed" : "replay")}...");
@@ -397,14 +404,31 @@ void PrintPeriodicStats()
         lastReady = true;
     }
 
+    // Compute rates
+    long nowTicks = sw.ElapsedTicks;
+    double secs = prevStatsTicks > 0
+        ? (double)(nowTicks - prevStatsTicks) / Stopwatch.Frequency
+        : sw.Elapsed.TotalSeconds;
+    if (secs < 0.5) secs = 0.5;
+
+    long totalEvents = stats.OrderCount + stats.TradeCount + stats.DeleteCount +
+                       stats.MarketDataCount + stats.StatusChangeCount +
+                       stats.ForwardTradeCount + stats.TradeBustCount + stats.ExecSummaryCount;
+
+    long pktRate = (long)((packets - prevPackets) / secs);
+    long evtRate = (long)((totalEvents - prevTotalEvents) / secs);
+    prevPackets = packets;
+    prevTotalEvents = totalEvents;
+    prevStatsTicks = nowTicks;
+
     Console.WriteLine();
     Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
-    Console.WriteLine($"   Packets: {packets:N0}  |  Orders: {stats.OrderCount:N0}  |  Trades: {stats.TradeCount:N0}  |  MktData: {stats.MarketDataCount:N0}  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
+    Console.WriteLine($"   Packets: {packets:N0} ({pktRate:N0}/s)  |  Events: {totalEvents:N0} ({evtRate:N0}/s)  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
 
     if (subscriptionManager is not null)
     {
-        foreach (var (id, depth) in subscriptionManager.GetClientStats())
-            Console.WriteLine($"   {id}: queue={depth:N0}");
+        foreach (var (id, depth, sent, _) in subscriptionManager.GetClientStats())
+            Console.WriteLine($"   {id}: queue={depth:N0}  sent={sent:N0}");
         if (subscriptionManager.UpstreamConflated > 0)
             Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
     }
@@ -434,17 +458,24 @@ void PrintPeriodicStats()
 
 void PrintFinalSummary()
 {
+    double totalSecs = sw.Elapsed.TotalSeconds;
+    long packets = multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0;
+    long totalEvents = stats.OrderCount + stats.TradeCount + stats.DeleteCount +
+                       stats.MarketDataCount + stats.StatusChangeCount +
+                       stats.ForwardTradeCount + stats.TradeBustCount + stats.ExecSummaryCount;
+
     Console.WriteLine($"═══ Complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
     Console.WriteLine($"  Channel groups: {groupIds.Count}");
-    Console.WriteLine($"  Packets:      {(multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0):N0}");
-    Console.WriteLine($"  Orders:       {stats.OrderCount:N0}");
-    Console.WriteLine($"  Trades:       {stats.TradeCount:N0}");
-    Console.WriteLine($"  Deletes:      {stats.DeleteCount:N0}");
-    Console.WriteLine($"  MarketData:   {stats.MarketDataCount:N0}");
-    Console.WriteLine($"  StatusChg:    {stats.StatusChangeCount:N0}");
-    Console.WriteLine($"  FwdTrades:    {stats.ForwardTradeCount:N0}");
-    Console.WriteLine($"  TradeBusts:   {stats.TradeBustCount:N0}");
-    Console.WriteLine($"  ExecSummary:  {stats.ExecSummaryCount:N0}");
+    Console.WriteLine($"  Packets:      {packets:N0}  ({(totalSecs > 0 ? (long)(packets / totalSecs) : 0):N0}/s avg)");
+    Console.WriteLine($"  Events:       {totalEvents:N0}  ({(totalSecs > 0 ? (long)(totalEvents / totalSecs) : 0):N0}/s avg)");
+    Console.WriteLine($"    Orders:     {stats.OrderCount:N0}");
+    Console.WriteLine($"    Trades:     {stats.TradeCount:N0}");
+    Console.WriteLine($"    Deletes:    {stats.DeleteCount:N0}");
+    Console.WriteLine($"    MarketData: {stats.MarketDataCount:N0}");
+    Console.WriteLine($"    StatusChg:  {stats.StatusChangeCount:N0}");
+    Console.WriteLine($"    FwdTrades:  {stats.ForwardTradeCount:N0}");
+    Console.WriteLine($"    TradeBusts: {stats.TradeBustCount:N0}");
+    Console.WriteLine($"    ExecSumm:   {stats.ExecSummaryCount:N0}");
     Console.WriteLine($"  Books:        {bookManagers.Sum(bm => bm.Books.Count):N0}");
     Console.WriteLine($"  Instruments:  {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
     Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");

@@ -25,8 +25,17 @@ public sealed class ClientSession : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
 
+    private long _messagesSent;
+    private long _bytesSent;
+
     public IReadOnlySet<ulong> Subscriptions => _subscriptions;
     public CancellationToken CancellationToken => _cts.Token;
+
+    /// <summary>Total messages (pre-serialized + info) sent to this client.</summary>
+    public long MessagesSent => Volatile.Read(ref _messagesSent);
+
+    /// <summary>Total bytes sent to this client.</summary>
+    public long BytesSent => Volatile.Read(ref _bytesSent);
 
     public ClientSession(WebSocket socket, int channelCapacity = 65536, ILogger? logger = null)
     {
@@ -141,8 +150,12 @@ public sealed class ClientSession : IDisposable
                 }
 
                 if (offset > 0)
+                {
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
+                    Volatile.Write(ref _messagesSent, _messagesSent + messages.Count);
+                    Volatile.Write(ref _bytesSent, _bytesSent + offset);
+                }
 
                 // 4. Slow-client self-detection
                 int remaining = QueueDepth;

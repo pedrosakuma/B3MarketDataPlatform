@@ -66,11 +66,11 @@ public sealed class SubscriptionManager
     /// <summary>Current number of connected clients.</summary>
     public int ClientCount => _clients.Count;
 
-    /// <summary>Get queue depth for all connected clients.</summary>
-    public IEnumerable<(string Id, int QueueDepth)> GetClientStats()
+    /// <summary>Get stats for all connected clients.</summary>
+    public IEnumerable<(string Id, int QueueDepth, long MessagesSent, long BytesSent)> GetClientStats()
     {
         foreach (var (_, session) in _clients)
-            yield return (session.Id, session.QueueDepth);
+            yield return (session.Id, session.QueueDepth, session.MessagesSent, session.BytesSent);
     }
 
     /// <summary>

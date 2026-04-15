@@ -43,6 +43,9 @@ public sealed class GroupConflationHandler : IBookEventHandler
     internal long UpstreamConflated =>
         Volatile.Read(ref _eventsReceived) - Volatile.Read(ref _eventsFlushed);
 
+    public long EventsReceived => Volatile.Read(ref _eventsReceived);
+    public long EventsFlushed => Volatile.Read(ref _eventsFlushed);
+
     internal GroupConflationHandler(SubscriptionManager parent)
     {
         _parent = parent;
