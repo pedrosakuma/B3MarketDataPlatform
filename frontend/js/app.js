@@ -53,6 +53,8 @@ function handleChartData(chartData) {
   if (chartData.full) {
     candleSeries.setData(chartData.candles);
     if (chartData.scroll) chart.timeScale().scrollToRealTime();
+  } else if (chartData.updates) {
+    for (const u of chartData.updates) candleSeries.update(u);
   } else if (chartData.update) {
     candleSeries.update(chartData.update);
   }
@@ -161,6 +163,7 @@ worker.onmessage = (evt) => {
       updateActionButtons();
       $('btnConnect').textContent = view.connected ? 'Disconnect' : 'Connect';
       if (view.connected) startHealthPolling();
+      else stopHealthPolling();
       break;
     case 'serverReady':
       view.serverReady = msg.ready;
@@ -222,6 +225,7 @@ function getFlags() {
 
 // ── Health polling (fetch stays on main thread) ──
 let healthInterval = null;
+let healthAbortController = null;
 
 function startHealthPolling() {
   if (healthInterval) return;
@@ -229,15 +233,23 @@ function startHealthPolling() {
   healthInterval = setInterval(pollHealth, 5000);
 }
 
+function stopHealthPolling() {
+  if (healthInterval) { clearInterval(healthInterval); healthInterval = null; }
+  if (healthAbortController) { healthAbortController.abort(); healthAbortController = null; }
+}
+
 function httpBase() {
   return $('wsUrl').value.trim().replace(/^ws(s?):\/\//, 'http$1://').replace(/\/ws\/?$/, '');
 }
 
 async function pollHealth() {
+  if (healthAbortController) healthAbortController.abort();
+  healthAbortController = new AbortController();
   try {
-    const resp = await fetch(httpBase() + '/health');
+    const resp = await fetch(httpBase() + '/health', { signal: healthAbortController.signal });
     view.healthData = resp.ok ? await resp.json() : { status: 'unreachable' };
-  } catch {
+  } catch (e) {
+    if (e.name === 'AbortError') return;
     view.healthData = { status: 'unreachable' };
   }
   renderHealth(view.healthData);
@@ -245,13 +257,19 @@ async function pollHealth() {
 
 // ── Symbol autocomplete ──
 let acTimer = null;
+let acAbortController = null;
 
 async function symbolAutocomplete(query) {
   clearTimeout(acTimer);
+  if (acAbortController) { acAbortController.abort(); acAbortController = null; }
   if (query.length < 2) { $('symbolSuggestions').innerHTML = ''; return; }
+  acAbortController = new AbortController();
+  const controller = acAbortController;
   acTimer = setTimeout(async () => {
     try {
-      const resp = await fetch(httpBase() + '/symbols?q=' + encodeURIComponent(query) + '&limit=20');
+      const resp = await fetch(httpBase() + '/symbols?q=' + encodeURIComponent(query) + '&limit=20', {
+        signal: controller.signal,
+      });
       if (!resp.ok) return;
       const data = await resp.json();
       const dl = $('symbolSuggestions');
@@ -261,13 +279,19 @@ async function symbolAutocomplete(query) {
         opt.value = sym;
         dl.appendChild(opt);
       }
-    } catch { /* ignore */ }
+    } catch (e) {
+      if (e.name !== 'AbortError') { /* ignore other errors */ }
+    }
   }, 150);
 }
 
 // ── UI actions (forward commands to worker) ──
 
+let connectDebounceTimer = null;
+
 function toggleConnection() {
+  if (connectDebounceTimer) return;
+  connectDebounceTimer = setTimeout(() => { connectDebounceTimer = null; }, 500);
   if (view.connected) {
     worker.postMessage({ cmd: 'disconnect' });
   } else {
@@ -299,6 +323,8 @@ function doUnsubscribe(securityId) {
 }
 
 function selectSubscription(id) {
+  view.selectedId = id; // Optimistic update — confirmed by next worker frame
+  scheduleRender();
   worker.postMessage({ cmd: 'select', securityId: id });
   closeSidebarIfMobile();
 }
@@ -386,9 +412,14 @@ function enumLabel(map, val) {
   return map[val] || String(val);
 }
 
+let detailAbortController = null;
+
 async function showInstrumentDetail(symbol) {
   symbol = symbol || view.selectedSymbol;
   if (!symbol) return;
+  if (detailAbortController) { detailAbortController.abort(); detailAbortController = null; }
+  detailAbortController = new AbortController();
+  const controller = detailAbortController;
   const modal = $('instrumentModal');
   const body = $('modalBody');
   $('modalTitle').textContent = 'Instrument Detail \u2014 ' + symbol;
@@ -396,12 +427,16 @@ async function showInstrumentDetail(symbol) {
   modal.classList.remove('hidden');
 
   try {
-    const resp = await fetch(httpBase() + '/instrument/' + encodeURIComponent(symbol));
+    const resp = await fetch(httpBase() + '/instrument/' + encodeURIComponent(symbol), {
+      signal: controller.signal,
+    });
     if (!resp.ok) { body.innerHTML = '<div class="empty-msg">Not available (HTTP ' + resp.status + ')</div>'; return; }
     const data = await resp.json();
     renderModal(body, data);
   } catch (e) {
-    body.innerHTML = '<div class="empty-msg">Error: ' + e.message + '</div>';
+    if (e.name !== 'AbortError') {
+      body.innerHTML = '<div class="empty-msg">Error: ' + e.message + '</div>';
+    }
   }
 }
 

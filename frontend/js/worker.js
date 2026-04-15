@@ -19,6 +19,7 @@ let autoReconnect = true;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let serverReady = false;
+let manualDisconnect = false;
 
 // ── Dirty tracking ──
 let dirty = 0;
@@ -50,34 +51,79 @@ function log(text, cssClass) {
 // ── Display resolution for chart (user-configurable, default auto) ──
 let displayResolution = 0; // 0 = auto, otherwise seconds (1, 5, 15, 60, ...)
 let lastSentResolution = 0; // tracks resolution sent to chart for detecting changes
+let lastSentCandleTime = 0; // tracks last candle time sent to chart for gap-fill
+let lastSentCandleClose = 0; // tracks last candle close sent to chart for gap-fill price
 
 const AUTO_RES_THRESHOLDS = [
-  { maxCandles: 600, resolution: 1 },
-  { maxCandles: 1200, resolution: 5 },
-  { maxCandles: 2400, resolution: 15 },
-  { maxCandles: 4800, resolution: 60 },
+  { maxSpan: 600, resolution: 1 },    // up to 10 min → 1s
+  { maxSpan: 3600, resolution: 5 },   // up to 1 hour → 5s
+  { maxSpan: 7200, resolution: 15 },  // up to 2 hours → 15s
+  { maxSpan: 14400, resolution: 60 }, // up to 4 hours → 1m
 ];
 
-function pickAutoResolution(candleCount) {
+function pickAutoResolution(candles) {
+  if (candles.length < 2) return 1;
+  const span = candles[candles.length - 1].time - candles[0].time;
   for (const t of AUTO_RES_THRESHOLDS) {
-    if (candleCount <= t.maxCandles) return t.resolution;
+    if (span <= t.maxSpan) return t.resolution;
   }
   return 300; // 5 min fallback
 }
 
+const MAX_GAP_FILL = 600; // max gap-fill candles per gap (covers ~10 min at 1s)
+
 function aggregateCandles(candles1s, resolution) {
-  if (resolution <= 1 || candles1s.length === 0) return candles1s;
+  if (candles1s.length === 0) return [];
+  const res = Math.max(resolution, 1);
+
+  if (res <= 1) {
+    // 1s: fill time gaps and enforce open=prev.close continuity
+    const first = { ...candles1s[0] };
+    const result = [first];
+    for (let i = 1; i < candles1s.length; i++) {
+      const prev = result[result.length - 1];
+      const gap = candles1s[i].time - prev.time;
+      if (gap > 1) {
+        const n = Math.min(gap - 1, MAX_GAP_FILL);
+        const p = prev.close;
+        for (let j = 1; j <= n; j++) {
+          result.push({ time: prev.time + j, open: p, high: p, low: p, close: p, volume: 0 });
+        }
+      }
+      const c = candles1s[i];
+      const prevClose = result[result.length - 1].close;
+      result.push({
+        time: c.time, open: prevClose,
+        high: Math.max(prevClose, c.high), low: Math.min(prevClose, c.low),
+        close: c.close, volume: c.volume,
+      });
+    }
+    return result;
+  }
+
+  // Higher resolutions: aggregate into buckets and fill gaps between them
   const result = [];
   let cur = null;
   for (const c of candles1s) {
-    const bucket = Math.floor(c.time / resolution) * resolution;
+    const bucket = Math.floor(c.time / res) * res;
     if (cur && cur.time === bucket) {
       if (c.high > cur.high) cur.high = c.high;
       if (c.low < cur.low) cur.low = c.low;
       cur.close = c.close;
       cur.volume += c.volume;
     } else {
-      if (cur) result.push(cur);
+      if (cur) {
+        result.push(cur);
+        // Gap-fill: insert flat buckets for missing periods
+        let gapBucket = cur.time + res;
+        let gapCount = 0;
+        const p = cur.close;
+        while (gapBucket < bucket && gapCount < MAX_GAP_FILL) {
+          result.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0 });
+          gapBucket += res;
+          gapCount++;
+        }
+      }
       const newOpen = cur ? cur.close : c.open;
       cur = { time: bucket, open: newOpen, high: Math.max(newOpen, c.high), low: Math.min(newOpen, c.low), close: c.close, volume: c.volume };
     }
@@ -89,8 +135,9 @@ function aggregateCandles(candles1s, resolution) {
 function getChartCandles(sub) {
   const raw = sub.candles;
   if (raw.length === 0) return { candles: [], resolution: 1 };
-  const res = displayResolution > 0 ? displayResolution : pickAutoResolution(raw.length);
-  return { candles: aggregateCandles(raw, res), resolution: res };
+  const res = displayResolution > 0 ? displayResolution : pickAutoResolution(raw);
+  const candles = aggregateCandles(raw, res);
+  return { candles, resolution: res };
 }
 
 /// Compute just the last aggregated candle by scanning 1s candles in the current bucket.
@@ -143,26 +190,72 @@ setInterval(() => {
 
   if (d & D_CHART) {
     const sub = selectedId ? subscriptions.get(selectedId) : null;
-    if (!sub || sub.candles.length === 0) {
+    if (!sub || !sub.snapshotReceived || sub.candles.length === 0) {
       frame.chart = null;
       lastSentResolution = 0;
+      lastSentCandleTime = 0;
+      lastSentCandleClose = 0;
     } else {
-      const res = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles.length);
-      const resChanged = res !== lastSentResolution;
+      // Compute desired resolution consistently with getChartCandles
+      const desiredRes = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles);
+      const resChanged = desiredRes !== lastSentResolution;
 
       if (fullSwap || resChanged) {
         // Full swap: snapshot arrival, symbol change, or resolution change
         const { candles, resolution } = getChartCandles(sub);
         frame.chart = { full: true, scroll: true, candles, resolution };
         lastSentResolution = resolution;
-      } else if (res <= 1 && sub.currentCandle) {
-        // 1s incremental update
-        frame.chart = { full: false, update: { ...sub.currentCandle }, resolution: res };
+        if (candles.length > 0) {
+          const last = candles[candles.length - 1];
+          lastSentCandleTime = last.time;
+          lastSentCandleClose = last.close;
+        } else {
+          lastSentCandleTime = 0;
+          lastSentCandleClose = 0;
+        }
       } else {
-        // Aggregated resolution: send incremental update for just the last bucket
-        const lastCandle = getLastAggregatedCandle(sub, res);
-        if (lastCandle) {
-          frame.chart = { full: false, update: lastCandle, resolution: res };
+        // Incremental update — use lastSentResolution (consistent with last full swap)
+        const res = lastSentResolution;
+        if (res <= 1 && sub.currentCandle) {
+          // 1s incremental update — include gap-fill candles if there's a time gap
+          const curTime = sub.currentCandle.time;
+          if (lastSentCandleTime > 0 && curTime > lastSentCandleTime + 1) {
+            const gap = curTime - lastSentCandleTime;
+            const n = Math.min(gap - 1, MAX_GAP_FILL);
+            const p = lastSentCandleClose;
+            const updates = [];
+            for (let j = 1; j <= n; j++) {
+              updates.push({ time: lastSentCandleTime + j, open: p, high: p, low: p, close: p, volume: 0 });
+            }
+            updates.push({ ...sub.currentCandle });
+            frame.chart = { full: false, updates, resolution: res };
+          } else {
+            frame.chart = { full: false, update: { ...sub.currentCandle }, resolution: res };
+          }
+          lastSentCandleTime = curTime;
+          lastSentCandleClose = sub.currentCandle.close;
+        } else if (res > 1) {
+          // Aggregated resolution: send incremental update for just the last bucket
+          const lastCandle = getLastAggregatedCandle(sub, res);
+          if (lastCandle) {
+            if (lastSentCandleTime > 0 && lastCandle.time > lastSentCandleTime + res) {
+              const p = lastSentCandleClose;
+              const updates = [];
+              let gapBucket = lastSentCandleTime + res;
+              let gapCount = 0;
+              while (gapBucket < lastCandle.time && gapCount < MAX_GAP_FILL) {
+                updates.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0 });
+                gapBucket += res;
+                gapCount++;
+              }
+              updates.push(lastCandle);
+              frame.chart = { full: false, updates, resolution: res };
+            } else {
+              frame.chart = { full: false, update: lastCandle, resolution: res };
+            }
+            lastSentCandleTime = lastCandle.time;
+            lastSentCandleClose = lastCandle.close;
+          }
         }
       }
     }
@@ -249,7 +342,8 @@ function connect(url) {
     log('Disconnected', 'log-error');
     rankings.volume = []; rankings.gainers = []; rankings.losers = [];
     mark(D_RANKINGS);
-    scheduleReconnect();
+    if (!manualDisconnect) scheduleReconnect();
+    manualDisconnect = false;
   };
 
   ws.onerror = () => log('WebSocket error', 'log-error');
@@ -299,7 +393,7 @@ function handleMessage(msg) {
       subscriptions.set(id, {
         symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
         orders: new Map(), info: {}, candles: [], currentCandle: null,
-        orderCount: 0, tradeCount: 0, candleResolution: 1,
+        orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
       });
       let d = D_SUBS | D_ALLINFO;
       if (!sel) { selectedId = id; d |= D_BOOK | D_TITLES; }
@@ -399,8 +493,10 @@ function handleMessage(msg) {
         }
         sub.currentCandle = sub.candles.length > 0 ? sub.candles[sub.candles.length - 1] : null;
         sub.candleResolution = msg.resolution;
+        sub.snapshotReceived = true;
       }
-      if (sel === id) { chartFullSwap = true; mark(D_CHART); }
+      // Full chart swap only on the first batch to avoid rendering partial data on each continuation
+      if (sel === id) { if (msg.isFirst) chartFullSwap = true; mark(D_CHART); }
       break;
     }
     case 'CandleUpdate': {
@@ -410,7 +506,6 @@ function handleMessage(msg) {
         const c = msg.candle;
         const last = sub.currentCandle;
         if (last && last.time === c.time) {
-          // Update existing candle in place
           last.open = c.open; last.high = c.high;
           last.low = c.low; last.close = c.close; last.volume = c.volume;
         } else {
@@ -419,7 +514,8 @@ function handleMessage(msg) {
         }
         sub.candleResolution = msg.resolution;
       }
-      if (sel === id) mark(D_CHART);
+      // Only render chart updates after snapshot has arrived
+      if (sel === id && sub && sub.snapshotReceived) mark(D_CHART);
       break;
     }
     case 'RankingsUpdate': {
@@ -451,29 +547,33 @@ self.onmessage = (evt) => {
     case 'disconnect':
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       if (ws && ws.readyState <= WebSocket.OPEN) {
-        autoReconnect = false;
+        manualDisconnect = true;
         ws.close();
-        autoReconnect = true;
       }
       break;
     case 'subscribe':
-      if (ws && ws.readyState === WebSocket.OPEN)
-        ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, msg.symbol, msg.flags));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, msg.symbol, msg.flags)); }
+        catch (e) { log('Subscribe send error: ' + e.message, 'log-error'); }
+      } else {
+        log('Cannot subscribe: not connected', 'log-error');
+      }
       break;
     case 'get':
-      if (ws && ws.readyState === WebSocket.OPEN)
-        ws.send(buildSubscribeOrGet(MSG.GET, msg.symbol, msg.flags));
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(buildSubscribeOrGet(MSG.GET, msg.symbol, msg.flags)); }
+        catch (e) { log('Get send error: ' + e.message, 'log-error'); }
+      } else {
+        log('Cannot get: not connected', 'log-error');
+      }
       break;
     case 'unsubscribe':
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(buildUnsubscribe(BigInt(msg.securityId)));
-        const sub = subscriptions.get(msg.securityId);
-        subscriptions.delete(msg.securityId);
-        if (selectedId === msg.securityId) {
-          selectedId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-          chartFullSwap = true;
-        }
-        mark(D_SUBS | D_BOOK | D_CHART | D_TITLES | D_ALLINFO);
+        try { ws.send(buildUnsubscribe(BigInt(msg.securityId))); }
+        catch (e) { log('Unsubscribe send error: ' + e.message, 'log-error'); }
+        // State cleanup happens when server confirms with 'Unsubscribed'
+      } else {
+        log('Cannot unsubscribe: not connected', 'log-error');
       }
       break;
     case 'select':
