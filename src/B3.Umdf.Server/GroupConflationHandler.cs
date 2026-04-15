@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
+using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Umdf.Server;
 
@@ -7,7 +8,7 @@ namespace B3.Umdf.Server;
 /// Per-group book event handler. Owns upstream conflation buffers and trade ring buffers.
 /// All methods run on the owning group's single thread — no locks needed.
 /// </summary>
-public sealed class GroupConflationHandler : IBookEventHandler
+public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEventHandler
 {
     private readonly SubscriptionManager _parent;
     internal BookManager BookManager { get; private set; } = null!;
@@ -30,6 +31,9 @@ public sealed class GroupConflationHandler : IBookEventHandler
 
     // Per-security candle aggregators (read via GetCandles from subscribe thread)
     internal readonly ConcurrentDictionary<ulong, CandleAggregator> Candles = new();
+
+    // Per-security trading phase (updated via IMarketDataEventHandler, read on same feed thread)
+    private readonly Dictionary<ulong, int> _tradingStatus = new();
 
     // Subscribe/Get requests routed to this group by the SubscriptionManager
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
@@ -77,9 +81,12 @@ public sealed class GroupConflationHandler : IBookEventHandler
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
 
-        // Aggregate into candles (always, so history is available on subscribe)
-        var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
-        candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        // Only aggregate trades into candles during Open trading phase
+        if (IsOpenPhase(securityId))
+        {
+            var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
+            candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        }
 
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
@@ -100,8 +107,11 @@ public sealed class GroupConflationHandler : IBookEventHandler
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
 
-        var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
-        candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        if (IsOpenPhase(securityId))
+        {
+            var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
+            candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        }
 
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
@@ -111,6 +121,30 @@ public sealed class GroupConflationHandler : IBookEventHandler
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
+
+    /// <summary>
+    /// Returns true if the instrument is in the Open trading phase (or if the phase is unknown).
+    /// Trades from auction/pre-open/closing call should not be plotted on the chart.
+    /// </summary>
+    private bool IsOpenPhase(ulong securityId)
+    {
+        if (!_tradingStatus.TryGetValue(securityId, out int status)) return true;
+        return status == (int)TradingSessionSubID.OPEN;
+    }
+
+    // ── IMarketDataEventHandler ──
+
+    public void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info)
+    {
+        if (info.TradingStatus is { } status)
+            _tradingStatus[securityId] = status;
+    }
+
+    public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
+    {
+        if (info.TradingStatus is { } status)
+            _tradingStatus[securityId] = status;
+    }
 
     /// <summary>
     /// Called after each packet is fully processed on the owning group's thread.

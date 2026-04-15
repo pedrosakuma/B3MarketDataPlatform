@@ -240,6 +240,7 @@ foreach (var gid in groupIds)
     {
         var gh = subscriptionManager.CreateGroupHandler();
         bookHandler = new CompositeBookEventHandler(stats, gh);
+        mdHandler = new CompositeMarketDataEventHandler(stats, gh);
         var bm = new BookManager(bookHandler, bmLogger);
         gh.SetBookManager(bm);
         groupHandlers.Add(gh);
