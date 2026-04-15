@@ -261,9 +261,9 @@
             <option value="300">5m</option>
           </select>
         </div>
-        <div class="panel-body no-pad" id="chartBody">
-          <div class="empty-msg" id="chartEmpty">Subscribe to see chart</div>
-          <div id="chartContainer" style="width:100%;height:100%;display:none"></div>
+        <div class="panel-body no-pad" id="chartBody" style="position:relative">
+          <div id="chartContainer" style="width:100%;height:100%"></div>
+          <div class="empty-msg" id="chartEmpty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg)">Subscribe to see chart</div>
         </div>
       </div>
       <!-- Subscriptions table panel -->

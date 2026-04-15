@@ -302,7 +302,7 @@ function handleMessage(msg) {
         orderCount: 0, tradeCount: 0, candleResolution: 1,
       });
       let d = D_SUBS | D_ALLINFO;
-      if (!sel) { selectedId = id; d |= D_BOOK | D_CHART | D_TITLES; chartFullSwap = true; }
+      if (!sel) { selectedId = id; d |= D_BOOK | D_TITLES; }
       mark(d);
       log('Subscribed ' + msg.symbol + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
       break;

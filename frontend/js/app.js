@@ -40,14 +40,12 @@ function initChart() {
 function handleChartData(chartData) {
   if (!chartData) {
     $('chartEmpty').style.display = '';
-    $('chartContainer').style.display = 'none';
     if (candleSeries) candleSeries.setData([]);
     updateResolutionLabel(null);
     return;
   }
 
   $('chartEmpty').style.display = 'none';
-  $('chartContainer').style.display = '';
 
   if (!chart) initChart();
   if (!candleSeries) return;
@@ -549,5 +547,6 @@ document.addEventListener('keydown', (e) => {
 // ── Init ──
 setStatus('disconnected');
 initColumnSelector();
+initChart();
 startHealthPolling();
 worker.postMessage({ cmd: 'connect', url: $('wsUrl').value.trim() });
