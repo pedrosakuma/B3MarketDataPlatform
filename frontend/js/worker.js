@@ -496,7 +496,7 @@ function handleMessage(msg) {
         sub.snapshotReceived = true;
       }
       // Full chart swap only on the first batch to avoid rendering partial data on each continuation
-      if (sel === id) { if (msg.isFirst) chartFullSwap = true; mark(D_CHART); }
+      if (sel === id) { chartFullSwap = true; mark(D_CHART); }
       break;
     }
     case 'CandleUpdate': {
