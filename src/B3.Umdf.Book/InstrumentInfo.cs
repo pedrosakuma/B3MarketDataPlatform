@@ -13,7 +13,7 @@ public sealed class InstrumentInfo
     public long Version => Volatile.Read(ref _version);
 
     /// <summary>Increment the version counter after updating fields. Feed-thread-only.</summary>
-    internal void BumpVersion() => ++_version;
+    public void BumpVersion() => ++_version;
 
     // SecurityStatus (3)
     public int? TradingStatus { get; set; }

@@ -529,6 +529,26 @@ public sealed class SubscriptionManager
         return null;
     }
 
+    /// <summary>
+    /// Update LastTradePrice/Size from trade events.
+    /// Called from GroupConflationHandler.OnTrade so that LastTradePrice is populated
+    /// even when the feed does not carry LastTradePrice_27 messages.
+    /// </summary>
+    internal void UpdateLastTradeFromEvent(ulong securityId, long price, long quantity)
+    {
+        if (_marketDataManagers is not { } managers) return;
+        foreach (var mdm in managers)
+        {
+            if (mdm.InstrumentData.TryGetValue(securityId, out var info))
+            {
+                info.LastTradePrice = price;
+                info.LastTradeSize = quantity;
+                info.BumpVersion();
+                return;
+            }
+        }
+    }
+
     private static void SendServerStatus(ClientSession session, bool ready)
     {
         var buf = new byte[5];

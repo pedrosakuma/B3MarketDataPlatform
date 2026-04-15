@@ -76,6 +76,7 @@ public sealed class GroupConflationHandler : IBookEventHandler
 
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
+        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
     }
 
@@ -94,6 +95,7 @@ public sealed class GroupConflationHandler : IBookEventHandler
 
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
+        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
     }
 

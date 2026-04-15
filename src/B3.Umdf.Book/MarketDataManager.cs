@@ -167,19 +167,23 @@ public sealed class MarketDataManager : IFeedEventHandler
         reader.ReadGroups(
             (in SecurityDefinition_12Data.NoUnderlyingsData u) =>
             {
+                ulong uid = (ulong)u.UnderlyingSecurityID;
+                if (uid == 0) return; // skip empty entries
                 underlyings ??= new();
                 underlyings.Add(new UnderlyingInfo
                 {
-                    SecurityId = (ulong)u.UnderlyingSecurityID,
+                    SecurityId = uid,
                     Symbol = u.UnderlyingSymbol.ToString().Trim(),
                 });
             },
             (in SecurityDefinition_12Data.NoLegsData leg) =>
             {
+                ulong lid = (ulong)leg.LegSecurityID;
+                if (lid == 0) return; // skip empty entries
                 legs ??= new();
                 legs.Add(new LegInfo
                 {
-                    SecurityId = (ulong)leg.LegSecurityID,
+                    SecurityId = lid,
                     Symbol = leg.LegSymbol.ToString().Trim(),
                     RatioQty = leg.LegRatioQty.Mantissa,
                     SecurityType = (int)leg.LegSecurityType,
