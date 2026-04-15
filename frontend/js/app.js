@@ -406,9 +406,13 @@ async function showInstrumentDetail(symbol) {
 }
 
 function renderModal(body, d) {
-  const dec = parseInt($('priceDecimals').value) || 0;
-  const divisor = Math.pow(10, dec);
-  const fmtP = (v) => v == null ? null : (v / divisor).toFixed(dec);
+  const fmtP = (v, dec = 4) => v == null ? null : (v / Math.pow(10, dec)).toFixed(dec);
+  const fmtP8 = (v) => fmtP(v, 8);
+  const fmtFixed8 = (v) => {
+    if (v == null) return null;
+    const s = (v / 1e8).toFixed(8);
+    return s.includes('.') ? s.replace(/0+$/, '').replace(/\.$/, '') : s;
+  };
   const fmtQ = (v) => v == null ? null : v.toLocaleString();
   const fmtDate = (v) => {
     if (v == null) return null;
@@ -439,9 +443,9 @@ function renderModal(body, d) {
       ['Maturity Date', fmtDate(d.maturityDate)],
     ]},
     { title: 'Tick & Lot', fields: [
-      ['Min Price Increment', fmtP(d.minPriceIncrement)],
-      ['Price Divisor', d.priceDivisor],
-      ['Contract Multiplier', d.contractMultiplier],
+      ['Min Price Increment', fmtFixed8(d.minPriceIncrement)],
+      ['Price Divisor', fmtFixed8(d.priceDivisor)],
+      ['Contract Multiplier', fmtFixed8(d.contractMultiplier)],
       ['Strike Price', fmtP(d.strikePrice)],
       ['Tick Size Denominator', d.tickSizeDenominator],
     ]},
@@ -451,7 +455,7 @@ function renderModal(body, d) {
     ]},
     { title: 'Prices', fields: [
       ['Opening', fmtP(d.openingPrice)],
-      ['Closing', fmtP(d.closingPrice)],
+      ['Closing', fmtP8(d.closingPrice)],
       ['High', fmtP(d.highPrice)],
       ['Low', fmtP(d.lowPrice)],
       ['Last Trade', fmtP(d.lastTradePrice)],
@@ -465,11 +469,11 @@ function renderModal(body, d) {
       ['Auction Imbalance', fmtQ(d.auctionImbalanceSize)],
       ['Band Low', fmtP(d.priceBandLow)],
       ['Band High', fmtP(d.priceBandHigh)],
-      ['Trading Reference', fmtP(d.tradingReferencePrice)],
+      ['Trading Reference', fmtP8(d.tradingReferencePrice)],
     ]},
     { title: 'Statistics', fields: [
       ['Trade Volume', fmtQ(d.tradeVolume)],
-      ['Net Change', fmtP(d.netChangeFromPrevDay)],
+      ['Net Change', fmtP8(d.netChangeFromPrevDay)],
       ['Number of Trades', fmtQ(d.numberOfTrades)],
       ['Open Interest', fmtQ(d.openInterest)],
       ['Avg Daily Traded Qty', fmtQ(d.avgDailyTradedQty)],

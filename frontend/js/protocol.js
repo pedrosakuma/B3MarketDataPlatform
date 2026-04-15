@@ -26,11 +26,24 @@ export const INFO_FIELDS = [
   'TradingStatus', 'TradingEvent',
 ];
 
-export const PRICE_FIELDS = new Set([
-  'OpeningPrice', 'ClosingPrice', 'HighPrice', 'LowPrice',
-  'LastTradePrice', 'SettlementPrice', 'TheoreticalOpeningPrice',
-  'VwapPrice', 'NetChange', 'PriceBandLow', 'PriceBandHigh', 'TradingReferencePrice',
-]);
+// Decimal places per price field, derived from SBE schema exponents.
+// Price/PriceOptional → -4 (4 decimals), Price8/PriceOffset8Optional/Fixed8 → -8 (8 decimals).
+export const FIELD_DECIMALS = {
+  OpeningPrice: 4,
+  ClosingPrice: 8,
+  HighPrice: 4,
+  LowPrice: 4,
+  LastTradePrice: 4,
+  SettlementPrice: 4,
+  TheoreticalOpeningPrice: 4,
+  VwapPrice: 4,
+  NetChange: 8,
+  PriceBandLow: 4,
+  PriceBandHigh: 4,
+  TradingReferencePrice: 8,
+};
+
+export const PRICE_FIELDS = new Set(Object.keys(FIELD_DECIMALS));
 
 export function flagsStr(f) {
   const parts = [];

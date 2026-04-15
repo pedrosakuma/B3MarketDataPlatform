@@ -2,15 +2,15 @@
 // All render functions are parameterized — no global state imports.
 // Main thread only: receives pre-computed data from worker, updates DOM pools.
 
-import { PRICE_FIELDS } from './protocol.js';
+import { FIELD_DECIMALS } from './protocol.js';
 
 export const $ = (id) => document.getElementById(id);
 
-export function formatPrice(mantissa) {
-  const dec = parseInt($('priceDecimals').value) || 0;
-  if (dec === 0) return mantissa.toLocaleString();
-  const divisor = Math.pow(10, dec);
-  return (mantissa / divisor).toFixed(dec);
+const DEFAULT_PRICE_DECIMALS = 4;
+
+export function formatPrice(mantissa, decimals = DEFAULT_PRICE_DECIMALS) {
+  const divisor = Math.pow(10, decimals);
+  return (mantissa / divisor).toFixed(decimals);
 }
 
 export function formatQty(v) { return v.toLocaleString(); }
@@ -253,7 +253,7 @@ export function renderRankings(rankingsData, tab, connected) {
       row.div.style.display = '';
       row.div.dataset.symbol = e.symbol;
       row.sym.textContent = e.symbol;
-      row.val.textContent = tab === 'volume' ? formatQty(e.value) : formatPrice(e.value);
+      row.val.textContent = tab === 'volume' ? formatQty(e.value) : formatPrice(e.value, 8);
       row.val.className = 'rank-val' + (tab === 'losers' ? ' ask-price' : tab === 'gainers' ? ' bid-price' : '');
     } else {
       row.div.style.display = 'none';
@@ -343,7 +343,8 @@ function formatField(field, value) {
   if (value == null || value === undefined) return '\u2014';
   if (field === 'TradingStatus') return tradingStatusName(value);
   if (field === 'TradingEvent') return tradingEventName(value);
-  if (PRICE_FIELDS.has(field)) return formatPrice(value);
+  const dec = FIELD_DECIMALS[field];
+  if (dec !== undefined) return formatPrice(value, dec);
   return formatQty(value);
 }
 
