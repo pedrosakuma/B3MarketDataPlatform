@@ -287,6 +287,7 @@ Additional variables used by `docker-compose.multicast.yml`:
 | `UMDF_MULTICAST_MERGE_CAPACITY` | `1000000` | Consumer merge queue capacity for live UDP bursts |
 | `UMDF_FEED_CHANNEL_CAPACITY` | `250000` | Consumer per-group feed queue capacity for live UDP bursts |
 | `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | `50000` | Per-group cap on the incremental packets retained while a snapshot is in flight (drop-oldest) |
+| `UMDF_GROUP_RING_CAPACITY` | `65536` | Per-group MPSC dispatch ring capacity (drop-newest on overflow; recovery handles downstream gaps) |
 
 ```bash
 # Both equities and derivatives (default)
@@ -518,8 +519,9 @@ Validated end-to-end with the `docker-compose.multicast.yml` stack (publisher + 
 Live-path optimizations:
 - **`recvmmsg` batching** — receive threads pull up to 64 datagrams per syscall
 - **`sendmmsg` publishing** — publisher batches datagrams per group to amortize syscall cost
-- **Inline dispatch with per-group lock** — `MultiFeedManager.PushPacketBatch` acquires the group lock once per batch (not per packet), avoiding starvation between concurrent receive threads
+- **Lock-free MPSC dispatch ring** — each group has its own bounded ring (`MpscPacketRing`) drained by a dedicated thread. Receive threads enqueue with a single `Interlocked.CompareExchange` and return immediately to `recvmmsg`. The previous per-group `Monitor` lock dropped from ~952 → ~186 samples in CPU profiles (-80% slow-path contention) at REPLAY=2.
 - **Configurable recovery queue cap** — `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` lets ops trade memory for the longest snapshot cycle the system tolerates without dropping incrementals
+- **Configurable group ring capacity** — `UMDF_GROUP_RING_CAPACITY` (default 65 536 slots/group) bounds memory and triggers drop-newest backpressure on overflow; downstream gap detection drives recovery
 
 #### Supported replay speed range
 
@@ -657,6 +659,7 @@ Settings can be provided via JSON file, environment variables, or CLI arguments 
 | `UMDF_MULTICAST_MERGE_CAPACITY` | — | `1000000` | Capacity of the shared live-UDP merge queue |
 | `UMDF_FEED_CHANNEL_CAPACITY` | — | `250000` | Capacity of each per-group feed queue behind the dispatcher |
 | `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | — | `50000` | Per-group cap on incrementals retained during a snapshot cycle (drop-oldest on overflow) |
+| `UMDF_GROUP_RING_CAPACITY` | — | `65536` | Per-group MPSC dispatch ring capacity (drop-newest on overflow) |
 | `UMDF_LOG_LEVEL` | — | `Information` | Minimum log level |
 | `UMDF_MULTICAST_CONFIG` | `--multicast-config` | — | Multicast JSON config path |
 

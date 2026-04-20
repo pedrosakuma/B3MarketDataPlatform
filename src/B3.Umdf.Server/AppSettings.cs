@@ -51,6 +51,15 @@ public sealed class AppSettings
     /// </summary>
     public int IncrementalRecoveryQueueCapacity { get; set; } = 50_000;
 
+    /// <summary>
+    /// Per-group MPSC dispatch ring capacity (slots). Default 65 536. Producers (recv
+    /// threads) drop newest packets when full; downstream gap detection triggers
+    /// snapshot recovery. Raise for high-rate replay (e.g. UMDF_SPEED=0) where the
+    /// dispatch thread can briefly fall behind the receive side. CLI: env
+    /// UMDF_GROUP_RING_CAPACITY.
+    /// </summary>
+    public int GroupRingCapacity { get; set; } = 65_536;
+
     /// <summary>Minimum log level (Trace, Debug, Information, Warning, Error, Critical).</summary>
     public string LogLevel { get; set; } = "Information";
 
@@ -106,6 +115,8 @@ public sealed class AppSettings
             FeedChannelCapacity = feedCapacity;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY"), out var recCapacity))
             IncrementalRecoveryQueueCapacity = recCapacity;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_GROUP_RING_CAPACITY"), out var ringCapacity))
+            GroupRingCapacity = ringCapacity;
         var logLevel = Environment.GetEnvironmentVariable("UMDF_LOG_LEVEL");
         if (!string.IsNullOrEmpty(logLevel))
             LogLevel = logLevel;

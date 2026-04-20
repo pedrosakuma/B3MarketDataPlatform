@@ -40,6 +40,7 @@ int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
 int incrementalRecoveryQueueCapacity = settings.IncrementalRecoveryQueueCapacity;
+int groupRingCapacity = settings.GroupRingCapacity;
 var logLevel = ParseLogLevel(settings.LogLevel);
 
 for (int i = 0; i < args.Length; i++)
@@ -454,7 +455,8 @@ if (groupIds.Count > 1)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity)
+            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
+            groupRingCapacity: groupRingCapacity)
         : new MultiFeedManager(
             packetSource,
             groupFeedHandlers,
@@ -462,7 +464,8 @@ if (groupIds.Count > 1)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity);
+            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
+            groupRingCapacity: groupRingCapacity);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }

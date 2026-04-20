@@ -123,10 +123,33 @@ static class AppMetrics
             unit: "ms", description: "Milliseconds since last packet received per group");
 
         // The legacy b3.umdf.feed.queue_depth / queue_dropped metrics were removed when the
-        // per-group bounded Channel<UmdfPacket> was eliminated in favor of inline dispatch
-        // under a per-group lock. Backpressure is now visible via kernel SO_RCVBUF and the
-        // sequence-gap / recovery counters (b3.umdf.feed.gaps, recovery_queue_dropped, ...).
-        _ = multiFeed;
+        // per-group bounded Channel<UmdfPacket> was eliminated. Backpressure is now visible
+        // via the per-group MPSC dispatch ring (b3.umdf.feed.ring.depth /
+        // b3.umdf.feed.ring.dropped) and the sequence-gap / recovery counters.
+        if (multiFeed is not null)
+        {
+            var feed = multiFeed;
+
+            IEnumerable<Measurement<int>> RingDepth()
+            {
+                foreach (var s in feed.GetChannelStats())
+                    yield return new Measurement<int>(s.Depth, Tag("group", $"G{s.GroupId}"));
+            }
+
+            IEnumerable<Measurement<long>> RingDropped()
+            {
+                foreach (var s in feed.GetChannelStats())
+                    yield return new Measurement<long>(s.DroppedPackets, Tag("group", $"G{s.GroupId}"));
+            }
+
+            Meter.CreateObservableGauge("b3.umdf.feed.ring.depth",
+                RingDepth,
+                unit: "{packets}", description: "Pending packets in the per-group MPSC dispatch ring");
+
+            Meter.CreateObservableCounter("b3.umdf.feed.ring.dropped",
+                RingDropped,
+                unit: "{packets}", description: "Packets dropped on per-group ring overflow (newest dropped)");
+        }
 
         if (multicastMerger is not null)
         {

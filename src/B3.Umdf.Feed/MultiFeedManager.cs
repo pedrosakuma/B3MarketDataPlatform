@@ -7,35 +7,41 @@ namespace B3.Umdf.Feed;
 /// <summary>
 /// Manages multiple FeedHandlers, one per channel group.
 ///
-/// Inline-dispatch architecture: receive threads call <see cref="PushPacket(in UmdfPacket)"/>
-/// directly, which acquires a per-group lock and feeds the packet straight into the group's
-/// FeedHandler on the calling thread. There is no intermediate queue, no async/await
-/// machinery and no dedicated worker thread per group.
+/// Lock-free MPSC dispatch: each group owns a bounded ring buffer
+/// (<see cref="MpscPacketRing"/>) and a dedicated dispatch thread that drains it and runs
+/// the FeedHandler pipeline. Receive threads enqueue into the ring without locks via
+/// <see cref="PushPacket(in UmdfPacket)"/> / <see cref="PushPacketBatch(ReadOnlySpan{UmdfPacket})"/>
+/// and return immediately to <c>recvmmsg</c>.
 ///
 /// Threading contract:
-/// - Multiple receive threads (one per (group, channel)) may call PushPacket concurrently.
-/// - Per-group serialization is provided by an internal lock object: only one thread at a
-///   time runs the FeedHandler dispatch path for any given group, so BookManager and
-///   MarketDataManager remain free of locks on the hot path.
-/// - Cross-group calls run fully in parallel (one lock per group).
+/// - Multiple receive threads (one per (group, channel)) may concurrently enqueue packets
+///   for any group; enqueues are wait-free under no contention and use a single
+///   <see cref="Interlocked.CompareExchange(ref long, long, long)"/> per packet.
+/// - Exactly one dispatch thread per group reads from that group's ring and calls
+///   <see cref="FeedHandler.FeedPacket(in UmdfPacket)"/>; BookManager and
+///   MarketDataManager remain single-threaded per group with zero locks on the hot path.
+/// - Cross-group dispatch runs fully in parallel (one ring + one thread per group).
 ///
-/// Backpressure: there is no application-level queue between the kernel UDP socket and
-/// the FeedHandler. If processing for a group can't keep up, peer receive threads in the
-/// same group block on the lock, which causes the kernel SO_RCVBUF to fill and eventually
-/// drop datagrams. The A/B reorder buffer + snapshot recovery in the FeedHandler handle
-/// the resulting sequence gaps.
+/// Backpressure: when a ring fills (consumer can't keep up with producers) the producer
+/// drops the packet and increments a counter; downstream sequence gaps trigger snapshot
+/// recovery as usual. The ring capacity defaults to 65 536 slots per group and is
+/// configurable via the constructor.
 /// </summary>
 public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
 {
+    public const int DefaultGroupRingCapacity = 65_536;
+
     private readonly IPacketSource? _source;
     private readonly Dictionary<int, FeedHandler> _handlers = new();
-    private readonly Dictionary<int, object> _groupLocks = new();
+    private readonly Dictionary<int, MpscPacketRing> _rings = new();
+    private readonly Dictionary<int, Thread> _dispatchThreads = new();
     private readonly Dictionary<int, int> _groupIndex = new();
     private volatile bool[] _groupReady = [];
     private CancellationTokenSource? _cts;
     private Task? _dispatchTask;
     private int _anyReadyFired;
     private readonly ILogger<MultiFeedManager> _logger;
+    private readonly int _ringCapacity;
 
     public event Action? AllGroupsReady;
 
@@ -70,8 +76,8 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         }
     }
 
-    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity)
-        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, incrementalRecoveryQueueCapacity)
+    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, incrementalRecoveryQueueCapacity, groupRingCapacity)
     {
         _ = feedChannelCapacity; // accepted for API compatibility; no longer used
     }
@@ -80,21 +86,23 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// Live-push constructor: no source / no internal dispatcher. Receive threads (e.g. one per
     /// MulticastPacketSource) must call <see cref="PushPacket(in UmdfPacket)"/> directly.
     /// </summary>
-    public MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity)
-        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source: null, incrementalRecoveryQueueCapacity)
+    public MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source: null, incrementalRecoveryQueueCapacity, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
-    private MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger, IFeedEventHandler? marketDataHandler, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity)
+    private MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger, IFeedEventHandler? marketDataHandler, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity, int groupRingCapacity)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(groupRingCapacity, 2);
         _source = source;
         _logger = logger ?? NullLogger<MultiFeedManager>.Instance;
+        _ringCapacity = groupRingCapacity;
         int idx = 0;
         foreach (var gid in groupIds)
         {
             _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler, incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity);
-            _groupLocks[gid] = new object();
+            _rings[gid] = new MpscPacketRing(_ringCapacity);
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -104,30 +112,32 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// Creates a MultiFeedManager where each group has its own event handler.
     /// Optionally accepts per-group market data handlers for passthrough during non-RealTime states.
     /// </summary>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, incrementalRecoveryQueueCapacity)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, incrementalRecoveryQueueCapacity, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
     /// <summary>Live-push constructor with per-group handlers (no internal dispatcher).</summary>
-    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, incrementalRecoveryQueueCapacity)
+    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, incrementalRecoveryQueueCapacity, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
-    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity)
+    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity, int groupRingCapacity)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(groupRingCapacity, 2);
         _source = source;
         _logger = logger ?? NullLogger<MultiFeedManager>.Instance;
+        _ringCapacity = groupRingCapacity;
         int idx = 0;
         foreach (var (gid, handler) in groupHandlers)
         {
             IFeedEventHandler? mdHandler = null;
             marketDataHandlers?.TryGetValue(gid, out mdHandler);
             _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler, incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity);
-            _groupLocks[gid] = new object();
+            _rings[gid] = new MpscPacketRing(_ringCapacity);
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -137,6 +147,21 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
+        // Spin up one dispatch thread per group. These are LongRunning, foreground-style
+        // threads so they keep the process alive and run on dedicated OS threads (not
+        // borrowed from the thread pool).
+        foreach (var (gid, ring) in _rings)
+        {
+            int groupId = gid;
+            var thread = new Thread(() => RunGroupDispatch(groupId, ring, _cts.Token))
+            {
+                IsBackground = true,
+                Name = $"FeedDispatch-G{groupId}",
+            };
+            _dispatchThreads[gid] = thread;
+            thread.Start();
+        }
+
         // No source -> live push mode: receive threads will call PushPacket directly.
         if (_source is null)
         {
@@ -144,8 +169,9 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             return Task.CompletedTask;
         }
 
-        // Source-driven mode (used by tests and by replay drivers): a single dispatch
-        // thread pulls from the source and inline-dispatches via PushPacket.
+        // Source-driven mode (used by tests and by replay drivers): a single feeder
+        // thread pulls from the source and enqueues into the per-group rings. The
+        // FeedHandler pipeline still runs on the dispatch threads above.
         if (_source is ISyncPacketSource syncSource)
             _dispatchTask = Task.Factory.StartNew(
                 () => RunSyncDispatch(syncSource, _cts.Token),
@@ -161,6 +187,25 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         if (_dispatchTask is not null)
         {
             await _dispatchTask;
+            // The feeder finished pulling from the source, but per-group rings may still
+            // hold packets that the dispatch threads haven't processed yet. Wait for them
+            // to drain so callers (tests, replay drivers) observe a stable end state.
+            var cts = _cts;
+            while (cts is not null && !cts.IsCancellationRequested)
+            {
+                bool allDrained = true;
+                foreach (var ring in _rings.Values)
+                {
+                    if (ring.ApproximateDepth > 0)
+                    {
+                        allDrained = false;
+                        break;
+                    }
+                }
+                if (allDrained)
+                    return;
+                await Task.Delay(2, cts.Token).ConfigureAwait(false);
+            }
             return;
         }
 
@@ -168,21 +213,26 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         // dispatcher task. Block until the manager is stopped (StopAsync) or the linked
         // cancellation token fires; otherwise the host process would fall through to
         // shutdown immediately.
-        var cts = _cts;
-        if (cts is null)
+        var liveCts = _cts;
+        if (liveCts is null)
             return;
-        try { await Task.Delay(Timeout.Infinite, cts.Token); }
+        try { await Task.Delay(Timeout.Infinite, liveCts.Token); }
         catch (OperationCanceledException) { }
     }
 
     public async Task StopAsync()
     {
         _cts?.Cancel();
+        // Wake any dispatch threads blocked on WaitForItems.
+        foreach (var ring in _rings.Values)
+            ring.SignalShutdown();
         if (_dispatchTask is not null)
         {
             try { await _dispatchTask; }
             catch (OperationCanceledException) { }
         }
+        foreach (var thread in _dispatchThreads.Values)
+            thread.Join(TimeSpan.FromSeconds(5));
     }
 
     private void RunSyncDispatch(ISyncPacketSource source, CancellationToken ct)
@@ -206,92 +256,87 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Direct push entry point for live receive threads. Acquires the per-group lock and
-    /// runs the FeedHandler dispatch on the calling thread. Concurrent callers for the
-    /// same group are serialized by the lock; cross-group callers run in parallel.
+    /// Per-group dispatch loop. Runs on a dedicated OS thread; the only consumer of the
+    /// group's ring. Tight drain loop with brief spin + block fallback when the ring
+    /// goes empty — gives optimal throughput under load and low CPU when idle.
+    /// </summary>
+    private void RunGroupDispatch(int groupId, MpscPacketRing ring, CancellationToken ct)
+    {
+        var handler = _handlers[groupId];
+        const int spinIterations = 64;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                if (ring.TryDequeue(out var packet))
+                {
+                    handler.FeedPacket(in packet);
+                    CheckReadyTransition(groupId, handler);
+                    continue;
+                }
+
+                // Brief spin to absorb tiny producer gaps without paying a syscall.
+                bool gotItem = false;
+                for (int i = 0; i < spinIterations; i++)
+                {
+                    if (ring.TryDequeue(out packet))
+                    {
+                        handler.FeedPacket(in packet);
+                        CheckReadyTransition(groupId, handler);
+                        gotItem = true;
+                        break;
+                    }
+                    Thread.SpinWait(1 << Math.Min(i, 6));
+                }
+
+                if (!gotItem)
+                {
+                    try { ring.WaitForItems(ct); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Dispatch thread for group {GroupId} crashed", groupId);
+        }
+        finally
+        {
+            // Drain any remaining packets so leases aren't leaked.
+            while (ring.TryDequeue(out var packet))
+                packet.Release();
+        }
+    }
+
+    /// <summary>
+    /// Direct push entry point for live receive threads. Lock-free enqueue into the
+    /// per-group ring; the dispatch thread for that group will pick it up.
     /// </summary>
     public void PushPacket(in UmdfPacket packet)
     {
-        if (!_handlers.TryGetValue(packet.ChannelGroup, out var handler))
+        if (!_rings.TryGetValue(packet.ChannelGroup, out var ring))
         {
             packet.Release();
             return;
         }
 
-        var lockObj = _groupLocks[packet.ChannelGroup];
-        // Hold the lock for the full FeedHandler.FeedPacket call. The critical section is
-        // small (microseconds — book/MD updates measured at <0.1% of total CPU) so peer
-        // receive threads in the same group rarely actually contend.
-        lock (lockObj)
+        if (!ring.TryEnqueue(in packet))
         {
-            handler.FeedPacket(in packet);
-            CheckReadyTransition(packet.ChannelGroup, handler);
+            // Ring full: drop and release. Producer counter inside the ring tracks drops.
+            packet.Release();
         }
     }
 
     /// <summary>
-    /// Bulk variant of <see cref="PushPacket(in UmdfPacket)"/>: acquires the per-group
-    /// lock once for the whole batch instead of once per packet. This dramatically
-    /// reduces lock acquire/release pressure when receive threads use recvmmsg-style
-    /// batching, and — more importantly — gives the other receive threads in the same
-    /// group (snapshot, instrument-definition, incremental-B) a fair shot at the lock
-    /// between batches instead of competing for it on every single packet.
-    ///
-    /// All packets in the batch must belong to the same channel group; the group is
-    /// determined from the first packet. Packets that route to an unknown group are
-    /// released individually (defensive).
+    /// Bulk variant of <see cref="PushPacket(in UmdfPacket)"/>: enqueues each packet from
+    /// a recvmmsg-style batch into the appropriate per-group ring. The receive thread
+    /// returns to the kernel as quickly as possible — there is no lock and no dispatch
+    /// work performed on the caller.
     /// </summary>
     public void PushPacketBatch(ReadOnlySpan<UmdfPacket> packets)
     {
-        if (packets.Length == 0)
-            return;
-
-        // Fast path: all packets in the batch share the same group (always true when
-        // called from a per-socket receive loop). Acquire the lock once and dispatch
-        // them in order.
-        int firstGroup = packets[0].ChannelGroup;
-        if (!_handlers.TryGetValue(firstGroup, out var handler))
-        {
-            // Unknown group on the lead packet — fall back to per-packet routing so
-            // each lease still gets released exactly once.
-            for (int i = 0; i < packets.Length; i++)
-                PushPacket(in packets[i]);
-            return;
-        }
-
-        var lockObj = _groupLocks[firstGroup];
-        lock (lockObj)
-        {
-            for (int i = 0; i < packets.Length; i++)
-            {
-                ref readonly var packet = ref packets[i];
-                if (packet.ChannelGroup == firstGroup)
-                {
-                    handler.FeedPacket(in packet);
-                }
-                else if (_handlers.TryGetValue(packet.ChannelGroup, out var otherHandler))
-                {
-                    // Cross-group packet snuck into the batch (shouldn't happen with the
-                    // standard per-socket receive loop). Re-route under its own group lock
-                    // by recursing through PushPacket; this releases firstGroup's lock for
-                    // the duration via Monitor reentrance only if the lock is the same
-                    // object — different groups have different lock objects, so we drop
-                    // back to PushPacket which acquires the correct lock.
-                    var otherLock = _groupLocks[packet.ChannelGroup];
-                    lock (otherLock)
-                    {
-                        otherHandler.FeedPacket(in packet);
-                        CheckReadyTransition(packet.ChannelGroup, otherHandler);
-                    }
-                }
-                else
-                {
-                    packet.Release();
-                }
-            }
-
-            CheckReadyTransition(firstGroup, handler);
-        }
+        for (int i = 0; i < packets.Length; i++)
+            PushPacket(in packets[i]);
     }
 
     private void CheckReadyTransition(int groupId, FeedHandler handler)
@@ -317,15 +362,14 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Returns per-group queue stats. With the inline-dispatch architecture there is no
-    /// application-level queue, so depth and dropped are always zero. Kept for API
-    /// compatibility with metrics consumers; the meaningful backpressure signal now comes
-    /// from kernel SO_RCVBUF + sequence gap counters.
+    /// Returns per-group ring stats: current depth and total dropped packets. Depth is
+    /// an approximate snapshot of <c>producerSeq - consumerSeq</c>; drops are exact
+    /// (incremented atomically inside <see cref="MpscPacketRing.TryEnqueue"/>).
     /// </summary>
     public IEnumerable<(int GroupId, int Depth, long DroppedPackets)> GetChannelStats()
     {
-        foreach (var gid in _handlers.Keys)
-            yield return (gid, 0, 0L);
+        foreach (var (gid, ring) in _rings)
+            yield return (gid, ring.ApproximateDepth, ring.DroppedPackets);
     }
 
     public void Dispose()
@@ -337,6 +381,8 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     {
         await StopAsync();
         _cts?.Dispose();
+        foreach (var ring in _rings.Values)
+            ring.Dispose();
         foreach (var h in _handlers.Values)
             h.Dispose();
     }
