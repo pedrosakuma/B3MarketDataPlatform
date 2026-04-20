@@ -220,6 +220,18 @@ public sealed class SubscriptionManager
     }
 
     /// <summary>
+    /// Lock-free accessor for the inner per-security subscriber dict (copy-on-write under
+    /// _subLock). Used by hot-path coalesced broadcast in <see cref="GroupConflationHandler"/>
+    /// to amortize the per-event Channel.TryWrite cost across an entire flush cycle.
+    /// </summary>
+    internal IReadOnlyDictionary<string, DataFlags>? GetSubscribers(ulong securityId) =>
+        _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
+
+    /// <summary>Lock-free lookup of a connected client session by id.</summary>
+    internal ClientSession? GetClient(string clientId) =>
+        _clients.TryGetValue(clientId, out var session) ? session : null;
+
+    /// <summary>
     /// Wake Info subscribers for a security so their latest InstrumentInfo version is flushed
     /// even when there is no concurrent book/rankings traffic.
     /// </summary>

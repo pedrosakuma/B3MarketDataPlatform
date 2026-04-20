@@ -16,16 +16,25 @@ public sealed class ClientSession : IDisposable
 {
     private readonly struct OutboundMessage
     {
-        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true);
+        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true, logicalCount: 0);
 
-        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false)
+        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false, int logicalCount = 1)
         {
             Payload = payload;
             IsInfoWake = isInfoWake;
+            LogicalCount = logicalCount;
         }
 
         public ReadOnlyMemory<byte> Payload { get; }
         public bool IsInfoWake { get; }
+
+        /// <summary>
+        /// Number of logical wire messages contained in this payload. Coalesced batches
+        /// from upstream conflation carry N pre-serialized messages back-to-back so the
+        /// stat counters (<see cref="MessagesSent"/>, <c>WsMessagesSent</c>) reflect the
+        /// true wire-event volume rather than the queue-write count.
+        /// </summary>
+        public int LogicalCount { get; }
     }
 
     private static int _nextId;
@@ -120,6 +129,20 @@ public sealed class ClientSession : IDisposable
         TryEnqueueCore(new OutboundMessage(message), "payload");
 
     /// <summary>
+    /// Enqueue a coalesced batch of <paramref name="logicalMessageCount"/> pre-serialized
+    /// messages packed back-to-back in <paramref name="batch"/>. Used by the per-group
+    /// flush path in <see cref="GroupConflationHandler"/> to amortize the per-event
+    /// Channel.TryWrite cost (one Monitor acquisition under contention) across an
+    /// entire flush cycle. The write loop concatenates messages identically to the
+    /// per-message path; only the queue-write count is reduced.
+    /// </summary>
+    public bool TryEnqueueBatch(ReadOnlyMemory<byte> batch, int logicalMessageCount)
+    {
+        if (batch.IsEmpty || logicalMessageCount <= 0) return true;
+        return TryEnqueueCore(new OutboundMessage(batch, logicalCount: logicalMessageCount), "batch");
+    }
+
+    /// <summary>
     /// Wake the writer so Info subscriptions can flush the latest InstrumentInfo version.
     /// Coalesces multiple updates into at most one pending wake item per client.
     /// </summary>
@@ -157,6 +180,7 @@ public sealed class ClientSession : IDisposable
                 // 1. Drain up to MaxDrainPerCycle pre-serialized messages
                 messages.Clear();
                 int drained = 0;
+                int logicalDrained = 0;
                 bool sawInfoWake = false;
                 while (drained < MaxDrainPerCycle && reader.TryRead(out var outbound))
                 {
@@ -168,6 +192,7 @@ public sealed class ClientSession : IDisposable
                     }
 
                     messages.Add(outbound.Payload);
+                    logicalDrained += outbound.LogicalCount;
                 }
                 if (sawInfoWake)
                     Interlocked.Exchange(ref _infoWakePending, 0);
@@ -209,7 +234,7 @@ public sealed class ClientSession : IDisposable
                 {
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
-                    int totalMessages = messages.Count + infoMessages;
+                    int totalMessages = logicalDrained + infoMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
                     AppMetrics.WsMessagesSent.Add(totalMessages);

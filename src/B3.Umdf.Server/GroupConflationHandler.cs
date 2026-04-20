@@ -21,6 +21,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
     private byte[] _flushBuf = new byte[4096];
+
+    // Per-flush per-client coalesced output buffer. Reused across flushes; the byte[]
+    // payload is freshly allocated per flush so it can be handed off to the client's
+    // outbound channel without copy. Coalescing N (events × subscribers) Channel.TryWrite
+    // calls into 1 per client amortizes the dominant cost in the WS broadcast path.
+    private readonly Dictionary<ClientSession, ClientBatchAccumulator> _clientBatches = new();
+
+    private struct ClientBatchAccumulator
+    {
+        public byte[] Buffer;
+        public int Offset;
+        public int LogicalCount;
+    }
+
     private long _eventsReceived;
     private long _eventsFlushed;
 
@@ -280,12 +294,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         int flushed = 0;
 
+        Span<byte> tmp = stackalloc byte[64];
+
         foreach (var (secId, side) in _clearBuffer)
         {
             if (!_parent.IsSubscribed(secId)) continue;
-            var buf = new byte[13];
-            WireProtocol.WriteBookCleared(buf, secId, side);
-            _parent.BroadcastToSubscribers(secId, buf);
+            int len = WireProtocol.WriteBookCleared(tmp, secId, side);
+            AppendForBookSubscribers(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _clearBuffer.Clear();
@@ -295,6 +310,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         if (_tradeBuffer.Count > 0)
             flushed += FlushTradeBuffer();
+
+        // Coalesced flush: one Channel.TryWrite per client per cycle (instead of one
+        // per event × subscriber). This is the single biggest WS-side optimization;
+        // see CHECKPOINT 014 for profile evidence.
+        FlushClientBatches();
 
         _eventsFlushed += flushed;
     }
@@ -313,24 +333,22 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private int FlushOrdersIndividually()
     {
         int flushed = 0;
+        Span<byte> tmp = stackalloc byte[64];
         foreach (var (orderId, order) in _orderBuffer)
         {
             if (!_parent.IsSubscribed(order.SecurityId)) { flushed++; continue; }
 
-            byte[] buf;
             int len;
             if (order.Kind == PendingOrderKind.Deleted)
             {
-                buf = new byte[21];
-                len = WireProtocol.WriteOrderDeleted(buf, order.SecurityId, orderId, order.Side);
+                len = WireProtocol.WriteOrderDeleted(tmp, order.SecurityId, orderId, order.Side);
             }
             else
             {
                 var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
-                buf = new byte[37];
-                len = WireProtocol.WriteOrderEvent(buf, msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
+                len = WireProtocol.WriteOrderEvent(tmp, msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
             }
-            _parent.BroadcastToSubscribers(order.SecurityId, new ReadOnlyMemory<byte>(buf, 0, len));
+            AppendForBookSubscribers(order.SecurityId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         return flushed;
@@ -355,6 +373,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         ulong currentSecId = 0;
         int segmentStart = 0;
+        int segmentCount = 0;
         int offset = 0;
 
         for (int i = 0; i < sorted.Length; i++)
@@ -364,8 +383,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             // Flush previous security's segment when switching to a new security
             if (order.SecurityId != currentSecId && offset > segmentStart)
             {
-                BroadcastSegment(currentSecId, segmentStart, offset);
+                AppendForBookSubscribers(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
                 segmentStart = offset;
+                segmentCount = 0;
             }
             currentSecId = order.SecurityId;
 
@@ -376,27 +396,21 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
                 offset += WireProtocol.WriteOrderEvent(_flushBuf.AsSpan(offset), msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
             }
+            segmentCount++;
             flushed++;
         }
 
         // Flush final segment
         if (offset > segmentStart)
-            BroadcastSegment(currentSecId, segmentStart, offset);
+            AppendForBookSubscribers(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
 
         return flushed;
-    }
-
-    private void BroadcastSegment(ulong securityId, int start, int end)
-    {
-        if (!_parent.IsSubscribed(securityId)) return;
-        var copy = new byte[end - start];
-        _flushBuf.AsSpan(start, end - start).CopyTo(copy);
-        _parent.BroadcastToSubscribers(securityId, copy);
     }
 
     private int FlushTradeBuffer()
     {
         int flushed = 0;
+        Span<byte> tmp = stackalloc byte[64];
 
         // Collect securities that need candle broadcasts (deduplicated)
         HashSet<ulong>? candleSecIds = null;
@@ -411,9 +425,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
             if (!_parent.IsSubscribed(secId)) { flushed++; continue; }
-            var buf = new byte[36];
-            int len = WireProtocol.WriteTrade(buf, secId, price, qty, tradeId);
-            _parent.BroadcastToSubscribers(secId, new ReadOnlyMemory<byte>(buf, 0, len));
+            int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
+            AppendForBookSubscribers(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _tradeBuffer.Clear();
@@ -421,19 +434,78 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // Broadcast candle updates (one per security, after all trades)
         if (candleSecIds is not null)
         {
+            Span<byte> cbuf = stackalloc byte[64]; // CandleUpdate fits in 62 bytes
             foreach (var secId in candleSecIds)
             {
                 if (!Candles.TryGetValue(secId, out var agg)) continue;
                 var latest = agg.GetLatest();
                 if (latest is { } c)
                 {
-                    var cbuf = new byte[62]; // CandleUpdate size
                     int clen = WireProtocol.WriteCandleUpdate(cbuf, secId, agg.Resolution, c);
-                    _parent.BroadcastToSubscribers(secId, new ReadOnlyMemory<byte>(cbuf, 0, clen));
+                    AppendForBookSubscribers(secId, cbuf[..clen], logicalCount: 1);
                 }
             }
         }
 
         return flushed;
+    }
+
+    /// <summary>
+    /// Append <paramref name="bytes"/> to every Book-flag subscriber's per-client coalesced
+    /// buffer. <paramref name="logicalCount"/> is the number of pre-serialized wire messages
+    /// packed back-to-back in <paramref name="bytes"/> (1 for single events, N for batched
+    /// segments). Buffers are flushed in <see cref="FlushClientBatches"/> at the end of the
+    /// per-packet flush cycle, so each client receives at most one Channel.TryWrite per
+    /// cycle even when many securities/events fan out to it.
+    /// </summary>
+    private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+
+        foreach (var (clientId, flags) in subs)
+        {
+            if (!flags.HasFlag(DataFlags.Book)) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+
+            if (!_clientBatches.TryGetValue(session, out var acc))
+            {
+                acc = new ClientBatchAccumulator
+                {
+                    Buffer = new byte[Math.Max(bytes.Length * 4, 1024)],
+                    Offset = 0,
+                    LogicalCount = 0,
+                };
+            }
+            if (acc.Offset + bytes.Length > acc.Buffer.Length)
+            {
+                int newSize = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
+                var newBuf = new byte[newSize];
+                acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
+                acc.Buffer = newBuf;
+            }
+            bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
+            acc.Offset += bytes.Length;
+            acc.LogicalCount += logicalCount;
+            _clientBatches[session] = acc;
+        }
+    }
+
+    /// <summary>
+    /// Hand each accumulated per-client buffer to its outbound channel as a single
+    /// coalesced batch, then drop the entries so the next flush allocates fresh buffers
+    /// (the channel still owns the previous byte[] until the write loop consumes it).
+    /// </summary>
+    private void FlushClientBatches()
+    {
+        if (_clientBatches.Count == 0) return;
+        foreach (var kv in _clientBatches)
+        {
+            var acc = kv.Value;
+            if (acc.Offset == 0) continue;
+            kv.Key.TryEnqueueBatch(new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset), acc.LogicalCount);
+        }
+        _clientBatches.Clear();
     }
 }
