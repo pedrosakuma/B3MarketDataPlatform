@@ -10,8 +10,8 @@ public enum BookClearSide : byte
 
 public interface IBookEventHandler
 {
-    void OnOrderAdded(OrderBook book, OrderBookEntry entry);
-    void OnOrderUpdated(OrderBook book, OrderBookEntry entry);
+    void OnOrderAdded(OrderBook book, in OrderBookEntry entry);
+    void OnOrderUpdated(OrderBook book, in OrderBookEntry entry);
     void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side);
     void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs);
     void OnBookCleared(ulong securityId, BookClearSide side);

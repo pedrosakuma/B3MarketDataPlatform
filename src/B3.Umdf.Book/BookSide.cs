@@ -42,8 +42,20 @@ public sealed class BookSide
         return idx >= 0 ? _levels[idx].Orders : null;
     }
 
-    public bool TryGetOrder(ulong orderId, out OrderBookEntry? entry)
+    public bool TryGetOrder(ulong orderId, out OrderBookEntry entry)
         => _orders.TryGetValue(orderId, out entry);
+
+    /// <summary>
+    /// Returns a ref to the stored order so callers can mutate fields in-place without copying.
+    /// Throws if the order does not exist.
+    /// </summary>
+    public ref OrderBookEntry GetOrderRef(ulong orderId)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrNullRef(_orders, orderId);
+        if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
+            throw new KeyNotFoundException($"OrderId {orderId} not found in BookSide({_side})");
+        return ref slot;
+    }
 
     public BookSide(BookSideType side)
     {
@@ -55,11 +67,11 @@ public sealed class BookSide
     /// Add a new order (caller must ensure orderId doesn't exist yet).
     /// Uses single-hash dictionary insert via CollectionsMarshal.
     /// </summary>
-    public void Add(OrderBookEntry entry)
+    public void Add(in OrderBookEntry entry)
     {
         ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orders, entry.OrderId, out _);
         slot = entry;
-        AddToPriceLevels(entry);
+        AddToPriceLevels(ref slot);
         AssertValid();
     }
 
@@ -67,48 +79,69 @@ public sealed class BookSide
     /// Update an existing order's price level placement after its fields were mutated.
     /// Only call when the price has changed.
     /// </summary>
-    public void MoveOrder(OrderBookEntry entry, long oldPrice)
+    public void MoveOrder(ulong orderId, long oldPrice)
     {
-        RemoveFromPriceLevelsByPrice(entry, oldPrice);
-        AddToPriceLevels(entry);
+        ref var slot = ref CollectionsMarshal.GetValueRefOrNullRef(_orders, orderId);
+        if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
+            return;
+        RemoveFromPriceLevelsByPrice(slot.PriceLevelIndex, oldPrice);
+        AddToPriceLevels(ref slot);
         AssertValid();
     }
 
     /// <returns>true if the order already existed (update); false if new (add).</returns>
-    public bool AddOrUpdate(OrderBookEntry entry)
+    public bool AddOrUpdate(in OrderBookEntry entry)
     {
         ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orders, entry.OrderId, out bool existed);
 
-        if (existed && slot is not null)
+        if (existed)
         {
-            var existing = slot;
-            if (existing.Price == entry.Price)
+            long existingPrice = slot.Price;
+            int existingIdx = slot.PriceLevelIndex;
+            if (existingPrice == entry.Price)
             {
                 // Same-price: swap entry in-place, no level restructuring
-                entry.PriceLevelIndex = existing.PriceLevelIndex;
+                slot = entry;
+                slot.PriceLevelIndex = existingIdx;
                 int levelIdx = FindPriceLevel(entry.Price);
                 if (levelIdx >= 0)
-                    _levels[levelIdx].Orders[existing.PriceLevelIndex] = entry;
-                slot = entry;
+                    CollectionsMarshal.AsSpan(_levels[levelIdx].Orders)[existingIdx] = slot;
                 AssertValid();
                 return true;
             }
-            RemoveFromPriceLevels(existing);
+            RemoveFromPriceLevelsByPrice(existingIdx, existingPrice);
         }
 
         slot = entry;
-        AddToPriceLevels(entry);
+        AddToPriceLevels(ref slot);
         AssertValid();
         return existed;
     }
 
     public bool Remove(ulong orderId)
     {
-        if (!_orders.Remove(orderId, out var entry))
+        if (!_orders.TryGetValue(orderId, out var entry))
             return false;
-        RemoveFromPriceLevels(entry);
+        RemoveFromPriceLevelsByPrice(entry.PriceLevelIndex, entry.Price);
+        _orders.Remove(orderId);
         AssertValid();
         return true;
+    }
+
+    /// <summary>
+    /// Re-writes the order's per-level list copy from the authoritative dictionary slot.
+    /// Called by callers that mutate fields in-place via <see cref="GetOrderRef"/> when the
+    /// price has not changed (so the level placement is unchanged but the list copy is stale).
+    /// </summary>
+    public void SyncPriceLevelCopy(ulong orderId)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrNullRef(_orders, orderId);
+        if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
+            return;
+        int levelIdx = FindPriceLevel(slot.Price);
+        if (levelIdx < 0)
+            return;
+        CollectionsMarshal.AsSpan(_levels[levelIdx].Orders)[slot.PriceLevelIndex] = slot;
     }
 
     public void Clear()
@@ -203,7 +236,7 @@ public sealed class BookSide
             throw new InvalidOperationException($"BookSide({_side}) invalid: {string.Join("; ", errors)}");
     }
 
-    private void AddToPriceLevels(OrderBookEntry entry)
+    private void AddToPriceLevels(ref OrderBookEntry entry)
     {
         int idx = FindPriceLevel(entry.Price);
         if (idx >= 0)
@@ -216,31 +249,31 @@ public sealed class BookSide
         {
             int insertIdx = ~idx;
             var orders = RentList();
-            orders.Add(entry);
             entry.PriceLevelIndex = 0;
+            orders.Add(entry);
             _levels.Insert(insertIdx, (entry.Price, orders));
         }
     }
 
-    private void RemoveFromPriceLevels(OrderBookEntry entry)
-    {
-        RemoveFromPriceLevelsByPrice(entry, entry.Price);
-    }
-
-    private void RemoveFromPriceLevelsByPrice(OrderBookEntry entry, long price)
+    private void RemoveFromPriceLevelsByPrice(int orderIdx, long price)
     {
         int levelIdx = FindPriceLevel(price);
         if (levelIdx < 0) return;
 
         var orders = _levels[levelIdx].Orders;
-        int orderIdx = entry.PriceLevelIndex;
 
         // Swap-remove: O(1) — swap with last, remove last
         int lastIdx = orders.Count - 1;
         if (orderIdx < lastIdx)
         {
-            orders[orderIdx] = orders[lastIdx];
-            orders[orderIdx].PriceLevelIndex = orderIdx;
+            var moved = orders[lastIdx];
+            moved.PriceLevelIndex = orderIdx;
+            orders[orderIdx] = moved;
+
+            // Sync the moved order's PriceLevelIndex inside _orders
+            ref var slot = ref CollectionsMarshal.GetValueRefOrNullRef(_orders, moved.OrderId);
+            if (!System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
+                slot.PriceLevelIndex = orderIdx;
         }
         orders.RemoveAt(lastIdx);
 

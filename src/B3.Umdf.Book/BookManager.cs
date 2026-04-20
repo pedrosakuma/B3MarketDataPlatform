@@ -285,7 +285,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
-        if (bookSide.TryGetOrder(orderId, out var existing) && existing is not null)
+        if (bookSide.TryGetOrder(orderId, out var existing))
         {
             if (rawPrice is null)
             {
@@ -300,17 +300,26 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 long price = rawPrice.Value;
                 long oldPrice = existing.Price;
 
-                existing.Price = price;
-                existing.Quantity = quantity;
-                existing.EnteringFirm = enteringFirm;
+                ref var slot = ref bookSide.GetOrderRef(orderId);
+                slot.Price = price;
+                slot.Quantity = quantity;
+                slot.EnteringFirm = enteringFirm;
 
                 if (oldPrice != price)
-                    bookSide.MoveOrder(existing, oldPrice);
+                {
+                    bookSide.MoveOrder(orderId, oldPrice);
+                }
+                else
+                {
+                    // Same price — also update the per-level list copy so iteration sees the new
+                    // quantity/firm. MoveOrder takes care of this when price changes.
+                    bookSide.SyncPriceLevelCopy(orderId);
+                }
 
                 if (msg.RptSeq is { } rptSeq)
                     book.LastRptSeq = (uint)rptSeq;
 
-                _eventHandler?.OnOrderUpdated(book, existing);
+                _eventHandler?.OnOrderUpdated(book, in slot);
                 CheckCrossing(book, "UPDATE", orderId, price, side);
             }
         }
@@ -333,13 +342,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 Side = side
             };
 
-            bookSide.Add(entry);
+            bookSide.Add(in entry);
             _orderAdds++;
 
             if (msg.RptSeq is { } rptSeq)
                 book.LastRptSeq = (uint)rptSeq;
 
-            _eventHandler?.OnOrderAdded(book, entry);
+            _eventHandler?.OnOrderAdded(book, in entry);
             CheckCrossing(book, "ADD", orderId, price, side);
         }
     }
@@ -534,7 +543,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 Side = side
             };
 
-            book.GetSide(side).Add(bookEntry);
+            book.GetSide(side).Add(in bookEntry);
         });
     }
 

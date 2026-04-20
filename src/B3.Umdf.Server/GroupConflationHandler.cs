@@ -60,11 +60,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     // ── IBookEventHandler ──
 
-    public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
+    public void OnOrderAdded(OrderBook book, in OrderBookEntry entry)
         => BufferOrder(PendingOrderKind.Added, book.SecurityId, entry.OrderId,
             (byte)entry.Side, entry.Price, entry.Quantity);
 
-    public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
+    public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry)
         => BufferOrder(PendingOrderKind.Updated, book.SecurityId, entry.OrderId,
             (byte)entry.Side, entry.Price, entry.Quantity);
 

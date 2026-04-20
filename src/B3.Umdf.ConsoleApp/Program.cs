@@ -924,12 +924,12 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
     public long TradeBustCount;
     public long ExecSummaryCount;
 
-    public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
+    public void OnOrderAdded(OrderBook book, in OrderBookEntry entry)
     {
         OrderCount++;
     }
 
-    public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
+    public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry)
     {
     }
 

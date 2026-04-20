@@ -9,14 +9,14 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
         _handlers = handlers;
     }
 
-    public void OnOrderAdded(OrderBook book, OrderBookEntry entry)
+    public void OnOrderAdded(OrderBook book, in OrderBookEntry entry)
     {
-        foreach (var h in _handlers) h.OnOrderAdded(book, entry);
+        foreach (var h in _handlers) h.OnOrderAdded(book, in entry);
     }
 
-    public void OnOrderUpdated(OrderBook book, OrderBookEntry entry)
+    public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry)
     {
-        foreach (var h in _handlers) h.OnOrderUpdated(book, entry);
+        foreach (var h in _handlers) h.OnOrderUpdated(book, in entry);
     }
 
     public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side)
