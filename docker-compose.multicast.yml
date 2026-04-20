@@ -1,0 +1,61 @@
+services:
+  publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: "service:consumer"
+    volumes:
+      - ./pcap:/app/pcap:ro
+      - ./config:/app/config:ro
+    environment:
+      PCAP_DIR: /app/pcap
+      PCAP_PREFIX: "${PCAP_PREFIX:-20250331_MBO_084_EQT,20250929_MBO_072_DRV}"
+      REPLAY_SPEED: "${REPLAY_SPEED:-1}"
+      UMDF_REPLAY_TO_MULTICAST: "true"
+      UMDF_MULTICAST_CONFIG: "/app/config/${MULTICAST_CONFIG_FILE:-multicast-compose.json}"
+    depends_on:
+      consumer:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    # Publisher shares the consumer's network namespace (network_mode: service:consumer).
+    # If the consumer dies, the namespace is destroyed and every send returns ENETUNREACH.
+    # `restart: "no"` keeps us from rebooting into a broken namespace and flooding the log.
+    restart: "no"
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2"
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${WS_PORT:-8080}:${WS_PORT:-8080}"
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      UMDF_MULTICAST_CONFIG: "/app/config/${MULTICAST_CONFIG_FILE:-multicast-compose.json}"
+      UMDF_WS_PORT: "${WS_PORT:-8080}"
+      UMDF_MULTICAST_MERGE_CAPACITY: "${UMDF_MULTICAST_MERGE_CAPACITY:-1000000}"
+      UMDF_FEED_CHANNEL_CAPACITY: "${UMDF_FEED_CHANNEL_CAPACITY:-250000}"
+      UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY: "${UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY:-50000}"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2"
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - consumer
+    restart: unless-stopped

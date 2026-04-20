@@ -17,14 +17,13 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     private readonly int[] _cachedUdpOffset;
     private readonly long[] _groupTimeOffset;
     private readonly ReplayOptions _options;
-    private long? _firstTimestamp;
-    private long _startTicks;
+    private long? _firstTimestampMicros;
+    private readonly System.Diagnostics.Stopwatch _stopwatch = System.Diagnostics.Stopwatch.StartNew();
     private bool _disposed;
 
     public TimestampMergedReplayer(IReadOnlyList<PcapChannelSource> sources, ReplayOptions? options = null)
     {
         _options = options ?? new ReplayOptions();
-        _startTicks = Environment.TickCount64;
         _cachedUdpOffset = new int[sources.Count];
         _groupTimeOffset = new long[sources.Count];
 
@@ -73,12 +72,32 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
 
         if (_options.SpeedMultiplier > 0)
         {
-            _firstTimestamp ??= normalizedTimestamp;
-            long elapsedTargetMs = (long)((normalizedTimestamp - _firstTimestamp.Value) / 1000.0 / _options.SpeedMultiplier);
-            long elapsedActualMs = Environment.TickCount64 - _startTicks;
-            long delayMs = elapsedTargetMs - elapsedActualMs;
-            if (delayMs > 1)
-                Thread.Sleep((int)delayMs);
+            _firstTimestampMicros ??= normalizedTimestamp;
+            // Sub-millisecond pacing: target elapsed time using Stopwatch ticks (typically 100 ns resolution).
+            // Coarse Thread.Sleep is replaced by a 3-tier wait that preserves microbursts of inter-packet gaps:
+            //   - long delay (>= 2 ms): Thread.Sleep((int)(delayMs - 1)) for OS-scheduled wait
+            //   - medium delay (>= 50 us): Thread.SpinWait + Yield to avoid kernel scheduling jitter
+            //   - tiny delay: tight Thread.SpinWait (sub-microsecond)
+            double targetElapsedMicros = (normalizedTimestamp - _firstTimestampMicros.Value) / _options.SpeedMultiplier;
+            long targetElapsedTicks = (long)(targetElapsedMicros * System.Diagnostics.Stopwatch.Frequency / 1_000_000.0);
+            long delayTicks = targetElapsedTicks - _stopwatch.ElapsedTicks;
+
+            if (delayTicks > 0)
+            {
+                long ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000;
+                if (delayTicks > ticksPerMs * 2)
+                {
+                    int sleepMs = (int)(delayTicks / ticksPerMs) - 1;
+                    if (sleepMs > 0) Thread.Sleep(sleepMs);
+                }
+                while (_stopwatch.ElapsedTicks < targetElapsedTicks)
+                {
+                    long remaining = targetElapsedTicks - _stopwatch.ElapsedTicks;
+                    if (remaining <= 0) break;
+                    if (remaining > ticksPerMs / 20) Thread.Yield();
+                    else Thread.SpinWait(20);
+                }
+            }
         }
 
         var (reader, channel, group) = _readers[item.ReaderIndex];

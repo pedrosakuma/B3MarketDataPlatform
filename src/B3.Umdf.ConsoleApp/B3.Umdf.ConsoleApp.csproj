@@ -3,11 +3,14 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>B3.Umdf.ConsoleApp</RootNamespace>
-    <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <!-- AOT codegen: target modern x64 with AVX2 for vectorized Span/Hash/Copy ops -->
-    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
-    <IlcInstructionSet>native</IlcInstructionSet>
+    <!-- JIT path: tiered compilation + dynamic PGO match (or beat) AOT for our hot loops,
+         while keeping the full diagnostic surface (dotnet-trace allocations, gcdump,
+         EventPipe, ETW). Startup cost is irrelevant for a long-running consumer. -->
+    <TieredCompilation>true</TieredCompilation>
+    <TieredPGO>true</TieredPGO>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>

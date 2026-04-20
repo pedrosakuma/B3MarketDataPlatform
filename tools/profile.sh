@@ -1,96 +1,78 @@
 #!/usr/bin/env bash
-# Profile the B3 UMDF consumer app using dotnet-trace.
+# Capture diagnostics from the consumer container.
+# All .NET diagnostic tools ship inside the runtime image at /usr/local/bin
+# (dotnet-trace, dotnet-counters, dotnet-dump, dotnet-gcdump, dotnet-stack).
 #
 # Usage:
-#   ./tools/profile.sh [pcap-dir]
+#   tools/profile.sh trace    [duration]   # CPU sample profile (default 30s)
+#   tools/profile.sh gc       [duration]   # GC + alloc trace
+#   tools/profile.sh counters              # live counter monitor (Ctrl-C to stop)
+#   tools/profile.sh gcdump                # heap object graph snapshot
+#   tools/profile.sh dump                  # full process dump
+#   tools/profile.sh stack                 # one-shot stack walk of all threads
+#   tools/profile.sh shell                 # interactive shell inside container
 #
-# Requirements:
-#   - dotnet-trace global tool: dotnet tool install -g dotnet-trace
-#
-# Outputs:
-#   /tmp/b3-trace.speedscope.json  — Open with https://speedscope.app or VS
-
+# Override container with CONTAINER=<service-name>. Captures land in ./profiles/.
 set -euo pipefail
 
-PCAP_DIR="${1:-pcap}"
-DLL="src/B3.Umdf.ConsoleApp/bin/Release/net10.0/B3.Umdf.ConsoleApp.dll"
-TRACE_OUT="/tmp/b3-trace.nettrace"
-DURATION="${TRACE_DURATION:-00:00:20}"
+CONTAINER="${CONTAINER:-consumer}"
+ACTION="${1:-trace}"
+DURATION="${2:-00:00:30}"
+HOST_OUT="$(pwd)/profiles"
+mkdir -p "$HOST_OUT"
 
-# Locate PCAP files
-INCR_A=$(find "$PCAP_DIR" -name '*Incremental_FeedA.pcap' | head -1)
-INCR_B=$(find "$PCAP_DIR" -name '*Incremental_FeedB.pcap' | head -1)
-INSTR=$(find "$PCAP_DIR" -name '*InstrumentDefinition.pcap' | head -1)
-SNAP=$(find "$PCAP_DIR" -name '*SnapshotRecovery.pcap' | head -1)
+CID="$(docker compose ps -q "$CONTAINER" 2>/dev/null || true)"
+[ -z "$CID" ] && CID="$CONTAINER"
 
-if [[ -z "$INCR_A" || -z "$INSTR" || -z "$SNAP" ]]; then
-    echo "ERROR: PCAP files not found in $PCAP_DIR"
-    echo "Run ./tools/download-pcaps.sh first."
-    exit 1
-fi
+run() { docker exec -i "$CID" "$@"; }
+pid() { docker exec "$CID" sh -c 'pgrep -f B3.Umdf.ConsoleApp | head -n1'; }
+ensure_dir() { docker exec "$CID" sh -c 'mkdir -p /profiles'; }
+stamp() { date +%Y%m%d_%H%M%S; }
+fetch() { docker cp "$CID:$1" "$HOST_OUT/" && echo "Saved → $HOST_OUT/$(basename "$1")"; }
 
-echo "Building Release..."
-dotnet build -c Release -q
-
-echo "Starting app..."
-dotnet "$DLL" "$INCR_A" ${INCR_B:+"$INCR_B"} "$INSTR" "$SNAP" &
-APP_PID=$!
-echo "  PID: $APP_PID"
-
-sleep 5
-
-echo "Collecting trace for $DURATION..."
-dotnet-trace collect -p "$APP_PID" --format Speedscope \
-    --providers "Microsoft-DotNETCore-SampleProfiler:0xF00000000000:4" \
-    --duration "$DURATION" -o "$TRACE_OUT" 2>&1
-
-wait "$APP_PID" 2>/dev/null || true
-
-SPEEDSCOPE="${TRACE_OUT%.nettrace}.speedscope.json"
-echo ""
-echo "=== Trace collected ==="
-echo "  Speedscope: $SPEEDSCOPE"
-echo "  Open with:  https://speedscope.app (drag & drop the file)"
-echo ""
-
-# Quick analysis if python3 is available
-if command -v python3 &>/dev/null; then
-    echo "=== Quick hotspot analysis ==="
-    python3 -c "
-import json, sys
-from collections import defaultdict
-
-with open('$SPEEDSCOPE') as f:
-    data = json.load(f)
-
-frames = data['shared']['frames']
-
-for prof in data['profiles']:
-    events = prof.get('events', [])
-    if len(events) < 200:
-        continue
-    stack = []
-    inclusive = defaultdict(float)
-    last = 0
-    for ev in events:
-        delta = ev['at'] - last
-        if stack and delta > 0:
-            seen = set()
-            for fid in stack:
-                n = frames[fid]['name']
-                if n not in seen:
-                    inclusive[n] += delta
-                    seen.add(n)
-        if ev['type'] == 'O': stack.append(ev['frame'])
-        elif ev['type'] == 'C' and stack: stack.pop()
-        last = ev['at']
-    total = sum(inclusive.values()) / len(set(id(x) for x in [1]))  # avoid div0
-    if total == 0: continue
-    app = {k: v for k, v in inclusive.items() if 'B3.Umdf' in k}
-    if not app: continue
-    print(f'Thread: {prof[\"name\"]} ({len(events)} samples)')
-    for name, t in sorted(app.items(), key=lambda x: -x[1])[:15]:
-        print(f'  {t/total*100:5.1f}%  {name[:120]}')
-    print()
-"
-fi
+case "$ACTION" in
+  trace)
+    PID=$(pid); ensure_dir
+    OUT="/profiles/trace_$(stamp).nettrace"
+    echo "CPU trace PID=$PID for $DURATION → $OUT"
+    run dotnet-trace collect -p "$PID" --duration "$DURATION" \
+        --providers Microsoft-DotNETCore-SampleProfiler -o "$OUT"
+    fetch "$OUT"
+    ;;
+  gc)
+    PID=$(pid); ensure_dir
+    OUT="/profiles/gc_$(stamp).nettrace"
+    echo "GC trace PID=$PID for $DURATION → $OUT"
+    run dotnet-trace collect -p "$PID" --duration "$DURATION" \
+        --profile gc-verbose -o "$OUT"
+    fetch "$OUT"
+    ;;
+  counters)
+    PID=$(pid)
+    docker exec -it "$CID" dotnet-counters monitor -p "$PID" \
+        --counters B3.Umdf.Consumer,System.Runtime
+    ;;
+  gcdump)
+    PID=$(pid); ensure_dir
+    OUT="/profiles/gcdump_$(stamp).gcdump"
+    run dotnet-gcdump collect -p "$PID" -o "$OUT"
+    fetch "$OUT"
+    ;;
+  dump)
+    PID=$(pid); ensure_dir
+    OUT="/profiles/dump_$(stamp).dmp"
+    run dotnet-dump collect -p "$PID" -o "$OUT" --type Full
+    fetch "$OUT"
+    ;;
+  stack)
+    PID=$(pid)
+    run dotnet-stack report -p "$PID"
+    ;;
+  shell)
+    docker exec -it "$CID" bash || docker exec -it "$CID" sh
+    ;;
+  *)
+    sed -n '2,15p' "$0" >&2
+    exit 2
+    ;;
+esac

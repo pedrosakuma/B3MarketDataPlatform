@@ -60,6 +60,7 @@ const AUTO_RES_THRESHOLDS = [
   { maxSpan: 7200, resolution: 15 },  // up to 2 hours → 15s
   { maxSpan: 14400, resolution: 60 }, // up to 4 hours → 1m
 ];
+const MAX_CANDLES = 10 * 60 * 60; // 10h retention at 1s resolution
 
 function pickAutoResolution(candles) {
   if (candles.length < 2) return 1;
@@ -138,6 +139,13 @@ function getChartCandles(sub) {
   const res = displayResolution > 0 ? displayResolution : pickAutoResolution(raw);
   const candles = aggregateCandles(raw, res);
   return { candles, resolution: res };
+}
+
+function trimCandles(sub) {
+  const excess = sub.candles.length - MAX_CANDLES;
+  if (excess <= 0) return false;
+  sub.candles.splice(0, excess);
+  return true;
 }
 
 /// Compute just the last aggregated candle by scanning 1s candles in the current bucket.
@@ -390,15 +398,27 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'SubscribeOk': {
       const id = secIdStr(msg.securityId);
-      subscriptions.set(id, {
-        symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
-        orders: new Map(), info: {}, candles: [], currentCandle: null,
-        orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
-      });
+      const existing = subscriptions.get(id);
+      if (existing) {
+        existing.symbol = msg.symbol;
+        existing.flags = msg.flags;
+        existing.securityId = msg.securityId;
+      } else {
+        subscriptions.set(id, {
+          symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
+          orders: new Map(), info: {}, candles: [], currentCandle: null,
+          orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
+        });
+      }
       let d = D_SUBS | D_ALLINFO;
-      if (!sel) { selectedId = id; d |= D_BOOK | D_TITLES; }
+      if (!sel) {
+        selectedId = id;
+        d |= D_BOOK | D_CHART | D_TITLES;
+      } else if (sel === id) {
+        d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES;
+      }
       mark(d);
-      log('Subscribed ' + msg.symbol + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
+      log((existing ? 'Subscription refreshed ' : 'Subscribed ') + msg.symbol + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
       break;
     }
     case 'SubscribeError':
@@ -486,22 +506,25 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         if (msg.isFirst) {
-          sub.candles = msg.candles;
+          sub.candles = msg.candles.slice(-MAX_CANDLES);
+          sub.snapshotReceived = false;
         } else {
           // Continuation batch — append
           for (const c of msg.candles) sub.candles.push(c);
+          trimCandles(sub);
         }
         sub.currentCandle = sub.candles.length > 0 ? sub.candles[sub.candles.length - 1] : null;
         sub.candleResolution = msg.resolution;
-        sub.snapshotReceived = true;
+        sub.snapshotReceived = msg.isLast;
       }
-      // Full chart swap only on the first batch to avoid rendering partial data on each continuation
-      if (sel === id) { chartFullSwap = true; mark(D_CHART); }
+      // Full chart swap only after the final snapshot batch, so the chart never renders partial history.
+      if (sel === id && msg.isLast) { chartFullSwap = true; mark(D_CHART); }
       break;
     }
     case 'CandleUpdate': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
+      let trimmed = false;
       if (sub) {
         const c = msg.candle;
         const last = sub.currentCandle;
@@ -510,12 +533,16 @@ function handleMessage(msg) {
           last.low = c.low; last.close = c.close; last.volume = c.volume;
         } else {
           sub.candles.push(c);
+          trimmed = trimCandles(sub);
           sub.currentCandle = c;
         }
         sub.candleResolution = msg.resolution;
       }
       // Only render chart updates after snapshot has arrived
-      if (sel === id && sub && sub.snapshotReceived) mark(D_CHART);
+      if (sel === id && sub && sub.snapshotReceived) {
+        if (trimmed) chartFullSwap = true;
+        mark(D_CHART);
+      }
       break;
     }
     case 'RankingsUpdate': {

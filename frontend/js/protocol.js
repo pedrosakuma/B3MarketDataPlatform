@@ -16,6 +16,7 @@ export const MSG = {
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
 
 export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, ALL: 0x03 };
+export const CANDLE_FLAGS = { FIRST: 0x01, LAST: 0x02 };
 
 export const INFO_FIELDS = [
   'OpeningPrice', 'ClosingPrice', 'HighPrice', 'LowPrice',
@@ -187,8 +188,9 @@ export function parseMessage(buf, baseOffset, msgLen) {
         const volume = Number(v.getBigInt64(o, true)); o += 8;
         candles.push({ time, open, high, low, close, volume });
       }
-      const isFirst = !!(flags & 0x01);
-      return { type: 'CandleSnapshot', securityId, resolution, candles, isFirst };
+      const isFirst = !!(flags & CANDLE_FLAGS.FIRST);
+      const isLast = !!(flags & CANDLE_FLAGS.LAST);
+      return { type: 'CandleSnapshot', securityId, resolution, candles, isFirst, isLast };
     }
     case MSG.CANDLE_UPDATE: {
       const securityId = v.getBigUint64(o, true); o += 8;

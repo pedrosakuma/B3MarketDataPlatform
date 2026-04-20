@@ -54,22 +54,35 @@ public class SubscriptionManagerTests
         var ws = new FakeWebSocket();
         var session = new ClientSession(ws, channelCapacity: 10);
         var msg = new byte[] { 1, 2, 3 };
-        session.TryEnqueue(msg);
+        Assert.True(session.TryEnqueue(msg));
         Assert.Equal(1, session.QueueDepth);
     }
 
     [Fact]
-    public void ClientSession_UnboundedChannel_NeverDrops()
+    public void ClientSession_BoundedChannel_DisconnectsWhenFull()
     {
         var ws = new FakeWebSocket();
         var session = new ClientSession(ws, channelCapacity: 2);
         var msg = new byte[] { 1, 2, 3 };
 
-        session.TryEnqueue(msg);
-        session.TryEnqueue(msg);
-        session.TryEnqueue(msg); // exceeds soft capacity — still enqueued
+        Assert.True(session.TryEnqueue(msg));
+        Assert.True(session.TryEnqueue(msg));
+        Assert.False(session.TryEnqueue(msg)); // hard capacity reached -> disconnect
 
-        Assert.Equal(3, session.QueueDepth);
+        Assert.Equal(2, session.QueueDepth);
+        Assert.True(session.CancellationToken.IsCancellationRequested);
+    }
+
+    [Fact]
+    public void ClientSession_NotifyInfoAvailable_CoalescesWakeSignals()
+    {
+        var ws = new FakeWebSocket();
+        var session = new ClientSession(ws, channelCapacity: 4);
+
+        Assert.True(session.NotifyInfoAvailable());
+        Assert.True(session.NotifyInfoAvailable());
+
+        Assert.Equal(1, session.QueueDepth);
     }
 
     [Fact]
@@ -78,11 +91,35 @@ public class SubscriptionManagerTests
         var settings = new AppSettings();
         Assert.Null(settings.WsPort);
         Assert.Equal(0.0, settings.Speed);
+        Assert.False(settings.ReplayToMulticast);
         Assert.Equal(4096, settings.ClientChannelCapacity);
         Assert.Equal(0.75, settings.SlowClientThreshold);
         Assert.Equal(100, settings.SlowClientMaxTicks);
         Assert.Equal(5, settings.ShutdownDrainSeconds);
+        Assert.Equal(1_000_000, settings.MulticastMergeCapacity);
+        Assert.Equal(250_000, settings.FeedChannelCapacity);
         Assert.Equal("Information", settings.LogLevel);
+    }
+
+    [Fact]
+    public void AppSettings_ApplyEnvironment_ParsesReplayToMulticastFlag()
+    {
+        const string key = "UMDF_REPLAY_TO_MULTICAST";
+        var previous = Environment.GetEnvironmentVariable(key);
+
+        try
+        {
+            Environment.SetEnvironmentVariable(key, "true");
+            var settings = new AppSettings();
+
+            settings.ApplyEnvironment();
+
+            Assert.True(settings.ReplayToMulticast);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(key, previous);
+        }
     }
 }
 

@@ -19,7 +19,12 @@ public sealed class WebSocketHost : IAsyncDisposable
     private readonly ILogger<WebSocketHost> _logger;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private WebApplication? _app;
+    private volatile bool _isShuttingDown;
+    private CancellationTokenRegistration _shutdownRegistration;
     private int _maxConnections;
+    private readonly int _clientChannelCapacity;
+    private readonly double _slowClientThreshold;
+    private readonly int _slowClientMaxTicks;
 
     /// <summary>Optional provider for feed group states (set before StartAsync).</summary>
     public Func<IReadOnlyDictionary<string, string>>? FeedStateProvider { get; set; }
@@ -27,15 +32,35 @@ public sealed class WebSocketHost : IAsyncDisposable
     /// <summary>Optional provider for last-packet timestamps per group.</summary>
     public Func<IReadOnlyDictionary<string, long>>? LastPacketTimestampProvider { get; set; }
 
-    public WebSocketHost(SubscriptionManager subscriptionManager, ILogger<WebSocketHost>? logger = null, int maxConnections = 0)
+    public WebSocketHost(
+        SubscriptionManager subscriptionManager,
+        ILogger<WebSocketHost>? logger = null,
+        int maxConnections = 0,
+        int clientChannelCapacity = 4096,
+        double slowClientThreshold = 0.75,
+        int slowClientMaxTicks = 100)
     {
         _subscriptionManager = subscriptionManager;
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSocketHost>.Instance;
         _maxConnections = maxConnections;
+        _clientChannelCapacity = clientChannelCapacity;
+        _slowClientThreshold = slowClientThreshold;
+        _slowClientMaxTicks = slowClientMaxTicks;
     }
 
     public async Task StartAsync(int port, CancellationToken ct = default)
     {
+        // Register an explicit shutdown flag toggled by the cancellation token. We don't
+        // rely on capturing `ct` in the request handler closure because some hosting paths
+        // make the captured struct surprisingly hard to observe; a plain volatile bool is
+        // unambiguous and cheap.
+        _shutdownRegistration = ct.Register(static state =>
+        {
+            var host = (WebSocketHost)state!;
+            host._isShuttingDown = true;
+            host._logger.LogInformation("WebSocket host marked as shutting down — new connections will be rejected with 503");
+        }, this);
+
         var builder = WebApplication.CreateSlimBuilder();
         builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
         builder.Logging.ClearProviders();
@@ -73,7 +98,14 @@ public sealed class WebSocketHost : IAsyncDisposable
             if (FeedStateProvider is not null)
                 result.FeedGroups = new Dictionary<string, string>(FeedStateProvider());
             if (LastPacketTimestampProvider is not null)
-                result.LastPacketTimestamps = new Dictionary<string, long>(LastPacketTimestampProvider());
+            {
+                var timestamps = LastPacketTimestampProvider();
+                var seconds = new Dictionary<string, double>(timestamps.Count);
+                long now = Environment.TickCount64;
+                foreach (var (k, v) in timestamps)
+                    seconds[k] = v > 0 ? (now - v) / 1000.0 : -1.0;
+                result.SecondsSinceLastPacket = seconds;
+            }
             return Results.Json(result, AppJsonContext.Default.HealthResponse);
         });
 
@@ -180,6 +212,17 @@ public sealed class WebSocketHost : IAsyncDisposable
 
         _app.Map("/ws", async context =>
         {
+            // Once shutdown has been signaled, refuse new connections immediately so the
+            // drain phase does not have to wait on freshly-accepted clients (and so we
+            // don't keep logging the connect/disconnect churn from clients that retry).
+            if (_isShuttingDown || ct.IsCancellationRequested)
+            {
+                _logger.LogInformation("Connection rejected: server is shutting down");
+                context.Response.StatusCode = 503;
+                context.Response.Headers["Connection"] = "close";
+                return;
+            }
+
             if (!context.WebSockets.IsWebSocketRequest)
             {
                 context.Response.StatusCode = 400;
@@ -195,7 +238,12 @@ public sealed class WebSocketHost : IAsyncDisposable
             }
 
             var ws = await context.WebSockets.AcceptWebSocketAsync();
-            var session = new ClientSession(ws);
+            var session = new ClientSession(
+                ws,
+                channelCapacity: _clientChannelCapacity,
+                slowClientThreshold: _slowClientThreshold,
+                slowClientMaxTicks: _slowClientMaxTicks,
+                logger: _logger);
             _subscriptionManager.RegisterClient(session);
 
             _logger.LogInformation("Client {ClientId} connected", session.Id);
@@ -235,8 +283,9 @@ public sealed class WebSocketHost : IAsyncDisposable
             {
                 _logger.LogInformation("Client {ClientId} disconnected", session.Id);
                 _subscriptionManager.UnregisterClient(session.Id);
+                session.Cancel();   // signal write loop to stop before awaiting
+                await writeTask;    // wait for clean exit before disposing CTS
                 session.Dispose();
-                await writeTask;
             }
         });
 
@@ -252,6 +301,7 @@ public sealed class WebSocketHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _shutdownRegistration.Dispose();
         if (_app is not null)
             await _app.DisposeAsync();
     }

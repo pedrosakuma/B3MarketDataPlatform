@@ -8,4 +8,7 @@ public sealed record ChannelConfig(
     IPAddress MulticastGroup,
     int Port,
     IPAddress? SourceAddress = null,
-    int ChannelGroup = 0);
+    IPAddress? LocalAddress = null,
+    int ReceiveBufferBytes = 16 * 1024 * 1024,
+    int ChannelGroup = 0,
+    int ReceiveSocketCount = 1);

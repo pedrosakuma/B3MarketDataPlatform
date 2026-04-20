@@ -1,8 +1,14 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS tools
 
-# AOT requires clang and build tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang zlib1g-dev && rm -rf /var/lib/apt/lists/*
+# .NET diagnostic tools: shipped inside the runtime image so we can
+# `docker exec consumer dotnet-trace ...` without a sidecar.
+RUN dotnet tool install --tool-path /tools dotnet-trace \
+ && dotnet tool install --tool-path /tools dotnet-counters \
+ && dotnet tool install --tool-path /tools dotnet-dump \
+ && dotnet tool install --tool-path /tools dotnet-gcdump \
+ && dotnet tool install --tool-path /tools dotnet-stack
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 
 WORKDIR /src
 
@@ -14,11 +20,13 @@ RUN dotnet restore src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj
 RUN dotnet publish src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj \
     -c Release -o /app --no-restore
 
-FROM mcr.microsoft.com/dotnet/runtime-deps:10.0-noble-chiseled AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
 WORKDIR /app
-COPY --from=build /app/B3.Umdf.ConsoleApp .
+COPY --from=build /app .
+COPY --from=tools /tools /usr/local/bin
 
+# DOTNET_DiagnosticPorts default lives at /tmp/dotnet-diagnostic-<pid> — fine as-is.
 EXPOSE 8080
 
 STOPSIGNAL SIGTERM

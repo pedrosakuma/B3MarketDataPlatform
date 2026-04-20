@@ -18,9 +18,22 @@ public sealed class FeedHandler : IDisposable
 
     private volatile FeedState _state = FeedState.WaitInstrumentDefinition;
     private readonly Queue<UmdfPacket> _incrementalQueue = new();
-    private const int MaxIncrementalQueueSize = 500_000;
+    /// <summary>
+    /// Max incrementals deferred during recovery before we start dropping the oldest.
+    /// Default 50,000 packets (≈ 75 MB pinned per FeedHandler) was chosen to bound the
+    /// pinned footprint when recovery storms spin in tight loops; the original
+    /// 500,000 cap (≈ 750 MB per group, 1.5 GB across both groups) was enough to OOM a
+    /// 4 GB container when the publisher sustained > consumer drain rate.
+    /// At 30k pkt/s the default covers ~1.6 s of incrementals — enough to bridge a
+    /// typical snapshot recovery cycle for the 18k-symbol universe.
+    /// Operators that publish at extreme rates (e.g. PCAP replay at SpeedMultiplier=0)
+    /// can raise this via the constructor / UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY env.
+    /// </summary>
+    public const int DefaultIncrementalRecoveryQueueCapacity = 50_000;
+    private readonly int _maxIncrementalQueueSize;
     private long _packetCount;
     private long _lastPacketTicks;
+    private long _incrementalQueueDroppedPackets;
 
     // Instrument Definition tracking
     private uint _instrDefTotalExpected;
@@ -34,36 +47,60 @@ public sealed class FeedHandler : IDisposable
     private bool _snapshotBoundaryFound;   // true after we've seen at least one seqVer change
     private ushort _snapshotSeqVer;
 
+    // Snapshot reset debounce: when a catch-up fails and we transition back to
+    // Recovery, fully resetting the snapshot tracker forces us to skip another
+    // (potentially partial) cycle before collecting a clean one — costing up to
+    // ~100s for an 18k-symbol universe. If the previous Recovery was very recent
+    // we keep _snapshotBoundaryFound=true so the next seqVer flip is treated as
+    // a fresh cycle boundary directly.
+    private const long SnapshotResetDebounceMs = 30_000;
+    private long _lastRecoveryEnteredTicks;
+    private long _snapshotResetsDebounced;
+
     public FeedState State => _state;
     public long PacketCount => _packetCount;
     public long InstrDefPacketCount => _instrDefPacketCount;
     public uint InstrDefReceived => _instrDefReceived;
     public uint InstrDefTotalExpected => _instrDefTotalExpected;
     public ChannelHandler IncrementalHandler => _incrementalHandler;
+    public long IncrementalQueueDroppedPackets => Volatile.Read(ref _incrementalQueueDroppedPackets);
+    /// <summary>
+    /// Number of times we transitioned back to Recovery soon after a previous
+    /// Recovery and avoided resetting the snapshot cycle tracker, so the
+    /// already-in-flight snapshot stream could be reused for catch-up.
+    /// </summary>
+    public long SnapshotResetsDebounced => Volatile.Read(ref _snapshotResetsDebounced);
 
-    /// <summary>Ticks (DateTime.UtcNow.Ticks) of the last packet processed. 0 if none yet.</summary>
+    /// <summary>Fires after the state machine transitions. Args are (oldState, newState). Invoked synchronously on the worker thread.</summary>
+    public event Action<FeedState, FeedState>? StateChanged;
+
+    /// <summary>TickCount64 (milliseconds since process start) of the last packet processed. 0 if none yet.</summary>
     public long LastPacketTicks => Volatile.Read(ref _lastPacketTicks);
 
-    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
+    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(incrementalRecoveryQueueCapacity, 1);
         _source = source;
         _eventHandler = eventHandler;
         _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
+        _maxIncrementalQueueSize = incrementalRecoveryQueueCapacity;
     }
 
     /// <summary>
     /// Creates a FeedHandler for external feeding (no owned source).
     /// Use FeedPacket() to push packets from an external loop.
     /// </summary>
-    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
+    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(incrementalRecoveryQueueCapacity, 1);
         _source = null;
         _eventHandler = eventHandler;
         _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
+        _maxIncrementalQueueSize = incrementalRecoveryQueueCapacity;
     }
 
     public Task StartAsync(CancellationToken ct = default)
@@ -108,7 +145,7 @@ public sealed class FeedHandler : IDisposable
             {
                 var packet = await _source!.ReceiveAsync(ct);
                 _packetCount++;
-                HandlePacket(in packet);
+                ProcessOwnedPacket(in packet);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -126,7 +163,7 @@ public sealed class FeedHandler : IDisposable
         while (!ct.IsCancellationRequested && source.TryReceive(out var packet))
         {
             _packetCount++;
-            HandlePacket(in packet);
+            ProcessOwnedPacket(in packet);
         }
     }
 
@@ -136,12 +173,24 @@ public sealed class FeedHandler : IDisposable
     public void FeedPacket(in UmdfPacket packet)
     {
         _packetCount++;
-        HandlePacket(in packet);
+        ProcessOwnedPacket(in packet);
+    }
+
+    private void ProcessOwnedPacket(in UmdfPacket packet)
+    {
+        try
+        {
+            HandlePacket(in packet);
+        }
+        finally
+        {
+            packet.Release();
+        }
     }
 
     private void HandlePacket(in UmdfPacket packet)
     {
-        Volatile.Write(ref _lastPacketTicks, DateTime.UtcNow.Ticks);
+        Volatile.Write(ref _lastPacketTicks, packet.ReceivedTimestampTicks);
 
         switch (_state)
         {
@@ -206,7 +255,20 @@ public sealed class FeedHandler : IDisposable
             case ChannelType.IncrementalB:
                 var result = _incrementalHandler.HandlePacket(in packet);
                 if (result == GapResult.Gap)
+                {
+                    EnqueueCopy(in packet);
+                    // Reorder buffer was holding future packets that now belong
+                    // to the catch-up window; transfer them into the deferred
+                    // queue so the snapshot+catch-up cycle replays them.
+                    foreach (var buffered in _incrementalHandler.DrainReorderBuffer())
+                        EnqueueOwned(in buffered);
+                    _logger.LogWarning(
+                        "Gap detected on {Channel}: expected SeqNum {Expected}, received {Received}. Deferring packet and entering recovery.",
+                        packet.Channel,
+                        _incrementalHandler.LastGapExpected,
+                        _incrementalHandler.LastGapReceived);
                     TransitionTo(FeedState.Recovery);
+                }
                 break;
 
             case ChannelType.InstrumentDefinition:
@@ -255,8 +317,45 @@ public sealed class FeedHandler : IDisposable
     /// </summary>
     private void EnqueueCopy(in UmdfPacket packet)
     {
-        if (_incrementalQueue.Count >= MaxIncrementalQueueSize)
-            _incrementalQueue.Dequeue();
+        if (_incrementalQueue.Count >= _maxIncrementalQueueSize
+            && _incrementalQueue.TryDequeue(out var dropped))
+        {
+            dropped.Release();
+            var droppedCount = Interlocked.Increment(ref _incrementalQueueDroppedPackets);
+            if (droppedCount == 1 || droppedCount % 10_000 == 0)
+            {
+                _logger.LogWarning(
+                    "Incremental recovery queue overflow: dropped {DroppedPackets} packets (capacity {Capacity})",
+                    droppedCount,
+                    _maxIncrementalQueueSize);
+            }
+        }
+
+        packet.Retain();
+        _incrementalQueue.Enqueue(packet);
+    }
+
+    /// <summary>
+    /// Like <see cref="EnqueueCopy"/> but for packets the caller already owns
+    /// (e.g. drained from the reorder buffer where Retain() was called on stash).
+    /// Does NOT retain again.
+    /// </summary>
+    private void EnqueueOwned(in UmdfPacket packet)
+    {
+        if (_incrementalQueue.Count >= _maxIncrementalQueueSize
+            && _incrementalQueue.TryDequeue(out var dropped))
+        {
+            dropped.Release();
+            var droppedCount = Interlocked.Increment(ref _incrementalQueueDroppedPackets);
+            if (droppedCount == 1 || droppedCount % 10_000 == 0)
+            {
+                _logger.LogWarning(
+                    "Incremental recovery queue overflow: dropped {DroppedPackets} packets (capacity {Capacity})",
+                    droppedCount,
+                    _maxIncrementalQueueSize);
+            }
+        }
+
         _incrementalQueue.Enqueue(packet);
     }
 
@@ -353,14 +452,22 @@ public sealed class FeedHandler : IDisposable
             if (_snapshotMaxSeqNum > 0)
             {
                 // Previous cycle had snapshot data — it's complete
-                CompleteSnapshotCycle();
-                return;
+                if (CompleteSnapshotCycle())
+                    return;
+
+                _snapshotSeqVer = pktHeader.SequenceVersion;
+                _snapshotMinSeqNum = 0;
+                _snapshotMaxSeqNum = 0;
+                _eventHandler.OnSnapshotStart();
             }
-            // Empty cycle (heartbeats only) — reset for next cycle
-            _snapshotSeqVer = pktHeader.SequenceVersion;
-            _snapshotMinSeqNum = 0;
-            _snapshotMaxSeqNum = 0;
-            _eventHandler.OnSnapshotStart();
+            else
+            {
+                // Empty cycle (heartbeats only) — reset for next cycle
+                _snapshotSeqVer = pktHeader.SequenceVersion;
+                _snapshotMinSeqNum = 0;
+                _snapshotMaxSeqNum = 0;
+                _eventHandler.OnSnapshotStart();
+            }
         }
 
         // Process all SBE messages in this packet
@@ -411,12 +518,23 @@ public sealed class FeedHandler : IDisposable
     /// Called when a snapshot cycle completes (SeqNum wraps back to 1).
     /// Transitions to CatchUp → RealTime.
     /// </summary>
-    public void CompleteSnapshotCycle()
+    public bool CompleteSnapshotCycle()
     {
         if (_state is not (FeedState.WaitSnapshot or FeedState.Recovery))
-            return;
+            return false;
 
         uint catchUpFrom = _snapshotMinSeqNum;
+        uint nextExpected = catchUpFrom + 1;
+
+        if (TryGetEarliestQueuedSequence(out var earliestQueuedSeq) && earliestQueuedSeq > nextExpected)
+        {
+            _logger.LogWarning(
+                "Snapshot complete but earliest retained incremental SeqNum is {EarliestQueuedSeq} while catch-up needs {NextExpected}. Waiting for a newer snapshot cycle.",
+                earliestQueuedSeq,
+                nextExpected);
+            return false;
+        }
+
         _logger.LogInformation(
             "Snapshot complete. MinSeq={MinSeq}, MaxSeq={MaxSeq}. Catching up from SeqNum > {CatchUpFrom}",
             _snapshotMinSeqNum, _snapshotMaxSeqNum, catchUpFrom);
@@ -425,51 +543,159 @@ public sealed class FeedHandler : IDisposable
 
         TransitionTo(FeedState.CatchUp);
 
-        _incrementalHandler.CompleteRecovery(catchUpFrom + 1);
+        _incrementalHandler.CompleteRecovery(nextExpected);
 
         int discarded = 0;
         int applied = 0;
 
         while (_incrementalQueue.TryDequeue(out var queued))
         {
-            if (!queued.TryGetHeader(out var hdr))
-                continue;
-
-            if (hdr.SequenceNumber <= catchUpFrom)
+            bool requeuedForRecovery = false;
+            try
             {
-                // Snapshot only contains order book state, not market statistics.
-                // Dispatch discarded packets to market data handler so OpeningPrice,
-                // ExecutionStatistics (TradeVolume), HighPrice etc. are not lost.
-                DispatchMarketDataPassthrough(in queued);
-                discarded++;
-                continue;
-            }
+                if (!queued.TryGetHeader(out var hdr))
+                    continue;
 
-            _incrementalHandler.HandlePacket(in queued);
-            applied++;
+                if (hdr.SequenceNumber <= catchUpFrom)
+                {
+                    // Snapshot only contains order book state, not market statistics.
+                    // Dispatch discarded packets to market data handler so OpeningPrice,
+                    // ExecutionStatistics (TradeVolume), HighPrice etc. are not lost.
+                    DispatchMarketDataPassthrough(in queued);
+                    discarded++;
+                    continue;
+                }
+
+                var result = _incrementalHandler.HandlePacket(in queued);
+                if (result == GapResult.Gap)
+                {
+                    RequeueIncrementalForRecovery(in queued);
+                    requeuedForRecovery = true;
+                    _logger.LogWarning(
+                        "Gap detected during catch-up on {Channel}: expected SeqNum {Expected}, received {Received}. Restarting recovery with pending incrementals preserved.",
+                        queued.Channel,
+                        _incrementalHandler.LastGapExpected,
+                        _incrementalHandler.LastGapReceived);
+                    TransitionTo(FeedState.Recovery);
+                    return false;
+                }
+
+                applied++;
+            }
+            finally
+            {
+                if (!requeuedForRecovery)
+                    queued.Release();
+            }
         }
 
         _logger.LogInformation("Catch-up done: {Applied} applied, {Discarded} discarded", applied, discarded);
         TransitionTo(FeedState.RealTime);
+        return true;
+    }
+
+    private void RequeueIncrementalForRecovery(in UmdfPacket current)
+    {
+        var pending = new List<UmdfPacket>();
+        while (_incrementalQueue.TryDequeue(out var queued))
+            pending.Add(queued);
+
+        _incrementalQueue.Enqueue(current);
+
+        foreach (var queued in pending)
+            _incrementalQueue.Enqueue(queued);
+    }
+
+    private bool TryGetEarliestQueuedSequence(out uint sequenceNumber)
+    {
+        while (_incrementalQueue.Count > 0)
+        {
+            var packet = _incrementalQueue.Peek();
+            if (packet.TryGetHeader(out var header))
+            {
+                sequenceNumber = header.SequenceNumber;
+                return true;
+            }
+
+            _incrementalQueue.Dequeue().Release();
+            _logger.LogWarning("Dropped queued incremental with invalid packet header while preparing catch-up.");
+        }
+
+        sequenceNumber = 0;
+        return false;
     }
 
     private void TransitionTo(FeedState newState)
     {
-        _logger.LogInformation("{OldState} → {NewState}", _state, newState);
+        var oldState = _state;
+        _logger.LogInformation("{OldState} → {NewState}", oldState, newState);
         _state = newState;
 
         if (newState == FeedState.Recovery)
         {
-            _snapshotCycleStarted = false;
-            _snapshotBoundaryFound = false;
+            long now = Environment.TickCount64;
+            long elapsedSinceLast = _lastRecoveryEnteredTicks > 0
+                ? now - _lastRecoveryEnteredTicks
+                : long.MaxValue;
+            _lastRecoveryEnteredTicks = now;
+
+            // Always clear the in-progress sequence range so the next cycle is
+            // collected freshly. Keep the cycle/boundary flags only if we just
+            // came out of Recovery very recently AND had already locked onto a
+            // boundary — that lets the next seqVer flip serve as a clean
+            // cycle start without paying for a skipped partial cycle.
             _snapshotMinSeqNum = 0;
             _snapshotMaxSeqNum = 0;
-            _snapshotSeqVer = 0;
+
+            if (elapsedSinceLast <= SnapshotResetDebounceMs && _snapshotBoundaryFound)
+            {
+                Interlocked.Increment(ref _snapshotResetsDebounced);
+                _logger.LogInformation(
+                    "Recovery debounce: keeping snapshot boundary lock (elapsed={ElapsedMs}ms, seqVer={SeqVer}). Next cycle boundary will be reused.",
+                    elapsedSinceLast, _snapshotSeqVer);
+            }
+            else
+            {
+                _snapshotCycleStarted = false;
+                _snapshotBoundaryFound = false;
+                _snapshotSeqVer = 0;
+            }
         }
+
+        try { StateChanged?.Invoke(oldState, newState); }
+        catch (Exception ex) { _logger.LogError(ex, "StateChanged handler threw"); }
     }
+
+    /// <summary>For testing: force the state machine into a specific state.</summary>
+    internal void SetStateForTesting(FeedState state) => _state = state;
+
+    /// <summary>For testing: invoke the real state transition (with all side effects).</summary>
+    internal void TransitionToForTesting(FeedState state) => TransitionTo(state);
+
+    /// <summary>For testing: seed snapshot tracking so catch-up can be exercised deterministically.</summary>
+    internal void SetSnapshotRangeForTesting(uint minSeqNum, uint maxSeqNum)
+    {
+        _snapshotMinSeqNum = minSeqNum;
+        _snapshotMaxSeqNum = maxSeqNum;
+    }
+
+    /// <summary>For testing: simulate the snapshot tracker having locked onto a clean cycle boundary.</summary>
+    internal void SetSnapshotBoundaryFoundForTesting()
+    {
+        _snapshotCycleStarted = true;
+        _snapshotBoundaryFound = true;
+        _snapshotSeqVer = 1;
+    }
+
+    internal bool SnapshotBoundaryFoundForTesting => _snapshotBoundaryFound;
 
     public void Dispose()
     {
+        while (_incrementalQueue.TryDequeue(out var packet))
+            packet.Release();
+
+        _incrementalHandler.Dispose();
+
         _cts?.Cancel();
         _cts?.Dispose();
     }

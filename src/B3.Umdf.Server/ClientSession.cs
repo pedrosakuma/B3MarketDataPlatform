@@ -14,19 +14,37 @@ namespace B3.Umdf.Server;
 /// </summary>
 public sealed class ClientSession : IDisposable
 {
+    private readonly struct OutboundMessage
+    {
+        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true);
+
+        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false)
+        {
+            Payload = payload;
+            IsInfoWake = isInfoWake;
+        }
+
+        public ReadOnlyMemory<byte> Payload { get; }
+        public bool IsInfoWake { get; }
+    }
+
     private static int _nextId;
 
     public string Id { get; }
     public WebSocket Socket { get; }
-    private readonly Channel<ReadOnlyMemory<byte>> _outbound;
+    private readonly Channel<OutboundMessage> _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
     private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
     private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
+    private readonly double _slowClientThreshold;
+    private readonly int _slowClientMaxTicks;
 
     private long _messagesSent;
     private long _bytesSent;
+    private int _disconnectRequested;
+    private int _infoWakePending;
 
     public IReadOnlySet<ulong> Subscriptions => _subscriptions;
     public CancellationToken CancellationToken => _cts.Token;
@@ -37,15 +55,31 @@ public sealed class ClientSession : IDisposable
     /// <summary>Total bytes sent to this client.</summary>
     public long BytesSent => Volatile.Read(ref _bytesSent);
 
-    public ClientSession(WebSocket socket, int channelCapacity = 65536, ILogger? logger = null)
+    public ClientSession(
+        WebSocket socket,
+        int channelCapacity = 4096,
+        double slowClientThreshold = 0.75,
+        int slowClientMaxTicks = 100,
+        ILogger? logger = null)
     {
+        ArgumentNullException.ThrowIfNull(socket);
+        ArgumentOutOfRangeException.ThrowIfLessThan(channelCapacity, 1);
+        if (slowClientThreshold is <= 0 or > 1)
+            throw new ArgumentOutOfRangeException(nameof(slowClientThreshold), "Threshold must be in the (0, 1] range.");
+        ArgumentOutOfRangeException.ThrowIfLessThan(slowClientMaxTicks, 1);
+
         Id = $"client-{Interlocked.Increment(ref _nextId)}";
         Socket = socket;
         ChannelCapacity = channelCapacity;
+        _slowClientThreshold = slowClientThreshold;
+        _slowClientMaxTicks = slowClientMaxTicks;
         _logger = logger ?? NullLogger.Instance;
-        _outbound = Channel.CreateUnbounded<ReadOnlyMemory<byte>>(new UnboundedChannelOptions
+        _outbound = Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(channelCapacity)
         {
+            SingleReader = true,
             SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false,
         });
     }
 
@@ -79,15 +113,26 @@ public sealed class ClientSession : IDisposable
 
     /// <summary>
     /// Enqueue a pre-serialized message. All events (orders, trades, clears, control)
-    /// arrive pre-serialized from upstream conflation. Unbounded — never drops.
+    /// arrive pre-serialized from upstream conflation. If the queue is full,
+    /// the client is disconnected to preserve feed health.
     /// </summary>
-    public void TryEnqueue(ReadOnlyMemory<byte> message) =>
-        _outbound.Writer.TryWrite(message);
+    public bool TryEnqueue(ReadOnlyMemory<byte> message) =>
+        TryEnqueueCore(new OutboundMessage(message), "payload");
+
+    /// <summary>
+    /// Wake the writer so Info subscriptions can flush the latest InstrumentInfo version.
+    /// Coalesces multiple updates into at most one pending wake item per client.
+    /// </summary>
+    public bool NotifyInfoAvailable()
+    {
+        if (Interlocked.Exchange(ref _infoWakePending, 1) != 0)
+            return true;
+
+        return TryEnqueueCore(OutboundMessage.InfoWake, "info update");
+    }
 
     // --- Write loop: coalesce + dirty-flag info ---
 
-    private const double SlowClientThreshold = 0.75;
-    private const int SlowClientMaxTicks = 100;
     private const int MaxDrainPerCycle = 16384;
 
     /// <summary>
@@ -112,11 +157,20 @@ public sealed class ClientSession : IDisposable
                 // 1. Drain up to MaxDrainPerCycle pre-serialized messages
                 messages.Clear();
                 int drained = 0;
-                while (drained < MaxDrainPerCycle && reader.TryRead(out var msg))
+                bool sawInfoWake = false;
+                while (drained < MaxDrainPerCycle && reader.TryRead(out var outbound))
                 {
                     drained++;
-                    messages.Add(msg);
+                    if (outbound.IsInfoWake)
+                    {
+                        sawInfoWake = true;
+                        continue;
+                    }
+
+                    messages.Add(outbound.Payload);
                 }
+                if (sawInfoWake)
+                    Interlocked.Exchange(ref _infoWakePending, 0);
 
                 // 2. Coalesce into buffer
                 int offset = 0;
@@ -128,6 +182,7 @@ public sealed class ClientSession : IDisposable
                 }
 
                 // 3. Dirty-flag info: read latest from MarketDataManagers for changed securities
+                int infoMessages = 0;
                 if (_marketDataManagers is { } managers)
                 {
                     foreach (var (secId, lastVer) in _infoVersions)
@@ -146,6 +201,7 @@ public sealed class ClientSession : IDisposable
                         int len = WireProtocol.WriteInfoSnapshot(coalesceBuf.AsSpan(offset), secId, info);
                         offset += len;
                         _infoVersions[secId] = ver;
+                        infoMessages++;
                     }
                 }
 
@@ -153,18 +209,20 @@ public sealed class ClientSession : IDisposable
                 {
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
-                    Volatile.Write(ref _messagesSent, _messagesSent + messages.Count);
-                    Volatile.Write(ref _bytesSent, _bytesSent + offset);
+                    int totalMessages = messages.Count + infoMessages;
+                    Interlocked.Add(ref _messagesSent, totalMessages);
+                    Interlocked.Add(ref _bytesSent, offset);
+                    AppMetrics.WsMessagesSent.Add(totalMessages);
                 }
 
                 // 4. Slow-client self-detection
                 int remaining = QueueDepth;
-                if (remaining > ChannelCapacity * SlowClientThreshold)
+                if (remaining > ChannelCapacity * _slowClientThreshold)
                 {
-                    if (++slowTicks >= SlowClientMaxTicks)
+                    if (++slowTicks >= _slowClientMaxTicks)
                     {
-                        _logger.LogWarning("Self-disconnecting {ClientId}: queue backlog persisted for {Ticks} cycles (depth={Depth}/{Capacity})",
-                            Id, slowTicks, remaining, ChannelCapacity);
+                        DisconnectSlowConsumer(
+                            $"queue backlog persisted for {slowTicks} cycles (depth={remaining}/{ChannelCapacity})");
                         break;
                     }
                 }
@@ -179,6 +237,29 @@ public sealed class ClientSession : IDisposable
         {
             _logger.LogWarning("Write error on {ClientId}: {Error}", Id, ex.Message);
         }
+    }
+
+    private bool TryEnqueueCore(OutboundMessage outbound, string itemKind)
+    {
+        if (_cts.IsCancellationRequested)
+            return false;
+
+        if (_outbound.Writer.TryWrite(outbound))
+            return true;
+
+        DisconnectSlowConsumer(
+            $"outbound queue full while enqueuing {itemKind} (depth={QueueDepth}/{ChannelCapacity})");
+        return false;
+    }
+
+    private void DisconnectSlowConsumer(string reason)
+    {
+        if (Interlocked.Exchange(ref _disconnectRequested, 1) != 0)
+            return;
+
+        AppMetrics.WsSlowDisconnects.Add(1);
+        _logger.LogWarning("Disconnecting slow client {ClientId}: {Reason}", Id, reason);
+        Cancel();
     }
 
     private static void EnsureCapacity(ref byte[] buf, int offset, int needed)
@@ -230,12 +311,18 @@ public sealed class ClientSession : IDisposable
         }
     }
 
-    public void Cancel() => _cts.Cancel();
+    public void Cancel()
+    {
+        if (_cts.IsCancellationRequested)
+            return;
+
+        _outbound.Writer.TryComplete();
+        _cts.Cancel();
+    }
 
     public void Dispose()
     {
-        _cts.Cancel();
-        _outbound.Writer.TryComplete();
+        Cancel();
         _cts.Dispose();
     }
 }

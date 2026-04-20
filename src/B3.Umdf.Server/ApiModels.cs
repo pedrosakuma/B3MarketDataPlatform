@@ -7,7 +7,7 @@ public sealed class HealthResponse
     public string Status { get; set; } = "";
     public string Uptime { get; set; } = "";
     public Dictionary<string, string>? FeedGroups { get; set; }
-    public Dictionary<string, long>? LastPacketTimestamps { get; set; }
+    public Dictionary<string, double>? SecondsSinceLastPacket { get; set; }
 }
 
 public sealed class SymbolsResponse

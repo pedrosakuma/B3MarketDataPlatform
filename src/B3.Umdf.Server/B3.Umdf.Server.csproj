@@ -16,4 +16,8 @@
     <ProjectReference Include="..\B3.Umdf.Book\B3.Umdf.Book.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Umdf.Server.Tests" />
+  </ItemGroup>
+
 </Project>

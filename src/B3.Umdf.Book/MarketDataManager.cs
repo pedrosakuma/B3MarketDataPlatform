@@ -124,7 +124,13 @@ public sealed class MarketDataManager : IFeedEventHandler
     }
 
     public void OnGapDetected(uint expected, uint received) { }
-    public void OnSequenceReset() { ClearAllInfo(); }
+    public void OnSequenceReset()
+    {
+        // Snapshot recovery rebuilds order book state only. Instrument definitions and
+        // incremental market-data fields are not replayed from the snapshot stream, so
+        // clearing them here would blank the UI without any authoritative way to restore
+        // them immediately. Keep the last known info until fresh updates arrive.
+    }
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeData(); }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
@@ -473,13 +479,5 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
-    }
-
-    private void ClearAllInfo()
-    {
-        foreach (var (_, info) in _data)
-        {
-            info.Reset();
-        }
     }
 }

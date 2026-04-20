@@ -1,0 +1,30 @@
+{
+  // Local compose-friendly multicast configuration for PCAP -> multicast validation.
+  // Uses administratively scoped groups and avoids sourceAddress/localAddress placeholders
+  // that are suitable for real SSM environments but break in local container setups.
+  //
+  // receiveSocketCount intentionally omitted (defaults to 1). On Linux, SO_REUSEPORT does
+  // NOT load-balance multicast across sockets — every bound socket receives a copy of each
+  // datagram. Replicating sockets only multiplies CPU cost without enlarging the effective
+  // receive window. The real lever against gaps is host net.core.rmem_max (see README).
+  "channelGroups": [
+    {
+      "name": "EQT",
+      "channels": [
+        { "channelId": 84, "type": "IncrementalA",         "multicastGroup": "239.10.0.84", "port": 30084 },
+        { "channelId": 84, "type": "IncrementalB",         "multicastGroup": "239.10.0.85", "port": 30085 },
+        { "channelId": 84, "type": "InstrumentDefinition", "multicastGroup": "239.10.0.86", "port": 30086 },
+        { "channelId": 84, "type": "SnapshotRecovery",     "multicastGroup": "239.10.0.87", "port": 30087 }
+      ]
+    },
+    {
+      "name": "DRV",
+      "channels": [
+        { "channelId": 72, "type": "IncrementalA",         "multicastGroup": "239.10.0.72", "port": 30072 },
+        { "channelId": 72, "type": "IncrementalB",         "multicastGroup": "239.10.0.73", "port": 30073 },
+        { "channelId": 72, "type": "InstrumentDefinition", "multicastGroup": "239.10.0.74", "port": 30074 },
+        { "channelId": 72, "type": "SnapshotRecovery",     "multicastGroup": "239.10.0.75", "port": 30075 }
+      ]
+    }
+  ]
+}

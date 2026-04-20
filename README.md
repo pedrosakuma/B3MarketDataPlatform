@@ -9,7 +9,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 ### Market Data Engine
 - **Zero-copy SBE decoding** — generated blittable structs via `SbeSourceGenerator`
 - **PCAP replay with cross-channel sync** — timestamp-based priority queue merge across all UMDF channels (Incremental A/B, Instrument Definition, Snapshot Recovery)
-- **Live multicast transport** — UDP multicast with source-specific multicast (SSM) support
+- **Live multicast transport** — UDP multicast with ASM/SSM support, configurable socket receive buffer, and bounded internal queues
 - **Multi-channel support** — process multiple channel groups simultaneously (e.g. EQT + DRV)
 - **Per-group architecture** — each channel group owns its `BookManager`, `MarketDataManager`, and conflation buffers; single-threaded hot path with zero locks
 - **Feed A/B deduplication** — automatic duplicate packet filtering
@@ -23,6 +23,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Data channel filtering** — subscribe to Book, Info, or both via `DataFlags` bitmask
 - **Unary Get** — one-shot snapshot without subscribing
 - **Upstream conflation** — order add+delete within the same packet are cancelled; same-price trades aggregate quantities
+- **Candle history** — retains the most recent 10h of 1s candles per instrument; snapshots are chunked across frames
 - **Rankings** — top 10 by volume, gainers, and losers pushed every 2s
 - **Server status broadcast** — sends ready state on connect; auto-resubscribes all instruments on reconnect
 - **Backpressure** — bounded per-client outbound queue, slow-client detection and auto-disconnect
@@ -133,11 +134,11 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 
 | Project | Tests | Description |
 |---------|-------|-------------|
-| `B3.Umdf.Book.Tests` | 18 | Order book operations, book side, concurrency stress |
-| `B3.Umdf.Feed.Tests` | 4 | Channel handler, gap detection |
+| `B3.Umdf.Book.Tests` | 19 | Order book operations, book side, concurrency stress |
+| `B3.Umdf.Feed.Tests` | 22 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
 | `B3.Umdf.PcapReplay.Tests` | 4 | PCAP reader, timestamp merge |
-| `B3.Umdf.Transport.Tests` | 5 | Packet source, multicast config |
-| `B3.Umdf.Server.Tests` | 7 | Subscription manager, client session, settings |
+| `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
+| `B3.Umdf.Server.Tests` | 36 | Subscription manager, client session, settings, backpressure |
 
 ## Quick Start
 
@@ -195,6 +196,23 @@ dotnet run --project src/B3.Umdf.ConsoleApp -- \
 
 The JSON config defines multicast group addresses and ports for each channel. See `config/multicast-sample.json` for the format.
 
+### Replay PCAP to Local Multicast
+
+Use the same merged PCAP timeline, but publish each channel group/type to its configured multicast destination:
+
+```bash
+dotnet run --project src/B3.Umdf.ConsoleApp -- \
+  --replay-to-multicast \
+  --multicast-config config/multicast-sample.json \
+  --pcap-prefix pcap/20250331_MBO_084_EQT \
+  --pcap-prefix pcap/20250929_MBO_072_DRV \
+  --speed 1
+```
+
+This mode is **publisher-only**: it reuses `TimestampMergedReplayer` as the single clock/source and emits `packet.Data` to multicast, but it does **not** start the feed/WebSocket pipeline in the same process. Run the publisher and the consumer as separate processes when validating the live UDP path.
+
+For safety, the JSON `channelGroups` count/order must match the replay input order used by `--pcap-prefix` (or the single-group positional PCAP mode).
+
 ### Run with WebSocket Server
 
 ```bash
@@ -213,7 +231,8 @@ Then open `frontend/index.html` in a browser and connect to `ws://localhost:8080
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--pcap-prefix <path>` | — | PCAP file prefix (repeatable for multi-channel). Auto-discovers 4 files per prefix |
-| `--multicast-config <file>` | — | JSON config with multicast group addresses/ports for live UDP |
+| `--multicast-config <file>` | — | JSON config with multicast group addresses/ports for live UDP or replay-to-multicast publishing |
+| `--replay-to-multicast` | `false` | Publish replayed PCAP payloads to multicast instead of consuming them in-process |
 | `--ws-port <port>` | *(off)* | Start WebSocket subscription server on the given port |
 | `--speed <mult>` | `0` | Replay speed: `0` = max, `1` = real-time, `5` = 5× accelerated |
 
@@ -221,7 +240,7 @@ Positional arguments (4 PCAP file paths) are also supported for single-channel b
 
 ## Docker Compose
 
-One command to run the full stack (backend + frontend):
+The default `docker-compose.yml` keeps the original in-process replay flow:
 
 ```bash
 docker compose up --build
@@ -232,6 +251,21 @@ docker compose up --build
 
 Open http://localhost:3000, connect to `ws://localhost:8080/ws`, and subscribe to a symbol.
 
+### Docker Compose: PCAP -> Multicast Validation
+
+Use `docker-compose.multicast.yml` to run the new split topology:
+- **Publisher**: PCAP replay -> multicast
+- **Consumer**: live multicast -> WebSocket
+- **Frontend**: static web viewer
+
+```bash
+docker compose -f docker-compose.multicast.yml up --build
+```
+
+This compose mounts both `./pcap` and `./config`, starts the multicast consumer first, and then starts the publisher in `--replay-to-multicast` mode.
+The publisher shares the consumer's network namespace so multicast send/receive happens inside the same container network stack, avoiding the usual Docker bridge/WSL2 multicast delivery issues.
+By default it uses `config/multicast-compose.json`, which is tailored for local/container validation and intentionally avoids the SSM placeholder addresses from `multicast-sample.json`.
+
 ### Environment Variables
 
 | Variable | Default | Description |
@@ -240,6 +274,19 @@ Open http://localhost:3000, connect to `ws://localhost:8080/ws`, and subscribe t
 | `WS_PORT` | `8080` | WebSocket server port |
 | `REPLAY_SPEED` | `5` | Replay speed multiplier |
 | `FRONTEND_PORT` | `3000` | Frontend HTTP port |
+
+Additional variables used by `docker-compose.multicast.yml`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PCAP_PREFIX` | `20250331_MBO_084_EQT,20250929_MBO_072_DRV` | Comma-separated replay prefixes used by the publisher |
+| `REPLAY_SPEED` | `1` | Replay speed multiplier used by the publisher |
+| `MULTICAST_CONFIG_FILE` | `multicast-compose.json` | Config file under `/app/config/` shared by publisher and consumer |
+| `WS_PORT` | `8080` | Consumer WebSocket port |
+| `FRONTEND_PORT` | `3000` | Frontend HTTP port |
+| `UMDF_MULTICAST_MERGE_CAPACITY` | `1000000` | Consumer merge queue capacity for live UDP bursts |
+| `UMDF_FEED_CHANNEL_CAPACITY` | `250000` | Consumer per-group feed queue capacity for live UDP bursts |
+| `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | `50000` | Per-group cap on the incremental packets retained while a snapshot is in flight (drop-oldest) |
 
 ```bash
 # Both equities and derivatives (default)
@@ -356,6 +403,7 @@ The application supports processing multiple UMDF channel groups simultaneously 
 | Mode | Source | Use Case |
 |------|--------|----------|
 | **PCAP Replay** | `TimestampMergedReplayer` (sync) | Development, testing, backtesting |
+| **PCAP -> Multicast** | `TimestampMergedReplayer` + `MulticastPacketPublisher` | Validate the UDP ingest path with controlled PCAP input |
 | **Live Multicast** | `MulticastChannelMerger` (async) | Production, B3 certification environment |
 
 Both implement `IPacketSource` — the feed handler layer is fully transport-agnostic.
@@ -375,18 +423,68 @@ The `--multicast-config` option takes a JSON file defining channel groups:
         { "channelId": 84, "type": "InstrumentDefinition", "multicastGroup": "224.0.20.86", "port": 30086 },
         { "channelId": 84, "type": "SnapshotRecovery", "multicastGroup": "224.0.20.87", "port": 30087 }
       ]
+    },
+    {
+      "name": "DRV",
+      "channels": [
+        {
+          "channelId": 72,
+          "type": "IncrementalA",
+          "multicastGroup": "224.0.20.72",
+          "port": 30072,
+          "sourceAddress": "10.0.0.1",
+          "localAddress": "10.0.0.10",
+          "receiveBufferBytes": 16777216
+        }
+      ]
     }
   ]
 }
 ```
 
-Optional `sourceAddress` field enables source-specific multicast (SSM). See `config/multicast-sample.json` for a complete example.
+Optional channel fields:
+- `sourceAddress` — enables source-specific multicast (SSM), receiving only from the given sender IP
+- `localAddress` — selects the local NIC/IP used for the multicast membership join (ASM or SSM)
+- `receiveBufferBytes` — per-socket UDP receive buffer size (default `16777216`, i.e. 16 MiB)
+
+When `--replay-to-multicast` is enabled, the same JSON is reused as the publish map:
+- `multicastGroup` + `port` become the destination endpoint
+- `localAddress` becomes the optional local bind/interface for outgoing multicast
+- `sourceAddress` is ignored in publisher mode (it remains receive-only)
+- `channelGroups` must match the replay input order/count so `groupId -> multicast route` stays deterministic
+
+The live UDP path uses a bounded multicast merge queue (default `1000000`) and bounded per-group feed queues (default `250000`). On overflow, the oldest queued packets are dropped, warnings/metrics are emitted, and downstream sequence gaps trigger the existing recovery flow. At startup the consumer also logs the **actual** UDP receive buffer granted by the OS.
+
+### Required host kernel tuning (Linux / WSL2 / Docker)
+
+`net.core.rmem_max` is **not** network-namespaced on most kernels and **cannot be raised from inside a container**. If `rmem_max` on the host is the Linux default (~208 KiB), the kernel will silently clamp the requested 16 MiB receive buffer down to ~208 KiB and **packet loss becomes inevitable** under burst (e.g. market open). Symptoms: persistent feed gaps, recoveries on every burst, crossed books.
+
+Raise on the **host** (not inside the container):
+
+```bash
+sudo sysctl -w net.core.rmem_max=67108864
+sudo sysctl -w net.core.rmem_default=16777216
+# persist:
+echo 'net.core.rmem_max=67108864'      | sudo tee /etc/sysctl.d/99-umdf.conf
+echo 'net.core.rmem_default=16777216' | sudo tee -a /etc/sysctl.d/99-umdf.conf
+sudo sysctl -p /etc/sysctl.d/99-umdf.conf
+```
+
+On **WSL2**, the same `sysctl` works at runtime but does not persist across `wsl --shutdown`. To persist, enable systemd in `/etc/wsl.conf` and add the same `/etc/sysctl.d/99-umdf.conf` inside the distro, or use a `[boot] command = ...` line in `/etc/wsl.conf`.
+
+After raising `rmem_max`, the consumer log line should read `recvBuffer=16777216` (or higher) without the `UDP receive buffer was clamped` warning.
+
+> **Note on `receiveSocketCount`** — the option exists in `ChannelEntryConfig` to bind multiple sockets per channel via `SO_REUSEPORT`, but on **Linux multicast** every bound socket receives a *copy* of each datagram (REUSEPORT only load-balances unicast). Replicating sockets multiplies CPU cost on the receive path without enlarging the effective kernel buffer. Leave it at `1` for multicast and rely on `rmem_max` instead.
+
+> **Per-channel-type buffer defaults** — when `receiveBufferBytes` is omitted in the JSON, the consumer picks a size based on the channel's expected burst profile: **16 MiB** for `IncrementalA`/`IncrementalB` (hot path, gap-critical), **8 MiB** for `SnapshotRecovery` (idle in RealTime, heavy during recovery), **2 MiB** for `InstrumentDefinition` (low-rate, idempotent). Override per-channel only when you have a specific reason. All values are still capped by `net.core.rmem_max`.
 
 ### Timestamp Ordering Note
 
 When replaying PCAPs from different dates (e.g. EQT 2025-03-31 and DRV 2025-09-29), the timestamp-based merge processes all packets from the earlier date first. This means one group reaches RealTime before the other starts its instrument definition phase. This is by design — the merge preserves chronological fidelity.
 
 ## Performance
+
+### PCAP Replay (in-process, single-threaded)
 
 Benchmark on 52M UMDF packets (EQT 2025-03-31 PCAPs, ~20GB):
 
@@ -404,6 +502,35 @@ Key optimizations:
 - **ArrayPool\<byte\>** — reuses buffers instead of allocating per-packet (`new byte[]` × 52M)
 - **1MB BufferedStream** — reduces I/O syscalls in `PcapReader`
 - **Zero-copy SBE** — `SbeSourceGenerator` produces blittable structs, no deserialization
+
+### Live Multicast (production-like, dual channel group)
+
+Validated end-to-end with the `docker-compose.multicast.yml` stack (publisher + consumer + frontend, EQT+DRV PCAPs, `REPLAY_SPEED=2`):
+
+| Metric | Value |
+|--------|-------|
+| Sustained throughput | ~18K pkts/s (per group, both groups RealTime) |
+| Consumer CPU | ~30% of one core |
+| Consumer RSS | ~550 MiB |
+| Recovery cycles in steady state | 0 (post startup catch-up) |
+| Tests | 95/95 passing |
+
+Live-path optimizations:
+- **`recvmmsg` batching** — receive threads pull up to 64 datagrams per syscall
+- **`sendmmsg` publishing** — publisher batches datagrams per group to amortize syscall cost
+- **Inline dispatch with per-group lock** — `MultiFeedManager.PushPacketBatch` acquires the group lock once per batch (not per packet), avoiding starvation between concurrent receive threads
+- **Configurable recovery queue cap** — `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` lets ops trade memory for the longest snapshot cycle the system tolerates without dropping incrementals
+
+#### Supported replay speed range
+
+`REPLAY_SPEED` controls the publisher's pacing only; the consumer is rate-agnostic by design.
+
+| Speed | Behavior | Status |
+|-------|----------|--------|
+| `1`–`5` | Production-like throughput, headroom on CPU and SO_RCVBUF | ✅ supported |
+| `0` (max) | Publisher floods at line rate; saturates `SO_RCVBUF` and triggers continuous kernel UDP drops → recovery cycles | ⚠️ artificial — not a real-world load profile |
+
+`REPLAY_SPEED=0` is intentionally not a target: at line rate the publisher overruns `SO_RCVBUF` (32 MiB ≈ 21K packets) before the consumer can drain, and kernel UDP losses dominate. Real B3 feeds are paced by the matching engine and never approach this regime. For high-throughput stress testing prefer `REPLAY_SPEED=2`–`5` with appropriately sized SO_RCVBUF (see [Required host kernel tuning](#required-host-kernel-tuning-linux--wsl2--docker)).
 
 ### Profiling
 
@@ -521,19 +648,25 @@ Settings can be provided via JSON file, environment variables, or CLI arguments 
 |---------------------|-----|---------|-------------|
 | `UMDF_WS_PORT` | `--ws-port` | *(off)* | WebSocket server port |
 | `UMDF_SPEED` | `--speed` | `0` | Replay speed multiplier |
+| `UMDF_REPLAY_TO_MULTICAST` | `--replay-to-multicast` | `false` | Publish replayed PCAP payloads to multicast instead of consuming them in-process |
 | `UMDF_MAX_CONNECTIONS` | — | `0` (unlimited) | Max concurrent WebSocket connections |
 | `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size |
+| `UMDF_SLOW_CLIENT_THRESHOLD` | — | `0.75` | Fraction of queue capacity considered congested |
+| `UMDF_SLOW_CLIENT_MAX_TICKS` | — | `100` | Consecutive congested write cycles before disconnect |
 | `UMDF_SHUTDOWN_DRAIN_SECONDS` | — | `5` | Graceful shutdown drain timeout |
+| `UMDF_MULTICAST_MERGE_CAPACITY` | — | `1000000` | Capacity of the shared live-UDP merge queue |
+| `UMDF_FEED_CHANNEL_CAPACITY` | — | `250000` | Capacity of each per-group feed queue behind the dispatcher |
+| `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | — | `50000` | Per-group cap on incrementals retained during a snapshot cycle (drop-oldest on overflow) |
 | `UMDF_LOG_LEVEL` | — | `Information` | Minimum log level |
 | `UMDF_MULTICAST_CONFIG` | `--multicast-config` | — | Multicast JSON config path |
 
 ### Backpressure & Slow Clients
 
 Each WebSocket client has a bounded outbound queue (default: 4096 messages). When a client can't keep up:
-1. Messages are dropped (newest data replaces oldest)
-2. Queue depth is monitored on every feed event
-3. Clients with queue depth above 75% capacity for 100+ consecutive checks are automatically disconnected
-4. Disconnected clients should reconnect and re-subscribe (will receive fresh snapshots)
+1. Enqueues stop at the configured capacity; the feed thread never blocks on a slow client
+2. Queue depth is monitored on every write cycle
+3. A client is disconnected immediately if its queue is already full, or after sustained backlog above the configured threshold/tick window
+4. Disconnected clients should reconnect and re-subscribe (they will receive fresh snapshots)
 
 ### Graceful Shutdown
 

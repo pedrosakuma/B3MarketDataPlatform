@@ -74,7 +74,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         BufferOrderDelete(book.SecurityId, orderId, (byte)side);
     }
 
-    public void OnTrade(ulong securityId, long price, long quantity, long tradeId)
+    public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
         // Always capture trades (regardless of subscription)
         var ring = RecentTrades.GetOrAdd(securityId,
@@ -85,7 +85,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (IsOpenPhase(securityId))
         {
             var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
-            candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            long timestampSeconds = sendingTimeNs > 0
+                ? sendingTimeNs / 1_000_000_000
+                : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            candle.Add(price, quantity, timestampSeconds);
         }
 
         if (!_parent.IsSubscribed(securityId)) return;
@@ -101,7 +104,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _clearBuffer.Add((securityId, (byte)side));
     }
 
-    public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId)
+    public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
@@ -110,7 +113,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (IsOpenPhase(securityId))
         {
             var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
-            candle.Add(price, quantity, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            long timestampSeconds = sendingTimeNs > 0
+                ? sendingTimeNs / 1_000_000_000
+                : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            candle.Add(price, quantity, timestampSeconds);
         }
 
         if (!_parent.IsSubscribed(securityId)) return;
@@ -138,12 +144,16 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (info.TradingStatus is { } status)
             _tradingStatus[securityId] = status;
+
+        _parent.NotifyInfoUpdated(securityId);
     }
 
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
         if (info.TradingStatus is { } status)
             _tradingStatus[securityId] = status;
+
+        _parent.NotifyInfoUpdated(securityId);
     }
 
     /// <summary>

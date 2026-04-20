@@ -2,6 +2,7 @@ using System.Diagnostics.Metrics;
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
 using B3.Umdf.Server;
+using B3.Umdf.Transport;
 
 /// <summary>
 /// Central OTEL-compatible metrics registration using System.Diagnostics.Metrics.
@@ -19,9 +20,11 @@ static class AppMetrics
         IReadOnlyList<int> groupIds,
         MultiFeedManager? multiFeed,
         FeedHandler? singleFeed,
+        MulticastChannelMerger? multicastMerger,
         SubscriptionManager? subscriptionManager,
         IReadOnlyList<GroupConflationHandler>? groupHandlers,
-        SymbolRegistry symbolRegistry)
+        SymbolRegistry symbolRegistry,
+        IReadOnlyList<MulticastPacketSource>? multicastSources = null)
     {
         // ── Helpers ──
 
@@ -83,6 +86,26 @@ static class AppMetrics
                 new Measurement<long>(h.Handler.InstrDefReceived, Tag("group", h.Label))),
             description: "Instrument definitions received");
 
+        Meter.CreateObservableCounter("b3.umdf.feed.recovery_queue_dropped",
+            () => FeedHandlers().Select(h =>
+                new Measurement<long>(h.Handler.IncrementalQueueDroppedPackets, Tag("group", h.Label))),
+            unit: "{packets}", description: "Packets dropped from the incremental catch-up queue while waiting for snapshot recovery");
+
+        Meter.CreateObservableCounter("b3.umdf.feed.reorder_hits",
+            () => FeedHandlers().Select(h =>
+                new Measurement<long>(h.Handler.IncrementalHandler.ReorderHits, Tag("group", h.Label))),
+            unit: "{packets}", description: "Out-of-order packets later drained from the A/B reorder buffer (avoided spurious recovery)");
+
+        Meter.CreateObservableGauge("b3.umdf.feed.reorder_buffer_depth",
+            () => FeedHandlers().Select(h =>
+                new Measurement<int>(h.Handler.IncrementalHandler.ReorderBufferDepth, Tag("group", h.Label))),
+            unit: "{packets}", description: "Current depth of the A/B reorder buffer");
+
+        Meter.CreateObservableCounter("b3.umdf.feed.snapshot_resets_debounced",
+            () => FeedHandlers().Select(h =>
+                new Measurement<long>(h.Handler.SnapshotResetsDebounced, Tag("group", h.Label))),
+            description: "Recovery transitions that reused an in-flight snapshot boundary instead of restarting cycle tracking");
+
         // ── Feed gauges ──
 
         Meter.CreateObservableGauge("b3.umdf.feed.state",
@@ -94,18 +117,68 @@ static class AppMetrics
             () => FeedHandlers().Select(h =>
             {
                 long ticks = h.Handler.LastPacketTicks;
-                long ageMs = ticks > 0 ? (DateTime.UtcNow.Ticks - ticks) / TimeSpan.TicksPerMillisecond : -1;
+                long ageMs = ticks > 0 ? Environment.TickCount64 - ticks : -1;
                 return new Measurement<long>(ageMs, Tag("group", h.Label));
             }),
             unit: "ms", description: "Milliseconds since last packet received per group");
 
-        if (multiFeed is not null)
+        // The legacy b3.umdf.feed.queue_depth / queue_dropped metrics were removed when the
+        // per-group bounded Channel<UmdfPacket> was eliminated in favor of inline dispatch
+        // under a per-group lock. Backpressure is now visible via kernel SO_RCVBUF and the
+        // sequence-gap / recovery counters (b3.umdf.feed.gaps, recovery_queue_dropped, ...).
+        _ = multiFeed;
+
+        if (multicastMerger is not null)
         {
-            var mf = multiFeed;
-            Meter.CreateObservableGauge("b3.umdf.feed.queue_depth",
-                () => mf.GetChannelDepths().Select(d =>
-                    new Measurement<int>(d.Depth, Tag("group", $"G{d.GroupId}"))),
-                unit: "{packets}", description: "Pending packets in feed queue per group");
+            var merger = multicastMerger;
+            Meter.CreateObservableGauge("b3.umdf.transport.merge_queue_depth",
+                () => merger.QueueDepth,
+                unit: "{packets}", description: "Pending packets in the multicast merge queue");
+
+            Meter.CreateObservableCounter("b3.umdf.transport.merge_dropped",
+                () => merger.DroppedPackets,
+                unit: "{packets}", description: "Packets dropped from the multicast merge queue on overflow");
+        }
+
+        if (multicastSources is { Count: > 0 })
+        {
+            var sources = multicastSources;
+
+            IEnumerable<Measurement<long>> PerSource(Func<MulticastPacketSource, long> selector)
+            {
+                foreach (var s in sources)
+                    yield return new Measurement<long>(selector(s),
+                        Tag("group", $"G{s.ChannelGroup}"),
+                        Tag("channel", s.ChannelType.ToString()));
+            }
+
+            IEnumerable<Measurement<int>> PerSourceInt(Func<MulticastPacketSource, int> selector)
+            {
+                foreach (var s in sources)
+                    yield return new Measurement<int>(selector(s),
+                        Tag("group", $"G{s.ChannelGroup}"),
+                        Tag("channel", s.ChannelType.ToString()));
+            }
+
+            Meter.CreateObservableCounter("b3.umdf.transport.recvmmsg.syscalls",
+                () => PerSource(s => s.BatchedSyscalls),
+                unit: "{calls}", description: "recvmmsg(2) syscalls that returned at least one datagram");
+
+            Meter.CreateObservableCounter("b3.umdf.transport.recvmmsg.datagrams",
+                () => PerSource(s => s.BatchedDatagrams),
+                unit: "{datagrams}", description: "Datagrams received via recvmmsg batched receive (avg batch = datagrams / syscalls)");
+
+            Meter.CreateObservableCounter("b3.umdf.transport.membership.joins",
+                () => PerSource(s => s.MembershipJoins),
+                unit: "{events}", description: "IGMP joins on multicast sources (initial + recovery rejoins)");
+
+            Meter.CreateObservableCounter("b3.umdf.transport.membership.leaves",
+                () => PerSource(s => s.MembershipLeaves),
+                unit: "{events}", description: "IGMP leaves on multicast sources (issued when group enters RealTime)");
+
+            Meter.CreateObservableGauge("b3.umdf.transport.membership.joined",
+                () => PerSourceInt(s => s.IsJoined ? 1 : 0),
+                unit: "{bool}", description: "1 if the multicast source is currently joined to its group, else 0");
         }
 
         // ── Book counters ──
@@ -133,6 +206,18 @@ static class AppMetrics
         Meter.CreateObservableCounter("b3.umdf.book.crossings",
             () => PerGroupBook(bm => bm.CrossingTransitions),
             description: "Bid/ask crossing transitions");
+
+        Meter.CreateObservableGauge("b3.umdf.book.currently_crossed",
+            () => PerGroupBook(bm => bm.CurrentlyCrossedBooks),
+            description: "Number of books currently crossed (bid >= ask) while in OPEN trading phase — true anomalies");
+
+        Meter.CreateObservableGauge("b3.umdf.book.currently_crossed_auction",
+            () => PerGroupBook(bm => bm.CurrentlyCrossedAuction),
+            description: "Number of books currently crossed/locked while in a non-OPEN phase (auction/halt/closed) — expected");
+
+        Meter.CreateObservableGauge("b3.umdf.book.currently_locked",
+            () => PerGroupBook(bm => bm.CurrentlyLockedBooks),
+            description: "Number of books where bestBid == bestAsk (locked subset of crossed)");
 
         Meter.CreateObservableCounter("b3.umdf.book.delete_not_found",
             () => PerGroupBook(bm => bm.DeleteNotFound),

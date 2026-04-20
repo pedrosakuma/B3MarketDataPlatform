@@ -215,10 +215,22 @@ public sealed class SubscriptionManager
         {
             if (!flags.HasFlag(DataFlags.Book)) continue;
             if (_clients.TryGetValue(clientId, out var session))
-            {
                 session.TryEnqueue(payload);
-                AppMetrics.WsMessagesSent.Add(1);
-            }
+        }
+    }
+
+    /// <summary>
+    /// Wake Info subscribers for a security so their latest InstrumentInfo version is flushed
+    /// even when there is no concurrent book/rankings traffic.
+    /// </summary>
+    internal void NotifyInfoUpdated(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, flags) in clients)
+        {
+            if (!flags.HasFlag(DataFlags.Info)) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+                session.NotifyInfoAvailable();
         }
     }
 
@@ -311,9 +323,12 @@ public sealed class SubscriptionManager
             if (group.RecentTrades.TryGetValue(securityId, out var trades))
                 SendTradeHistory(session, securityId, trades);
 
-            // Send candle history from the owning group's aggregator
+            // Send candle history from the owning group's aggregator.
+            // Always send a CandleSnapshot (even empty) so the frontend knows the snapshot phase is complete.
             if (group.Candles.TryGetValue(securityId, out var agg))
                 SendCandleHistory(session, securityId, agg);
+            else
+                SendEmptyCandleSnapshot(session, securityId);
         }
 
         if (flags.HasFlag(DataFlags.Info))
@@ -344,11 +359,14 @@ public sealed class SubscriptionManager
         if (_subscriptions.TryGetValue(securityId, out var existing))
         {
             var newClients = new Dictionary<string, DataFlags>(existing);
-            newClients.Remove(clientId);
-            if (newClients.Count == 0)
-                _subscriptions.TryRemove(securityId, out _);
-            else
-                _subscriptions[securityId] = newClients;
+            if (newClients.Remove(clientId))
+            {
+                AppMetrics.WsSubscriptions.Add(-1);
+                if (newClients.Count == 0)
+                    _subscriptions.TryRemove(securityId, out _);
+                else
+                    _subscriptions[securityId] = newClients;
+            }
         }
 
         var buf = new byte[12];
@@ -362,10 +380,12 @@ public sealed class SubscriptionManager
         // Copy-on-write: build list of security IDs that need updating.
         List<ulong>? toRemove = null;
         List<ulong>? toUpdate = null;
+        int removedSubscriptions = 0;
 
         foreach (var (secId, clients) in _subscriptions)
         {
             if (!clients.ContainsKey(clientId)) continue;
+            removedSubscriptions++;
 
             if (clients.Count == 1)
             {
@@ -380,8 +400,10 @@ public sealed class SubscriptionManager
         }
 
         if (toRemove is not null)
+        {
             foreach (var key in toRemove)
                 _subscriptions.TryRemove(key, out _);
+        }
 
         if (toUpdate is not null)
         {
@@ -393,6 +415,9 @@ public sealed class SubscriptionManager
                 _subscriptions[secId] = newClients;
             }
         }
+
+        if (removedSubscriptions > 0)
+            AppMetrics.WsSubscriptions.Add(-removedSubscriptions);
     }
 
     // --- Snapshot serialization ---
@@ -498,6 +523,8 @@ public sealed class SubscriptionManager
     /// <summary>Called when feed enters RealTime state. Enables subscriptions and starts background rankings.</summary>
     public void SetReady()
     {
+        if (_ready) return;
+
         _ready = true;
         BroadcastServerStatus(true);
         StartRankingsTimer();
@@ -548,6 +575,7 @@ public sealed class SubscriptionManager
                 info.LastTradePrice = price;
                 info.LastTradeSize = quantity;
                 info.BumpVersion();
+                NotifyInfoUpdated(securityId);
                 return;
             }
         }
@@ -582,17 +610,38 @@ public sealed class SubscriptionManager
     private static void SendCandleHistory(ClientSession session, ulong securityId, CandleAggregator agg)
     {
         var candles = agg.GetCandles();
-        if (candles.Length == 0) return;
+        if (candles.Length == 0)
+        {
+            SendEmptyCandleSnapshot(session, securityId);
+            return;
+        }
 
         int maxPerBatch = WireProtocol.MaxCandlesPerSnapshot;
         for (int i = 0; i < candles.Length; i += maxPerBatch)
         {
             int count = Math.Min(maxPerBatch, candles.Length - i);
-            byte flags = i == 0 ? WireProtocol.CandleFlagFirst : (byte)0;
+            byte flags = 0;
+            if (i == 0)
+                flags |= WireProtocol.CandleFlagFirst;
+            if (i + count >= candles.Length)
+                flags |= WireProtocol.CandleFlagLast;
+
             var batch = candles.AsSpan(i, count);
             var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2 + count * WireProtocol.CandleSize];
             int len = WireProtocol.WriteCandleSnapshot(buf, securityId, agg.Resolution, flags, batch);
             session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
         }
+    }
+
+    private static void SendEmptyCandleSnapshot(ClientSession session, ulong securityId)
+    {
+        var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2];
+        int len = WireProtocol.WriteCandleSnapshot(
+            buf,
+            securityId,
+            1,
+            (byte)(WireProtocol.CandleFlagFirst | WireProtocol.CandleFlagLast),
+            ReadOnlySpan<Candle>.Empty);
+        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 }

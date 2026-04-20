@@ -355,7 +355,8 @@ public static class WireProtocol
     public const int MaxCandlesPerSnapshot = (ushort.MaxValue - CandleSnapshotHeaderSize) / CandleSize; // 1364
 
     /// <summary>CandleSnapshot flags.</summary>
-    internal const byte CandleFlagFirst = 0x01; // first batch (replace), subsequent batches = 0 (append)
+    internal const byte CandleFlagFirst = 0x01; // first batch (replace)
+    internal const byte CandleFlagLast = 0x02;  // final batch of the snapshot
 
     /// <summary>
     /// Write CandleSnapshot batch: securityId + resolution + flags + count + candle data.

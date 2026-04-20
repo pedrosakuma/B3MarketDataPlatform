@@ -47,8 +47,16 @@ public sealed class MmapPcapReader : IDisposable
         ptr += _view.PointerOffset;
         _basePtr = ptr;
 
-        // Tell OS this is a sequential scan — enables aggressive read-ahead
-        madvise((nint)_basePtr, (nuint)_fileLength, MADV_SEQUENTIAL);
+        // Tell OS this is a sequential scan — enables aggressive read-ahead (Linux only).
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                madvise((nint)_basePtr, (nuint)_fileLength, MADV_SEQUENTIAL);
+            }
+            catch (DllNotFoundException) { /* libc unavailable — skip hint */ }
+            catch (EntryPointNotFoundException) { /* madvise missing — skip hint */ }
+        }
 
         // Create segmented Memory<byte> views (each ≤SegmentSize)
         int segCount = (int)((_fileLength + SegmentSize - 1) / SegmentSize);
