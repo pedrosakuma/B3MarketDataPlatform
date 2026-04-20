@@ -29,6 +29,12 @@ internal sealed class MpscPacketRing
     private PaddedLong _consumerSeq;
     private long _droppedPackets;
 
+    // 0 = consumer is busy draining; 1 = consumer has parked (or is about to park) and
+    // needs an explicit wake. Producers gate the cost of ManualResetEventSlim.Set()
+    // (which takes an internal Monitor lock when a waiter exists) on this flag, so the
+    // common steady-state case — consumer keeping up — never touches the event.
+    private int _consumerWaiting;
+
     private readonly ManualResetEventSlim _itemsAvailable = new(initialState: false, spinCount: 0);
 
     public int Capacity => _slots.Length;
@@ -78,7 +84,14 @@ internal sealed class MpscPacketRing
                 {
                     _slots[idx] = packet;
                     Volatile.Write(ref _seqs[idx], pos + 1);
-                    if (!_itemsAvailable.IsSet)
+                    // Wake the consumer only if it has signaled it is parked. The
+                    // CompareExchange below is a full barrier, so our slot publish
+                    // (Volatile.Write above) happens-before this read of the flag;
+                    // and the consumer's Interlocked.Exchange(_consumerWaiting, 1)
+                    // happens-before its re-check of the slot. Either the consumer
+                    // observes our publish on the re-check, or we observe its waiting
+                    // flag and Set the event — never both miss.
+                    if (Interlocked.CompareExchange(ref _consumerWaiting, 0, 1) == 1)
                         _itemsAvailable.Set();
                     return true;
                 }
@@ -131,12 +144,20 @@ internal sealed class MpscPacketRing
     /// </summary>
     public void WaitForItems(CancellationToken ct)
     {
-        // Reset before re-checking to avoid losing a producer signal that arrived
-        // between the failed TryDequeue and Wait.
+        // Reset before publishing the waiting flag so a concurrent producer that observes
+        // the flag will Set the event into a known state. Then publish the flag with a
+        // full barrier (Interlocked.Exchange) and re-check the ring before blocking, to
+        // avoid sleeping on packets that were enqueued during the gap between the
+        // failed TryDequeue (in the caller) and this point.
         _itemsAvailable.Reset();
+        Interlocked.Exchange(ref _consumerWaiting, 1);
         if (TryDequeueAvailable())
+        {
+            Volatile.Write(ref _consumerWaiting, 0);
             return;
-        _itemsAvailable.Wait(ct);
+        }
+        try { _itemsAvailable.Wait(ct); }
+        finally { Volatile.Write(ref _consumerWaiting, 0); }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
