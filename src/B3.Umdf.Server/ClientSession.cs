@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading.Channels;
@@ -16,13 +17,14 @@ public sealed class ClientSession : IDisposable
 {
     private readonly struct OutboundMessage
     {
-        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true, logicalCount: 0);
+        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true, logicalCount: 0, pooledArray: null);
 
-        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false, int logicalCount = 1)
+        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false, int logicalCount = 1, byte[]? pooledArray = null)
         {
             Payload = payload;
             IsInfoWake = isInfoWake;
             LogicalCount = logicalCount;
+            PooledArray = pooledArray;
         }
 
         public ReadOnlyMemory<byte> Payload { get; }
@@ -35,6 +37,14 @@ public sealed class ClientSession : IDisposable
         /// true wire-event volume rather than the queue-write count.
         /// </summary>
         public int LogicalCount { get; }
+
+        /// <summary>
+        /// When non-null, the backing array was rented from <see cref="ArrayPool{T}.Shared"/>
+        /// by the producer; the write loop must return it after the WS frame is sent (or
+        /// the channel must return it on shutdown). <see cref="Payload"/> is a slice of
+        /// this array.
+        /// </summary>
+        public byte[]? PooledArray { get; }
     }
 
     private static int _nextId;
@@ -135,11 +145,21 @@ public sealed class ClientSession : IDisposable
     /// Channel.TryWrite cost (one Monitor acquisition under contention) across an
     /// entire flush cycle. The write loop concatenates messages identically to the
     /// per-message path; only the queue-write count is reduced.
+    ///
+    /// When <paramref name="pooledArray"/> is provided, ownership transfers to the
+    /// session: the write loop returns it to <see cref="ArrayPool{T}.Shared"/> after
+    /// the WS frame is sent. If the channel is full and the client is disconnected,
+    /// the array is returned synchronously here. Empty/zero-count batches are no-ops
+    /// and the array (if any) is returned immediately.
     /// </summary>
-    public bool TryEnqueueBatch(ReadOnlyMemory<byte> batch, int logicalMessageCount)
+    public bool TryEnqueueBatch(ReadOnlyMemory<byte> batch, int logicalMessageCount, byte[]? pooledArray = null)
     {
-        if (batch.IsEmpty || logicalMessageCount <= 0) return true;
-        return TryEnqueueCore(new OutboundMessage(batch, logicalCount: logicalMessageCount), "batch");
+        if (batch.IsEmpty || logicalMessageCount <= 0)
+        {
+            if (pooledArray is not null) ArrayPool<byte>.Shared.Return(pooledArray);
+            return true;
+        }
+        return TryEnqueueCore(new OutboundMessage(batch, logicalCount: logicalMessageCount, pooledArray: pooledArray), "batch");
     }
 
     /// <summary>
@@ -168,6 +188,7 @@ public sealed class ClientSession : IDisposable
         var ct = _cts.Token;
         var coalesceBuf = new byte[65536];
         var messages = new List<ReadOnlyMemory<byte>>();
+        var pooledToReturn = new List<byte[]>();
         int slowTicks = 0;
 
         try
@@ -179,6 +200,7 @@ public sealed class ClientSession : IDisposable
 
                 // 1. Drain up to MaxDrainPerCycle pre-serialized messages
                 messages.Clear();
+                pooledToReturn.Clear();
                 int drained = 0;
                 int logicalDrained = 0;
                 bool sawInfoWake = false;
@@ -193,6 +215,8 @@ public sealed class ClientSession : IDisposable
 
                     messages.Add(outbound.Payload);
                     logicalDrained += outbound.LogicalCount;
+                    if (outbound.PooledArray is { } pooled)
+                        pooledToReturn.Add(pooled);
                 }
                 if (sawInfoWake)
                     Interlocked.Exchange(ref _infoWakePending, 0);
@@ -240,6 +264,12 @@ public sealed class ClientSession : IDisposable
                     AppMetrics.WsMessagesSent.Add(totalMessages);
                 }
 
+                // Return pooled producer buffers AFTER SendAsync completes (Payload spans
+                // were copied into coalesceBuf, but returning earlier would invalidate the
+                // backing arrays held in `messages` if SendAsync inspected them later).
+                for (int i = 0; i < pooledToReturn.Count; i++)
+                    ArrayPool<byte>.Shared.Return(pooledToReturn[i]);
+
                 // 4. Slow-client self-detection
                 int remaining = QueueDepth;
                 if (remaining > ChannelCapacity * _slowClientThreshold)
@@ -262,19 +292,42 @@ public sealed class ClientSession : IDisposable
         {
             _logger.LogWarning("Write error on {ClientId}: {Error}", Id, ex.Message);
         }
+        finally
+        {
+            // Ensure any items left in the channel (after Cancel/disconnect) release
+            // their pooled buffers so the ArrayPool doesn't accumulate orphans.
+            DrainAndReturnPooled();
+        }
     }
 
     private bool TryEnqueueCore(OutboundMessage outbound, string itemKind)
     {
         if (_cts.IsCancellationRequested)
+        {
+            if (outbound.PooledArray is { } pooled)
+                ArrayPool<byte>.Shared.Return(pooled);
             return false;
+        }
 
         if (_outbound.Writer.TryWrite(outbound))
             return true;
 
+        if (outbound.PooledArray is { } pooled2)
+            ArrayPool<byte>.Shared.Return(pooled2);
+
         DisconnectSlowConsumer(
             $"outbound queue full while enqueuing {itemKind} (depth={QueueDepth}/{ChannelCapacity})");
         return false;
+    }
+
+    private void DrainAndReturnPooled()
+    {
+        var reader = _outbound.Reader;
+        while (reader.TryRead(out var outbound))
+        {
+            if (outbound.PooledArray is { } pooled)
+                ArrayPool<byte>.Shared.Return(pooled);
+        }
     }
 
     private void DisconnectSlowConsumer(string reason)

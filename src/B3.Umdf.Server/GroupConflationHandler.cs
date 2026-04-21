@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -473,7 +474,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             {
                 acc = new ClientBatchAccumulator
                 {
-                    Buffer = new byte[Math.Max(bytes.Length * 4, 1024)],
+                    Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024)),
                     Offset = 0,
                     LogicalCount = 0,
                 };
@@ -481,8 +482,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             if (acc.Offset + bytes.Length > acc.Buffer.Length)
             {
                 int newSize = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
-                var newBuf = new byte[newSize];
+                var newBuf = ArrayPool<byte>.Shared.Rent(newSize);
                 acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
+                ArrayPool<byte>.Shared.Return(acc.Buffer);
                 acc.Buffer = newBuf;
             }
             bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
@@ -494,8 +496,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     /// <summary>
     /// Hand each accumulated per-client buffer to its outbound channel as a single
-    /// coalesced batch, then drop the entries so the next flush allocates fresh buffers
-    /// (the channel still owns the previous byte[] until the write loop consumes it).
+    /// coalesced batch and transfer ownership of the pooled byte[] to the session's
+    /// write loop, which returns it to <see cref="ArrayPool{T}.Shared"/> after the WS
+    /// frame is sent. <see cref="ClientSession.TryEnqueueBatch"/> is responsible for
+    /// returning the array if the channel is full or already cancelled.
     /// </summary>
     private void FlushClientBatches()
     {
@@ -503,8 +507,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var kv in _clientBatches)
         {
             var acc = kv.Value;
-            if (acc.Offset == 0) continue;
-            kv.Key.TryEnqueueBatch(new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset), acc.LogicalCount);
+            if (acc.Offset == 0)
+            {
+                ArrayPool<byte>.Shared.Return(acc.Buffer);
+                continue;
+            }
+            kv.Key.TryEnqueueBatch(
+                new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset),
+                acc.LogicalCount,
+                pooledArray: acc.Buffer);
         }
         _clientBatches.Clear();
     }
