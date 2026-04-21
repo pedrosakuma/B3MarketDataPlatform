@@ -5,24 +5,53 @@ using System.Runtime.InteropServices;
 namespace B3.Umdf.Server;
 
 /// <summary>
+/// Discriminator for entries pushed through the outbound ring. Most entries carry a
+/// pre-serialized <c>Payload</c>; the admin kinds (<see cref="AddInfoSub"/>,
+/// <see cref="RemoveInfoSub"/>) carry a <c>SecurityId</c> instead so that the per-
+/// client write loop can mutate its own (single-threaded) info-version map without
+/// needing a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey, TValue}"/>.
+/// </summary>
+internal enum OutboundKind : byte
+{
+    Payload = 0,
+    InfoWake = 1,
+    AddInfoSub = 2,
+    RemoveInfoSub = 3,
+}
+
+/// <summary>
 /// Carries one queued outbound payload from a producer (group flush thread, snapshot
 /// path, or info-wake) to the per-client write loop. Top-level so the lock-free
 /// <see cref="MpscOutboundRing"/> can store instances directly.
 /// </summary>
 internal readonly struct OutboundMessage
 {
-    public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true, logicalCount: 0, pooledArray: null);
+    public static readonly OutboundMessage InfoWake = new(OutboundKind.InfoWake, ReadOnlyMemory<byte>.Empty, securityId: 0, logicalCount: 0, pooledArray: null);
 
-    public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false, int logicalCount = 1, byte[]? pooledArray = null)
+    public OutboundMessage(ReadOnlyMemory<byte> payload, int logicalCount = 1, byte[]? pooledArray = null)
+        : this(OutboundKind.Payload, payload, securityId: 0, logicalCount, pooledArray)
     {
+    }
+
+    private OutboundMessage(OutboundKind kind, ReadOnlyMemory<byte> payload, ulong securityId, int logicalCount, byte[]? pooledArray)
+    {
+        Kind = kind;
         Payload = payload;
-        IsInfoWake = isInfoWake;
+        SecurityId = securityId;
         LogicalCount = logicalCount;
         PooledArray = pooledArray;
     }
 
+    public static OutboundMessage AddInfoSub(ulong securityId) =>
+        new(OutboundKind.AddInfoSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage RemoveInfoSub(ulong securityId) =>
+        new(OutboundKind.RemoveInfoSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public OutboundKind Kind { get; }
     public ReadOnlyMemory<byte> Payload { get; }
-    public bool IsInfoWake { get; }
+    public ulong SecurityId { get; }
+    public bool IsInfoWake => Kind == OutboundKind.InfoWake;
 
     /// <summary>
     /// Number of logical wire messages contained in this payload. Coalesced batches

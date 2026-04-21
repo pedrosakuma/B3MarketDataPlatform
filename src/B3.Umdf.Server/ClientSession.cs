@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
@@ -20,7 +19,9 @@ public sealed class ClientSession : IDisposable
     public WebSocket Socket { get; }
     private readonly MpscOutboundRing _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
-    private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
+    // Owned by RunWriteLoopAsync. Populated/cleared exclusively via OutboundKind.AddInfoSub/
+    // RemoveInfoSub deltas drained from _outbound, so no synchronization is needed.
+    private readonly Dictionary<ulong, long> _infoVersions = new();
     private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
@@ -71,16 +72,21 @@ public sealed class ClientSession : IDisposable
     /// <summary>Add a subscription. Called on the feed thread.</summary>
     public void AddSubscription(ulong securityId) => _subscriptions.Add(securityId);
 
-    /// <summary>Remove a subscription. Called on the feed thread or WS read thread.</summary>
+    /// <summary>Remove a subscription. Called on the feed thread or WS read thread.
+    /// The HashSet remove stays inline (legacy single-thread access pattern); the
+    /// info-version delete is routed through the outbound ring so the WriteLoop is
+    /// the sole writer to <c>_infoVersions</c>.</summary>
     public void RemoveSubscription(ulong securityId)
     {
         _subscriptions.Remove(securityId);
-        _infoVersions.TryRemove(securityId, out _);
+        TryEnqueueCore(OutboundMessage.RemoveInfoSub(securityId), "remove-info-sub");
     }
 
-    /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.</summary>
+    /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.
+    /// Routes through the outbound ring so <c>_infoVersions</c> remains a plain
+    /// (lock-free) <see cref="Dictionary{TKey, TValue}"/> mutated only by the WriteLoop.</summary>
     public void AddInfoSubscription(ulong securityId) =>
-        _infoVersions.TryAdd(securityId, 0);
+        TryEnqueueCore(OutboundMessage.AddInfoSub(securityId), "add-info-sub");
 
     /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
@@ -170,16 +176,26 @@ public sealed class ClientSession : IDisposable
                 while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
                 {
                     drained++;
-                    if (outbound.IsInfoWake)
+                    switch (outbound.Kind)
                     {
-                        sawInfoWake = true;
-                        continue;
+                        case OutboundKind.Payload:
+                            messages.Add(outbound.Payload);
+                            logicalDrained += outbound.LogicalCount;
+                            if (outbound.PooledArray is { } pooled)
+                                pooledToReturn.Add(pooled);
+                            break;
+                        case OutboundKind.InfoWake:
+                            sawInfoWake = true;
+                            break;
+                        case OutboundKind.AddInfoSub:
+                            // First time we see this securityId: seed version 0 so the next
+                            // info-snapshot scan emits the current value. Re-adds are no-ops.
+                            _infoVersions.TryAdd(outbound.SecurityId, 0);
+                            break;
+                        case OutboundKind.RemoveInfoSub:
+                            _infoVersions.Remove(outbound.SecurityId);
+                            break;
                     }
-
-                    messages.Add(outbound.Payload);
-                    logicalDrained += outbound.LogicalCount;
-                    if (outbound.PooledArray is { } pooled)
-                        pooledToReturn.Add(pooled);
                 }
 
                 if (drained == 0)
