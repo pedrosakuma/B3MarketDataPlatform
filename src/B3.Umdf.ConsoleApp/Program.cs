@@ -421,6 +421,7 @@ foreach (var gid in groupIds)
         var bm = new BookManager(bookHandler, bmLogger);
         mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm);
         gh.SetBookManager(bm);
+        gh.StartBroadcaster(gid);
         groupHandlers.Add(gh);
         bookManagers.Add(bm);
     }
@@ -655,6 +656,11 @@ if (wsHost is not null)
 
 multiFeed?.Dispose();
 singleFeed?.Dispose();
+
+// Stop broadcaster threads after feed sources are disposed so no more batches can be
+// published. StopBroadcaster signals the ring and joins the thread.
+foreach (var gh in groupHandlers) gh.StopBroadcaster();
+
 if (liveMulticastSources is not null)
 {
     // Dispose sockets first to unblock the blocking Receive() calls, then join threads.

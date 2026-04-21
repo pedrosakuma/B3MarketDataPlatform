@@ -219,13 +219,62 @@ public sealed class SubscriptionManager
         }
     }
 
-    /// <summary>
-    /// Lock-free accessor for the inner per-security subscriber dict (copy-on-write under
+    /// <summary>Lock-free accessor for the inner per-security subscriber dict (copy-on-write under
     /// _subLock). Used by hot-path coalesced broadcast in <see cref="GroupConflationHandler"/>
     /// to amortize the per-event Channel.TryWrite cost across an entire flush cycle.
     /// </summary>
     internal IReadOnlyDictionary<string, DataFlags>? GetSubscribers(ulong securityId) =>
         _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
+
+    /// <summary>
+    /// Lock-free quick check used by the dispatch thread to skip buffering wire bytes
+    /// for securities that have no Book-flag subscriber. Returns true if at least one
+    /// current subscriber has <see cref="DataFlags.Book"/> set.
+    /// </summary>
+    internal bool HasAnyBookSubscriber(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        foreach (var (_, f) in clients)
+            if (f.HasFlag(DataFlags.Book)) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Invoked from the dispatch thread when a broadcast batch had to be dropped
+    /// (broadcaster ring full). Schedules a fresh snapshot (Get) request for every
+    /// current Book-flag subscriber of <paramref name="securityId"/> so they can
+    /// recover the state they missed. Returns true if at least one resync request
+    /// was enqueued.
+    /// </summary>
+    internal bool RequestResyncForBookSubscribers(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        if (_symbolRegistry is null) return false;
+        if (!_symbolRegistry.TryGetSymbol(securityId, out var symbol)) return false;
+
+        bool any = false;
+        var group = GetOwningGroup(securityId);
+        if (group is null) return false;
+        foreach (var (clientId, flags) in clients)
+        {
+            if (!flags.HasFlag(DataFlags.Book)) continue;
+            group.EnqueueRequest(clientId, symbol, DataFlags.Book, isGet: true);
+            any = true;
+        }
+        return any;
+    }
+
+    private GroupConflationHandler? GetOwningGroup(ulong securityId)
+    {
+        var handlers = _groupHandlers;
+        if (handlers is null) return null;
+        foreach (var gh in handlers)
+        {
+            if (gh.BookManager is not null && gh.BookManager.Books.ContainsKey(securityId))
+                return gh;
+        }
+        return null;
+    }
 
     /// <summary>Lock-free lookup of a connected client session by id.</summary>
     internal ClientSession? GetClient(string clientId) =>

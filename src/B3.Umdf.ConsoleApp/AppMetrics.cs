@@ -356,6 +356,52 @@ static class AppMetrics
                     return measurements;
                 },
                 description: "Events flushed from conflation to clients");
+
+            // ── Broadcaster decoupling path (per-group) ──
+
+            Meter.CreateObservableCounter("b3.umdf.server.broadcast.batches_published",
+                () =>
+                {
+                    var m = new List<Measurement<long>>();
+                    for (int i = 0; i < groupHandlers.Count; i++)
+                        m.Add(new Measurement<long>(groupHandlers[i].BroadcastBatchesPublished,
+                            Tag("group", $"G{groupIds[i]}")));
+                    return m;
+                },
+                unit: "{batches}", description: "Per-packet broadcast batches published from dispatch to broadcaster thread");
+
+            Meter.CreateObservableCounter("b3.umdf.server.broadcast.batches_dropped",
+                () =>
+                {
+                    var m = new List<Measurement<long>>();
+                    for (int i = 0; i < groupHandlers.Count; i++)
+                        m.Add(new Measurement<long>(groupHandlers[i].BroadcastBatchesDroppedFull,
+                            Tag("group", $"G{groupIds[i]}")));
+                    return m;
+                },
+                unit: "{batches}", description: "Broadcast batches dropped because the broadcaster ring was full");
+
+            Meter.CreateObservableCounter("b3.umdf.server.broadcast.resync_requests",
+                () =>
+                {
+                    var m = new List<Measurement<long>>();
+                    for (int i = 0; i < groupHandlers.Count; i++)
+                        m.Add(new Measurement<long>(groupHandlers[i].BroadcastResyncRequests,
+                            Tag("group", $"G{groupIds[i]}")));
+                    return m;
+                },
+                unit: "{requests}", description: "Resnapshot requests enqueued after broadcast drops");
+
+            Meter.CreateObservableGauge("b3.umdf.server.broadcast.ring_depth",
+                () =>
+                {
+                    var m = new List<Measurement<int>>();
+                    for (int i = 0; i < groupHandlers.Count; i++)
+                        m.Add(new Measurement<int>(groupHandlers[i].BroadcastRingDepth,
+                            Tag("group", $"G{groupIds[i]}")));
+                    return m;
+                },
+                unit: "{batches}", description: "Current broadcaster ring depth (per group)");
         }
     }
 }

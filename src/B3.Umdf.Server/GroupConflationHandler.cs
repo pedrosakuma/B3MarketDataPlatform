@@ -24,10 +24,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
     private byte[] _flushBuf = new byte[4096];
 
-    // Per-flush per-client coalesced output buffer. Reused across flushes; the byte[]
-    // payload is freshly allocated per flush so it can be handed off to the client's
-    // outbound channel without copy. Coalescing N (events × subscribers) Channel.TryWrite
-    // calls into 1 per client amortizes the dominant cost in the WS broadcast path.
+    // Per-packet work batch. Dispatch thread rents on first event in a packet, appends
+    // all per-event wire-bytes into it, and publishes to _broadcastRing on
+    // OnBatchComplete. The broadcaster thread drains _broadcastRing and performs the
+    // subscriber fan-out there, keeping the dispatch thread independent of client count.
+    private BroadcastWorkBatch? _currentBatch;
+    private readonly BroadcastRing _broadcastRing;
+    private Thread? _broadcasterThread;
+    private CancellationTokenSource? _broadcasterCts;
+
+    // Broadcaster-thread local: per-client coalesced output buffer. Accumulates across
+    // events within one batch (one packet) so each client receives at most one
+    // Channel.TryWrite per packet even when many securities fan out to it. Reused
+    // across batches (Dictionary instance) but the byte[] payloads are rented per flush
+    // and handed off to the session's write loop.
     private readonly Dictionary<ClientSession, ClientBatchAccumulator> _clientBatches = new();
 
     private struct ClientBatchAccumulator
@@ -36,6 +46,17 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         public int Offset;
         public int LogicalCount;
     }
+
+    // Metrics (all written/read via Volatile from different threads)
+    private long _broadcastBatchesPublished;
+    private long _broadcastBatchesDroppedFull;
+    private long _broadcastResyncRequests;
+
+    public long BroadcastBatchesPublished => Volatile.Read(ref _broadcastBatchesPublished);
+    public long BroadcastBatchesDroppedFull => Volatile.Read(ref _broadcastBatchesDroppedFull);
+    public long BroadcastResyncRequests => Volatile.Read(ref _broadcastResyncRequests);
+    public int BroadcastRingDepth => _broadcastRing.ApproximateDepth;
+    public int BroadcastRingCapacity => _broadcastRing.Capacity;
 
     private long _eventsReceived;
     private long _eventsFlushed;
@@ -69,9 +90,40 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public long EventsReceived => Volatile.Read(ref _eventsReceived);
     public long EventsFlushed => Volatile.Read(ref _eventsFlushed);
 
-    internal GroupConflationHandler(SubscriptionManager parent)
+    internal GroupConflationHandler(SubscriptionManager parent, int broadcastRingCapacity = 256)
     {
         _parent = parent;
+        _broadcastRing = new BroadcastRing(broadcastRingCapacity);
+    }
+
+    /// <summary>
+    /// Start the per-group broadcaster thread. Must be called once after construction,
+    /// before feed processing begins. Idempotent.
+    /// </summary>
+    public void StartBroadcaster(int groupId)
+    {
+        if (_broadcasterThread is not null) return;
+        _broadcasterCts = new CancellationTokenSource();
+        var t = new Thread(() => RunBroadcaster(_broadcasterCts.Token))
+        {
+            IsBackground = true,
+            Name = $"UmdfBroadcaster-G{groupId}",
+        };
+        _broadcasterThread = t;
+        t.Start();
+    }
+
+    /// <summary>Signals the broadcaster thread to stop and waits for it to exit.</summary>
+    public void StopBroadcaster()
+    {
+        if (_broadcasterCts is null) return;
+        _broadcasterCts.Cancel();
+        _broadcastRing.SignalShutdown();
+        _broadcasterThread?.Join(TimeSpan.FromSeconds(2));
+        _broadcastRing.Dispose();
+        _broadcasterCts.Dispose();
+        _broadcasterCts = null;
+        _broadcasterThread = null;
     }
 
     // ── IBookEventHandler ──
@@ -174,7 +226,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     /// <summary>
     /// Called after each packet is fully processed on the owning group's thread.
-    /// Drains pending requests and flushes conflation buffers.
+    /// Drains pending requests, flushes conflation buffers into the current broadcast
+    /// batch, then publishes the batch to the broadcaster thread.
     /// </summary>
     public void OnBatchComplete()
     {
@@ -184,10 +237,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // 2. Process this group's routed subscribe/get requests (single-threaded, safe book access)
         ProcessOwnSubscribeRequests();
 
-        // 3. Flush conflation buffers
-        if (_orderBuffer.Count == 0 && _clearBuffer.Count == 0 && _tradeBuffer.Count == 0)
-            return;
-        FlushBuffers();
+        // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
+        //    no subscriber fan-out, no ArrayPool rentals for client buffers).
+        if (_orderBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0)
+            FlushBuffers();
+
+        // 4. Publish the batch to the broadcaster thread. On full ring, drop + schedule
+        //    a resnapshot for each affected security so subscribers recover state.
+        PublishCurrentBatch();
     }
 
     // ── Request processing ──
@@ -290,7 +347,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 _orderBuffer.Remove(id);
     }
 
-    // ── Buffer flushing ──
+    // ── Buffer flushing (dispatch thread) ──────────────────────────────────────
+    //
+    // These methods now only *append events to the current broadcast batch*. They do
+    // NOT perform subscriber fan-out — that moved to the broadcaster thread
+    // (see FanoutBatch). The goal is to keep the dispatch thread's per-packet work
+    // bounded and independent of the number of subscribers.
 
     private void FlushBuffers()
     {
@@ -302,7 +364,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         {
             if (!_parent.IsSubscribed(secId)) continue;
             int len = WireProtocol.WriteBookCleared(tmp, secId, side);
-            AppendForBookSubscribers(secId, tmp[..len], logicalCount: 1);
+            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _clearBuffer.Clear();
@@ -312,11 +374,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         if (_tradeBuffer.Count > 0)
             flushed += FlushTradeBuffer();
-
-        // Coalesced flush: one Channel.TryWrite per client per cycle (instead of one
-        // per event × subscriber). This is the single biggest WS-side optimization;
-        // see CHECKPOINT 014 for profile evidence.
-        FlushClientBatches();
 
         _eventsFlushed += flushed;
     }
@@ -350,7 +407,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 var msgType = order.Kind == PendingOrderKind.Added ? MessageType.OrderAdded : MessageType.OrderUpdated;
                 len = WireProtocol.WriteOrderEvent(tmp, msgType, order.SecurityId, orderId, order.Side, order.Price, order.Quantity);
             }
-            AppendForBookSubscribers(order.SecurityId, tmp[..len], logicalCount: 1);
+            AppendEventToBatch(order.SecurityId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         return flushed;
@@ -385,7 +442,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             // Flush previous security's segment when switching to a new security
             if (order.SecurityId != currentSecId && offset > segmentStart)
             {
-                AppendForBookSubscribers(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
+                AppendEventToBatch(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
                 segmentStart = offset;
                 segmentCount = 0;
             }
@@ -404,7 +461,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         // Flush final segment
         if (offset > segmentStart)
-            AppendForBookSubscribers(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
+            AppendEventToBatch(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
 
         return flushed;
     }
@@ -428,7 +485,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         {
             if (!_parent.IsSubscribed(secId)) { flushed++; continue; }
             int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
-            AppendForBookSubscribers(secId, tmp[..len], logicalCount: 1);
+            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _tradeBuffer.Clear();
@@ -444,7 +501,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 if (latest is { } c)
                 {
                     int clen = WireProtocol.WriteCandleUpdate(cbuf, secId, agg.Resolution, c);
-                    AppendForBookSubscribers(secId, cbuf[..clen], logicalCount: 1);
+                    AppendEventToBatch(secId, cbuf[..clen], logicalCount: 1);
                 }
             }
         }
@@ -453,13 +510,132 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     }
 
     /// <summary>
-    /// Append <paramref name="bytes"/> to every Book-flag subscriber's per-client coalesced
-    /// buffer. <paramref name="logicalCount"/> is the number of pre-serialized wire messages
-    /// packed back-to-back in <paramref name="bytes"/> (1 for single events, N for batched
-    /// segments). Buffers are flushed in <see cref="FlushClientBatches"/> at the end of the
-    /// per-packet flush cycle, so each client receives at most one Channel.TryWrite per
-    /// cycle even when many securities/events fan out to it.
+    /// Dispatch thread: append <paramref name="bytes"/> (one or more pre-serialized wire
+    /// messages packed back-to-back) to the current packet's broadcast batch. No
+    /// subscriber lookup happens here — that runs on the broadcaster thread when the
+    /// batch is fanned out, so dispatch-side work is bounded by event count, not
+    /// subscriber count.
     /// </summary>
+    private void AppendEventToBatch(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        if (bytes.Length == 0) return;
+        // Skip events for securities nobody is subscribed to. This check is cheap
+        // (ConcurrentDictionary lookup) and lets us avoid enqueueing dead bytes into
+        // the batch — matches old behaviour which the call sites also guarded against.
+        if (!_parent.HasAnyBookSubscriber(securityId)) return;
+
+        _currentBatch ??= BroadcastWorkBatch.Rent();
+        _currentBatch.Append(securityId, bytes, logicalCount);
+    }
+
+    /// <summary>
+    /// Dispatch thread: hand the current batch to the broadcaster thread. On ring full,
+    /// drop the batch and enqueue resnapshot (Get) requests for each affected security
+    /// so every Book-flag subscriber receives a fresh MBP snapshot to recover state.
+    /// </summary>
+    private void PublishCurrentBatch()
+    {
+        var batch = _currentBatch;
+        _currentBatch = null;
+        if (batch is null) return;
+        if (batch.EventCount == 0)
+        {
+            BroadcastWorkBatch.Return(batch);
+            return;
+        }
+
+        if (_broadcastRing.TryEnqueue(batch))
+        {
+            Volatile.Write(ref _broadcastBatchesPublished, _broadcastBatchesPublished + 1);
+            return;
+        }
+
+        // Ring full: drop + schedule resync for every security in the dropped batch.
+        Volatile.Write(ref _broadcastBatchesDroppedFull, _broadcastBatchesDroppedFull + 1);
+        EnqueueResyncForDroppedBatch(batch);
+        BroadcastWorkBatch.Return(batch);
+    }
+
+    private void EnqueueResyncForDroppedBatch(BroadcastWorkBatch batch)
+    {
+        // Dedupe SecIds (the same security often contributes multiple events per packet).
+        // Using a reused scratch HashSet would be nicer but a temporary allocation here
+        // is rare (only on ring full) and keeps the method simple.
+        var seen = new HashSet<ulong>();
+        for (int i = 0; i < batch.EventCount; i++)
+        {
+            ulong secId = batch.Events[i].SecId;
+            if (!seen.Add(secId)) continue;
+            if (!_parent.RequestResyncForBookSubscribers(secId)) continue;
+            Volatile.Write(ref _broadcastResyncRequests, _broadcastResyncRequests + 1);
+        }
+    }
+
+    // ── Broadcaster thread ─────────────────────────────────────────────────────
+    //
+    // Dedicated thread per group drains _broadcastRing and performs subscriber
+    // fan-out. Runs entirely off the feed/dispatch thread so client scaling (N=200+)
+    // never back-pressures UDP receive.
+
+    private void RunBroadcaster(CancellationToken ct)
+    {
+        const int spinIterations = 32;
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                if (_broadcastRing.TryDequeue(out var batch))
+                {
+                    FanoutBatch(batch!);
+                    BroadcastWorkBatch.Return(batch!);
+                    continue;
+                }
+
+                bool gotItem = false;
+                for (int i = 0; i < spinIterations; i++)
+                {
+                    if (_broadcastRing.TryDequeue(out batch))
+                    {
+                        FanoutBatch(batch!);
+                        BroadcastWorkBatch.Return(batch!);
+                        gotItem = true;
+                        break;
+                    }
+                    Thread.SpinWait(1 << Math.Min(i, 6));
+                }
+
+                if (!gotItem)
+                {
+                    try { _broadcastRing.WaitForItems(ct); }
+                    catch (OperationCanceledException) { break; }
+                }
+            }
+        }
+        finally
+        {
+            // Drain remaining batches on shutdown so pool doesn't leak.
+            while (_broadcastRing.TryDequeue(out var batch))
+                BroadcastWorkBatch.Return(batch!);
+        }
+    }
+
+    /// <summary>
+    /// Broadcaster thread: for each event in the batch, resolve subscribers and
+    /// accumulate wire-bytes into per-session buffers; at end of batch hand each buffer
+    /// to its session's outbound channel as one coalesced write. This preserves the
+    /// "one Channel.TryWrite per client per packet" coalescing property.
+    /// </summary>
+    private void FanoutBatch(BroadcastWorkBatch batch)
+    {
+        for (int i = 0; i < batch.EventCount; i++)
+        {
+            ref var ev = ref batch.Events[i];
+            var bytes = batch.Buffer.AsSpan(ev.Offset, ev.Len);
+            AppendForBookSubscribers(ev.SecId, bytes, ev.LogicalCount);
+        }
+        FlushClientBatches();
+    }
+
     private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
     {
         var subs = _parent.GetSubscribers(securityId);
@@ -471,9 +647,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
 
-            // GetValueRefOrAddDefault returns a ref to the slot, avoiding the
-            // double dictionary access (TryGetValue + indexer set) we'd otherwise
-            // need for a struct value.
             ref var acc = ref CollectionsMarshal.GetValueRefOrAddDefault(_clientBatches, session, out bool exists);
             if (!exists)
             {
@@ -495,13 +668,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         }
     }
 
-    /// <summary>
-    /// Hand each accumulated per-client buffer to its outbound channel as a single
-    /// coalesced batch and transfer ownership of the pooled byte[] to the session's
-    /// write loop, which returns it to <see cref="ArrayPool{T}.Shared"/> after the WS
-    /// frame is sent. <see cref="ClientSession.TryEnqueueBatch"/> is responsible for
-    /// returning the array if the channel is full or already cancelled.
-    /// </summary>
     private void FlushClientBatches()
     {
         if (_clientBatches.Count == 0) return;
