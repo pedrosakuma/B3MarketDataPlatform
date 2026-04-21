@@ -1,6 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks.Sources;
 
 namespace B3.Umdf.Server;
 
@@ -78,12 +79,14 @@ internal readonly struct OutboundMessage
 /// Designed to replace <see cref="System.Threading.Channels.Channel{T}"/> on the WS
 /// outbound path: <c>Channel{T}.TryWrite</c> takes an internal Monitor on every call,
 /// which dominated the broadcast-side CPU cost in trace 014 even after per-flush
-/// coalescing. The wake/park path uses <see cref="SemaphoreSlim"/> so the consumer
-/// can <c>await</c> without blocking a thread-pool worker, gated by the
-/// <c>_consumerWaiting</c> flag so the steady-state hot path never touches the
-/// semaphore.
+/// coalescing. The wake/park path is a custom allocation-free
+/// <see cref="IValueTaskSource{TResult}"/> (built on
+/// <see cref="ManualResetValueTaskSourceCore{TResult}"/>) so that the write loop can
+/// <c>await</c> without boxing the async state machine or allocating a completion
+/// source on every park. Producers gate the wake on the <c>_consumerWaiting</c> flag
+/// so the steady-state hot path touches nothing shared beyond the ring slots.
 /// </summary>
-internal sealed class MpscOutboundRing : IDisposable
+internal sealed class MpscOutboundRing : IValueTaskSource, IDisposable
 {
     private readonly OutboundMessage[] _slots;
     private readonly long[] _seqs;
@@ -92,13 +95,26 @@ internal sealed class MpscOutboundRing : IDisposable
     private PaddedLong _producerSeq;
     private PaddedLong _consumerSeq;
 
-    // 0 = consumer is busy draining; 1 = consumer has parked (or is about to park) on
-    // the semaphore. Producers gate the cost of SemaphoreSlim.Release (which acquires
-    // an internal Monitor lock) on this flag, so the steady-state case — consumer
-    // keeping up — never wakes the semaphore.
+    // 0 = consumer is busy draining; 1 = consumer has parked (or is about to park)
+    // on the IValueTaskSource. At most one actor (producer, cancellation callback,
+    // or consumer fast-path rescue) wins the 1→0 CAS and is therefore the sole
+    // completer of the current wait cycle, preventing double-SetResult.
     private int _consumerWaiting;
 
-    private readonly SemaphoreSlim _itemsAvailable = new(initialCount: 0);
+    private ManualResetValueTaskSourceCore<bool> _vts = new() { RunContinuationsAsynchronously = false };
+    private CancellationTokenRegistration _ctr;
+    private CancellationToken _activeCt;
+    private volatile bool _disposed;
+
+    private static readonly Action<object?, CancellationToken> s_cancelCallback = static (state, ct) =>
+    {
+        var ring = (MpscOutboundRing)state!;
+        // Only the winner of the CAS completes the wait; if the producer already won,
+        // we leave the wait completed with success and let the consumer loop observe
+        // cancellation on its next pass through RunWriteLoopAsync.
+        if (Interlocked.CompareExchange(ref ring._consumerWaiting, 0, 1) == 1)
+            ring._vts.SetException(new OperationCanceledException(ct));
+    };
 
     public int Capacity => _slots.Length;
 
@@ -149,9 +165,9 @@ internal sealed class MpscOutboundRing : IDisposable
                     // happens-before this read; and the consumer's Exchange of
                     // _consumerWaiting=1 happens-before its re-check of the slot.
                     // Either it observes our publish on the re-check, or we observe
-                    // its waiting flag and Release the semaphore — never both miss.
+                    // its waiting flag and complete the value-task source — never both miss.
                     if (Interlocked.CompareExchange(ref _consumerWaiting, 0, 1) == 1)
-                        _itemsAvailable.Release();
+                        _vts.SetResult(true);
                     return true;
                 }
                 pos = Volatile.Read(ref _producerSeq.Value);
@@ -193,26 +209,62 @@ internal sealed class MpscOutboundRing : IDisposable
     /// <summary>
     /// Asynchronously park the consumer until at least one message is observable in
     /// the ring or <paramref name="ct"/> fires. Caller must have already drained
-    /// everything available via <see cref="TryDequeue"/>.
+    /// everything available via <see cref="TryDequeue"/> and must not invoke this
+    /// concurrently — there is exactly one consumer by design.
     /// </summary>
     public ValueTask WaitForItemsAsync(CancellationToken ct)
     {
+        if (ct.IsCancellationRequested)
+            return ValueTask.FromCanceled(ct);
+        if (_disposed)
+            return ValueTask.CompletedTask;
+
+        // Reset the source for a new wait cycle. Only the single consumer ever
+        // touches _vts.Reset, so this is safe without synchronization.
+        _vts.Reset();
+        _activeCt = ct;
+
         // Publish "waiting" with a full barrier, then re-check the ring to close the
         // window where a producer enqueued between the caller's last failed
         // TryDequeue and this point.
         Interlocked.Exchange(ref _consumerWaiting, 1);
         if (TryPeekAvailable())
         {
-            Volatile.Write(ref _consumerWaiting, 0);
-            return ValueTask.CompletedTask;
+            // If we still own the flag, rescue it ourselves so the producer that
+            // enqueued the racing item does not later observe 1 and call SetResult
+            // on a source we never awaited. If the producer already flipped the flag
+            // it has also called SetResult(true), so we must go through the VTS.
+            if (Interlocked.CompareExchange(ref _consumerWaiting, 0, 1) == 1)
+                return ValueTask.CompletedTask;
         }
-        return new ValueTask(WaitSlowAsync(ct));
+
+        if (ct.CanBeCanceled)
+            _ctr = ct.UnsafeRegister(s_cancelCallback, this);
+
+        return new ValueTask(this, _vts.Version);
     }
 
-    private async Task WaitSlowAsync(CancellationToken ct)
+    // --- IValueTaskSource ---
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _vts.GetStatus(token);
+
+    void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags) =>
+        _vts.OnCompleted(continuation, state, token, flags);
+
+    void IValueTaskSource.GetResult(short token)
     {
-        try { await _itemsAvailable.WaitAsync(ct).ConfigureAwait(false); }
-        finally { Volatile.Write(ref _consumerWaiting, 0); }
+        // Dispose the registration first so we never leak a pending callback; this
+        // is cheap (no-op if default) and also synchronously waits for any in-flight
+        // callback to complete so it's safe to Reset the source on the next cycle.
+        _ctr.Dispose();
+        _ctr = default;
+        try
+        {
+            _vts.GetResult(token);
+        }
+        finally
+        {
+            _activeCt = default;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -227,13 +279,23 @@ internal sealed class MpscOutboundRing : IDisposable
     /// <summary>Wakes the consumer (used at shutdown/cancel to break a Wait).</summary>
     public void SignalShutdown()
     {
-        // Best-effort: if nobody is waiting, this just raises the count and the next
-        // WaitForItemsAsync returns immediately. The fast-path consumer would then
-        // re-enter, find an empty ring, and re-park — harmless one-shot extra cycle.
-        try { _itemsAvailable.Release(); } catch (ObjectDisposedException) { }
+        _disposed = true;
+        // If the consumer is parked, rescue it so it exits the Wait and the write
+        // loop can observe cancellation via its CancellationToken. If it isn't
+        // parked, the next call to WaitForItemsAsync returns CompletedTask because
+        // _disposed is set.
+        if (Interlocked.CompareExchange(ref _consumerWaiting, 0, 1) == 1)
+        {
+            try { _vts.SetResult(true); } catch (InvalidOperationException) { /* already completed */ }
+        }
     }
 
-    public void Dispose() => _itemsAvailable.Dispose();
+    public void Dispose()
+    {
+        _disposed = true;
+        _ctr.Dispose();
+        _ctr = default;
+    }
 
     private static int NextPow2(int v)
     {
