@@ -1,7 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
-using System.Threading.Channels;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -9,49 +8,17 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace B3.Umdf.Server;
 
 /// <summary>
-/// Per-WebSocket-connection state. Manages subscriptions and outbound message channel.
+/// Per-WebSocket-connection state. Manages subscriptions and outbound message ring.
 /// All book/trade events arrive pre-serialized from upstream conflation in SubscriptionManager.
 /// The write loop coalesces pre-serialized messages + dirty-flag info into single WebSocket frames.
 /// </summary>
 public sealed class ClientSession : IDisposable
 {
-    private readonly struct OutboundMessage
-    {
-        public static readonly OutboundMessage InfoWake = new(ReadOnlyMemory<byte>.Empty, isInfoWake: true, logicalCount: 0, pooledArray: null);
-
-        public OutboundMessage(ReadOnlyMemory<byte> payload, bool isInfoWake = false, int logicalCount = 1, byte[]? pooledArray = null)
-        {
-            Payload = payload;
-            IsInfoWake = isInfoWake;
-            LogicalCount = logicalCount;
-            PooledArray = pooledArray;
-        }
-
-        public ReadOnlyMemory<byte> Payload { get; }
-        public bool IsInfoWake { get; }
-
-        /// <summary>
-        /// Number of logical wire messages contained in this payload. Coalesced batches
-        /// from upstream conflation carry N pre-serialized messages back-to-back so the
-        /// stat counters (<see cref="MessagesSent"/>, <c>WsMessagesSent</c>) reflect the
-        /// true wire-event volume rather than the queue-write count.
-        /// </summary>
-        public int LogicalCount { get; }
-
-        /// <summary>
-        /// When non-null, the backing array was rented from <see cref="ArrayPool{T}.Shared"/>
-        /// by the producer; the write loop must return it after the WS frame is sent (or
-        /// the channel must return it on shutdown). <see cref="Payload"/> is a slice of
-        /// this array.
-        /// </summary>
-        public byte[]? PooledArray { get; }
-    }
-
     private static int _nextId;
 
     public string Id { get; }
     public WebSocket Socket { get; }
-    private readonly Channel<OutboundMessage> _outbound;
+    private readonly MpscOutboundRing _outbound;
     private readonly HashSet<ulong> _subscriptions = new();
     private readonly ConcurrentDictionary<ulong, long> _infoVersions = new();
     private MarketDataManager[]? _marketDataManagers;
@@ -93,13 +60,10 @@ public sealed class ClientSession : IDisposable
         _slowClientThreshold = slowClientThreshold;
         _slowClientMaxTicks = slowClientMaxTicks;
         _logger = logger ?? NullLogger.Instance;
-        _outbound = Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(channelCapacity)
-        {
-            SingleReader = true,
-            SingleWriter = false,
-            FullMode = BoundedChannelFullMode.Wait,
-            AllowSynchronousContinuations = false,
-        });
+        // Lock-free MPSC ring rounds capacity up to the next power of two; the
+        // user-facing ChannelCapacity stays as the requested value (used as the
+        // slow-client threshold denominator and for back-compat with tests).
+        _outbound = new MpscOutboundRing(channelCapacity);
     }
 
     public bool IsSubscribed(ulong securityId) => _subscriptions.Contains(securityId);
@@ -122,8 +86,8 @@ public sealed class ClientSession : IDisposable
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
         _marketDataManagers = managers;
 
-    /// <summary>Current outbound queue depth.</summary>
-    public int QueueDepth => _outbound.Reader.CanCount ? _outbound.Reader.Count : 0;
+    /// <summary>Current outbound queue depth (approximate, MPSC ring observation).</summary>
+    public int QueueDepth => _outbound.ApproximateDepth;
 
     /// <summary>Soft capacity reference for slow-client detection.</summary>
     public int ChannelCapacity { get; }
@@ -179,7 +143,7 @@ public sealed class ClientSession : IDisposable
     private const int MaxDrainPerCycle = 16384;
 
     /// <summary>
-    /// Write loop: drains the outbound channel (pre-serialized messages),
+    /// Write loop: drains the outbound MPSC ring (pre-serialized messages),
     /// reads dirty info via version counters, coalesces everything
     /// into a single WebSocket binary frame.
     /// </summary>
@@ -193,8 +157,7 @@ public sealed class ClientSession : IDisposable
 
         try
         {
-            var reader = _outbound.Reader;
-            while (await reader.WaitToReadAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
                 if (Socket.State != WebSocketState.Open) break;
 
@@ -204,7 +167,7 @@ public sealed class ClientSession : IDisposable
                 int drained = 0;
                 int logicalDrained = 0;
                 bool sawInfoWake = false;
-                while (drained < MaxDrainPerCycle && reader.TryRead(out var outbound))
+                while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
                 {
                     drained++;
                     if (outbound.IsInfoWake)
@@ -218,6 +181,16 @@ public sealed class ClientSession : IDisposable
                     if (outbound.PooledArray is { } pooled)
                         pooledToReturn.Add(pooled);
                 }
+
+                if (drained == 0)
+                {
+                    // Park until a producer enqueues. The ring's WaitForItemsAsync
+                    // re-checks after publishing the waiting flag, so producers that
+                    // raced our last failed TryDequeue are observed without sleeping.
+                    await _outbound.WaitForItemsAsync(ct).ConfigureAwait(false);
+                    continue;
+                }
+
                 if (sawInfoWake)
                     Interlocked.Exchange(ref _infoWakePending, 0);
 
@@ -300,7 +273,7 @@ public sealed class ClientSession : IDisposable
         }
     }
 
-    private bool TryEnqueueCore(OutboundMessage outbound, string itemKind)
+    private bool TryEnqueueCore(in OutboundMessage outbound, string itemKind)
     {
         if (_cts.IsCancellationRequested)
         {
@@ -309,7 +282,7 @@ public sealed class ClientSession : IDisposable
             return false;
         }
 
-        if (_outbound.Writer.TryWrite(outbound))
+        if (_outbound.TryEnqueue(outbound))
             return true;
 
         if (outbound.PooledArray is { } pooled2)
@@ -322,8 +295,7 @@ public sealed class ClientSession : IDisposable
 
     private void DrainAndReturnPooled()
     {
-        var reader = _outbound.Reader;
-        while (reader.TryRead(out var outbound))
+        while (_outbound.TryDequeue(out var outbound))
         {
             if (outbound.PooledArray is { } pooled)
                 ArrayPool<byte>.Shared.Return(pooled);
@@ -394,13 +366,16 @@ public sealed class ClientSession : IDisposable
         if (_cts.IsCancellationRequested)
             return;
 
-        _outbound.Writer.TryComplete();
         _cts.Cancel();
+        // Wake the writer if it is parked on the ring so it can observe cancellation
+        // and exit through the finally block (which drains any remaining pooled buffers).
+        _outbound.SignalShutdown();
     }
 
     public void Dispose()
     {
         Cancel();
         _cts.Dispose();
+        _outbound.Dispose();
     }
 }
