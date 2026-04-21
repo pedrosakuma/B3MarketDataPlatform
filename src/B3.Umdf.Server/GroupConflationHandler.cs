@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using B3.Umdf.Book;
 using B3.Umdf.Mbo.Sbe.V16;
 
@@ -470,14 +471,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
 
-            if (!_clientBatches.TryGetValue(session, out var acc))
+            // GetValueRefOrAddDefault returns a ref to the slot, avoiding the
+            // double dictionary access (TryGetValue + indexer set) we'd otherwise
+            // need for a struct value.
+            ref var acc = ref CollectionsMarshal.GetValueRefOrAddDefault(_clientBatches, session, out bool exists);
+            if (!exists)
             {
-                acc = new ClientBatchAccumulator
-                {
-                    Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024)),
-                    Offset = 0,
-                    LogicalCount = 0,
-                };
+                acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024));
+                acc.Offset = 0;
+                acc.LogicalCount = 0;
             }
             if (acc.Offset + bytes.Length > acc.Buffer.Length)
             {
@@ -490,7 +492,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
             acc.Offset += bytes.Length;
             acc.LogicalCount += logicalCount;
-            _clientBatches[session] = acc;
         }
     }
 

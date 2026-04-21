@@ -101,7 +101,15 @@ internal sealed class MpscOutboundRing : IValueTaskSource, IDisposable
     // completer of the current wait cycle, preventing double-SetResult.
     private int _consumerWaiting;
 
-    private ManualResetValueTaskSourceCore<bool> _vts = new() { RunContinuationsAsynchronously = false };
+    // RunContinuationsAsynchronously=true offloads the write loop to the ThreadPool
+    // when a producer (feed thread) wakes the consumer. Otherwise SetResult runs the
+    // entire writer chain inline — drain → coalesce → SendAsync → Kestrel pipe write
+    // — on the feed thread, serializing all per-client writes through that single
+    // thread and amplifying Kestrel pipe-lock contention. Trace 020 attributed ~85%
+    // of Monitor.Enter_Slowpath samples to that inline chain. The cost of this flag
+    // is one ThreadPool dispatch per wake (a few per second per client), which is
+    // negligible compared to the parallelism it unlocks.
+    private ManualResetValueTaskSourceCore<bool> _vts = new() { RunContinuationsAsynchronously = true };
     private CancellationTokenRegistration _ctr;
     private CancellationToken _activeCt;
     private volatile bool _disposed;
