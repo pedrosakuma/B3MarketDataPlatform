@@ -123,10 +123,10 @@ function aggregateCandles(candles1s, resolution) {
   }
 
   // Higher resolutions: aggregate into buckets and fill gaps between them.
-  // Bucket VWAP = sum(avg * volume) / sum(volume); falls back to close on zero volume.
+  // Avg is session-cumulative VWAP, so the bucket's representative value is the
+  // LAST 1s candle's Avg in that bucket (latest session VWAP at bucket end).
   const result = [];
   let cur = null;
-  let curSumAvgVol = 0;
   for (const c of candles1s) {
     const bucket = Math.floor(c.time / res) * res;
     if (cur && cur.time === bucket) {
@@ -134,27 +134,25 @@ function aggregateCandles(candles1s, resolution) {
       if (c.low < cur.low) cur.low = c.low;
       cur.close = c.close;
       cur.volume += c.volume;
-      curSumAvgVol += c.avg * c.volume;
-      cur.avg = cur.volume > 0 ? curSumAvgVol / cur.volume : cur.close;
+      cur.avg = c.avg;
     } else {
       if (cur) {
         result.push(cur);
         let gapBucket = cur.time + res;
         let gapCount = 0;
         const p = cur.close;
+        const a = cur.avg;
         while (gapBucket < bucket && gapCount < MAX_GAP_FILL) {
-          result.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0, avg: p });
+          result.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0, avg: a });
           gapBucket += res;
           gapCount++;
         }
       }
       const newOpen = cur ? cur.close : c.open;
-      curSumAvgVol = c.avg * c.volume;
       cur = {
         time: bucket, open: newOpen,
         high: Math.max(newOpen, c.high), low: Math.min(newOpen, c.low),
-        close: c.close, volume: c.volume,
-        avg: c.volume > 0 ? c.avg : c.close,
+        close: c.close, volume: c.volume, avg: c.avg,
       };
     }
   }
