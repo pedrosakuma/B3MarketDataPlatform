@@ -26,7 +26,9 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 - **Candle history** — retains the most recent 10h of 1s candles per instrument; snapshots are chunked across frames
 - **Rankings** — top 10 by volume, gainers, and losers pushed every 2s
 - **Server status broadcast** — sends ready state on connect; auto-resubscribes all instruments on reconnect
-- **Backpressure** — bounded per-client outbound queue, slow-client detection and auto-disconnect
+- **Backpressure** — layered defense: bounded per-client outbound ring, hard pending-bytes cap with disconnect, periodic outlier sweep under aggregate pressure, fanout suppression while the upstream group is recovering (see [docs/RESILIENCE.md](docs/RESILIENCE.md))
+- **Per-client coalesce window** — outbound batching window (`UMDF_CLIENT_COALESCE_WINDOW_MS`) trades a few ms of latency for an order-of-magnitude reduction in syscalls under high client counts
+- **Decoupled broadcaster thread** — fanout runs on its own thread per group, so client serialization never stalls feed dispatch
 
 ### Web Frontend
 - **Web Worker architecture** — worker thread owns WebSocket connection, message parsing, state management, and MBP computation; main thread only renders DOM
@@ -138,7 +140,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 | `B3.Umdf.Feed.Tests` | 22 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
 | `B3.Umdf.PcapReplay.Tests` | 4 | PCAP reader, timestamp merge |
 | `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
-| `B3.Umdf.Server.Tests` | 36 | Subscription manager, client session, settings, backpressure |
+| `B3.Umdf.Server.Tests` | 38 | Subscription manager, client session, settings, backpressure, outlier sweep |
 
 ## Quick Start
 
@@ -514,7 +516,24 @@ Validated end-to-end with the `docker-compose.multicast.yml` stack (publisher + 
 | Consumer CPU | ~30% of one core |
 | Consumer RSS | ~550 MiB |
 | Recovery cycles in steady state | 0 (post startup catch-up) |
-| Tests | 95/95 passing |
+| Tests | 97/97 passing |
+
+#### High-fanout / slow-consumer stress
+
+200 WebSocket clients × 200 symbols (40 k subscriptions) × 180 s with
+15 – 30 % of clients artificially slowed via TCP socket pause/resume
+(same 2-CPU / 4-GiB container, REPLAY_SPEED=2):
+
+| Metric | Value |
+|--------|-------|
+| Per-process throughput at the client | 150 k – 700 k msgs/s |
+| Consumer RSS | ~2.0 GiB stable |
+| Slow disconnects (matched to slow clients) | 100 % of `closes` |
+| Healthy clients disconnected | 0 |
+
+Full slow-consumer protection design and benchmark methodology in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) and
+[docs/RESILIENCE.md](docs/RESILIENCE.md).
 
 Live-path optimizations:
 - **`recvmmsg` batching** — receive threads pull up to 64 datagrams per syscall
@@ -652,24 +671,55 @@ Settings can be provided via JSON file, environment variables, or CLI arguments 
 | `UMDF_SPEED` | `--speed` | `0` | Replay speed multiplier |
 | `UMDF_REPLAY_TO_MULTICAST` | `--replay-to-multicast` | `false` | Publish replayed PCAP payloads to multicast instead of consuming them in-process |
 | `UMDF_MAX_CONNECTIONS` | — | `0` (unlimited) | Max concurrent WebSocket connections |
-| `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size |
+| `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size (msgs) |
+| `UMDF_CLIENT_MAX_PENDING_BYTES` | — | `4194304` | Per-client outbound hard byte cap; client is disconnected as slow consumer when exceeded |
+| `UMDF_CLIENT_COALESCE_WINDOW_MS` | — | `10` | Per-client outbound coalesce window; trades a few ms of latency for fewer syscalls under high client counts |
 | `UMDF_SLOW_CLIENT_THRESHOLD` | — | `0.75` | Fraction of queue capacity considered congested |
 | `UMDF_SLOW_CLIENT_MAX_TICKS` | — | `100` | Consecutive congested write cycles before disconnect |
+| `UMDF_CLIENT_OUTLIER_INTERVAL_MS` | — | `1000` | Outlier-sweep period; `0` disables sweep |
+| `UMDF_CLIENT_OUTLIER_PRESSURE_PCT` | — | `0.50` | Aggregate-pressure gate (Σpending / (clients × maxPending)) below which the sweep is a no-op |
+| `UMDF_CLIENT_OUTLIER_MULTIPLIER` | — | `4.0` | Disconnect threshold = `max(median × multiplier, minBytes)` |
+| `UMDF_CLIENT_OUTLIER_MIN_BYTES` | — | `262144` | Floor on the outlier disconnect threshold |
+| `UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH` | — | `32` | Cap on Book snapshot requests serviced by the dispatch thread per packet (paces connect storms) |
 | `UMDF_SHUTDOWN_DRAIN_SECONDS` | — | `5` | Graceful shutdown drain timeout |
 | `UMDF_MULTICAST_MERGE_CAPACITY` | — | `1000000` | Capacity of the shared live-UDP merge queue |
 | `UMDF_FEED_CHANNEL_CAPACITY` | — | `250000` | Capacity of each per-group feed queue behind the dispatcher |
-| `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | — | `50000` | Per-group cap on incrementals retained during a snapshot cycle (drop-oldest on overflow) |
+| `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | — | `200000` | Per-group cap on incrementals retained during a snapshot cycle (drop-oldest on overflow) |
 | `UMDF_GROUP_RING_CAPACITY` | — | `65536` | Per-group MPSC dispatch ring capacity (drop-newest on overflow) |
 | `UMDF_LOG_LEVEL` | — | `Information` | Minimum log level |
 | `UMDF_MULTICAST_CONFIG` | `--multicast-config` | — | Multicast JSON config path |
 
 ### Backpressure & Slow Clients
 
-Each WebSocket client has a bounded outbound queue (default: 4096 messages). When a client can't keep up:
-1. Enqueues stop at the configured capacity; the feed thread never blocks on a slow client
-2. Queue depth is monitored on every write cycle
-3. A client is disconnected immediately if its queue is already full, or after sustained backlog above the configured threshold/tick window
-4. Disconnected clients should reconnect and re-subscribe (they will receive fresh snapshots)
+The consumer enforces the invariant **clients can never impair feed
+consumption** through layered defenses (full design in
+[docs/RESILIENCE.md](docs/RESILIENCE.md)):
+
+1. **Bounded per-client outbound ring** (`UMDF_CLIENT_CHANNEL_CAPACITY`,
+   default 4096 msgs) — the feed thread never blocks on a slow client; on
+   overflow the message is dropped for that one client only.
+2. **Hard pending-bytes cap** (`UMDF_CLIENT_MAX_PENDING_BYTES`, default
+   4 MiB) — when exceeded the client is disconnected with WebSocket close
+   code `PolicyViolation "slow consumer"`. This is the absolute
+   per-client memory ceiling.
+3. **Outlier sweep** (1 Hz by default) — periodically computes the median
+   pending-bytes across clients and disconnects every client above
+   `max(median × UMDF_CLIENT_OUTLIER_MULTIPLIER,
+   UMDF_CLIENT_OUTLIER_MIN_BYTES)`, **gated** on aggregate pressure
+   crossing `UMDF_CLIENT_OUTLIER_PRESSURE_PCT` (default 50 %). This is
+   the "fairness layer" — it removes anomalous clients without affecting
+   the healthy fleet during a systemic slowdown.
+4. **Fanout suppression during Recovery / CatchUp** — while a feed group
+   is recovering, per-client fanout is suppressed; on transition back to
+   `RealTime`, all Book subscribers in that group receive a fresh
+   snapshot. This breaks the cascading-recovery loop where slow clients
+   would otherwise prevent the dispatch thread from ever catching up.
+5. **Snapshot rate-limit** (`UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH`,
+   default 32/packet) — bounds the dispatch thread's allocation rate
+   under connect storms.
+
+Disconnected clients should reconnect and re-subscribe; they will receive
+fresh snapshots and resume cleanly.
 
 ### Graceful Shutdown
 
@@ -694,6 +744,11 @@ ASPNETCORE_Kestrel__Certificates__Default__Password=changeit
 - [B3 Binary UMDF Developer Page](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/)
 - [SbeSourceGenerator](https://github.com/pedrosakuma/SbeSourceGenerator)
 - [FIX Simple Binary Encoding](https://github.com/FIXTradingCommunity/fix-simple-binary-encoding)
+
+### Further reading
+
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks
+- [docs/RESILIENCE.md](docs/RESILIENCE.md) — failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook
 
 ## License
 
