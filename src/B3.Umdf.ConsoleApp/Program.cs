@@ -493,16 +493,15 @@ if (subscriptionManager is not null)
 
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
-var lastReady = false;
-long prevPackets = 0, prevTotalEvents = 0;
-long prevStatsTicks = 0;
+var statsPrinter = new StatsPrinter(sw, stats, bookManagers, marketDataManagers, symbolRegistry,
+    groupIds, multiFeed, singleFeed, subscriptionManager);
 
 // Register OTEL-compatible metrics (System.Diagnostics.Metrics)
 MetricsBinder.Register(stats, bookManagers, marketDataManagers, groupIds,
     multiFeed, singleFeed, multicastMerger: null, subscriptionManager, groupHandlers, symbolRegistry,
     multicastSources: liveMulticastSources);
 
-using var statsTimer = new Timer(_ => PrintPeriodicStats(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
+using var statsTimer = new Timer(_ => statsPrinter.PrintPeriodic(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(liveMulticastSources is not null ? "live feed" : "replay")}...");
 
@@ -644,148 +643,12 @@ else
 }
 
 Console.WriteLine();
-PrintFinalSummary();
+statsPrinter.PrintFinal();
 
 return 0;
 
 // ── Local functions ──
 
-
-void PrintPeriodicStats()
-{
-    bool ready;
-    long packets;
-    string stateStr;
-
-    if (multiFeed is not null)
-    {
-        ready = multiFeed.IsAllReady;
-        packets = multiFeed.TotalPacketCount;
-        var states = string.Join(", ", multiFeed.Handlers.Select(h => $"G{h.Key}:{h.Value.State}"));
-        stateStr = states;
-    }
-    else if (singleFeed is not null)
-    {
-        ready = singleFeed.State == FeedState.RealTime;
-        packets = singleFeed.PacketCount;
-        stateStr = singleFeed.State.ToString();
-    }
-    else return;
-
-    if (ready && !lastReady)
-    {
-        if (singleFeed is not null)
-            subscriptionManager?.SetReady();
-        lastReady = true;
-    }
-
-    // Compute rates
-    long nowTicks = sw.ElapsedTicks;
-    double secs = prevStatsTicks > 0
-        ? (double)(nowTicks - prevStatsTicks) / Stopwatch.Frequency
-        : sw.Elapsed.TotalSeconds;
-    if (secs < 0.5) secs = 0.5;
-
-    long totalEvents = stats.OrderCount + stats.TradeCount + stats.DeleteCount +
-                       stats.MarketDataCount + stats.StatusChangeCount +
-                       stats.ForwardTradeCount + stats.TradeBustCount + stats.ExecSummaryCount;
-
-    long pktRate = (long)((packets - prevPackets) / secs);
-    long evtRate = (long)((totalEvents - prevTotalEvents) / secs);
-    prevPackets = packets;
-    prevTotalEvents = totalEvents;
-    prevStatsTicks = nowTicks;
-
-    Console.WriteLine();
-    Console.WriteLine($"── [{sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
-    Console.WriteLine($"   Packets: {packets:N0} ({pktRate:N0}/s)  |  Events: {totalEvents:N0} ({evtRate:N0}/s)  |  Books: {bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {symbolRegistry.Count:N0}");
-
-    if (subscriptionManager is not null)
-    {
-        foreach (var (id, depth, pendingBytes, sent, _) in subscriptionManager.GetClientStats())
-            Console.WriteLine($"   {id}: queue={depth:N0}  pending={pendingBytes:N0}B  sent={sent:N0}");
-        if (subscriptionManager.UpstreamConflated > 0)
-            Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
-    }
-
-    // Per-group feed queue stats removed: inline dispatch (Option A) eliminated the bounded
-    // Channel<UmdfPacket>; backpressure now manifests as kernel SO_RCVBUF drops -> sequence
-    // gaps -> recovery, which is already reported below.
-
-    var recoveryParts = new List<string>();
-    if (singleFeed is not null)
-    {
-        if (singleFeed.State == FeedState.Recovery || singleFeed.IncrementalQueueDroppedPackets > 0)
-        {
-            recoveryParts.Add(
-                $"G{groupIds[0]}={singleFeed.State} gap={singleFeed.IncrementalHandler.LastGapExpected}->{singleFeed.IncrementalHandler.LastGapReceived} catchupDropped={singleFeed.IncrementalQueueDroppedPackets:N0}");
-        }
-    }
-    else if (multiFeed is not null)
-    {
-        foreach (var (gid, handler) in multiFeed.Handlers.OrderBy(h => h.Key))
-        {
-            if (handler.State == FeedState.Recovery || handler.IncrementalQueueDroppedPackets > 0)
-            {
-                recoveryParts.Add(
-                    $"G{gid}={handler.State} gap={handler.IncrementalHandler.LastGapExpected}->{handler.IncrementalHandler.LastGapReceived} catchupDropped={handler.IncrementalQueueDroppedPackets:N0}");
-            }
-        }
-    }
-
-    if (recoveryParts.Count > 0)
-        Console.WriteLine($"   recovery: {string.Join("  ", recoveryParts)}");
-
-    var crossedParts = new List<string>();
-    for (int i = 0; i < bookManagers.Count; i++)
-    {
-        long crossed = bookManagers[i].CurrentlyCrossedBooks;
-        long auction = bookManagers[i].CurrentlyCrossedAuction;
-        long locked = bookManagers[i].CurrentlyLockedBooks;
-        long transitions = bookManagers[i].CrossingTransitions;
-        if (crossed > 0 || auction > 0 || transitions > 0)
-            crossedParts.Add($"G{groupIds[i]}=trading:{crossed} auction:{auction} locked:{locked} (transitions={transitions:N0})");
-    }
-    if (crossedParts.Count > 0)
-        Console.WriteLine($"   crossed books: {string.Join("  ", crossedParts)}");
-
-    if (!ready && singleFeed is not null && singleFeed.State == FeedState.WaitInstrumentDefinition)
-        Console.WriteLine($"   InstrDef: {singleFeed.InstrDefReceived:N0}/{singleFeed.InstrDefTotalExpected:N0} parsed  ({singleFeed.InstrDefPacketCount:N0} packets)");
-
-    if (!ready && multiFeed is not null)
-    {
-        foreach (var (gid, h) in multiFeed.Handlers)
-        {
-            if (h.State == FeedState.WaitInstrumentDefinition)
-                Console.WriteLine($"   G{gid} InstrDef: {h.InstrDefReceived:N0}/{h.InstrDefTotalExpected:N0} parsed  ({h.InstrDefPacketCount:N0} idef pkts, {h.PacketCount:N0} total pkts)");
-        }
-    }
-}
-
-void PrintFinalSummary()
-{
-    double totalSecs = sw.Elapsed.TotalSeconds;
-    long packets = multiFeed?.TotalPacketCount ?? singleFeed?.PacketCount ?? 0;
-    long totalEvents = stats.OrderCount + stats.TradeCount + stats.DeleteCount +
-                       stats.MarketDataCount + stats.StatusChangeCount +
-                       stats.ForwardTradeCount + stats.TradeBustCount + stats.ExecSummaryCount;
-
-    Console.WriteLine($"═══ Complete ({sw.Elapsed:hh\\:mm\\:ss}) ═══");
-    Console.WriteLine($"  Channel groups: {groupIds.Count}");
-    Console.WriteLine($"  Packets:      {packets:N0}  ({(totalSecs > 0 ? (long)(packets / totalSecs) : 0):N0}/s avg)");
-    Console.WriteLine($"  Events:       {totalEvents:N0}  ({(totalSecs > 0 ? (long)(totalEvents / totalSecs) : 0):N0}/s avg)");
-    Console.WriteLine($"    Orders:     {stats.OrderCount:N0}");
-    Console.WriteLine($"    Trades:     {stats.TradeCount:N0}");
-    Console.WriteLine($"    Deletes:    {stats.DeleteCount:N0}");
-    Console.WriteLine($"    MarketData: {stats.MarketDataCount:N0}");
-    Console.WriteLine($"    StatusChg:  {stats.StatusChangeCount:N0}");
-    Console.WriteLine($"    FwdTrades:  {stats.ForwardTradeCount:N0}");
-    Console.WriteLine($"    TradeBusts: {stats.TradeBustCount:N0}");
-    Console.WriteLine($"    ExecSumm:   {stats.ExecSummaryCount:N0}");
-    Console.WriteLine($"  Books:        {bookManagers.Sum(bm => bm.Books.Count):N0}");
-    Console.WriteLine($"  Instruments:  {marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
-    Console.WriteLine($"  Symbols:      {symbolRegistry.Count:N0}");
-}
 
 sealed class Stats : IBookEventHandler, IMarketDataEventHandler
 {
