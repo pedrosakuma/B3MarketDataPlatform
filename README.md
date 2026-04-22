@@ -138,7 +138,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 |---------|-------|-------------|
 | `B3.Umdf.Book.Tests` | 19 | Order book operations, book side, concurrency stress |
 | `B3.Umdf.Feed.Tests` | 22 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
-| `B3.Umdf.PcapReplay.Tests` | 4 | PCAP reader, timestamp merge |
+| `B3.Umdf.PcapReplay.Tests` | 13 | PCAP reader, UDP/VLAN/SLL extraction, timestamp-merge ordering across channels and groups |
 | `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
 | `B3.Umdf.Server.Tests` | 41 | Subscription manager, client session, settings, backpressure, outlier sweep |
 

@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="B3.Umdf.Feed.Tests" />
+    <InternalsVisibleTo Include="B3.Umdf.Feed.Benchmarks" />
   </ItemGroup>
 
 </Project>
