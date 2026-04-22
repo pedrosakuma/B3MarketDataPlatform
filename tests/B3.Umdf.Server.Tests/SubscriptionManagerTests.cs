@@ -223,7 +223,7 @@ public class SubscriptionManagerTests
         Assert.Null(settings.WsPort);
         Assert.Equal(0.0, settings.Speed);
         Assert.False(settings.ReplayToMulticast);
-        Assert.Equal(4096, settings.ClientChannelCapacity);
+        Assert.Equal(32768, settings.ClientChannelCapacity);
         Assert.Equal(0.75, settings.SlowClientThreshold);
         Assert.Equal(100, settings.SlowClientMaxTicks);
         Assert.Equal(32L * 1024 * 1024, settings.ClientMaxPendingBytes);

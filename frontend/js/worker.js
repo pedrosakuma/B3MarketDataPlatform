@@ -45,7 +45,15 @@ function scheduleAllInfo() {
 }
 
 // ── Helpers ──
-function secIdStr(bigint) { return bigint.toString(); }
+const _secIdCache = new Map();
+function secIdStr(bigint) {
+  let s = _secIdCache.get(bigint);
+  if (s === undefined) {
+    s = bigint.toString();
+    _secIdCache.set(bigint, s);
+  }
+  return s;
+}
 
 function log(text, cssClass) {
   postMessage({ type: 'log', text, cssClass });
@@ -81,15 +89,11 @@ const MAX_RECENT_TRADES = 50; // trade tape length per subscription
 //   0 = unknown (mid-price or no top-of-book yet)
 //   1 = Buy aggressor (trade lifted the ask)
 //   2 = Sell aggressor (trade hit the bid)
-function inferAggressor(orders, tradePrice) {
-  let bestBid = -Infinity;
-  let bestAsk = Infinity;
-  for (const [, o] of orders) {
-    if (o.side === 0) { if (o.price > bestBid) bestBid = o.price; }
-    else              { if (o.price < bestAsk) bestAsk = o.price; }
-  }
-  if (bestAsk !== Infinity && tradePrice >= bestAsk) return 1;
-  if (bestBid !== -Infinity && tradePrice <= bestBid) return 2;
+function inferAggressor(sub, tradePrice) {
+  const bid = bestOfSide(sub, 0);
+  const ask = bestOfSide(sub, 1);
+  if (ask !== null && tradePrice >= ask) return 1;
+  if (bid !== null && tradePrice <= bid) return 2;
   return 0;
 }
 
@@ -361,18 +365,49 @@ setInterval(() => {
 // ── MBP computation (runs in worker, off main thread) ──
 // Incremental price-level helpers. Maintained by order-event handlers so
 // computeBook() avoids iterating all orders (often 100k+) every render frame.
-function levelAdd(levels, price, qty) {
+// Also maintain cached best-of-side prices so inferAggressor() (called per
+// trade) doesn't have to scan all open orders.
+function levelAdd(sub, side, price, qty) {
+  const levels = side === 0 ? sub.bidLevels : sub.askLevels;
   const lvl = levels.get(price);
   if (lvl) { lvl.qty += qty; lvl.count++; }
   else levels.set(price, { price, qty, count: 1 });
+  if (side === 0) {
+    if (sub.bestBid === null || price > sub.bestBid) sub.bestBid = price;
+  } else {
+    if (sub.bestAsk === null || price < sub.bestAsk) sub.bestAsk = price;
+  }
 }
 
-function levelRemove(levels, price, qty) {
+function levelRemove(sub, side, price, qty) {
+  const levels = side === 0 ? sub.bidLevels : sub.askLevels;
   const lvl = levels.get(price);
   if (!lvl) return;
   lvl.qty -= qty;
   lvl.count--;
-  if (lvl.count <= 0 || lvl.qty <= 0) levels.delete(price);
+  if (lvl.count <= 0 || lvl.qty <= 0) {
+    levels.delete(price);
+    // Best-of-side may need recomputation if we just removed the best level.
+    // null sentinel triggers lazy recompute on next read in bestOfSide().
+    if (side === 0 && price === sub.bestBid) sub.bestBid = null;
+    else if (side === 1 && price === sub.bestAsk) sub.bestAsk = null;
+  }
+}
+
+function bestOfSide(sub, side) {
+  if (side === 0) {
+    if (sub.bestBid !== null) return sub.bestBid;
+    let max = -Infinity;
+    for (const p of sub.bidLevels.keys()) if (p > max) max = p;
+    sub.bestBid = max === -Infinity ? null : max;
+    return sub.bestBid;
+  } else {
+    if (sub.bestAsk !== null) return sub.bestAsk;
+    let min = Infinity;
+    for (const p of sub.askLevels.keys()) if (p < min) min = p;
+    sub.bestAsk = min === Infinity ? null : min;
+    return sub.bestAsk;
+  }
 }
 
 function computeBook() {
@@ -444,11 +479,21 @@ function connect(url) {
       if (msg) handleMessage(msg);
       offset += len;
     }
-    mark(D_STATS);
+    scheduleStats();
   };
 }
 
-function scheduleReconnect() {
+// Stats are throttled separately so they don't drag the whole render loop
+// to 60Hz when nothing else is dirty. The stats counter row updates at most
+// every STATS_THROTTLE_MS.
+const STATS_THROTTLE_MS = 250;
+let statsPending = false;
+function scheduleStats() {
+  if (statsPending) return;
+  statsPending = true;
+  setTimeout(() => { statsPending = false; mark(D_STATS); }, STATS_THROTTLE_MS);
+}
+
   if (!autoReconnect) return;
   reconnectAttempts++;
   const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
@@ -485,6 +530,7 @@ function handleMessage(msg) {
           // Aggregated price levels — maintained incrementally on each order event
           // so computeBook() avoids a full O(N) scan over all orders every render frame.
           bidLevels: new Map(), askLevels: new Map(),
+          bestBid: null, bestAsk: null,
           info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
@@ -528,6 +574,8 @@ function handleMessage(msg) {
         sub.orders = new Map();
         sub.bidLevels.clear();
         sub.askLevels.clear();
+        sub.bestBid = null;
+        sub.bestAsk = null;
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -558,13 +606,9 @@ function handleMessage(msg) {
       if (sub) {
         sub.orderCount++;
         const prev = sub.orders.get(msg.orderId);
-        if (prev) {
-          const prevLevels = prev.side === 0 ? sub.bidLevels : sub.askLevels;
-          levelRemove(prevLevels, prev.price, prev.qty);
-        }
+        if (prev) levelRemove(sub, prev.side, prev.price, prev.qty);
         sub.orders.set(msg.orderId, { side: msg.side, price: msg.price, qty: msg.qty });
-        const levels = msg.side === 0 ? sub.bidLevels : sub.askLevels;
-        levelAdd(levels, msg.price, msg.qty);
+        levelAdd(sub, msg.side, msg.price, msg.qty);
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -577,8 +621,7 @@ function handleMessage(msg) {
         sub.orderCount++;
         const prev = sub.orders.get(msg.orderId);
         if (prev) {
-          const levels = prev.side === 0 ? sub.bidLevels : sub.askLevels;
-          levelRemove(levels, prev.price, prev.qty);
+          levelRemove(sub, prev.side, prev.price, prev.qty);
           sub.orders.delete(msg.orderId);
         }
       }
@@ -591,7 +634,7 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.tradeCount++;
-        const side = inferAggressor(sub.orders, msg.price);
+        const side = inferAggressor(sub, msg.price);
         sub.recentTrades.push({
           time: Date.now(), price: msg.price, qty: msg.qty,
           side, tradeId: msg.tradeId,
@@ -612,12 +655,16 @@ function handleMessage(msg) {
           sub.orders = new Map();
           sub.bidLevels.clear();
           sub.askLevels.clear();
+          sub.bestBid = null;
+          sub.bestAsk = null;
         } else {
           const orderSide = msg.side - 1;
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
           (orderSide === 0 ? sub.bidLevels : sub.askLevels).clear();
+          if (orderSide === 0) sub.bestBid = null;
+          else sub.bestAsk = null;
         }
       }
       if (sel === id) mark(D_BOOK);

@@ -158,6 +158,7 @@ function initColumnSelector() {
         visibleColumns = visibleColumns.filter(c => c !== field);
       }
       saveColumns();
+      renderDirty |= DR_SUBS;
       scheduleRender();
     });
     label.appendChild(cb);
@@ -201,15 +202,30 @@ const view = {
 // overwriting a pending snapshot full-swap.
 let chartQueue = [];
 
+// Per-section dirty bits for doRender. Each worker frame sets the bits it
+// touched; doRender renders only those sections, then clears them. This
+// avoids unconditional full re-renders of book/subs/stats/rankings every
+// 16ms when only a counter changed.
+const DR_TITLES   = 0x01;
+const DR_BOOK     = 0x02;
+const DR_CHART    = 0x04;
+const DR_OVERLAYS = 0x08;
+const DR_SUBS     = 0x10;
+const DR_TRADES   = 0x20;
+const DR_AUCTION  = 0x40;
+const DR_STATS    = 0x80;
+const DR_RANKINGS = 0x100;
+let renderDirty = 0;
+
 // ── Worker message handler ──
 worker.onmessage = (evt) => {
   const msg = evt.data;
 
   switch (msg.type) {
     case 'frame':
-      if (msg.selectedId !== undefined) view.selectedId = msg.selectedId;
-      if (msg.selectedSymbol !== undefined) view.selectedSymbol = msg.selectedSymbol;
-      if (msg.book !== undefined) view.book = msg.book;
+      if (msg.selectedId !== undefined) { view.selectedId = msg.selectedId; renderDirty |= DR_TITLES | DR_BOOK | DR_CHART | DR_OVERLAYS | DR_TRADES | DR_AUCTION; }
+      if (msg.selectedSymbol !== undefined) { view.selectedSymbol = msg.selectedSymbol; renderDirty |= DR_TITLES; }
+      if (msg.book !== undefined) { view.book = msg.book; renderDirty |= DR_BOOK; }
       if (msg.chart !== undefined) {
         if (msg.chart === null || msg.chart.full) {
           // Full swap or clear: discard any queued incrementals — full swap is authoritative
@@ -218,14 +234,15 @@ worker.onmessage = (evt) => {
           // Incremental: append after whatever is already queued
           chartQueue.push(msg.chart);
         }
+        renderDirty |= DR_CHART;
       }
-      if (msg.allInfo !== undefined) view.allInfo = msg.allInfo;
-      if (msg.overlays !== undefined) view.overlays = msg.overlays;
-      if (msg.trades !== undefined) view.trades = msg.trades;
-      if (msg.auction !== undefined) view.auction = msg.auction;
-      if (msg.rankings !== undefined) view.rankings = msg.rankings;
-      if (msg.stats !== undefined) view.stats = msg.stats;
-      scheduleRender();
+      if (msg.allInfo !== undefined) { view.allInfo = msg.allInfo; renderDirty |= DR_SUBS; }
+      if (msg.overlays !== undefined) { view.overlays = msg.overlays; renderDirty |= DR_OVERLAYS; }
+      if (msg.trades !== undefined) { view.trades = msg.trades; renderDirty |= DR_TRADES; }
+      if (msg.auction !== undefined) { view.auction = msg.auction; renderDirty |= DR_AUCTION; }
+      if (msg.rankings !== undefined) { view.rankings = msg.rankings; renderDirty |= DR_RANKINGS; }
+      if (msg.stats !== undefined) { view.stats = msg.stats; renderDirty |= DR_STATS; }
+      if (renderDirty !== 0) scheduleRender();
       break;
     case 'status':
       view.connected = msg.status === 'connected';
@@ -257,27 +274,29 @@ function scheduleRender() {
 
 function doRender() {
   renderPending = false;
-  updateTitles(view.selectedSymbol);
-  renderBook(view.book);
+  const d = renderDirty;
+  renderDirty = 0;
+  if (d & DR_TITLES) updateTitles(view.selectedSymbol);
+  if (d & DR_BOOK) renderBook(view.book);
   if (chartQueue.length > 0) {
     const pending = chartQueue.splice(0);
     for (const cd of pending) handleChartData(cd);
   }
-  if (view.overlays !== undefined) {
+  if (d & DR_OVERLAYS && view.overlays !== undefined) {
     handleOverlays(view.overlays);
     view.overlays = undefined;
   }
-  renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
-  if (view.trades !== undefined) {
+  if (d & DR_SUBS) renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
+  if (d & DR_TRADES && view.trades !== undefined) {
     renderTrades(view.trades);
     view.trades = undefined;
   }
-  if (view.auction !== undefined) {
+  if (d & DR_AUCTION && view.auction !== undefined) {
     renderAuction(view.auction);
     view.auction = undefined;
   }
-  updateStats(view.stats);
-  renderRankings(view.rankings, view.rankingsTab, view.connected);
+  if (d & DR_STATS) updateStats(view.stats);
+  if (d & DR_RANKINGS) renderRankings(view.rankings, view.rankingsTab, view.connected);
 }
 
 // ── Subscriptions table event delegation ──
@@ -406,6 +425,7 @@ function doUnsubscribe(securityId) {
 
 function selectSubscription(id) {
   view.selectedId = id; // Optimistic update — confirmed by next worker frame
+  renderDirty |= DR_TITLES | DR_BOOK | DR_SUBS;
   scheduleRender();
   worker.postMessage({ cmd: 'select', securityId: id });
   closeSidebarIfMobile();
@@ -431,6 +451,7 @@ function closeSidebarIfMobile() {
 
 function switchRankingsTab(tab) {
   view.rankingsTab = tab;
+  renderDirty |= DR_RANKINGS;
   scheduleRender();
 }
 
