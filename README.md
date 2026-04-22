@@ -163,6 +163,7 @@ the only modification to the original B3 schema.
 ## References
 
 - [B3 Binary UMDF Developer Page](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/)
+- [B3 Binary Market Data — Client Portal (SBE specs, schemas, release notes)](https://clientes.b3.com.br/en/w/binary-market-data)
 - [B3 SBE PCAP samples (public Azure storage)](https://mktdatabinario.z15.web.core.windows.net/PCAPS/BinaryUMDF/SiteB3/) — downloaded by `tools/pcap/download-pcaps.sh`
 - [SbeSourceGenerator](https://github.com/pedrosakuma/SbeSourceGenerator)
 - [FIX Simple Binary Encoding](https://github.com/FIXTradingCommunity/fix-simple-binary-encoding)
