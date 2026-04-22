@@ -132,7 +132,7 @@ public class SubscriptionManagerTests
         Assert.Equal(4096, settings.ClientChannelCapacity);
         Assert.Equal(0.75, settings.SlowClientThreshold);
         Assert.Equal(100, settings.SlowClientMaxTicks);
-        Assert.Equal(16L * 1024 * 1024, settings.ClientMaxPendingBytes);
+        Assert.Equal(4L * 1024 * 1024, settings.ClientMaxPendingBytes);
         Assert.Equal(10, settings.ClientCoalesceWindowMs);
         Assert.Equal(5, settings.ShutdownDrainSeconds);
         Assert.Equal(1_000_000, settings.MulticastMergeCapacity);

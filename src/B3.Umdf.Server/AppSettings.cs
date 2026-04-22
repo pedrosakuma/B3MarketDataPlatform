@@ -38,9 +38,13 @@ public sealed class AppSettings
     /// disconnect the client immediately when accepting a new payload would exceed this
     /// budget — guards against multi-MB coalesced batches accumulating into OOM before
     /// the queue-depth threshold (counted in messages) trips. 0 disables the check.
-    /// CLI: env UMDF_CLIENT_MAX_PENDING_BYTES.
+    /// Default 4 MiB is sized to fit hundreds of concurrent clients within typical
+    /// container memory limits (e.g. 500 clients × 4 MiB = 2 GiB worst case, leaving
+    /// head-room for the recovery queue, pinned buffer pool, books, and broadcaster
+    /// state in a 4 GiB container). Raise to 16+ MiB if running with fewer clients
+    /// and larger memory budgets. CLI: env UMDF_CLIENT_MAX_PENDING_BYTES.
     /// </summary>
-    public long ClientMaxPendingBytes { get; set; } = 16L * 1024 * 1024;
+    public long ClientMaxPendingBytes { get; set; } = 4L * 1024 * 1024;
 
     /// <summary>
     /// Coalescing window (milliseconds) the per-client write loop waits AFTER being
@@ -75,12 +79,18 @@ public sealed class AppSettings
 
     /// <summary>
     /// Cap of the per-group recovery bridge buffer (incrementals deferred while a snapshot
-    /// completes). Default 50,000 (~75 MB pinned per group) bounds memory at the cost of
-    /// dropping oldest incrementals during long recovery cycles. Raise for high-rate
-    /// replay scenarios (e.g. UMDF_SPEED=0) where snapshot wall-time is dominated by
-    /// receive-side serialization. CLI: env UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY.
+    /// cycle completes). Must be sized to outlast the wall-time of one snapshot cycle:
+    /// if the earliest packet retained when the snapshot completes is newer than
+    /// (snapshot.MinSeqNum + 1), the catch-up step has nothing to bridge with and the
+    /// FeedHandler waits for another cycle — re-overflowing the queue with the same
+    /// ratio and producing a permanent recovery loop. Empirically, a B3 snapshot for
+    /// ~18k symbols takes ~12 s of wall-time; at ~4.5k incrementals/s per group that
+    /// requires ~55k slots minimum. Default 200,000 gives ~45 s of head-room. Memory
+    /// cost: ~MTU × capacity × groups (200k × 1.5 KiB × 2 ≈ 600 MiB worst case;
+    /// typically half that since average B3 packet is ~700 B). CLI: env
+    /// UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY.
     /// </summary>
-    public int IncrementalRecoveryQueueCapacity { get; set; } = 50_000;
+    public int IncrementalRecoveryQueueCapacity { get; set; } = 200_000;
 
     /// <summary>
     /// Per-group MPSC dispatch ring capacity (slots). Default 65 536. Producers (recv
