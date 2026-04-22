@@ -377,13 +377,16 @@ public static class WireProtocol
         return totalLen;
     }
 
+    /// <summary>CandleUpdate wire size: framing(4) + secId(8) + resolution(2) + candle(56) = 70 bytes.</summary>
+    public const int CandleUpdateMessageSize = FramingHeaderSize + 8 + 2 + CandleSize;
+
     /// <summary>
     /// Write CandleUpdate: securityId + resolution + single candle.
     /// Format: [header][u64 secId][u16 resolution][candle]
     /// </summary>
     internal static int WriteCandleUpdate(Span<byte> dest, ulong securityId, int resolution, in Candle candle)
     {
-        const ushort totalLen = (ushort)(FramingHeaderSize + 8 + 2 + CandleSize); // 62
+        const ushort totalLen = (ushort)CandleUpdateMessageSize;
         WriteFramingHeader(dest, totalLen, MessageType.CandleUpdate);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;

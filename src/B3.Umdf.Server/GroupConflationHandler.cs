@@ -71,6 +71,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     // Per-security trading phase (updated via IMarketDataEventHandler, read on same feed thread)
     private readonly Dictionary<ulong, int> _tradingStatus = new();
+    // Latest authoritative session VWAP from B3 (InfoSnapshot.VwapPrice). Stamped on every
+    // candle so the chart line matches what B3 publishes — no parallel computation drift.
+    private readonly Dictionary<ulong, long> _vwapBySecurity = new();
 
     // Subscribe/Get requests routed to this group by the SubscriptionManager
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
@@ -164,7 +167,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             long timestampSeconds = sendingTimeNs > 0
                 ? sendingTimeNs / 1_000_000_000
                 : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            candle.Add(price, quantity, timestampSeconds);
+            long sessionVwap = _vwapBySecurity.TryGetValue(securityId, out var v) ? v : price;
+            candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
 
         if (!_parent.IsSubscribed(securityId)) return;
@@ -192,7 +196,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             long timestampSeconds = sendingTimeNs > 0
                 ? sendingTimeNs / 1_000_000_000
                 : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            candle.Add(price, quantity, timestampSeconds);
+            long sessionVwap = _vwapBySecurity.TryGetValue(securityId, out var v) ? v : price;
+            candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
 
         if (!_parent.IsSubscribed(securityId)) return;
@@ -220,6 +225,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (info.TradingStatus is { } status)
             _tradingStatus[securityId] = status;
+        if (info.VwapPrice is { } vwap)
+            _vwapBySecurity[securityId] = vwap;
 
         _parent.NotifyInfoUpdated(securityId);
     }
@@ -228,6 +235,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (info.TradingStatus is { } status)
             _tradingStatus[securityId] = status;
+        if (info.VwapPrice is { } vwap)
+            _vwapBySecurity[securityId] = vwap;
 
         _parent.NotifyInfoUpdated(securityId);
     }
@@ -548,7 +557,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // Broadcast candle updates (one per security, after all trades)
         if (candleSecIds is not null)
         {
-            Span<byte> cbuf = stackalloc byte[64]; // CandleUpdate fits in 62 bytes
+            Span<byte> cbuf = stackalloc byte[WireProtocol.CandleUpdateMessageSize];
             foreach (var secId in candleSecIds)
             {
                 if (!Candles.TryGetValue(secId, out var agg)) continue;

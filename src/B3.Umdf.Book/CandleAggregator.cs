@@ -34,11 +34,6 @@ internal sealed class CandleAggregator
     /// </summary>
     private readonly Candle[]?[] _chunks = new Candle[MaxChunks][];
     private long _lastClose;
-    // Cumulative session VWAP numerator/denominator. Avg on each candle is the session-rolling
-    // VWAP at that bucket's last trade — matches conventional "VWAP" semantics traders expect
-    // and equals InfoSnapshot.VwapPrice modulo float-vs-fixed rounding.
-    private long _sessionSumPriceQty;
-    private long _sessionVolume;
     /// <summary>Logical index of the oldest candle (0..MaxRetainedCandles-1).</summary>
     private volatile int _head;
     private volatile int _count;
@@ -53,18 +48,20 @@ internal sealed class CandleAggregator
     /// <summary>Version counter — incremented on every Add.</summary>
     public int Version => _version;
 
+    /// <summary>Convenience overload for tests/callers that don't have a session VWAP.
+    /// Stamps the trade price as Avg (best-effort fallback).</summary>
+    public bool Add(long price, long quantity, long timestampSeconds)
+        => Add(price, quantity, timestampSeconds, price);
+
     /// <summary>
     /// Add a trade to the aggregator. Handles gap-fill and continuity.
+    /// <paramref name="sessionVwap"/> is B3's authoritative session VWAP at the moment of
+    /// the trade (InfoSnapshot.VwapPrice); stamped on the candle's Avg field. Pass the
+    /// trade price if no VWAP has been published yet — a sane fallback.
     /// Returns true if a new candle was started (vs updating existing).
     /// </summary>
-    public bool Add(long price, long quantity, long timestampSeconds)
+    public bool Add(long price, long quantity, long timestampSeconds, long sessionVwap)
     {
-        // Accumulate into session VWAP (price·qty); cap quantity·price per trade to avoid
-        // pathological overflow when raw mantissas (price·1e4) meet large derivative lots.
-        _sessionSumPriceQty += price * quantity;
-        _sessionVolume += quantity;
-        long sessionAvg = _sessionVolume > 0 ? _sessionSumPriceQty / _sessionVolume : price;
-
         if (_count > 0)
         {
             int lastPos = (_head + _count - 1) % MaxRetainedCandles;
@@ -79,17 +76,17 @@ internal sealed class CandleAggregator
                 if (price < last.Low) last.Low = price;
                 last.Close = price;
                 last.Volume += quantity;
-                last.Avg = sessionAvg;
+                last.Avg = sessionVwap;
                 _lastClose = price;
                 _version++;
                 return false;
             }
 
             // Gap-fill: insert flat candles for empty seconds between last and current.
-            // Avg = current session VWAP (no trades happened, so it stays where it was).
+            // Avg = previous bucket's VWAP (no trades happened during the gap, so VWAP is unchanged).
             long gapStart = last.Time + 1;
             int gaps = 0;
-            long gapAvg = last.Avg; // session VWAP didn't move during the gap
+            long gapAvg = last.Avg;
             while (gapStart < timestampSeconds && gaps < MaxGapFill)
             {
                 AppendCandle(new Candle(gapStart, _lastClose, _lastClose, _lastClose, _lastClose, 0, gapAvg));
@@ -97,13 +94,12 @@ internal sealed class CandleAggregator
                 gaps++;
             }
 
-            // New candle with open = previous close (continuity)
-            AppendCandle(new Candle(timestampSeconds, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity, sessionAvg));
+            AppendCandle(new Candle(timestampSeconds, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity, sessionVwap));
         }
         else
         {
             // First candle ever
-            AppendCandle(new Candle(timestampSeconds, price, price, price, price, quantity, sessionAvg));
+            AppendCandle(new Candle(timestampSeconds, price, price, price, price, quantity, sessionVwap));
         }
 
         _lastClose = price;
