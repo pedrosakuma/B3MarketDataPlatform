@@ -487,6 +487,29 @@ if (subscriptionManager is not null)
         marketDataManagers.ToArray(),
         symbolRegistry,
         groupHandlers.ToArray());
+
+    // Suppress per-client fanout while the feed for a group is in Recovery/CatchUp
+    // (book is being rebuilt; broadcasting partial state both wastes per-client
+    // bandwidth and risks shipping inconsistent updates). On RealTime entry the
+    // GroupConflationHandler schedules a fresh book snapshot for every Book subscriber.
+    var groupHandlersByGid = new Dictionary<int, GroupConflationHandler>();
+    for (int i = 0; i < groupIds.Count && i < groupHandlers.Count; i++)
+        groupHandlersByGid[groupIds[i]] = groupHandlers[i];
+
+    void WireFanoutSuppression(int gid, FeedHandler fh)
+    {
+        if (!groupHandlersByGid.TryGetValue(gid, out var gh)) return;
+        // Initialize from current state in case we attach after the first transition.
+        gh.SetFanoutSuppressed(fh.State != FeedState.RealTime);
+        fh.StateChanged += (_, newState) =>
+            gh.SetFanoutSuppressed(newState != FeedState.RealTime);
+    }
+
+    if (multiFeed is not null)
+        foreach (var (gid, handler) in multiFeed.Handlers) WireFanoutSuppression(gid, handler);
+    else if (singleFeed is not null)
+        WireFanoutSuppression(groupIds[0], singleFeed);
+
     wsHost = new WebSocketHost(
         subscriptionManager,
         loggerFactory.CreateLogger<WebSocketHost>(),

@@ -267,6 +267,23 @@ public sealed class SubscriptionManager
         return any;
     }
 
+    /// <summary>
+    /// Schedule a fresh book snapshot (Get) for every Book-flag subscriber whose security
+    /// is owned by <paramref name="group"/>. Used when a feed group exits Recovery/CatchUp
+    /// and resumes fanout: clients receive a clean snapshot to recover any state that
+    /// was suppressed during the recovery window. Pacing is enforced by the per-batch
+    /// snapshot budget in <see cref="GroupConflationHandler.OnBatchComplete"/>.
+    /// </summary>
+    internal void RequestResyncForAllSubscribersInGroup(GroupConflationHandler group)
+    {
+        // _subscriptions is a ConcurrentDictionary; enumeration is safe under concurrent mutation.
+        foreach (var kv in _subscriptions)
+        {
+            if (GetOwningGroup(kv.Key) != group) continue;
+            RequestResyncForBookSubscribers(kv.Key);
+        }
+    }
+
     private GroupConflationHandler? GetOwningGroup(ulong securityId)
     {
         var handlers = _groupHandlers;

@@ -76,6 +76,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
     // Cap of snapshot requests serviced per OnBatchComplete invocation. See AppSettings.
     private readonly int _maxSnapshotRequestsPerBatch;
+    // When true, OnBatchComplete drops accumulated wire events instead of flushing+publishing.
+    // Set during FeedHandler Recovery/CatchUp; cleared on RealTime entry, which also
+    // schedules a fresh book snapshot (Get) for every current Book-flag subscriber so
+    // they recover any state that was suppressed.
+    private volatile bool _suppressFanout;
 
     /// <summary>Enqueue a subscribe/get request routed to this group.</summary>
     internal void EnqueueRequest(string clientId, string? symbol, DataFlags flags, bool isGet)
@@ -237,6 +242,18 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // 1. Process shared unsubscribe queue (any group, under _subLock)
         _parent.ProcessUnsubscribes();
 
+        if (_suppressFanout)
+        {
+            // Feed is in Recovery/CatchUp: the book is being rebuilt and broadcasting
+            // partial state to clients would (a) push large catch-up backlogs through
+            // the per-client outbound rings and (b) ship interim/inconsistent updates.
+            // Discard the wire-event buffers; SetFanoutSuppressed(false) (called on
+            // RealTime entry) schedules a fresh snapshot for every Book subscriber.
+            // Subscribe/Get requests stay queued and drain when fanout resumes.
+            DiscardConflationBuffers();
+            return;
+        }
+
         // 2. Process this group's routed subscribe/get requests (single-threaded, safe book access)
         ProcessOwnSubscribeRequests();
 
@@ -248,6 +265,34 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // 4. Publish the batch to the broadcaster thread. On full ring, drop + schedule
         //    a resnapshot for each affected security so subscribers recover state.
         PublishCurrentBatch();
+    }
+
+    /// <summary>
+    /// Toggle fanout suppression. When transitioning from suppressed to live, schedules
+    /// a fresh book snapshot for every current Book-flag subscriber owned by this group.
+    /// Must be called from the dispatch thread (or via FeedHandler StateChanged hook
+    /// that runs on the dispatch thread).
+    /// </summary>
+    public void SetFanoutSuppressed(bool suppressed)
+    {
+        bool wasSuppressed = _suppressFanout;
+        _suppressFanout = suppressed;
+        if (wasSuppressed && !suppressed)
+            _parent.RequestResyncForAllSubscribersInGroup(this);
+    }
+
+    /// <summary>True while OnBatchComplete is dropping wire events instead of fanning out.</summary>
+    public bool IsFanoutSuppressed => _suppressFanout;
+
+    private void DiscardConflationBuffers()
+    {
+        // Equivalent of FlushBuffers without producing wire bytes — keep the upstream
+        // event counter accurate so UpstreamConflated reflects discarded work too.
+        int discarded = _orderBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count;
+        _orderBuffer.Clear();
+        _clearBuffer.Clear();
+        _tradeBuffer.Clear();
+        _eventsFlushed += discarded;
     }
 
     // ── Request processing ──
