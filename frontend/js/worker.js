@@ -359,21 +359,28 @@ setInterval(() => {
 }, FRAME_INTERVAL_MS);
 
 // ── MBP computation (runs in worker, off main thread) ──
+// Incremental price-level helpers. Maintained by order-event handlers so
+// computeBook() avoids iterating all orders (often 100k+) every render frame.
+function levelAdd(levels, price, qty) {
+  const lvl = levels.get(price);
+  if (lvl) { lvl.qty += qty; lvl.count++; }
+  else levels.set(price, { price, qty, count: 1 });
+}
+
+function levelRemove(levels, price, qty) {
+  const lvl = levels.get(price);
+  if (!lvl) return;
+  lvl.qty -= qty;
+  lvl.count--;
+  if (lvl.count <= 0 || lvl.qty <= 0) levels.delete(price);
+}
+
 function computeBook() {
   const sub = selectedId ? subscriptions.get(selectedId) : null;
   if (!sub || sub.orders.size === 0) return null;
 
-  const bidMap = new Map();
-  const askMap = new Map();
-  for (const [, order] of sub.orders) {
-    const map = order.side === 0 ? bidMap : askMap;
-    const existing = map.get(order.price);
-    if (existing) { existing.qty += order.qty; existing.count++; }
-    else map.set(order.price, { price: order.price, qty: order.qty, count: 1 });
-  }
-
-  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price).slice(0, bookDepth);
-  const asks = [...askMap.values()].sort((a, b) => a.price - b.price).slice(0, bookDepth);
+  const bids = [...sub.bidLevels.values()].sort((a, b) => b.price - a.price).slice(0, bookDepth);
+  const asks = [...sub.askLevels.values()].sort((a, b) => a.price - b.price).slice(0, bookDepth);
 
   let maxQty = 1;
   for (const b of bids) if (b.qty > maxQty) maxQty = b.qty;
@@ -381,7 +388,7 @@ function computeBook() {
 
   return {
     bids, asks, maxQty,
-    totalBids: bidMap.size, totalAsks: askMap.size,
+    totalBids: sub.bidLevels.size, totalAsks: sub.askLevels.size,
     totalOrders: sub.orders.size, orderCount: sub.orderCount,
   };
 }
@@ -474,7 +481,11 @@ function handleMessage(msg) {
       } else {
         subscriptions.set(id, {
           symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
-          orders: new Map(), info: {}, candles: [], currentCandle: null,
+          orders: new Map(),
+          // Aggregated price levels — maintained incrementally on each order event
+          // so computeBook() avoids a full O(N) scan over all orders every render frame.
+          bidLevels: new Map(), askLevels: new Map(),
+          info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
         });
@@ -513,7 +524,11 @@ function handleMessage(msg) {
       stats.books++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) sub.orders = new Map();
+      if (sub) {
+        sub.orders = new Map();
+        sub.bidLevels.clear();
+        sub.askLevels.clear();
+      }
       if (sel === id) mark(D_BOOK);
       break;
     }
@@ -535,13 +550,21 @@ function handleMessage(msg) {
       break;
     }
     case 'OrderAdded':
+    case 'OrderAdded':
     case 'OrderUpdated': {
       stats.orders++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
+        const prev = sub.orders.get(msg.orderId);
+        if (prev) {
+          const prevLevels = prev.side === 0 ? sub.bidLevels : sub.askLevels;
+          levelRemove(prevLevels, prev.price, prev.qty);
+        }
         sub.orders.set(msg.orderId, { side: msg.side, price: msg.price, qty: msg.qty });
+        const levels = msg.side === 0 ? sub.bidLevels : sub.askLevels;
+        levelAdd(levels, msg.price, msg.qty);
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -552,7 +575,12 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         sub.orderCount++;
-        sub.orders.delete(msg.orderId);
+        const prev = sub.orders.get(msg.orderId);
+        if (prev) {
+          const levels = prev.side === 0 ? sub.bidLevels : sub.askLevels;
+          levelRemove(levels, prev.price, prev.qty);
+          sub.orders.delete(msg.orderId);
+        }
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -580,12 +608,16 @@ function handleMessage(msg) {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
       if (sub) {
-        if (msg.side === 0) sub.orders = new Map();
-        else {
+        if (msg.side === 0) {
+          sub.orders = new Map();
+          sub.bidLevels.clear();
+          sub.askLevels.clear();
+        } else {
           const orderSide = msg.side - 1;
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
+          (orderSide === 0 ? sub.bidLevels : sub.askLevels).clear();
         }
       }
       if (sel === id) mark(D_BOOK);
