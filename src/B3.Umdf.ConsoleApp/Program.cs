@@ -38,6 +38,7 @@ double slowClientThreshold = settings.SlowClientThreshold;
 int slowClientMaxTicks = settings.SlowClientMaxTicks;
 long clientMaxPendingBytes = settings.ClientMaxPendingBytes;
 int clientCoalesceWindowMs = settings.ClientCoalesceWindowMs;
+int maxSnapshotRequestsPerBatch = settings.MaxSnapshotRequestsPerBatch;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
@@ -399,7 +400,7 @@ WebSocketHost? wsHost = null;
 var symbolRegistry = new SymbolRegistry();
 
 if (wsPort is not null)
-    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>());
+    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>(), maxSnapshotRequestsPerBatch);
 
 // Create per-group BookManager + MarketDataManager + FeedHandler
 var bookManagers = new List<BookManager>();

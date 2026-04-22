@@ -52,6 +52,18 @@ public sealed class AppSettings
     /// </summary>
     public int ClientCoalesceWindowMs { get; set; } = 10;
 
+    /// <summary>
+    /// Maximum number of subscribe/get snapshot requests the dispatch thread will
+    /// service per packet batch. Snapshots allocate (CopyOrderData + ArrayPool rent)
+    /// and are queued onto per-client outbound rings. Without a per-batch cap, an
+    /// initial flood (e.g. hundreds of clients × 200 symbols on connect) can spike
+    /// allocation faster than the GC + write loops can drain, leading to OOM on the
+    /// dispatch thread. Excess requests stay in the queue and are drained on
+    /// subsequent packets. 0 disables the cap (legacy behavior). CLI: env
+    /// UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH.
+    /// </summary>
+    public int MaxSnapshotRequestsPerBatch { get; set; } = 32;
+
     /// <summary>Graceful shutdown drain timeout in seconds.</summary>
     public int ShutdownDrainSeconds { get; set; } = 5;
 
@@ -130,6 +142,8 @@ public sealed class AppSettings
             ClientMaxPendingBytes = maxPending;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_COALESCE_WINDOW_MS"), out var coalesceMs))
             ClientCoalesceWindowMs = coalesceMs;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH"), out var maxSnapPerBatch))
+            MaxSnapshotRequestsPerBatch = maxSnapPerBatch;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SHUTDOWN_DRAIN_SECONDS"), out var sd))
             ShutdownDrainSeconds = sd;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MULTICAST_MERGE_CAPACITY"), out var mergeCapacity))

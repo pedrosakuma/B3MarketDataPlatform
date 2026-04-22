@@ -56,10 +56,12 @@ public sealed class SubscriptionManager
     }
 
     private volatile bool _ready;
+    private readonly int _maxSnapshotRequestsPerBatch;
 
-    public SubscriptionManager(ILogger<SubscriptionManager>? logger = null)
+    public SubscriptionManager(ILogger<SubscriptionManager>? logger = null, int maxSnapshotRequestsPerBatch = 32)
     {
         _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
+        _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
     }
 
     public bool IsReady => _ready;
@@ -81,7 +83,7 @@ public sealed class SubscriptionManager
     /// </summary>
     public GroupConflationHandler CreateGroupHandler()
     {
-        return new GroupConflationHandler(this);
+        return new GroupConflationHandler(this, maxSnapshotRequestsPerBatch: _maxSnapshotRequestsPerBatch);
     }
 
     public void SetDataSources(

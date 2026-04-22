@@ -74,6 +74,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     // Subscribe/Get requests routed to this group by the SubscriptionManager
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
+    // Cap of snapshot requests serviced per OnBatchComplete invocation. See AppSettings.
+    private readonly int _maxSnapshotRequestsPerBatch;
 
     /// <summary>Enqueue a subscribe/get request routed to this group.</summary>
     internal void EnqueueRequest(string clientId, string? symbol, DataFlags flags, bool isGet)
@@ -90,10 +92,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public long EventsReceived => Volatile.Read(ref _eventsReceived);
     public long EventsFlushed => Volatile.Read(ref _eventsFlushed);
 
-    internal GroupConflationHandler(SubscriptionManager parent, int broadcastRingCapacity = 256)
+    internal GroupConflationHandler(SubscriptionManager parent, int broadcastRingCapacity = 256, int maxSnapshotRequestsPerBatch = 32)
     {
         _parent = parent;
         _broadcastRing = new BroadcastRing(broadcastRingCapacity);
+        _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
     }
 
     /// <summary>
@@ -251,7 +254,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     private void ProcessOwnSubscribeRequests()
     {
-        while (_pendingSubscribeRequests.TryDequeue(out var req))
+        // Cap snapshots per batch: each Get/Subscribe runs SendMboSnapshot which allocates
+        // a tuple array per side + rents an ArrayPool buffer (book-size proportional).
+        // Without this cap, an initial flood (e.g. 500 clients × 200 syms = 100k requests)
+        // can saturate the dispatch thread allocator faster than the GC + write loops
+        // drain — observed OOM in CopyOrderData under that load. Excess requests stay in
+        // the queue and drain on subsequent packets.
+        int budget = _maxSnapshotRequestsPerBatch > 0 ? _maxSnapshotRequestsPerBatch : int.MaxValue;
+        while (budget-- > 0 && _pendingSubscribeRequests.TryDequeue(out var req))
         {
             switch (req.Kind)
             {
