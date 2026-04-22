@@ -400,7 +400,14 @@ WebSocketHost? wsHost = null;
 var symbolRegistry = new SymbolRegistry();
 
 if (wsPort is not null)
-    subscriptionManager = new SubscriptionManager(loggerFactory.CreateLogger<SubscriptionManager>(), maxSnapshotRequestsPerBatch);
+    subscriptionManager = new SubscriptionManager(
+        loggerFactory.CreateLogger<SubscriptionManager>(),
+        maxSnapshotRequestsPerBatch,
+        clientMaxPendingBytes: clientMaxPendingBytes,
+        outlierMultiplier: settings.ClientOutlierMultiplier,
+        outlierMinBytes: settings.ClientOutlierMinBytes,
+        outlierPressurePct: settings.ClientOutlierPressurePct,
+        outlierIntervalMs: settings.ClientOutlierIntervalMs);
 
 // Create per-group BookManager + MarketDataManager + FeedHandler
 var bookManagers = new List<BookManager>();

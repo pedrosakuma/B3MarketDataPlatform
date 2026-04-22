@@ -387,6 +387,13 @@ public sealed class ClientSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Force-disconnect this client as a slow consumer with the given reason.
+    /// Idempotent. Used by the periodic outlier sweep when the client's pending
+    /// payload bytes are an outlier relative to the median active client.
+    /// </summary>
+    internal void DisconnectAsSlowConsumer(string reason) => DisconnectSlowConsumer(reason);
+
     private void DisconnectSlowConsumer(string reason)
     {
         if (Interlocked.Exchange(ref _disconnectRequested, 1) != 0)

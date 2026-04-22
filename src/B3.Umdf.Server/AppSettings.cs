@@ -47,6 +47,43 @@ public sealed class AppSettings
     public long ClientMaxPendingBytes { get; set; } = 4L * 1024 * 1024;
 
     /// <summary>
+    /// Outlier multiplier used by the periodic slow-consumer sweep. A client is a
+    /// candidate for forced disconnect when its pending payload bytes exceed
+    /// max(median × <c>ClientOutlierMultiplier</c>, <see cref="ClientOutlierMinBytes"/>).
+    /// Disabled when ≤ 0. Default 4.0 keeps outlier definition stable across feed
+    /// rates: a healthy fleet's pending bytes track the coalescing window, and a
+    /// genuinely stuck consumer trails by orders of magnitude. CLI: env
+    /// UMDF_CLIENT_OUTLIER_MULTIPLIER.
+    /// </summary>
+    public double ClientOutlierMultiplier { get; set; } = 4.0;
+
+    /// <summary>
+    /// Absolute floor (bytes) below which a client is never disconnected by the
+    /// outlier sweep, regardless of multiplier. Prevents killing clients with
+    /// trivial pending bytes when the median is near zero. Default 256 KiB.
+    /// CLI: env UMDF_CLIENT_OUTLIER_MIN_BYTES.
+    /// </summary>
+    public long ClientOutlierMinBytes { get; set; } = 256L * 1024;
+
+    /// <summary>
+    /// Aggregate-pressure gate (0.0–1.0). The outlier sweep only disconnects when
+    /// the sum of all clients' pending bytes exceeds this fraction of the total
+    /// budget (<c>ClientCount × ClientMaxPendingBytes</c>). Below the gate, a few
+    /// momentarily-slow outliers are harmless and left alone; above it, the
+    /// fleet is under real memory pressure and outliers are the most likely
+    /// root cause. Default 0.50. CLI: env UMDF_CLIENT_OUTLIER_PRESSURE_PCT.
+    /// </summary>
+    public double ClientOutlierPressurePct { get; set; } = 0.50;
+
+    /// <summary>
+    /// Period (milliseconds) of the outlier sweep timer. 0 disables the sweep
+    /// entirely (only the hard <see cref="ClientMaxPendingBytes"/> cap remains in
+    /// force). Default 1000 ms keeps overhead negligible (one O(n) scan per
+    /// second over connected clients). CLI: env UMDF_CLIENT_OUTLIER_INTERVAL_MS.
+    /// </summary>
+    public int ClientOutlierIntervalMs { get; set; } = 1000;
+
+    /// <summary>
     /// Coalescing window (milliseconds) the per-client write loop waits AFTER being
     /// woken on the first item before draining + sending. Larger values produce bigger
     /// frames + fewer Kestrel pipe-lock acquisitions at the cost of added latency.
@@ -150,6 +187,14 @@ public sealed class AppSettings
             SlowClientMaxTicks = slowTicks;
         if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_MAX_PENDING_BYTES"), out var maxPending))
             ClientMaxPendingBytes = maxPending;
+        if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_OUTLIER_MULTIPLIER"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var outlierMul))
+            ClientOutlierMultiplier = outlierMul;
+        if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_OUTLIER_MIN_BYTES"), out var outlierMin))
+            ClientOutlierMinBytes = outlierMin;
+        if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_OUTLIER_PRESSURE_PCT"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var outlierPress))
+            ClientOutlierPressurePct = outlierPress;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_OUTLIER_INTERVAL_MS"), out var outlierMs))
+            ClientOutlierIntervalMs = outlierMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_COALESCE_WINDOW_MS"), out var coalesceMs))
             ClientCoalesceWindowMs = coalesceMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH"), out var maxSnapPerBatch))

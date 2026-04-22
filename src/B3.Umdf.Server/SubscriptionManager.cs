@@ -16,7 +16,7 @@ namespace B3.Umdf.Server;
 /// copy-on-write inner dictionaries for lock-free reads on the hot path.
 /// A lightweight <see cref="_subLock"/> serialises rare subscription mutations.
 /// </summary>
-public sealed class SubscriptionManager
+public sealed class SubscriptionManager : IDisposable
 {
     private volatile BookManager[]? _bookManagers;
     private volatile MarketDataManager[]? _marketDataManagers;
@@ -58,10 +58,37 @@ public sealed class SubscriptionManager
     private volatile bool _ready;
     private readonly int _maxSnapshotRequestsPerBatch;
 
-    public SubscriptionManager(ILogger<SubscriptionManager>? logger = null, int maxSnapshotRequestsPerBatch = 32)
+    // Outlier sweep configuration (see AppSettings).
+    private readonly double _outlierMultiplier;
+    private readonly long _outlierMinBytes;
+    private readonly double _outlierPressurePct;
+    private readonly long _clientMaxPendingBytes;
+    private readonly Timer? _outlierSweepTimer;
+
+    public SubscriptionManager(
+        ILogger<SubscriptionManager>? logger = null,
+        int maxSnapshotRequestsPerBatch = 32,
+        long clientMaxPendingBytes = 0,
+        double outlierMultiplier = 4.0,
+        long outlierMinBytes = 256L * 1024,
+        double outlierPressurePct = 0.50,
+        int outlierIntervalMs = 1000)
     {
         _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
+        _clientMaxPendingBytes = clientMaxPendingBytes;
+        _outlierMultiplier = outlierMultiplier;
+        _outlierMinBytes = outlierMinBytes;
+        _outlierPressurePct = outlierPressurePct;
+
+        if (outlierIntervalMs > 0 && outlierMultiplier > 0 && clientMaxPendingBytes > 0)
+        {
+            _outlierSweepTimer = new Timer(
+                static state => ((SubscriptionManager)state!).RunOutlierSweep(),
+                this,
+                outlierIntervalMs,
+                outlierIntervalMs);
+        }
     }
 
     public bool IsReady => _ready;
@@ -281,6 +308,106 @@ public sealed class SubscriptionManager
         {
             if (GetOwningGroup(kv.Key) != group) continue;
             RequestResyncForBookSubscribers(kv.Key);
+        }
+    }
+
+    /// <summary>
+    /// Periodic sweep that disconnects pending-bytes outliers under aggregate memory
+    /// pressure. Runs on a Timer thread (background). Algorithm:
+    ///
+    ///  1. Snapshot pending bytes for every connected client into a stack/heap buffer.
+    ///  2. If aggregate &lt; <c>pressurePct × clients × maxPendingBytes</c>, do nothing —
+    ///     the fleet is healthy, individual outliers are not hurting anyone.
+    ///  3. Otherwise compute the median pending and disconnect each client whose
+    ///     pending exceeds <c>max(median × multiplier, minBytes)</c>.
+    ///
+    /// This protects against the "fixed-threshold pitfall" where a system-wide
+    /// slowdown (GC pause, market burst, network jitter) lifts every client past
+    /// the absolute cap and a naive guard would mass-disconnect the whole fleet.
+    /// The hard cap in <see cref="ClientSession"/> remains in force for genuinely
+    /// runaway producers.
+    /// </summary>
+    private void RunOutlierSweep()
+    {
+        try
+        {
+            int n = _clients.Count;
+            if (n == 0) return;
+
+            // O(n) snapshot of (session, pending). Pool this buffer to avoid per-tick allocation.
+            var sessions = ArrayPool<ClientSession>.Shared.Rent(n);
+            var pending = ArrayPool<long>.Shared.Rent(n);
+            int count = 0;
+            long aggregate = 0;
+            try
+            {
+                foreach (var (_, s) in _clients)
+                {
+                    if (count >= n) break; // dictionary may have grown; ignore late arrivals this tick
+                    long p = s.PendingBytes;
+                    sessions[count] = s;
+                    pending[count] = p;
+                    aggregate += p;
+                    count++;
+                }
+                if (count == 0) return;
+
+                long budget = (long)count * _clientMaxPendingBytes;
+                if (budget <= 0) return;
+                if (aggregate < (long)(budget * _outlierPressurePct)) return;
+
+                // Median via in-place selection on the pending copy (sessions stay aligned by index
+                // before this sort — we use the unsorted view for the disconnect pass).
+                long median = ComputeMedian(pending, count);
+                long threshold = Math.Max((long)(median * _outlierMultiplier), _outlierMinBytes);
+
+                int killed = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    if (pending[i] > threshold)
+                    {
+                        sessions[i].DisconnectAsSlowConsumer(
+                            $"outlier sweep: pending={pending[i]} > threshold={threshold} (median={median}, multiplier={_outlierMultiplier:F1}, aggregate={aggregate}/{budget})");
+                        killed++;
+                    }
+                }
+                if (killed > 0)
+                {
+                    _logger.LogWarning(
+                        "Outlier sweep disconnected {Killed}/{Count} clients (aggregate={Aggregate} / budget={Budget}, median={Median}, threshold={Threshold})",
+                        killed, count, aggregate, budget, median, threshold);
+                }
+            }
+            finally
+            {
+                Array.Clear(sessions, 0, count); // release session refs to GC
+                ArrayPool<ClientSession>.Shared.Return(sessions);
+                ArrayPool<long>.Shared.Return(pending);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Outlier sweep failed");
+        }
+    }
+
+    private static long ComputeMedian(long[] values, int count)
+    {
+        // O(n log n) sort is fine: count is bounded by MaxConnections (hundreds-thousands)
+        // and the sweep runs at ~1 Hz. Allocates a copy to avoid disturbing the index
+        // alignment between `values` and the parallel `sessions` array used for disconnect.
+        var copy = ArrayPool<long>.Shared.Rent(count);
+        try
+        {
+            Array.Copy(values, copy, count);
+            Array.Sort(copy, 0, count);
+            return count % 2 == 1
+                ? copy[count / 2]
+                : (copy[count / 2 - 1] + copy[count / 2]) / 2;
+        }
+        finally
+        {
+            ArrayPool<long>.Shared.Return(copy);
         }
     }
 
@@ -633,6 +760,12 @@ public sealed class SubscriptionManager
 
     /// <summary>Stop the background rankings timer.</summary>
     public void StopRankingsTimer() => _rankingsTimer?.Dispose();
+
+    public void Dispose()
+    {
+        _rankingsTimer?.Dispose();
+        _outlierSweepTimer?.Dispose();
+    }
 
     /// <summary>Find an instrument across all per-group MarketDataManagers.</summary>
     public InstrumentInfo? FindInstrumentInfo(ulong securityId)
