@@ -22,7 +22,7 @@ internal sealed class CandleAggregator
     private const int MaxGapFill = 60; // max gap-fill candles per trade gap
     internal const int MaxRetainedCandles = 10 * 60 * 60; // 10h @ 1s resolution
     /// <summary>
-    /// 512 candles × 48 bytes = 24,576 bytes per chunk — comfortably below the .NET LOH
+    /// 512 candles × 56 bytes = 28,672 bytes per chunk — comfortably below the .NET LOH
     /// threshold (85,000 bytes), so chunk allocations stay on the SOH and are cheap to GC.
     /// </summary>
     internal const int ChunkSize = 512;
@@ -34,6 +34,11 @@ internal sealed class CandleAggregator
     /// </summary>
     private readonly Candle[]?[] _chunks = new Candle[MaxChunks][];
     private long _lastClose;
+    // Numerator of the VWAP for the current (still-open) bucket. The denominator is
+    // the bucket's Volume field, kept on the candle itself. We carry the sum here so
+    // we can recompute Avg in O(1) when a same-second trade extends the bucket
+    // without storing per-trade history.
+    private long _currentSumPriceQty;
     /// <summary>Logical index of the oldest candle (0..MaxRetainedCandles-1).</summary>
     private volatile int _head;
     private volatile int _count;
@@ -68,28 +73,35 @@ internal sealed class CandleAggregator
                 if (price < last.Low) last.Low = price;
                 last.Close = price;
                 last.Volume += quantity;
+                _currentSumPriceQty += price * quantity;
+                last.Avg = last.Volume > 0 ? _currentSumPriceQty / last.Volume : price;
                 _lastClose = price;
                 _version++;
                 return false;
             }
 
-            // Gap-fill: insert flat candles for empty seconds between last and current
+            // Gap-fill: insert flat candles for empty seconds between last and current.
+            // Avg = Close for gap-fill candles (no trades, so VWAP collapses to the carry-forward price).
             long gapStart = last.Time + 1;
             int gaps = 0;
             while (gapStart < timestampSeconds && gaps < MaxGapFill)
             {
-                AppendCandle(new Candle(gapStart, _lastClose, _lastClose, _lastClose, _lastClose, 0));
+                AppendCandle(new Candle(gapStart, _lastClose, _lastClose, _lastClose, _lastClose, 0, _lastClose));
                 gapStart++;
                 gaps++;
             }
 
             // New candle with open = previous close (continuity)
-            AppendCandle(new Candle(timestampSeconds, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity));
+            _currentSumPriceQty = price * quantity;
+            long avg = quantity > 0 ? _currentSumPriceQty / quantity : price;
+            AppendCandle(new Candle(timestampSeconds, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity, avg));
         }
         else
         {
             // First candle ever
-            AppendCandle(new Candle(timestampSeconds, price, price, price, price, quantity));
+            _currentSumPriceQty = price * quantity;
+            long avg = quantity > 0 ? _currentSumPriceQty / quantity : price;
+            AppendCandle(new Candle(timestampSeconds, price, price, price, price, quantity, avg));
         }
 
         _lastClose = price;
@@ -177,5 +189,9 @@ internal sealed class CandleAggregator
     }
 }
 
-/// <summary>OHLCV candle data point.</summary>
-internal record struct Candle(long Time, long Open, long High, long Low, long Close, long Volume);
+/// <summary>
+/// OHLCV candle data point. <see cref="Avg"/> is the volume-weighted average price
+/// (sum(price × qty) / sum(qty)) computed from all trades that landed in this
+/// 1-second bucket; for gap-fill candles it equals <see cref="Close"/>.
+/// </summary>
+internal record struct Candle(long Time, long Open, long High, long Low, long Close, long Volume, long Avg);

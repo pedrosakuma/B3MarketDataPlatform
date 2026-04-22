@@ -186,7 +186,8 @@ export function parseMessage(buf, baseOffset, msgLen) {
         const low = Number(v.getBigInt64(o, true)); o += 8;
         const close = Number(v.getBigInt64(o, true)); o += 8;
         const volume = Number(v.getBigInt64(o, true)); o += 8;
-        candles.push({ time, open, high, low, close, volume });
+        const avg = Number(v.getBigInt64(o, true)); o += 8;
+        candles.push({ time, open, high, low, close, volume, avg });
       }
       const isFirst = !!(flags & CANDLE_FLAGS.FIRST);
       const isLast = !!(flags & CANDLE_FLAGS.LAST);
@@ -200,8 +201,9 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const high = Number(v.getBigInt64(o, true)); o += 8;
       const low = Number(v.getBigInt64(o, true)); o += 8;
       const close = Number(v.getBigInt64(o, true)); o += 8;
-      const volume = Number(v.getBigInt64(o, true));
-      return { type: 'CandleUpdate', securityId, resolution, candle: { time, open, high, low, close, volume } };
+      const volume = Number(v.getBigInt64(o, true)); o += 8;
+      const avg = Number(v.getBigInt64(o, true));
+      return { type: 'CandleUpdate', securityId, resolution, candle: { time, open, high, low, close, volume, avg } };
     }
     default:
       return null;

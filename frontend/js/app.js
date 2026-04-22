@@ -74,17 +74,11 @@ function applyPriceBands(low, high) {
   }
 }
 
-function clearOverlays() {
-  if (vwapSeries) vwapSeries.setData([]);
-  applyPriceBands(null, null);
-}
-
 function handleChartData(chartData) {
   if (!chartData) {
     $('chartEmpty').style.display = '';
     if (candleSeries) candleSeries.setData([]);
-    clearOverlays();
-    updateResolutionLabel(null);
+    if (vwapSeries) vwapSeries.setData([]);
     return;
   }
 
@@ -95,24 +89,26 @@ function handleChartData(chartData) {
 
   if (chartData.full) {
     candleSeries.setData(chartData.candles);
+    if (vwapSeries) {
+      vwapSeries.setData(chartData.candles.map(c => ({ time: c.time, value: c.avg })));
+    }
     if (chartData.scroll) chart.timeScale().scrollToRealTime();
   } else if (chartData.updates) {
-    for (const u of chartData.updates) candleSeries.update(u);
+    for (const u of chartData.updates) {
+      candleSeries.update(u);
+      if (vwapSeries) vwapSeries.update({ time: u.time, value: u.avg });
+    }
   } else if (chartData.update) {
     candleSeries.update(chartData.update);
+    if (vwapSeries) vwapSeries.update({ time: chartData.update.time, value: chartData.update.avg });
   }
 
   updateResolutionLabel(chartData.resolution);
 }
 
-// Overlays (VWAP line + price bands) come on their own dirty bit. The worker emits
-// either vwapFull (selection change / fresh subscribe) or vwapAppend (new sample),
-// which lets us avoid a full setData on every InfoSnapshot.
+// Overlay frame carries only price bands now; VWAP is derived per-candle by handleChartData.
 function handleOverlays(ov) {
-  if (!ov) { clearOverlays(); return; }
-  if (!vwapSeries) return;
-  if (ov.vwapFull) vwapSeries.setData(ov.vwapFull);
-  else if (ov.vwapAppend) vwapSeries.update(ov.vwapAppend);
+  if (!ov) { applyPriceBands(null, null); return; }
   applyPriceBands(ov.priceBandLow, ov.priceBandHigh);
 }
 

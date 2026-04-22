@@ -108,7 +108,7 @@ function aggregateCandles(candles1s, resolution) {
         const n = Math.min(gap - 1, MAX_GAP_FILL);
         const p = prev.close;
         for (let j = 1; j <= n; j++) {
-          result.push({ time: prev.time + j, open: p, high: p, low: p, close: p, volume: 0 });
+          result.push({ time: prev.time + j, open: p, high: p, low: p, close: p, volume: 0, avg: p });
         }
       }
       const c = candles1s[i];
@@ -116,15 +116,17 @@ function aggregateCandles(candles1s, resolution) {
       result.push({
         time: c.time, open: prevClose,
         high: Math.max(prevClose, c.high), low: Math.min(prevClose, c.low),
-        close: c.close, volume: c.volume,
+        close: c.close, volume: c.volume, avg: c.avg,
       });
     }
     return result;
   }
 
-  // Higher resolutions: aggregate into buckets and fill gaps between them
+  // Higher resolutions: aggregate into buckets and fill gaps between them.
+  // Bucket VWAP = sum(avg * volume) / sum(volume); falls back to close on zero volume.
   const result = [];
   let cur = null;
+  let curSumAvgVol = 0;
   for (const c of candles1s) {
     const bucket = Math.floor(c.time / res) * res;
     if (cur && cur.time === bucket) {
@@ -132,21 +134,28 @@ function aggregateCandles(candles1s, resolution) {
       if (c.low < cur.low) cur.low = c.low;
       cur.close = c.close;
       cur.volume += c.volume;
+      curSumAvgVol += c.avg * c.volume;
+      cur.avg = cur.volume > 0 ? curSumAvgVol / cur.volume : cur.close;
     } else {
       if (cur) {
         result.push(cur);
-        // Gap-fill: insert flat buckets for missing periods
         let gapBucket = cur.time + res;
         let gapCount = 0;
         const p = cur.close;
         while (gapBucket < bucket && gapCount < MAX_GAP_FILL) {
-          result.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0 });
+          result.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0, avg: p });
           gapBucket += res;
           gapCount++;
         }
       }
       const newOpen = cur ? cur.close : c.open;
-      cur = { time: bucket, open: newOpen, high: Math.max(newOpen, c.high), low: Math.min(newOpen, c.low), close: c.close, volume: c.volume };
+      curSumAvgVol = c.avg * c.volume;
+      cur = {
+        time: bucket, open: newOpen,
+        high: Math.max(newOpen, c.high), low: Math.min(newOpen, c.low),
+        close: c.close, volume: c.volume,
+        avg: c.volume > 0 ? c.avg : c.close,
+      };
     }
   }
   if (cur) result.push(cur);
@@ -185,15 +194,17 @@ function getLastAggregatedCandle(sub, resolution) {
   // For the open: we need the close of the previous bucket's last candle
   const prevClose = i > 0 ? raw[i - 1].close : raw[i].open;
 
-  let high = prevClose, low = prevClose, close = prevClose, volume = 0;
+  let high = prevClose, low = prevClose, close = prevClose, volume = 0, sumAvgVol = 0;
   for (let j = i; j < raw.length; j++) {
     const c = raw[j];
     if (c.high > high) high = c.high;
     if (c.low < low) low = c.low;
     close = c.close;
     volume += c.volume;
+    sumAvgVol += c.avg * c.volume;
   }
-  return { time: bucket, open: prevClose, high, low, close, volume };
+  const avg = volume > 0 ? sumAvgVol / volume : close;
+  return { time: bucket, open: prevClose, high, low, close, volume, avg };
 }
 
 // ── Frame sending (interval-based, only when dirty) ──
@@ -253,7 +264,7 @@ setInterval(() => {
             const p = lastSentCandleClose;
             const updates = [];
             for (let j = 1; j <= n; j++) {
-              updates.push({ time: lastSentCandleTime + j, open: p, high: p, low: p, close: p, volume: 0 });
+              updates.push({ time: lastSentCandleTime + j, open: p, high: p, low: p, close: p, volume: 0, avg: p });
             }
             updates.push({ ...sub.currentCandle });
             frame.chart = { full: false, updates, resolution: res };
@@ -272,7 +283,7 @@ setInterval(() => {
               let gapBucket = lastSentCandleTime + res;
               let gapCount = 0;
               while (gapBucket < lastCandle.time && gapCount < MAX_GAP_FILL) {
-                updates.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0 });
+                updates.push({ time: gapBucket, open: p, high: p, low: p, close: p, volume: 0, avg: p });
                 gapBucket += res;
                 gapCount++;
               }
@@ -294,19 +305,10 @@ setInterval(() => {
     if (!sub) {
       frame.overlays = null;
     } else {
-      const overlay = {
+      frame.overlays = {
         priceBandLow: sub.info.PriceBandLow ?? null,
         priceBandHigh: sub.info.PriceBandHigh ?? null,
       };
-      if (sub.vwapResetNext) {
-        overlay.vwapFull = sub.vwapPoints.slice();
-        sub.vwapResetNext = false;
-        sub.vwapDelta = null;
-      } else if (sub.vwapDelta) {
-        overlay.vwapAppend = sub.vwapDelta;
-        sub.vwapDelta = null;
-      }
-      frame.overlays = overlay;
     }
   }
 
@@ -477,11 +479,6 @@ function handleMessage(msg) {
           orders: new Map(), info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
-          vwapPoints: [],     // [{time, value}] — sampled from InfoSnapshot.VwapPrice
-          vwapDelta: null,    // last point pushed since the previous overlays frame
-          vwapResetNext: true,// force a vwapFull on the next D_OVERLAYS frame
-          lastVwap: null,
-          lastVwapTime: 0,
         });
       }
       let d = D_SUBS | D_ALLINFO;
@@ -507,8 +504,6 @@ function handleMessage(msg) {
         if (sel === id) {
           selectedId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
           d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
-          const newSub = selectedId ? subscriptions.get(selectedId) : null;
-          if (newSub) newSub.vwapResetNext = true;
           chartFullSwap = true;
         }
         mark(d);
@@ -530,25 +525,6 @@ function handleMessage(msg) {
       const sub = subscriptions.get(id);
       if (sub) {
         Object.assign(sub.info, msg.fields);
-        // Sample VWAP for chart line series — coalesce repeated values within VWAP_MIN_INTERVAL_MS.
-        if ('VwapPrice' in msg.fields && msg.fields.VwapPrice !== null && sub.candles.length > 0) {
-          const v = msg.fields.VwapPrice;
-          const tNow = sub.candles[sub.candles.length - 1].time;
-          if (v !== sub.lastVwap || (tNow - sub.lastVwapTime) >= 1) {
-            const point = { time: tNow, value: v };
-            // Lightweight Charts requires strictly increasing timestamps. If the InfoSnapshot
-            // arrives in the same second as the previous sample but with a new value, replace
-            // the last point in place (and overwrite the delta) so app.update() stays valid.
-            const last = sub.vwapPoints.length > 0 ? sub.vwapPoints[sub.vwapPoints.length - 1] : null;
-            if (last && last.time === tNow) last.value = v;
-            else sub.vwapPoints.push(point);
-            if (sub.vwapPoints.length > 36000) sub.vwapPoints.shift();
-            sub.vwapDelta = point;
-            sub.lastVwap = v;
-            sub.lastVwapTime = tNow;
-            if (sel === id) mark(D_OVERLAYS);
-          }
-        }
         if (sel === id) {
           if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields) mark(D_OVERLAYS);
           if ('TradingStatus' in msg.fields || 'TheoreticalOpeningPrice' in msg.fields
@@ -646,7 +622,7 @@ function handleMessage(msg) {
         const last = sub.currentCandle;
         if (last && last.time === c.time) {
           last.open = c.open; last.high = c.high;
-          last.low = c.low; last.close = c.close; last.volume = c.volume;
+          last.low = c.low; last.close = c.close; last.volume = c.volume; last.avg = c.avg;
         } else {
           sub.candles.push(c);
           trimmed = trimCandles(sub);
@@ -722,10 +698,6 @@ self.onmessage = (evt) => {
     case 'select':
       selectedId = msg.securityId;
       chartFullSwap = true;
-      {
-        const sub = selectedId ? subscriptions.get(selectedId) : null;
-        if (sub) sub.vwapResetNext = true;
-      }
       mark(D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS);
       break;
     case 'rankingSubscribe':

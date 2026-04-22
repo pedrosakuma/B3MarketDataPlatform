@@ -345,8 +345,8 @@ public static class WireProtocol
 
     // --- CandleSnapshot / CandleUpdate ---
 
-    /// <summary>Candle wire size: time(8) + open(8) + high(8) + low(8) + close(8) + volume(8) = 48 bytes.</summary>
-    public const int CandleSize = 48;
+    /// <summary>Candle wire size: time(8) + open(8) + high(8) + low(8) + close(8) + volume(8) + avg(8) = 56 bytes.</summary>
+    public const int CandleSize = 56;
 
     /// <summary>CandleSnapshot header overhead: framing(4) + secId(8) + resolution(2) + flags(1) + count(2) = 17.</summary>
     private const int CandleSnapshotHeaderSize = FramingHeaderSize + 8 + 2 + 1 + 2;
@@ -400,6 +400,7 @@ public static class WireProtocol
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Low); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Close); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Volume); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Avg); offset += 8;
         return offset;
     }
 

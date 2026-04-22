@@ -180,7 +180,7 @@ public class WireProtocolTests
     public void WriteCandleUpdate_RoundTrip()
     {
         var buf = new byte[128];
-        var candle = new Candle(Time: 1000L, Open: 100L, High: 120L, Low: 90L, Close: 110L, Volume: 500L);
+        var candle = new Candle(Time: 1000L, Open: 100L, High: 120L, Low: 90L, Close: 110L, Volume: 500L, Avg: 108L);
         int len = WireProtocol.WriteCandleUpdate(buf, securityId: 333, resolution: 1, in candle);
 
         Assert.Equal(WireProtocol.FramingHeaderSize + 8 + 2 + WireProtocol.CandleSize, len);
@@ -196,7 +196,8 @@ public class WireProtocolTests
         Assert.Equal(120L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;  // High
         Assert.Equal(90L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;   // Low
         Assert.Equal(110L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;  // Close
-        Assert.Equal(500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));             // Volume
+        Assert.Equal(500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;  // Volume
+        Assert.Equal(108L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));            // Avg
     }
 
     [Fact]
@@ -205,8 +206,8 @@ public class WireProtocolTests
         var buf = new byte[4096];
         var candles = new[]
         {
-            new Candle(1L, 100L, 110L, 90L, 105L, 200L),
-            new Candle(2L, 105L, 115L, 95L, 108L, 150L),
+            new Candle(1L, 100L, 110L, 90L, 105L, 200L, 100L),
+            new Candle(2L, 105L, 115L, 95L, 108L, 150L, 105L),
         };
         int len = WireProtocol.WriteCandleSnapshot(buf, securityId: 55, resolution: 1,
             flags: (byte)(WireProtocol.CandleFlagFirst | WireProtocol.CandleFlagLast), candles);

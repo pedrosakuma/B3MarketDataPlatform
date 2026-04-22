@@ -38,13 +38,16 @@ public sealed class AppSettings
     /// disconnect the client immediately when accepting a new payload would exceed this
     /// budget — guards against multi-MB coalesced batches accumulating into OOM before
     /// the queue-depth threshold (counted in messages) trips. 0 disables the check.
-    /// Default 4 MiB is sized to fit hundreds of concurrent clients within typical
-    /// container memory limits (e.g. 500 clients × 4 MiB = 2 GiB worst case, leaving
-    /// head-room for the recovery queue, pinned buffer pool, books, and broadcaster
-    /// state in a 4 GiB container). Raise to 16+ MiB if running with fewer clients
-    /// and larger memory budgets. CLI: env UMDF_CLIENT_MAX_PENDING_BYTES.
+    /// Default 32 MiB is sized to absorb the initial snapshot burst — a deep MBO book
+    /// for one B3 active stock can be ~6 MiB on the wire (≈170k orders × 37 B), and a
+    /// client typically subscribes to several at once. With 32 MiB per client, even
+    /// hundreds of clients fit a ~4 GiB container (e.g. 500 × 32 MiB = 16 GiB upper
+    /// bound, but the steady-state pending bytes are ~50 KB once the snapshot has
+    /// drained — the cap only matters during the burst). Lower it (e.g. 8–16 MiB) if
+    /// memory is constrained and clients are expected to subscribe to ≤2 deep books at
+    /// a time. CLI: env UMDF_CLIENT_MAX_PENDING_BYTES.
     /// </summary>
-    public long ClientMaxPendingBytes { get; set; } = 4L * 1024 * 1024;
+    public long ClientMaxPendingBytes { get; set; } = 32L * 1024 * 1024;
 
     /// <summary>
     /// Outlier multiplier used by the periodic slow-consumer sweep. A client is a
