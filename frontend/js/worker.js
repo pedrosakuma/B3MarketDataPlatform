@@ -598,7 +598,6 @@ function handleMessage(msg) {
       break;
     }
     case 'OrderAdded':
-    case 'OrderAdded':
     case 'OrderUpdated': {
       stats.orders++;
       const id = secIdStr(msg.securityId);
