@@ -33,6 +33,15 @@ public sealed class AppSettings
     /// <summary>Slow client detection: consecutive ticks before disconnect.</summary>
     public int SlowClientMaxTicks { get; set; } = 100;
 
+    /// <summary>
+    /// Hard cap (in bytes) of payload pending in a client's outbound ring. Producers
+    /// disconnect the client immediately when accepting a new payload would exceed this
+    /// budget — guards against multi-MB coalesced batches accumulating into OOM before
+    /// the queue-depth threshold (counted in messages) trips. 0 disables the check.
+    /// CLI: env UMDF_CLIENT_MAX_PENDING_BYTES.
+    /// </summary>
+    public long ClientMaxPendingBytes { get; set; } = 16L * 1024 * 1024;
+
     /// <summary>Graceful shutdown drain timeout in seconds.</summary>
     public int ShutdownDrainSeconds { get; set; } = 5;
 
@@ -107,6 +116,8 @@ public sealed class AppSettings
             SlowClientThreshold = slowThreshold;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SLOW_CLIENT_MAX_TICKS"), out var slowTicks))
             SlowClientMaxTicks = slowTicks;
+        if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_MAX_PENDING_BYTES"), out var maxPending))
+            ClientMaxPendingBytes = maxPending;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SHUTDOWN_DRAIN_SECONDS"), out var sd))
             ShutdownDrainSeconds = sd;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MULTICAST_MERGE_CAPACITY"), out var mergeCapacity))

@@ -74,6 +74,43 @@ public class SubscriptionManagerTests
     }
 
     [Fact]
+    public void ClientSession_PendingBytesBudget_DisconnectsBeforeQueueDepth()
+    {
+        var ws = new FakeWebSocket();
+        // Large queue capacity but tiny byte budget: bytes guard must trip first.
+        var session = new ClientSession(
+            ws,
+            channelCapacity: 1024,
+            maxPendingBytes: 16);
+        var msg = new byte[10];
+
+        Assert.True(session.TryEnqueue(msg));
+        Assert.Equal(10, session.PendingBytes);
+        // Second enqueue would push pending to 20 > 16: disconnect.
+        Assert.False(session.TryEnqueue(msg));
+        Assert.True(session.CancellationToken.IsCancellationRequested);
+        // Bytes counter is unchanged when the new payload is rejected.
+        Assert.Equal(10, session.PendingBytes);
+    }
+
+    [Fact]
+    public void ClientSession_PendingBytesBudget_Disabled_AllowsAnySize()
+    {
+        var ws = new FakeWebSocket();
+        var session = new ClientSession(
+            ws,
+            channelCapacity: 1024,
+            maxPendingBytes: 0); // disabled
+        var msg = new byte[1_000_000];
+
+        Assert.True(session.TryEnqueue(msg));
+        Assert.True(session.TryEnqueue(msg));
+        Assert.False(session.CancellationToken.IsCancellationRequested);
+        // With the guard disabled PendingBytes stays at 0 (no tracking).
+        Assert.Equal(0, session.PendingBytes);
+    }
+
+    [Fact]
     public void ClientSession_NotifyInfoAvailable_CoalescesWakeSignals()
     {
         var ws = new FakeWebSocket();
@@ -95,6 +132,7 @@ public class SubscriptionManagerTests
         Assert.Equal(4096, settings.ClientChannelCapacity);
         Assert.Equal(0.75, settings.SlowClientThreshold);
         Assert.Equal(100, settings.SlowClientMaxTicks);
+        Assert.Equal(16L * 1024 * 1024, settings.ClientMaxPendingBytes);
         Assert.Equal(5, settings.ShutdownDrainSeconds);
         Assert.Equal(1_000_000, settings.MulticastMergeCapacity);
         Assert.Equal(250_000, settings.FeedChannelCapacity);

@@ -322,6 +322,11 @@ static class AppMetrics
                     new Measurement<int>(c.QueueDepth, Tag("client", c.Id))),
                 unit: "{messages}", description: "Client outbound queue depth");
 
+            Meter.CreateObservableGauge("b3.umdf.server.client_pending_bytes",
+                () => sm.GetClientStats().Select(c =>
+                    new Measurement<long>(c.PendingBytes, Tag("client", c.Id))),
+                unit: "By", description: "Bytes currently sitting in the client outbound ring");
+
             Meter.CreateObservableCounter("b3.umdf.server.messages_sent",
                 () => sm.GetClientStats().Select(c =>
                     new Measurement<long>(c.MessagesSent, Tag("client", c.Id))),

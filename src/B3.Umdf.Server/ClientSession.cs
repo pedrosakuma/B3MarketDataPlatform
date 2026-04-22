@@ -27,9 +27,11 @@ public sealed class ClientSession : IDisposable
     private readonly ILogger _logger;
     private readonly double _slowClientThreshold;
     private readonly int _slowClientMaxTicks;
+    private readonly long _maxPendingBytes;
 
     private long _messagesSent;
     private long _bytesSent;
+    private long _pendingBytes;
     private int _disconnectRequested;
     private int _infoWakePending;
 
@@ -42,11 +44,27 @@ public sealed class ClientSession : IDisposable
     /// <summary>Total bytes sent to this client.</summary>
     public long BytesSent => Volatile.Read(ref _bytesSent);
 
+    /// <summary>
+    /// Bytes currently sitting in the outbound ring (enqueued by producers, not yet
+    /// drained by the write loop). Used for the byte-budget slow-consumer guard so
+    /// large coalesced payloads cannot accumulate unbounded memory before the
+    /// queue-depth threshold trips.
+    /// </summary>
+    public long PendingBytes => Volatile.Read(ref _pendingBytes);
+
+    /// <summary>
+    /// Hard cap (in bytes) of pending payload sitting in the outbound ring. Producers
+    /// disconnect the client immediately on enqueue if accepting the new payload would
+    /// exceed this budget. 0 disables the check (back-compat for tests).
+    /// </summary>
+    public long MaxPendingBytes => _maxPendingBytes;
+
     public ClientSession(
         WebSocket socket,
         int channelCapacity = 4096,
         double slowClientThreshold = 0.75,
         int slowClientMaxTicks = 100,
+        long maxPendingBytes = 16L * 1024 * 1024,
         ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(socket);
@@ -54,12 +72,14 @@ public sealed class ClientSession : IDisposable
         if (slowClientThreshold is <= 0 or > 1)
             throw new ArgumentOutOfRangeException(nameof(slowClientThreshold), "Threshold must be in the (0, 1] range.");
         ArgumentOutOfRangeException.ThrowIfLessThan(slowClientMaxTicks, 1);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxPendingBytes);
 
         Id = $"client-{Interlocked.Increment(ref _nextId)}";
         Socket = socket;
         ChannelCapacity = channelCapacity;
         _slowClientThreshold = slowClientThreshold;
         _slowClientMaxTicks = slowClientMaxTicks;
+        _maxPendingBytes = maxPendingBytes;
         _logger = logger ?? NullLogger.Instance;
         // Lock-free MPSC ring rounds capacity up to the next power of two; the
         // user-facing ChannelCapacity stays as the requested value (used as the
@@ -172,6 +192,7 @@ public sealed class ClientSession : IDisposable
                 pooledToReturn.Clear();
                 int drained = 0;
                 int logicalDrained = 0;
+                long payloadBytesDrained = 0;
                 bool sawInfoWake = false;
                 while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
                 {
@@ -181,6 +202,7 @@ public sealed class ClientSession : IDisposable
                         case OutboundKind.Payload:
                             messages.Add(outbound.Payload);
                             logicalDrained += outbound.LogicalCount;
+                            payloadBytesDrained += outbound.Payload.Length;
                             if (outbound.PooledArray is { } pooled)
                                 pooledToReturn.Add(pooled);
                             break;
@@ -197,6 +219,9 @@ public sealed class ClientSession : IDisposable
                             break;
                     }
                 }
+
+                if (_maxPendingBytes > 0 && payloadBytesDrained > 0)
+                    Interlocked.Add(ref _pendingBytes, -payloadBytesDrained);
 
                 if (drained == 0)
                 {
@@ -298,8 +323,32 @@ public sealed class ClientSession : IDisposable
             return false;
         }
 
+        // Bytes budget guard: payload-bearing messages count toward the cap.
+        // Trip the slow-consumer disconnect immediately when accepting the new
+        // payload would push us past the budget — this keeps fast producers
+        // from accumulating multi-MB queues that the queue-depth threshold
+        // (counted in messages) wouldn't catch in time.
+        int payloadLen = outbound.Payload.Length;
+        if (_maxPendingBytes > 0 && payloadLen > 0)
+        {
+            long current = Interlocked.Read(ref _pendingBytes);
+            if (current + payloadLen > _maxPendingBytes)
+            {
+                if (outbound.PooledArray is { } pooledOver)
+                    ArrayPool<byte>.Shared.Return(pooledOver);
+                DisconnectSlowConsumer(
+                    $"pending-bytes budget exceeded while enqueuing {itemKind} (pending={current}+{payloadLen} > {_maxPendingBytes})");
+                return false;
+            }
+            Interlocked.Add(ref _pendingBytes, payloadLen);
+        }
+
         if (_outbound.TryEnqueue(outbound))
             return true;
+
+        // Enqueue failed: we already reserved bytes above; release them.
+        if (_maxPendingBytes > 0 && payloadLen > 0)
+            Interlocked.Add(ref _pendingBytes, -payloadLen);
 
         if (outbound.PooledArray is { } pooled2)
             ArrayPool<byte>.Shared.Return(pooled2);
@@ -313,6 +362,8 @@ public sealed class ClientSession : IDisposable
     {
         while (_outbound.TryDequeue(out var outbound))
         {
+            if (outbound.Payload.Length > 0 && _maxPendingBytes > 0)
+                Interlocked.Add(ref _pendingBytes, -outbound.Payload.Length);
             if (outbound.PooledArray is { } pooled)
                 ArrayPool<byte>.Shared.Return(pooled);
         }

@@ -67,10 +67,10 @@ public sealed class SubscriptionManager
     public int ClientCount => _clients.Count;
 
     /// <summary>Get stats for all connected clients.</summary>
-    public IEnumerable<(string Id, int QueueDepth, long MessagesSent, long BytesSent)> GetClientStats()
+    public IEnumerable<(string Id, int QueueDepth, long PendingBytes, long MessagesSent, long BytesSent)> GetClientStats()
     {
         foreach (var (_, session) in _clients)
-            yield return (session.Id, session.QueueDepth, session.MessagesSent, session.BytesSent);
+            yield return (session.Id, session.QueueDepth, session.PendingBytes, session.MessagesSent, session.BytesSent);
     }
 
     /// <summary>

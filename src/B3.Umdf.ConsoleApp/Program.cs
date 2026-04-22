@@ -36,6 +36,7 @@ int maxConnections = settings.MaxConnections;
 int clientChannelCapacity = settings.ClientChannelCapacity;
 double slowClientThreshold = settings.SlowClientThreshold;
 int slowClientMaxTicks = settings.SlowClientMaxTicks;
+long clientMaxPendingBytes = settings.ClientMaxPendingBytes;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
@@ -490,7 +491,8 @@ if (subscriptionManager is not null)
         maxConnections: maxConnections,
         clientChannelCapacity: clientChannelCapacity,
         slowClientThreshold: slowClientThreshold,
-        slowClientMaxTicks: slowClientMaxTicks);
+        slowClientMaxTicks: slowClientMaxTicks,
+        clientMaxPendingBytes: clientMaxPendingBytes);
 
     // Wire up feed state and last-packet providers for /health endpoint
     if (multiFeed is not null)
@@ -837,8 +839,8 @@ void PrintPeriodicStats()
 
     if (subscriptionManager is not null)
     {
-        foreach (var (id, depth, sent, _) in subscriptionManager.GetClientStats())
-            Console.WriteLine($"   {id}: queue={depth:N0}  sent={sent:N0}");
+        foreach (var (id, depth, pendingBytes, sent, _) in subscriptionManager.GetClientStats())
+            Console.WriteLine($"   {id}: queue={depth:N0}  pending={pendingBytes:N0}B  sent={sent:N0}");
         if (subscriptionManager.UpstreamConflated > 0)
             Console.WriteLine($"   upstream conflated (total): {subscriptionManager.UpstreamConflated:N0}");
     }
