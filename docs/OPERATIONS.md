@@ -18,7 +18,13 @@ dotnet test
 
 ### PCAP samples
 
-B3 publishes sample PCAPs for development:
+B3 publishes sample PCAPs for development on a public Azure storage:
+
+- Index page: <https://mktdatabinario.z15.web.core.windows.net/>
+- Direct folder: <https://mktdatabinario.z15.web.core.windows.net/PCAPS/BinaryUMDF/SiteB3/>
+
+A helper script downloads and extracts the 8 files used by the default
+multi-channel setup (EQT + DRV, all four channel types each):
 
 ```bash
 ./tools/pcap/download-pcaps.sh
