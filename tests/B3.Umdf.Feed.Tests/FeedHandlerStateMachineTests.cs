@@ -287,6 +287,122 @@ public class FeedHandlerStateMachineTests
         Assert.True(handler.SnapshotBoundaryFoundForTesting);
     }
 
+    // ── A/B reorder stress tests ──
+
+    [Fact]
+    public void AbStress_BurstLossOnA_FilledByB_StaysRealTime_NoGapEvent()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        // A delivers 1..10, then loses a burst of 11..30, then resumes at 31..40.
+        // B delivers 11..30 belatedly. The reorder buffer should absorb the gap.
+        const uint preBurst = 10;
+        const uint burst = 20;
+        const uint postBurst = 10;
+
+        for (uint s = 1; s <= preBurst; s++)
+            handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: s));
+
+        // A skips the burst entirely.
+        for (uint s = preBurst + burst + 1; s <= preBurst + burst + postBurst; s++)
+            handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: s));
+
+        // While A waits, no gap event fired and we stayed in RealTime.
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Null(tracker.LastGap);
+        Assert.Equal((int)preBurst, tracker.PacketProcessedCount);
+
+        // B fills the burst out of order.
+        var burstSeqs = new List<uint>();
+        for (uint s = preBurst + 1; s <= preBurst + burst; s++) burstSeqs.Add(s);
+        var rng = new Random(1234);
+        for (int i = burstSeqs.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (burstSeqs[i], burstSeqs[j]) = (burstSeqs[j], burstSeqs[i]);
+        }
+        foreach (var s in burstSeqs)
+            handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: s));
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Null(tracker.LastGap);
+        Assert.Equal((int)(preBurst + burst + postBurst), tracker.PacketProcessedCount);
+        Assert.Equal(preBurst + burst + postBurst + 1, handler.IncrementalHandler.ExpectedSequenceNumber);
+        Assert.True(handler.IncrementalHandler.ReorderHits > 0);
+    }
+
+    [Fact]
+    public void AbStress_HeavyInterleaving_DeduplicatesAndPreservesOrder()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        // Both feeds deliver 1..200 with random ordering of arrivals on each
+        // channel. Roughly 70% of A arrives "first", 30% of B arrives first;
+        // the late one is always treated as a duplicate.
+        const uint total = 200;
+        var rng = new Random(7);
+        var aArrivals = new List<uint>();
+        var bArrivals = new List<uint>();
+        for (uint s = 1; s <= total; s++)
+        {
+            aArrivals.Add(s);
+            bArrivals.Add(s);
+        }
+        // Shuffle B (simulates B being reordered relative to A).
+        for (int i = bArrivals.Count - 1; i > 0; i--)
+        {
+            int j = rng.Next(i + 1);
+            (bArrivals[i], bArrivals[j]) = (bArrivals[j], bArrivals[i]);
+        }
+
+        // Interleave: send one from A, one from B, etc.
+        int ai = 0, bi = 0;
+        while (ai < aArrivals.Count || bi < bArrivals.Count)
+        {
+            bool pickA = (rng.NextDouble() < 0.7 && ai < aArrivals.Count) || bi >= bArrivals.Count;
+            if (pickA)
+            {
+                handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: aArrivals[ai++]));
+            }
+            else
+            {
+                handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: bArrivals[bi++]));
+            }
+        }
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Null(tracker.LastGap);
+        Assert.Equal((int)total, tracker.PacketProcessedCount);
+        Assert.Equal(total + 1, handler.IncrementalHandler.ExpectedSequenceNumber);
+        // Every late copy on the slower feed must be flagged as a duplicate.
+        Assert.Equal((int)total, handler.IncrementalHandler.DuplicatesSkipped);
+    }
+
+    [Fact]
+    public void AbStress_BothFeedsLoseSamePacket_TransitionsToRecovery()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        // Both A and B drop seq=2; both keep delivering well past the reorder
+        // window — the gap can no longer be filled and must escalate to Recovery.
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: 1));
+        Assert.Equal(FeedState.RealTime, handler.State);
+
+        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
+        Assert.Equal(FeedState.Recovery, handler.State);
+        Assert.NotNull(tracker.LastGap);
+        Assert.Equal(2u, tracker.LastGap!.Value.Expected);
+        Assert.Equal(farFuture, tracker.LastGap!.Value.Received);
+    }
+
     private class TrackingFeedEventHandler : IFeedEventHandler
     {
         public int PacketProcessedCount;
