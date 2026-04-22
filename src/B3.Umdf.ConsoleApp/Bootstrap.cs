@@ -7,6 +7,74 @@ using Microsoft.Extensions.Logging;
 
 namespace B3.Umdf.ConsoleApp;
 
+internal static class CliArgs
+{
+    /// <summary>
+    /// Applies CLI argument overrides to <paramref name="settings"/> in place and
+    /// collects any positional arguments. Returns false on a validation error and
+    /// sets <paramref name="error"/> with a user-facing message.
+    /// </summary>
+    public static bool TryApply(
+        string[] args,
+        AppSettings settings,
+        List<string> positionalArgs,
+        out string? error)
+    {
+        var cliPrefixes = new List<string>();
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--ws-port" when i + 1 < args.Length:
+                    if (!int.TryParse(args[++i], out var p) || p < 1 || p > 65535)
+                    { error = "Invalid --ws-port value."; return false; }
+                    settings.WsPort = p;
+                    break;
+
+                case "--speed" when i + 1 < args.Length:
+                    if (!double.TryParse(args[++i],
+                            System.Globalization.NumberStyles.Any,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out var sp) || sp < 0)
+                    {
+                        error = "Invalid --speed value. Use 0 for max speed, 1 for real-time, >1 for accelerated.";
+                        return false;
+                    }
+                    settings.Speed = sp;
+                    break;
+
+                case "--pcap-prefix" when i + 1 < args.Length:
+                    cliPrefixes.Add(args[++i]);
+                    break;
+
+                case "--multicast-config" when i + 1 < args.Length:
+                    settings.MulticastConfig = args[++i];
+                    break;
+
+                case "--replay-to-multicast":
+                    settings.ReplayToMulticast = true;
+                    break;
+
+                default:
+                    positionalArgs.Add(args[i]);
+                    break;
+            }
+        }
+
+        // CLI prefixes win over env/json prefixes when present; otherwise leave
+        // settings.PcapPrefixes (env/json) untouched as the default.
+        if (cliPrefixes.Count > 0)
+        {
+            settings.PcapPrefixes.Clear();
+            settings.PcapPrefixes.AddRange(cliPrefixes);
+        }
+
+        error = null;
+        return true;
+    }
+}
+
 internal static class HealthCheckCommand
 {
     public static async Task<int?> TryRunAsync(string[] args)

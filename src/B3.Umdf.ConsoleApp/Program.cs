@@ -14,11 +14,17 @@ if (healthExit is int code) return code;
 var settings = AppSettings.LoadDefault();
 settings.ApplyEnvironment();
 
+var positionalArgs = new List<string>();
+if (!CliArgs.TryApply(args, settings, positionalArgs, out var cliError))
+{
+    Console.Error.WriteLine(cliError);
+    return 1;
+}
+
 int? wsPort = settings.WsPort;
 double speed = settings.Speed;
 bool replayToMulticast = settings.ReplayToMulticast;
-var pcapPrefixes = new List<string>();
-var positionalArgs = new List<string>();
+var pcapPrefixes = new List<string>(settings.PcapPrefixes);
 string? multicastConfig = settings.MulticastConfig;
 int maxConnections = settings.MaxConnections;
 int clientChannelCapacity = settings.ClientChannelCapacity;
@@ -33,46 +39,6 @@ int feedChannelCapacity = settings.FeedChannelCapacity;
 int incrementalRecoveryQueueCapacity = settings.IncrementalRecoveryQueueCapacity;
 int groupRingCapacity = settings.GroupRingCapacity;
 var logLevel = LogLevelParser.Parse(settings.LogLevel);
-
-for (int i = 0; i < args.Length; i++)
-{
-    if (args[i] == "--ws-port" && i + 1 < args.Length)
-    {
-        if (!int.TryParse(args[++i], out var p) || p < 1 || p > 65535)
-        {
-            Console.Error.WriteLine("Invalid --ws-port value.");
-            return 1;
-        }
-        wsPort = p;
-    }
-    else if (args[i] == "--speed" && i + 1 < args.Length)
-    {
-        if (!double.TryParse(args[++i], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out speed) || speed < 0)
-        {
-            Console.Error.WriteLine("Invalid --speed value. Use 0 for max speed, 1 for real-time, >1 for accelerated.");
-            return 1;
-        }
-    }
-    else if (args[i] == "--pcap-prefix" && i + 1 < args.Length)
-    {
-        pcapPrefixes.Add(args[++i]);
-    }
-    else if (args[i] == "--multicast-config" && i + 1 < args.Length)
-    {
-        multicastConfig = args[++i];
-    }
-    else if (args[i] == "--replay-to-multicast")
-    {
-        replayToMulticast = true;
-    }
-    else
-    {
-        positionalArgs.Add(args[i]);
-    }
-}
-
-if (pcapPrefixes.Count == 0 && settings.PcapPrefixes.Count > 0)
-    pcapPrefixes.AddRange(settings.PcapPrefixes);
 
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
