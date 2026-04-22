@@ -24,8 +24,15 @@ public sealed class AppSettings
     /// <summary>Maximum WebSocket connections allowed (0 = unlimited).</summary>
     public int MaxConnections { get; set; }
 
-    /// <summary>Per-client outbound channel capacity.</summary>
-    public int ClientChannelCapacity { get; set; } = 4096;
+    /// <summary>
+    /// Per-client outbound channel capacity (number of pre-serialized batches the broadcaster
+    /// can stage ahead of the WebSocket send loop). The send loop drains up to MaxDrainPerCycle
+    /// per iteration, coalesces all into one WS frame, then awaits SendAsync. While that send
+    /// is in flight the broadcaster keeps producing — at 50k+ packets/s, a single 100 ms WS
+    /// write can stage thousands of items. Sized to cover that burst window without false-
+    /// positive disconnects; the byte budget (ClientMaxPendingBytes) is the real memory cap.
+    /// </summary>
+    public int ClientChannelCapacity { get; set; } = 32768;
 
     /// <summary>Slow client detection: queue depth threshold (0.0-1.0).</summary>
     public double SlowClientThreshold { get; set; } = 0.75;

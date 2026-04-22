@@ -56,7 +56,7 @@ Docker-specific helpers consumed by `docker-entrypoint.sh`:
 |----------|---------|-------------|
 | `PCAP_PREFIX` | `20250331_MBO_084_EQT,20250929_MBO_072_DRV` | Comma-separated PCAP prefixes (multi-channel) |
 | `WS_PORT` | `8080` | WebSocket server port |
-| `REPLAY_SPEED` | `5` | Replay speed multiplier |
+| `REPLAY_SPEED` | `2` | Replay speed multiplier |
 | `FRONTEND_PORT` | `3000` | Frontend HTTP port |
 | `MULTICAST_CONFIG_FILE` | `multicast-compose.json` | Config file under `/app/config/` shared by publisher and consumer |
 

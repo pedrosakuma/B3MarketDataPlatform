@@ -4,7 +4,7 @@ set -e
 PCAP_DIR="${PCAP_DIR:-/app/pcap}"
 PCAP_PREFIX="${PCAP_PREFIX:-20250331_MBO_084_EQT}"
 WS_PORT="${WS_PORT:-8080}"
-REPLAY_SPEED="${REPLAY_SPEED:-5}"
+REPLAY_SPEED="${REPLAY_SPEED:-2}"
 
 # Build --pcap-prefix args (comma-separated for multi-channel)
 PREFIX_ARGS=""
