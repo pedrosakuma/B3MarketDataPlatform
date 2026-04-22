@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging;
@@ -492,7 +493,8 @@ public sealed class SubscriptionManager
 
         int headerSize = WireProtocol.BookSnapshotSize(0, 0);
         int totalOrders = bidOrders.Length + askOrders.Length;
-        var buf = new byte[headerSize + totalOrders * 37];
+        int needed = headerSize + totalOrders * 37;
+        var buf = ArrayPool<byte>.Shared.Rent(needed);
 
         WireProtocol.WriteBookSnapshotHeader(buf, securityId, lastRptSeq, 0, 0);
         int offset = headerSize;
@@ -500,7 +502,9 @@ public sealed class SubscriptionManager
         SerializeOrderArray(buf, ref offset, securityId, bidOrders);
         SerializeOrderArray(buf, ref offset, securityId, askOrders);
 
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, offset));
+        // ClientSession.TryEnqueueCore returns the pooled buffer on enqueue failure
+        // (overflow / disconnect), so we don't need a manual return here.
+        session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
     }
 
     private static (ulong OrderId, byte Side, long Price, long Quantity)[] CopyOrderData(BookSide side)

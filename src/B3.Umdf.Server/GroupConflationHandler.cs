@@ -636,6 +636,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         FlushClientBatches();
     }
 
+    // Hard cap on per-client per-batch accumulator size. Beyond this, the partial
+    // buffer is flushed to the client immediately (as its own enqueue) and a fresh
+    // one is rented for the remainder of the batch. Bounds peak memory pinned in
+    // ArrayPool at high fan-out (e.g. 500 clients × snapshot bursts).
+    private const int MaxAccumulatorBytes = 256 * 1024;
+
     private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
     {
         var subs = _parent.GetSubscribers(securityId);
@@ -656,11 +662,34 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             }
             if (acc.Offset + bytes.Length > acc.Buffer.Length)
             {
-                int newSize = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
-                var newBuf = ArrayPool<byte>.Shared.Rent(newSize);
-                acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
-                ArrayPool<byte>.Shared.Return(acc.Buffer);
-                acc.Buffer = newBuf;
+                int desired = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
+                if (desired <= MaxAccumulatorBytes)
+                {
+                    var newBuf = ArrayPool<byte>.Shared.Rent(desired);
+                    acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
+                    ArrayPool<byte>.Shared.Return(acc.Buffer);
+                    acc.Buffer = newBuf;
+                }
+                else
+                {
+                    // Cap reached: flush what we already have to the client and
+                    // start a fresh accumulator for the current event.
+                    if (acc.Offset > 0)
+                    {
+                        session.TryEnqueueBatch(
+                            new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset),
+                            acc.LogicalCount,
+                            pooledArray: acc.Buffer);
+                    }
+                    else
+                    {
+                        ArrayPool<byte>.Shared.Return(acc.Buffer);
+                    }
+                    int initial = Math.Max(bytes.Length * 2, 1024);
+                    acc.Buffer = ArrayPool<byte>.Shared.Rent(initial);
+                    acc.Offset = 0;
+                    acc.LogicalCount = 0;
+                }
             }
             bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
             acc.Offset += bytes.Length;
