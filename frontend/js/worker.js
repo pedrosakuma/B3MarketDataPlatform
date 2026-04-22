@@ -30,6 +30,8 @@ const D_RANKINGS = 0x10;
 const D_STATS    = 0x20;
 const D_TITLES   = 0x40;
 const D_ALLINFO  = 0x80;
+const D_TRADES   = 0x100;
+const D_AUCTION  = 0x200;
 let chartFullSwap = false;
 function mark(flags) { dirty |= flags; }
 
@@ -72,6 +74,24 @@ function pickAutoResolution(candles) {
 }
 
 const MAX_GAP_FILL = 600; // max gap-fill candles per gap (covers ~10 min at 1s)
+const MAX_RECENT_TRADES = 50; // trade tape length per subscription
+const VWAP_MIN_INTERVAL_MS = 1000; // minimum spacing between VWAP samples plotted on the chart
+
+// AggressorSide values exposed to the UI:
+//   0 = unknown (mid-price or no top-of-book yet)
+//   1 = Buy aggressor (trade lifted the ask)
+//   2 = Sell aggressor (trade hit the bid)
+function inferAggressor(orders, tradePrice) {
+  let bestBid = -Infinity;
+  let bestAsk = Infinity;
+  for (const [, o] of orders) {
+    if (o.side === 0) { if (o.price > bestBid) bestBid = o.price; }
+    else              { if (o.price < bestAsk) bestAsk = o.price; }
+  }
+  if (bestAsk !== Infinity && tradePrice >= bestAsk) return 1;
+  if (bestBid !== -Infinity && tradePrice <= bestBid) return 2;
+  return 0;
+}
 
 function aggregateCandles(candles1s, resolution) {
   if (candles1s.length === 0) return [];
@@ -204,6 +224,14 @@ setInterval(() => {
       lastSentCandleTime = 0;
       lastSentCandleClose = 0;
     } else {
+      // Always include the latest VWAP curve and current price bands for the selected sub.
+      // Both are cheap (small arrays / two numbers) and let the chart layer render overlays
+      // without round-tripping for incremental updates.
+      const overlays = {
+        vwap: sub.vwapPoints.length > 0 ? sub.vwapPoints.slice() : null,
+        priceBandLow: sub.info.PriceBandLow ?? null,
+        priceBandHigh: sub.info.PriceBandHigh ?? null,
+      };
       // Compute desired resolution consistently with getChartCandles
       const desiredRes = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles);
       const resChanged = desiredRes !== lastSentResolution;
@@ -265,6 +293,37 @@ setInterval(() => {
             lastSentCandleClose = lastCandle.close;
           }
         }
+      }
+      // Attach overlays (vwap line + price-band horizontal lines) to whatever chart
+      // payload we built. App.js applies them on every frame; cost is one array slice.
+      if (frame.chart) frame.chart.overlays = overlays;
+    }
+  }
+
+  if (d & D_TRADES) {
+    const sub = selectedId ? subscriptions.get(selectedId) : null;
+    frame.trades = sub && sub.recentTrades.length > 0
+      ? { items: sub.recentTrades.slice() }
+      : { items: [] };
+  }
+
+  if (d & D_AUCTION) {
+    const sub = selectedId ? subscriptions.get(selectedId) : null;
+    if (!sub) {
+      frame.auction = null;
+    } else {
+      const ts = sub.info.TradingStatus;
+      // B3 SecurityTradingStatus (subset relevant to auction): 2/5/8/21 are pre/post-auction phases.
+      const isAuction = ts === 2 || ts === 5 || ts === 8 || ts === 21;
+      if (!isAuction) {
+        frame.auction = null;
+      } else {
+        frame.auction = {
+          tradingStatus: ts,
+          theoreticalPrice: sub.info.TheoreticalOpeningPrice ?? null,
+          theoreticalSize: sub.info.TheoreticalOpeningSize ?? null,
+          imbalance: sub.info.AuctionImbalanceSize ?? null,
+        };
       }
     }
   }
@@ -408,14 +467,19 @@ function handleMessage(msg) {
           symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
           orders: new Map(), info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
+          recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
+          tradesDirty: false, // flips on any push so we send full list once per frame
+          vwapPoints: [],     // [{time, value}] — sampled from InfoSnapshot.VwapPrice
+          lastVwap: null,
+          lastVwapTime: 0,
         });
       }
       let d = D_SUBS | D_ALLINFO;
       if (!sel) {
         selectedId = id;
-        d |= D_BOOK | D_CHART | D_TITLES;
+        d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
       } else if (sel === id) {
-        d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES;
+        d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
       }
       mark(d);
       log((existing ? 'Subscription refreshed ' : 'Subscribed ') + msg.symbol + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
@@ -432,7 +496,7 @@ function handleMessage(msg) {
         let d = D_SUBS | D_ALLINFO;
         if (sel === id) {
           selectedId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-          d |= D_BOOK | D_CHART | D_TITLES;
+          d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
           chartFullSwap = true;
         }
         mark(d);
@@ -452,7 +516,30 @@ function handleMessage(msg) {
       stats.info++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) Object.assign(sub.info, msg.fields);
+      if (sub) {
+        Object.assign(sub.info, msg.fields);
+        // Sample VWAP for chart line series — coalesce repeated values within VWAP_MIN_INTERVAL_MS.
+        if ('VwapPrice' in msg.fields && msg.fields.VwapPrice !== null && sub.candles.length > 0) {
+          const v = msg.fields.VwapPrice;
+          const tNow = sub.candles[sub.candles.length - 1].time;
+          if (v !== sub.lastVwap || (tNow - sub.lastVwapTime) * 1000 >= VWAP_MIN_INTERVAL_MS) {
+            // VwapPrice exponent matches OpeningPrice/HighPrice (1e-4); the chart price scale is in mantissa units.
+            sub.vwapPoints.push({ time: tNow, value: v });
+            if (sub.vwapPoints.length > 36000) sub.vwapPoints.shift(); // ~10h at 1s safety bound
+            sub.lastVwap = v;
+            sub.lastVwapTime = tNow;
+            if (sel === id) mark(D_CHART);
+          }
+        }
+        // Price bands and trading status are also chart/auction inputs for the selected sub.
+        if (sel === id) {
+          if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields) mark(D_CHART);
+          if ('TradingStatus' in msg.fields || 'TheoreticalOpeningPrice' in msg.fields
+              || 'TheoreticalOpeningSize' in msg.fields || 'AuctionImbalanceSize' in msg.fields) {
+            mark(D_AUCTION);
+          }
+        }
+      }
       scheduleAllInfo();
       break;
     }
@@ -483,7 +570,19 @@ function handleMessage(msg) {
       stats.trades++;
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);
-      if (sub) sub.tradeCount++;
+      if (sub) {
+        sub.tradeCount++;
+        const side = inferAggressor(sub.orders, msg.price);
+        sub.recentTrades.push({
+          time: Date.now(), price: msg.price, qty: msg.qty,
+          side, tradeId: msg.tradeId,
+        });
+        if (sub.recentTrades.length > MAX_RECENT_TRADES) {
+          sub.recentTrades.splice(0, sub.recentTrades.length - MAX_RECENT_TRADES);
+        }
+        sub.tradesDirty = true;
+        if (sel === id) mark(D_TRADES);
+      }
       break;
     }
     case 'BookCleared': {
@@ -606,7 +705,7 @@ self.onmessage = (evt) => {
     case 'select':
       selectedId = msg.securityId;
       chartFullSwap = true;
-      mark(D_BOOK | D_CHART | D_TITLES);
+      mark(D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION);
       break;
     case 'rankingSubscribe':
       if (ws && ws.readyState === WebSocket.OPEN)

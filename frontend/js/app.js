@@ -5,6 +5,7 @@ import { DATA_FLAGS, INFO_FIELDS } from './protocol.js';
 import {
   $, setStatus, updateTitles, renderBook, renderSubsTable,
   renderHealth, renderRankings, showToast, updateStats, formatPrice,
+  renderTrades, renderAuction,
 } from './ui.js';
 
 // ── Worker ──
@@ -14,6 +15,11 @@ const worker = new Worker('./js/worker.js', { type: 'module' });
 const LWC = globalThis.LightweightCharts;
 let chart = null;
 let candleSeries = null;
+let vwapSeries = null;
+let priceLineLow = null;
+let priceLineHigh = null;
+let lastPriceBandLow = null;
+let lastPriceBandHigh = null;
 
 function initChart() {
   const container = $('chartContainer');
@@ -35,12 +41,49 @@ function initChart() {
     wickUpColor: '#00c853', wickDownColor: '#ff1744',
     priceFormat: { type: 'custom', formatter: (p) => formatPrice(p), minMove: 1 },
   });
+  // VWAP overlay — thin yellow line. Hidden until first sample arrives.
+  vwapSeries = chart.addLineSeries({
+    color: '#ffd600', lineWidth: 1,
+    priceLineVisible: false, lastValueVisible: false,
+    priceFormat: { type: 'custom', formatter: (p) => formatPrice(p), minMove: 1 },
+  });
+}
+
+// Add/update/remove the price-band horizontal lines on the candle series. Compares against
+// the cached values to avoid removing+recreating lines on every frame.
+function applyPriceBands(low, high) {
+  if (low !== lastPriceBandLow) {
+    if (priceLineLow) { candleSeries.removePriceLine(priceLineLow); priceLineLow = null; }
+    if (low != null) {
+      priceLineLow = candleSeries.createPriceLine({
+        price: low, color: '#ff5252', lineWidth: 1,
+        lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: 'PB Low',
+      });
+    }
+    lastPriceBandLow = low;
+  }
+  if (high !== lastPriceBandHigh) {
+    if (priceLineHigh) { candleSeries.removePriceLine(priceLineHigh); priceLineHigh = null; }
+    if (high != null) {
+      priceLineHigh = candleSeries.createPriceLine({
+        price: high, color: '#ff5252', lineWidth: 1,
+        lineStyle: LWC.LineStyle.Dashed, axisLabelVisible: true, title: 'PB High',
+      });
+    }
+    lastPriceBandHigh = high;
+  }
+}
+
+function clearOverlays() {
+  if (vwapSeries) vwapSeries.setData([]);
+  applyPriceBands(null, null);
 }
 
 function handleChartData(chartData) {
   if (!chartData) {
     $('chartEmpty').style.display = '';
     if (candleSeries) candleSeries.setData([]);
+    clearOverlays();
     updateResolutionLabel(null);
     return;
   }
@@ -58,6 +101,14 @@ function handleChartData(chartData) {
   } else if (chartData.update) {
     candleSeries.update(chartData.update);
   }
+
+  // Overlays ride along with the chart frame; worker emits them on every chart-dirty tick.
+  const ov = chartData.overlays;
+  if (ov) {
+    if (ov.vwap && vwapSeries) vwapSeries.setData(ov.vwap);
+    applyPriceBands(ov.priceBandLow, ov.priceBandHigh);
+  }
+
   updateResolutionLabel(chartData.resolution);
 }
 
@@ -132,6 +183,8 @@ const view = {
   selectedSymbol: null,
   book: null,
   allInfo: null,
+  trades: null,
+  auction: null,
   rankings: { volume: [], gainers: [], losers: [] },
   stats: { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 },
   connected: false,
@@ -166,6 +219,8 @@ worker.onmessage = (evt) => {
         }
       }
       if (msg.allInfo !== undefined) view.allInfo = msg.allInfo;
+      if (msg.trades !== undefined) view.trades = msg.trades;
+      if (msg.auction !== undefined) view.auction = msg.auction;
       if (msg.rankings !== undefined) view.rankings = msg.rankings;
       if (msg.stats !== undefined) view.stats = msg.stats;
       scheduleRender();
@@ -207,6 +262,8 @@ function doRender() {
     for (const cd of pending) handleChartData(cd);
   }
   renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
+  renderTrades(view.trades);
+  renderAuction(view.auction);
   updateStats(view.stats);
   renderRankings(view.rankings, view.rankingsTab, view.connected);
 }

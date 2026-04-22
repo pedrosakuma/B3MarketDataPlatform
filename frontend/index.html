@@ -34,7 +34,7 @@
   .main { flex: 1; display: grid; grid-template-columns: 220px 1fr; overflow: hidden; }
   .sidebar { background: var(--bg2); border-right: 1px solid var(--border); padding: .75rem; overflow-y: auto; display: flex; flex-direction: column; gap: .75rem; }
   .content { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
-  .panels { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 3fr 2fr; gap: 0; overflow: hidden; min-height: 0; }
+  .panels { flex: 1; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 3fr 1.2fr 2fr; gap: 0; overflow: hidden; min-height: 0; }
   .panel { border: 1px solid var(--border); margin: .5rem; border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; }
   .panel.wide { grid-column: 1 / -1; }
   .panel-head { background: var(--bg3); padding: .4rem .7rem; font-size: .75rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
@@ -57,6 +57,24 @@
 
   /* Spread bar */
   .spread-bar { text-align: center; font-size: .75rem; padding: .3rem; margin-bottom: .3rem; background: rgba(0,210,255,.08); border-radius: 4px; font-family: monospace; }
+
+  /* Auction banner — shown inside the book panel header area when in an auction phase. */
+  .auction-banner { padding: .35rem .6rem; font-size: .72rem; font-family: 'Cascadia Code', monospace;
+    background: linear-gradient(90deg, rgba(240,160,48,.18), rgba(240,160,48,.05));
+    border-bottom: 1px solid rgba(240,160,48,.5); color: #ffb84d;
+    display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; }
+  .auction-banner.hidden { display: none; }
+  .auction-banner .au-label { color: var(--muted); margin-right: .25rem; }
+  .auction-banner .au-tag { background: rgba(240,160,48,.25); padding: .1rem .4rem; border-radius: 3px; font-weight: 600; }
+
+  /* Trade tape */
+  .trades-table { width: 100%; border-collapse: collapse; font-size: .72rem; font-family: 'Cascadia Code', monospace; }
+  .trades-table th { position: sticky; top: 0; background: var(--bg3); color: var(--muted); padding: .3rem .5rem; text-align: right; border-bottom: 1px solid var(--border); font-weight: 600; }
+  .trades-table th:first-child, .trades-table td:first-child { text-align: left; }
+  .trades-table td { padding: .2rem .5rem; border-bottom: 1px solid rgba(255,255,255,.04); text-align: right; white-space: nowrap; }
+  .trade-buy  { color: var(--green); }
+  .trade-sell { color: var(--red); }
+  .trade-flat { color: var(--muted); }
 
   /* Subscriptions table */
   .subs-table-wrap { overflow-x: auto; overflow-y: auto; flex: 1; }
@@ -241,6 +259,7 @@
             <option value="50">50 levels</option>
           </select>
         </div>
+        <div class="auction-banner hidden" id="auctionBanner"></div>
         <div class="panel-body" id="bookBody">
           <div class="empty-msg">Subscribe to see order book</div>
         </div>
@@ -261,6 +280,25 @@
         <div class="panel-body no-pad" id="chartBody" style="position:relative">
           <div id="chartContainer" style="width:100%;height:100%"></div>
           <div class="empty-msg" id="chartEmpty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg)">Subscribe to see chart</div>
+        </div>
+      </div>
+      <!-- Trade tape panel -->
+      <div class="panel wide">
+        <div class="panel-head">
+          <span>Trades <span id="tradesSubtitle" class="chart-res-label"></span></span>
+        </div>
+        <div class="panel-body no-pad" id="tradesBody" style="padding:0">
+          <div class="empty-msg" id="tradesEmpty">Subscribe to see trade tape</div>
+          <div id="tradesWrap" style="display:none;height:100%;overflow-y:auto">
+            <table class="trades-table">
+              <thead>
+                <tr>
+                  <th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>Trade ID</th>
+                </tr>
+              </thead>
+              <tbody id="tradesRows"></tbody>
+            </table>
+          </div>
         </div>
       </div>
       <!-- Subscriptions table panel -->

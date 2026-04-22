@@ -442,3 +442,108 @@ export function renderSubsTable(allInfo, columns, selectedId) {
     }
   }
 }
+
+// ── Trade tape (DOM-pooled, mirrors getBookPool pattern) ──
+
+const MAX_TAPE_ROWS = 50;
+let tradesPool = null;
+
+function getTradesPool() {
+  if (tradesPool) return tradesPool;
+  const tbody = $('tradesRows');
+  tbody.innerHTML = '';
+  const rows = [];
+  for (let i = 0; i < MAX_TAPE_ROWS; i++) {
+    const tr = document.createElement('tr');
+    const tdTime = document.createElement('td');
+    const tdSide = document.createElement('td');
+    const tdPrice = document.createElement('td');
+    const tdQty = document.createElement('td');
+    const tdId = document.createElement('td');
+    tr.append(tdTime, tdSide, tdPrice, tdQty, tdId);
+    tbody.appendChild(tr);
+    rows.push({ tr, tdTime, tdSide, tdPrice, tdQty, tdId });
+  }
+  tradesPool = { rows };
+  return tradesPool;
+}
+
+function formatTimeOfDay(ts) {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  const mss = String(d.getMilliseconds()).padStart(3, '0');
+  return `${hh}:${mm}:${ss}.${mss}`;
+}
+
+export function renderTrades(tradesData) {
+  const empty = $('tradesEmpty');
+  const wrap = $('tradesWrap');
+  if (!tradesData || !tradesData.items || tradesData.items.length === 0) {
+    empty.style.display = '';
+    wrap.style.display = 'none';
+    return;
+  }
+  empty.style.display = 'none';
+  wrap.style.display = '';
+
+  const pool = getTradesPool();
+  const items = tradesData.items;
+  // Newest first: iterate input from end → start.
+  const n = items.length;
+  for (let i = 0; i < MAX_TAPE_ROWS; i++) {
+    const row = pool.rows[i];
+    if (i >= n) {
+      if (row.tr.style.display !== 'none') row.tr.style.display = 'none';
+      continue;
+    }
+    const t = items[n - 1 - i];
+    if (row.tr.style.display === 'none') row.tr.style.display = '';
+    row.tdTime.textContent = formatTimeOfDay(t.time);
+    let sideText, sideClass;
+    if (t.side === 1)      { sideText = 'BUY';  sideClass = 'trade-buy'; }
+    else if (t.side === 2) { sideText = 'SELL'; sideClass = 'trade-sell'; }
+    else                   { sideText = '—';    sideClass = 'trade-flat'; }
+    if (row.tdSide.textContent !== sideText) row.tdSide.textContent = sideText;
+    if (row.tdSide.className !== sideClass) row.tdSide.className = sideClass;
+    if (row.tdPrice.className !== sideClass) row.tdPrice.className = sideClass;
+    row.tdPrice.textContent = formatPrice(t.price, 4);
+    row.tdQty.textContent = formatQty(t.qty);
+    row.tdId.textContent = String(t.tradeId);
+  }
+}
+
+// ── Auction banner (no pool needed; few elements, infrequent updates) ──
+
+let auctionEls = null;
+
+function getAuctionEls() {
+  if (auctionEls) return auctionEls;
+  const banner = $('auctionBanner');
+  banner.innerHTML = '';
+  const tag = document.createElement('span');
+  tag.className = 'au-tag';
+  const price = document.createElement('span');
+  const size = document.createElement('span');
+  const imb = document.createElement('span');
+  banner.append(tag, price, size, imb);
+  auctionEls = { banner, tag, price, size, imb };
+  return auctionEls;
+}
+
+export function renderAuction(auctionData) {
+  const els = getAuctionEls();
+  if (!auctionData) {
+    if (!els.banner.classList.contains('hidden')) els.banner.classList.add('hidden');
+    return;
+  }
+  els.banner.classList.remove('hidden');
+  els.tag.textContent = tradingStatusName(auctionData.tradingStatus).toUpperCase();
+  els.price.innerHTML = '<span class="au-label">Theor. Price</span>'
+    + (auctionData.theoreticalPrice != null ? formatPrice(auctionData.theoreticalPrice, 4) : '\u2014');
+  els.size.innerHTML = '<span class="au-label">Theor. Size</span>'
+    + (auctionData.theoreticalSize != null ? formatQty(auctionData.theoreticalSize) : '\u2014');
+  els.imb.innerHTML = '<span class="au-label">Imbalance</span>'
+    + (auctionData.imbalance != null ? formatQty(auctionData.imbalance) : '\u2014');
+}
