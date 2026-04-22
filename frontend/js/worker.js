@@ -432,14 +432,12 @@ function computeBook() {
 let wsUrl = '';
 
 function connect(url) {
-  console.log('[worker] connect() called with url=', url, 'wsUrl=', wsUrl);
   wsUrl = url || wsUrl;
-  if (!wsUrl) { console.warn('[worker] no wsUrl, aborting connect'); return; }
+  if (!wsUrl) return;
   postMessage({ type: 'status', status: 'connecting' });
 
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
-  console.log('[worker] WebSocket created, readyState=', ws.readyState);
 
   const connectTimeout = setTimeout(() => {
     if (ws && ws.readyState === WebSocket.CONNECTING) {
@@ -496,6 +494,7 @@ function scheduleStats() {
   setTimeout(() => { statsPending = false; mark(D_STATS); }, STATS_THROTTLE_MS);
 }
 
+function scheduleReconnect() {
   if (!autoReconnect) return;
   reconnectAttempts++;
   const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
@@ -734,10 +733,8 @@ function handleMessage(msg) {
 }
 
 // ── Commands from main thread ──
-console.log('[worker] module loaded, registering onmessage');
 self.onmessage = (evt) => {
   const msg = evt.data;
-  console.log('[worker] received cmd:', msg.cmd, msg);
   switch (msg.cmd) {
     case 'connect':
       autoReconnect = true;
