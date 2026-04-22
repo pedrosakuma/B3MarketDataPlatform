@@ -445,9 +445,15 @@ export function renderSubsTable(allInfo, columns, selectedId) {
 
 // ── Trade tape (DOM-pooled, mirrors getBookPool pattern) ──
 
+// Trade tape: pool of MAX_TAPE_ROWS <tr> elements held in display order
+// (newest at index 0). We accept either a full snapshot or an append delta:
+//   - { full: true, items: [...] }  oldest-first (matches sub.recentTrades)
+//   - { append: [...] }             oldest-first new trades since last frame
+// On append we mutate only the rows that change and use insertBefore to move
+// the recycled row to the top of the tbody — no re-render of unchanged rows.
 const MAX_TAPE_ROWS = 50;
 let tradesPool = null;
-let lastRenderedTradeIds = new Array(MAX_TAPE_ROWS);
+let tradesCount = 0; // number of pool rows currently bound to a real trade
 
 function getTradesPool() {
   if (tradesPool) return tradesPool;
@@ -456,6 +462,7 @@ function getTradesPool() {
   const rows = [];
   for (let i = 0; i < MAX_TAPE_ROWS; i++) {
     const tr = document.createElement('tr');
+    tr.style.display = 'none';
     const tdTime = document.createElement('td');
     const tdSide = document.createElement('td');
     const tdPrice = document.createElement('td');
@@ -465,8 +472,23 @@ function getTradesPool() {
     tbody.appendChild(tr);
     rows.push({ tr, tdTime, tdSide, tdPrice, tdQty, tdId });
   }
-  tradesPool = { rows };
+  tradesPool = { rows, tbody };
   return tradesPool;
+}
+
+function bindTradeRow(row, t) {
+  if (row.tr.style.display === 'none') row.tr.style.display = '';
+  row.tdTime.textContent = formatTimeOfDay(t.time);
+  let sideText, sideClass;
+  if (t.side === 1)      { sideText = 'BUY';  sideClass = 'trade-buy'; }
+  else if (t.side === 2) { sideText = 'SELL'; sideClass = 'trade-sell'; }
+  else                   { sideText = '—';    sideClass = 'trade-flat'; }
+  row.tdSide.textContent = sideText;
+  row.tdSide.className = sideClass;
+  row.tdPrice.className = sideClass;
+  row.tdPrice.textContent = formatPrice(t.price, 4);
+  row.tdQty.textContent = formatQty(t.qty);
+  row.tdId.textContent = String(t.tradeId);
 }
 
 function formatTimeOfDay(ts) {
@@ -481,46 +503,55 @@ function formatTimeOfDay(ts) {
 export function renderTrades(tradesData) {
   const empty = $('tradesEmpty');
   const wrap = $('tradesWrap');
-  if (!tradesData || !tradesData.items || tradesData.items.length === 0) {
-    empty.style.display = '';
-    wrap.style.display = 'none';
-    for (let i = 0; i < lastRenderedTradeIds.length; i++) lastRenderedTradeIds[i] = undefined;
+
+  if (!tradesData) return;
+
+  if (tradesData.full) {
+    const items = tradesData.items || [];
+    if (items.length === 0) {
+      empty.style.display = '';
+      wrap.style.display = 'none';
+      const pool = getTradesPool();
+      for (let i = 0; i < tradesCount; i++) pool.rows[i].tr.style.display = 'none';
+      tradesCount = 0;
+      return;
+    }
+    empty.style.display = 'none';
+    wrap.style.display = '';
+    const pool = getTradesPool();
+    const n = Math.min(items.length, MAX_TAPE_ROWS);
+    for (let i = 0; i < n; i++) {
+      bindTradeRow(pool.rows[i], items[items.length - 1 - i]); // newest first
+    }
+    for (let i = n; i < tradesCount; i++) pool.rows[i].tr.style.display = 'none';
+    tradesCount = n;
     return;
   }
+
+  // Append delta: rotate rows so newest are at top. Process oldest-first so
+  // the most recent trade ends up at index 0.
+  const appends = tradesData.append;
+  if (!appends || appends.length === 0) return;
   empty.style.display = 'none';
   wrap.style.display = '';
-
   const pool = getTradesPool();
-  const items = tradesData.items;
-  const n = items.length;
-  for (let i = 0; i < MAX_TAPE_ROWS; i++) {
-    const row = pool.rows[i];
-    if (i >= n) {
-      if (lastRenderedTradeIds[i] !== undefined) {
-        row.tr.style.display = 'none';
-        lastRenderedTradeIds[i] = undefined;
-      }
-      continue;
+  const tbody = pool.tbody;
+  for (let k = 0; k < appends.length; k++) {
+    const t = appends[k];
+    let row;
+    if (tradesCount < MAX_TAPE_ROWS) {
+      // Reuse the next hidden row at position `tradesCount`.
+      row = pool.rows[tradesCount];
+      pool.rows.splice(tradesCount, 1);
+      tradesCount++;
+    } else {
+      // Evict the oldest visible row (last position).
+      row = pool.rows[MAX_TAPE_ROWS - 1];
+      pool.rows.splice(MAX_TAPE_ROWS - 1, 1);
     }
-    const t = items[n - 1 - i];
-    // Skip rows where the trade at this position hasn't shifted — the only churn on
-    // a typical frame is the newest row (i=0). When a single new trade arrives the
-    // tape rotates: previous i-th entry is now at i+1 — so we still re-render most
-    // rows in that case; gain is when no new trade but flag re-fires.
-    if (lastRenderedTradeIds[i] === t.tradeId) continue;
-    lastRenderedTradeIds[i] = t.tradeId;
-    if (row.tr.style.display === 'none') row.tr.style.display = '';
-    row.tdTime.textContent = formatTimeOfDay(t.time);
-    let sideText, sideClass;
-    if (t.side === 1)      { sideText = 'BUY';  sideClass = 'trade-buy'; }
-    else if (t.side === 2) { sideText = 'SELL'; sideClass = 'trade-sell'; }
-    else                   { sideText = '—';    sideClass = 'trade-flat'; }
-    row.tdSide.textContent = sideText;
-    row.tdSide.className = sideClass;
-    row.tdPrice.className = sideClass;
-    row.tdPrice.textContent = formatPrice(t.price, 4);
-    row.tdQty.textContent = formatQty(t.qty);
-    row.tdId.textContent = String(t.tradeId);
+    bindTradeRow(row, t);
+    pool.rows.unshift(row);
+    tbody.insertBefore(row.tr, tbody.firstChild);
   }
 }
 

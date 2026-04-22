@@ -316,9 +316,18 @@ setInterval(() => {
 
   if (d & D_TRADES) {
     const sub = selectedId ? subscriptions.get(selectedId) : null;
-    frame.trades = sub && sub.recentTrades.length > 0
-      ? { items: sub.recentTrades.slice() }
-      : { items: [] };
+    if (!sub) {
+      frame.trades = { full: true, items: [] };
+    } else if (sub.tradesNeedFullSync) {
+      frame.trades = { full: true, items: sub.recentTrades.slice() };
+      sub.tradesNeedFullSync = false;
+      sub.pendingTradeAppends.length = 0;
+    } else if (sub.pendingTradeAppends.length > 0) {
+      frame.trades = { append: sub.pendingTradeAppends.slice() };
+      sub.pendingTradeAppends.length = 0;
+    } else {
+      frame.trades = { append: [] };
+    }
   }
 
   if (d & D_AUCTION) {
@@ -365,18 +374,28 @@ setInterval(() => {
 // ── MBP computation (runs in worker, off main thread) ──
 // Incremental price-level helpers. Maintained by order-event handlers so
 // computeBook() avoids iterating all orders (often 100k+) every render frame.
-// Also maintain cached best-of-side prices so inferAggressor() (called per
-// trade) doesn't have to scan all open orders.
+// We keep two parallel structures per side:
+//   - bidLevels / askLevels  Map<price, lvl>   — full state, every level
+//   - topBids   / topAsks    Array<lvl>        — sorted top `bookDepth`
+// Level objects are SHARED references across both, so mutating qty/count
+// updates both. computeBook just hands back the pre-sorted top arrays;
+// bestOfSide reads topBids[0] / topAsks[0]. The full Map is consulted
+// only when a top-N entry is fully removed and we need to refill its
+// slot from the next-best price beyond the current top.
 function levelAdd(sub, side, price, qty) {
   const levels = side === 0 ? sub.bidLevels : sub.askLevels;
-  const lvl = levels.get(price);
-  if (lvl) { lvl.qty += qty; lvl.count++; }
-  else levels.set(price, { price, qty, count: 1 });
-  if (side === 0) {
-    if (sub.bestBid === null || price > sub.bestBid) sub.bestBid = price;
-  } else {
-    if (sub.bestAsk === null || price < sub.bestAsk) sub.bestAsk = price;
+  let lvl = levels.get(price);
+  if (lvl) {
+    lvl.qty += qty;
+    lvl.count++;
+    // If the level is already in topN, the shared reference is updated.
+    // If not in topN and the cumulative qty makes it more interesting,
+    // we still don't promote — promotion is by price, not qty.
+    return;
   }
+  lvl = { price, qty, count: 1 };
+  levels.set(price, lvl);
+  topInsert(sub, side, lvl);
 }
 
 function levelRemove(sub, side, price, qty) {
@@ -385,37 +404,79 @@ function levelRemove(sub, side, price, qty) {
   if (!lvl) return;
   lvl.qty -= qty;
   lvl.count--;
-  if (lvl.count <= 0 || lvl.qty <= 0) {
-    levels.delete(price);
-    // Best-of-side may need recomputation if we just removed the best level.
-    // null sentinel triggers lazy recompute on next read in bestOfSide().
-    if (side === 0 && price === sub.bestBid) sub.bestBid = null;
-    else if (side === 1 && price === sub.bestAsk) sub.bestAsk = null;
+  if (lvl.count > 0 && lvl.qty > 0) return;
+  levels.delete(price);
+  topRemoveAndRefill(sub, side, lvl);
+}
+
+function isBetter(side, a, b) {
+  return side === 0 ? a > b : a < b;
+}
+
+// Insert a new level into the top-N array, maintaining sorted order.
+// If the array is at capacity and the new price isn't better than the
+// current worst, this is a no-op (the level lives only in the full Map).
+function topInsert(sub, side, lvl) {
+  const top = side === 0 ? sub.topBids : sub.topAsks;
+  if (top.length >= bookDepth) {
+    const worst = top[top.length - 1];
+    if (!isBetter(side, lvl.price, worst.price)) return; // beyond cutoff
   }
+  let i = 0;
+  while (i < top.length && isBetter(side, top[i].price, lvl.price)) i++;
+  top.splice(i, 0, lvl);
+  if (top.length > bookDepth) top.length = bookDepth;
+}
+
+// Remove `lvl` from the top-N (if present) and refill the freed slot
+// from the next-best price not currently in topN. Refill scans the full
+// Map keys (O(L)) but only runs when a top-N price fully disappears.
+function topRemoveAndRefill(sub, side, lvl) {
+  const top = side === 0 ? sub.topBids : sub.topAsks;
+  const idx = top.indexOf(lvl);
+  if (idx < 0) return; // wasn't in top — nothing to do
+  top.splice(idx, 1);
+  const fullMap = side === 0 ? sub.bidLevels : sub.askLevels;
+  // Find the next best price beyond the current top.
+  // The "current top" prices are in `top`; everything else in fullMap is
+  // a candidate. We want the best price that isn't already represented.
+  const cutoff = top.length > 0 ? top[top.length - 1].price : null;
+  let bestPrice = null;
+  let bestLvl = null;
+  for (const [p, l] of fullMap) {
+    if (cutoff !== null && !isBetter(side, p, cutoff) && p !== cutoff) {
+      // p is worse than cutoff — could still be candidate if cutoff itself
+      // is the new last; we want strictly worse-than-current-worst as the
+      // refill candidate. But to be safe and correct, treat any not in top
+      // as a candidate.
+    }
+    if (top.indexOf(l) >= 0) continue; // already in top
+    if (bestPrice === null || isBetter(side, p, bestPrice)) {
+      bestPrice = p;
+      bestLvl = l;
+    }
+  }
+  if (bestLvl !== null) top.push(bestLvl);
+}
+
+// Rebuild top-N for both sides from the full Maps. Used on bookDepth
+// change at runtime.
+function rebuildTopN(sub) {
+  sub.topBids = [...sub.bidLevels.values()].sort((a, b) => b.price - a.price).slice(0, bookDepth);
+  sub.topAsks = [...sub.askLevels.values()].sort((a, b) => a.price - b.price).slice(0, bookDepth);
 }
 
 function bestOfSide(sub, side) {
-  if (side === 0) {
-    if (sub.bestBid !== null) return sub.bestBid;
-    let max = -Infinity;
-    for (const p of sub.bidLevels.keys()) if (p > max) max = p;
-    sub.bestBid = max === -Infinity ? null : max;
-    return sub.bestBid;
-  } else {
-    if (sub.bestAsk !== null) return sub.bestAsk;
-    let min = Infinity;
-    for (const p of sub.askLevels.keys()) if (p < min) min = p;
-    sub.bestAsk = min === Infinity ? null : min;
-    return sub.bestAsk;
-  }
+  if (side === 0) return sub.topBids.length > 0 ? sub.topBids[0].price : null;
+  return sub.topAsks.length > 0 ? sub.topAsks[0].price : null;
 }
 
 function computeBook() {
   const sub = selectedId ? subscriptions.get(selectedId) : null;
   if (!sub || sub.orders.size === 0) return null;
 
-  const bids = [...sub.bidLevels.values()].sort((a, b) => b.price - a.price).slice(0, bookDepth);
-  const asks = [...sub.askLevels.values()].sort((a, b) => a.price - b.price).slice(0, bookDepth);
+  const bids = sub.topBids;
+  const asks = sub.topAsks;
 
   let maxQty = 1;
   for (const b of bids) if (b.qty > maxQty) maxQty = b.qty;
@@ -531,16 +592,24 @@ function handleMessage(msg) {
           // Aggregated price levels — maintained incrementally on each order event
           // so computeBook() avoids a full O(N) scan over all orders every render frame.
           bidLevels: new Map(), askLevels: new Map(),
-          bestBid: null, bestAsk: null,
+          topBids: [], topAsks: [],
           info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
+          // Trade tape delta: accumulates trades since the last frame the
+          // main thread received. Drained by the frame builder.
+          pendingTradeAppends: [],
+          // Set whenever the trade tape needs a full resync (initial select,
+          // resubscribe, sub change). Frame builder honors this.
+          tradesNeedFullSync: true,
         });
       }
       let d = D_SUBS | D_ALLINFO;
       if (!sel) {
         selectedId = id;
         d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
+        const newSub = subscriptions.get(id);
+        if (newSub) newSub.tradesNeedFullSync = true;
       } else if (sel === id) {
         d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
       }
@@ -561,6 +630,10 @@ function handleMessage(msg) {
           selectedId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
           d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
           chartFullSwap = true;
+          if (selectedId) {
+            const newSub = subscriptions.get(selectedId);
+            if (newSub) newSub.tradesNeedFullSync = true;
+          }
         }
         mark(d);
       }
@@ -575,8 +648,8 @@ function handleMessage(msg) {
         sub.orders = new Map();
         sub.bidLevels.clear();
         sub.askLevels.clear();
-        sub.bestBid = null;
-        sub.bestAsk = null;
+        sub.topBids = [];
+        sub.topAsks = [];
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -635,13 +708,17 @@ function handleMessage(msg) {
       if (sub) {
         sub.tradeCount++;
         const side = inferAggressor(sub, msg.price);
-        sub.recentTrades.push({
+        const trade = {
           time: Date.now(), price: msg.price, qty: msg.qty,
           side, tradeId: msg.tradeId,
-        });
+        };
+        sub.recentTrades.push(trade);
         if (sub.recentTrades.length > MAX_RECENT_TRADES) {
           sub.recentTrades.splice(0, sub.recentTrades.length - MAX_RECENT_TRADES);
         }
+        // Append to the per-frame delta. If a full sync is already pending
+        // we don't bother appending (the snapshot will carry it).
+        if (!sub.tradesNeedFullSync) sub.pendingTradeAppends.push(trade);
         sub.tradesDirty = true;
         if (sel === id) mark(D_TRADES);
       }
@@ -655,16 +732,16 @@ function handleMessage(msg) {
           sub.orders = new Map();
           sub.bidLevels.clear();
           sub.askLevels.clear();
-          sub.bestBid = null;
-          sub.bestAsk = null;
+          sub.topBids = [];
+          sub.topAsks = [];
         } else {
           const orderSide = msg.side - 1;
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
           (orderSide === 0 ? sub.bidLevels : sub.askLevels).clear();
-          if (orderSide === 0) sub.bestBid = null;
-          else sub.bestAsk = null;
+          if (orderSide === 0) sub.topBids = [];
+          else sub.topAsks = [];
         }
       }
       if (sel === id) mark(D_BOOK);
@@ -772,11 +849,16 @@ self.onmessage = (evt) => {
         log('Cannot unsubscribe: not connected', 'log-error');
       }
       break;
-    case 'select':
+    case 'select': {
+      const prev = selectedId ? subscriptions.get(selectedId) : null;
+      if (prev) { prev.tradesNeedFullSync = true; prev.pendingTradeAppends.length = 0; }
       selectedId = msg.securityId;
       chartFullSwap = true;
+      const newSub = selectedId ? subscriptions.get(selectedId) : null;
+      if (newSub) newSub.tradesNeedFullSync = true;
       mark(D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS);
       break;
+    }
     case 'rankingSubscribe':
       if (ws && ws.readyState === WebSocket.OPEN)
         ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, msg.symbol, DATA_FLAGS.ALL));
@@ -790,6 +872,9 @@ self.onmessage = (evt) => {
       break;
     case 'setBookDepth':
       bookDepth = msg.value;
+      // Rebuild every subscription's top-N arrays from the full Maps.
+      // This is O(L log L) per sub but only runs on user action.
+      for (const sub of subscriptions.values()) rebuildTopN(sub);
       mark(D_BOOK);
       break;
   }
