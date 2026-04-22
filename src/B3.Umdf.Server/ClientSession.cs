@@ -293,7 +293,7 @@ public sealed class ClientSession : IDisposable
                     int totalMessages = logicalDrained + infoMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
-                    AppMetrics.WsMessagesSent.Add(totalMessages);
+                    MetricsRegistry.WsMessagesSent.Add(totalMessages);
                 }
 
                 // Return pooled producer buffers AFTER SendAsync completes (Payload spans
@@ -399,7 +399,7 @@ public sealed class ClientSession : IDisposable
         if (Interlocked.Exchange(ref _disconnectRequested, 1) != 0)
             return;
 
-        AppMetrics.WsSlowDisconnects.Add(1);
+        MetricsRegistry.WsSlowDisconnects.Add(1);
         _logger.LogWarning("Disconnecting slow client {ClientId}: {Reason}", Id, reason);
         Cancel();
     }

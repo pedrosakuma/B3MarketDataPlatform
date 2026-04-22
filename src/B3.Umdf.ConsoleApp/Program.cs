@@ -1,27 +1,15 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using B3.Umdf.Book;
+using B3.Umdf.ConsoleApp;
 using B3.Umdf.Feed;
 using B3.Umdf.PcapReplay;
 using B3.Umdf.Server;
 using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 
-// Parse named arguments
-// Quick health check mode for Docker HEALTHCHECK
-if (args.Length == 1 && args[0] == "--health-check")
-{
-    try
-    {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
-        var port = Environment.GetEnvironmentVariable("UMDF_WS_PORT")
-            ?? Environment.GetEnvironmentVariable("WS_PORT")
-            ?? "8080";
-        var resp = await http.GetAsync($"http://localhost:{port}/live");
-        return resp.IsSuccessStatusCode ? 0 : 1;
-    }
-    catch { return 1; }
-}
+var healthExit = await HealthCheckCommand.TryRunAsync(args);
+if (healthExit is int code) return code;
 
 var settings = AppSettings.LoadDefault();
 settings.ApplyEnvironment();
@@ -44,7 +32,7 @@ int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
 int incrementalRecoveryQueueCapacity = settings.IncrementalRecoveryQueueCapacity;
 int groupRingCapacity = settings.GroupRingCapacity;
-var logLevel = ParseLogLevel(settings.LogLevel);
+var logLevel = LogLevelParser.Parse(settings.LogLevel);
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -193,7 +181,7 @@ List<PcapChannelSource>? replaySources = null;
 
 if (replayToMulticast || multicastConfig is null)
 {
-    if (!TryBuildReplaySources(out var builtSources, out groupIds))
+    if (!ReplaySourcesBuilder.TryBuild(pcapPrefixes, positionalArgs, out var builtSources, out groupIds))
         return 1;
 
     replaySources = builtSources;
@@ -313,7 +301,7 @@ if (replayToMulticast)
     }
 
     Console.WriteLine();
-    PrintPublisherSummary(publishSw, groupIds.Count, publisher.PublishedPackets, publisher.PublishedBytes);
+    PublisherSummary.Print(publishSw, groupIds.Count, publisher.PublishedPackets, publisher.PublishedBytes);
     return publisherExitCode;
 
     void PrintPublisherProgress()
@@ -495,27 +483,8 @@ if (subscriptionManager is not null)
         symbolRegistry,
         groupHandlers.ToArray());
 
-    // Suppress per-client fanout while the feed for a group is in Recovery/CatchUp
-    // (book is being rebuilt; broadcasting partial state both wastes per-client
-    // bandwidth and risks shipping inconsistent updates). On RealTime entry the
-    // GroupConflationHandler schedules a fresh book snapshot for every Book subscriber.
-    var groupHandlersByGid = new Dictionary<int, GroupConflationHandler>();
-    for (int i = 0; i < groupIds.Count && i < groupHandlers.Count; i++)
-        groupHandlersByGid[groupIds[i]] = groupHandlers[i];
-
-    void WireFanoutSuppression(int gid, FeedHandler fh)
-    {
-        if (!groupHandlersByGid.TryGetValue(gid, out var gh)) return;
-        // Initialize from current state in case we attach after the first transition.
-        gh.SetFanoutSuppressed(fh.State != FeedState.RealTime);
-        fh.StateChanged += (_, newState) =>
-            gh.SetFanoutSuppressed(newState != FeedState.RealTime);
-    }
-
-    if (multiFeed is not null)
-        foreach (var (gid, handler) in multiFeed.Handlers) WireFanoutSuppression(gid, handler);
-    else if (singleFeed is not null)
-        WireFanoutSuppression(groupIds[0], singleFeed);
+    // Suppress per-client fanout while the feed for a group is in Recovery/CatchUp.
+    FanoutSuppressionWiring.Wire(groupIds, groupHandlers, multiFeed, singleFeed);
 
     wsHost = new WebSocketHost(
         subscriptionManager,
@@ -563,7 +532,7 @@ long prevPackets = 0, prevTotalEvents = 0;
 long prevStatsTicks = 0;
 
 // Register OTEL-compatible metrics (System.Diagnostics.Metrics)
-AppMetrics.Register(stats, bookManagers, marketDataManagers, groupIds,
+MetricsBinder.Register(stats, bookManagers, marketDataManagers, groupIds,
     multiFeed, singleFeed, multicastMerger: null, subscriptionManager, groupHandlers, symbolRegistry,
     multicastSources: liveMulticastSources);
 
@@ -715,111 +684,6 @@ return 0;
 
 // ── Local functions ──
 
-static LogLevel ParseLogLevel(string value) =>
-    Enum.TryParse<LogLevel>(value, ignoreCase: true, out var parsed)
-        ? parsed
-        : LogLevel.Information;
-
-bool TryBuildReplaySources(out List<PcapChannelSource> sources, out List<int> replayGroupIds)
-{
-    sources = new List<PcapChannelSource>();
-    replayGroupIds = new List<int>();
-
-    var channelSuffixes = new[]
-    {
-        ("Incremental_FeedA", ChannelType.IncrementalA),
-        ("Incremental_FeedB", ChannelType.IncrementalB),
-        ("InstrumentDefinition", ChannelType.InstrumentDefinition),
-        ("SnapshotRecovery", ChannelType.SnapshotRecovery),
-    };
-
-    if (pcapPrefixes.Count > 0)
-    {
-        for (int g = 0; g < pcapPrefixes.Count; g++)
-        {
-            var prefix = pcapPrefixes[g];
-            Console.WriteLine($"  Channel group {g}: {Path.GetFileName(prefix)}");
-            replayGroupIds.Add(g);
-
-            foreach (var (suffix, channelType) in channelSuffixes)
-            {
-                var filePath = $"{prefix}_{suffix}.pcap";
-                if (!File.Exists(filePath))
-                {
-                    Console.Error.WriteLine($"  File not found: {filePath}");
-                    return false;
-                }
-
-                sources.Add(new PcapChannelSource(filePath, channelType, g));
-                Console.WriteLine($"    {channelType,-25} <- {Path.GetFileName(filePath)}");
-            }
-        }
-
-        return true;
-    }
-
-    if (positionalArgs.Count >= 1)
-    {
-        var channelTypes = new[]
-        {
-            ChannelType.IncrementalA,
-            ChannelType.IncrementalB,
-            ChannelType.InstrumentDefinition,
-            ChannelType.SnapshotRecovery
-        };
-
-        replayGroupIds.Add(0);
-
-        for (int i = 0; i < positionalArgs.Count && i < channelTypes.Length; i++)
-        {
-            if (!File.Exists(positionalArgs[i]))
-            {
-                Console.Error.WriteLine($"File not found: {positionalArgs[i]}");
-                return false;
-            }
-
-            sources.Add(new PcapChannelSource(positionalArgs[i], channelTypes[i], 0));
-            Console.WriteLine($"  {channelTypes[i],-25} <- {positionalArgs[i]}");
-        }
-
-        return true;
-    }
-
-    PrintUsage();
-    return false;
-}
-
-void PrintUsage()
-{
-    Console.WriteLine("Usage:");
-    Console.WriteLine("  B3.Umdf.ConsoleApp --pcap-prefix <prefix> [--pcap-prefix <prefix2>] [options]");
-    Console.WriteLine("  B3.Umdf.ConsoleApp --multicast-config <config.json> [options]");
-    Console.WriteLine("  B3.Umdf.ConsoleApp --replay-to-multicast --multicast-config <config.json> --pcap-prefix <prefix> [--pcap-prefix <prefix2>] [options]");
-    Console.WriteLine("  B3.Umdf.ConsoleApp <incrA.pcap> [incrB.pcap] [instrdef.pcap] [snapshot.pcap] [options]");
-    Console.WriteLine();
-    Console.WriteLine("The --pcap-prefix mode auto-discovers files by naming convention:");
-    Console.WriteLine("  <prefix>_Incremental_FeedA.pcap, <prefix>_Incremental_FeedB.pcap,");
-    Console.WriteLine("  <prefix>_InstrumentDefinition.pcap, <prefix>_SnapshotRecovery.pcap");
-    Console.WriteLine();
-    Console.WriteLine("The --multicast-config mode reads channel configs from a JSON file.");
-    Console.WriteLine("  See config/multicast-sample.json for the format.");
-    Console.WriteLine();
-    Console.WriteLine("Options:");
-    Console.WriteLine("  --ws-port <port>              Start WebSocket subscription server on the given port");
-    Console.WriteLine("  --speed <mult>                Replay speed: 0=max, 1=real-time, 2=2x, etc. (default: 0)");
-    Console.WriteLine("  --pcap-prefix <prefix>        Channel group PCAP prefix (repeatable for multi-channel)");
-    Console.WriteLine("  --multicast-config <file>     JSON config with multicast group addresses/ports");
-    Console.WriteLine("  --replay-to-multicast         Publish replayed PCAP payloads to multicast instead of consuming them");
-}
-
-void PrintPublisherSummary(Stopwatch publishSw, int channelGroupCount, long publishedPackets, long publishedBytes)
-{
-    double totalSecs = publishSw.Elapsed.TotalSeconds;
-    Console.WriteLine($"═══ Publish complete ({publishSw.Elapsed:hh\\:mm\\:ss}) ═══");
-    Console.WriteLine($"  Channel groups: {channelGroupCount}");
-    Console.WriteLine($"  Packets:        {publishedPackets:N0}  ({(totalSecs > 0 ? (long)(publishedPackets / totalSecs) : 0):N0}/s avg)");
-    Console.WriteLine($"  Bytes:          {publishedBytes:N0}");
-}
 
 void PrintPeriodicStats()
 {

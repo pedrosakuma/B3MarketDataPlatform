@@ -219,7 +219,7 @@ layers.
 
 ```bash
 dotnet tool install -g dotnet-trace dotnet-counters
-./tools/profile.sh
+./tools/profile/profile.sh
 
 # live counters during a run
 dotnet-counters monitor --counters B3.Umdf.Consumer --process-id <pid>

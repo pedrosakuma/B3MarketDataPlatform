@@ -140,7 +140,7 @@ public sealed class SubscriptionManager : IDisposable
         _clients[session.Id] = session;
         if (_marketDataManagers is { Length: > 0 } managers)
             session.SetMarketDataManagers(managers);
-        AppMetrics.WsConnectionsActive.Add(1);
+        MetricsRegistry.WsConnectionsActive.Add(1);
 
         // Immediately tell the client whether the server is ready
         SendServerStatus(session, _ready);
@@ -151,7 +151,7 @@ public sealed class SubscriptionManager : IDisposable
     {
         _clients.TryRemove(clientId, out _);
         _pendingUnsubscribes.Enqueue(SubscriptionRequest.UnsubscribeAll(clientId));
-        AppMetrics.WsConnectionsActive.Add(-1);
+        MetricsRegistry.WsConnectionsActive.Add(-1);
     }
 
     /// <summary>Called from WebSocket read thread to request a subscription.</summary>
@@ -472,7 +472,7 @@ public sealed class SubscriptionManager : IDisposable
             newClients[clientId] = flags;
             _subscriptions[securityId] = newClients;
         }
-        AppMetrics.WsSubscriptions.Add(1);
+        MetricsRegistry.WsSubscriptions.Add(1);
     }
 
     internal void HandleGet(string clientId, string symbol, DataFlags flags,
@@ -569,7 +569,7 @@ public sealed class SubscriptionManager : IDisposable
             var newClients = new Dictionary<string, DataFlags>(existing);
             if (newClients.Remove(clientId))
             {
-                AppMetrics.WsSubscriptions.Add(-1);
+                MetricsRegistry.WsSubscriptions.Add(-1);
                 if (newClients.Count == 0)
                     _subscriptions.TryRemove(securityId, out _);
                 else
@@ -625,7 +625,7 @@ public sealed class SubscriptionManager : IDisposable
         }
 
         if (removedSubscriptions > 0)
-            AppMetrics.WsSubscriptions.Add(-removedSubscriptions);
+            MetricsRegistry.WsSubscriptions.Add(-removedSubscriptions);
     }
 
     // --- Snapshot serialization ---

@@ -1,4 +1,4 @@
-namespace B3.Umdf.Server;
+namespace B3.Umdf.Book;
 
 /// <summary>
 /// Per-security 1-second OHLCV candle aggregator with 10-hour retention.

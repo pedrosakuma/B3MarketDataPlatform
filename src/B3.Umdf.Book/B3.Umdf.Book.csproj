@@ -13,4 +13,9 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Umdf.Server" />
+    <InternalsVisibleTo Include="B3.Umdf.Server.Tests" />
+  </ItemGroup>
+
 </Project>

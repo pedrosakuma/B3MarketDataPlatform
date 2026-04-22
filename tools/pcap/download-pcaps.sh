@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads B3 UMDF Binary PCAP examples from the B3 website.
-# Usage: ./tools/download-pcaps.sh [output-dir]
+# Usage: ./tools/pcap/download-pcaps.sh [output-dir]
 
 set -euo pipefail
 

@@ -6,7 +6,7 @@ namespace B3.Umdf.Server;
 /// OpenTelemetry-compatible metrics using System.Diagnostics.Metrics.
 /// Meter name: "B3.Umdf" — collect via OTLP or Prometheus scrape.
 /// </summary>
-public sealed class AppMetrics
+public sealed class MetricsRegistry
 {
     public static readonly Meter Meter = new("B3.Umdf", "1.0.0");
 

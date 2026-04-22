@@ -4,13 +4,13 @@
 # (dotnet-trace, dotnet-counters, dotnet-dump, dotnet-gcdump, dotnet-stack).
 #
 # Usage:
-#   tools/profile.sh trace    [duration]   # CPU sample profile (default 30s)
-#   tools/profile.sh gc       [duration]   # GC + alloc trace
-#   tools/profile.sh counters              # live counter monitor (Ctrl-C to stop)
-#   tools/profile.sh gcdump                # heap object graph snapshot
-#   tools/profile.sh dump                  # full process dump
-#   tools/profile.sh stack                 # one-shot stack walk of all threads
-#   tools/profile.sh shell                 # interactive shell inside container
+#   tools/profile/profile.sh trace    [duration]   # CPU sample profile (default 30s)
+#   tools/profile/profile.sh gc       [duration]   # GC + alloc trace
+#   tools/profile/profile.sh counters              # live counter monitor (Ctrl-C to stop)
+#   tools/profile/profile.sh gcdump                # heap object graph snapshot
+#   tools/profile/profile.sh dump                  # full process dump
+#   tools/profile/profile.sh stack                 # one-shot stack walk of all threads
+#   tools/profile/profile.sh shell                 # interactive shell inside container
 #
 # Override container with CONTAINER=<service-name>. Captures land in ./profiles/.
 set -euo pipefail

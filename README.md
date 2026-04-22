@@ -140,7 +140,7 @@ Uses the [`SbeSourceGenerator`](https://www.nuget.org/packages/SbeSourceGenerato
 | `B3.Umdf.Feed.Tests` | 22 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
 | `B3.Umdf.PcapReplay.Tests` | 4 | PCAP reader, timestamp merge |
 | `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
-| `B3.Umdf.Server.Tests` | 38 | Subscription manager, client session, settings, backpressure, outlier sweep |
+| `B3.Umdf.Server.Tests` | 41 | Subscription manager, client session, settings, backpressure, outlier sweep |
 
 ## Quick Start
 
@@ -160,7 +160,7 @@ dotnet test
 B3 provides sample PCAP files for development:
 
 ```bash
-./tools/download-pcaps.sh
+./tools/pcap/download-pcaps.sh
 ```
 
 ### Run with PCAP Replay (Single Channel)
@@ -560,7 +560,7 @@ Live-path optimizations:
 dotnet tool install -g dotnet-trace
 
 # Run profiling script
-./tools/profile.sh
+./tools/profile/profile.sh
 ```
 
 ## B3 Schema

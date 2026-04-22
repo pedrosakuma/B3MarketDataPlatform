@@ -9,7 +9,7 @@ using B3.Umdf.Transport;
 /// All instruments are observable (pull-based) — zero overhead on the hot path.
 /// Monitor with: dotnet-counters monitor --counters B3.Umdf.Consumer
 /// </summary>
-static class AppMetrics
+static class MetricsBinder
 {
     public static readonly Meter Meter = new("B3.Umdf.Consumer", "1.0.0");
 

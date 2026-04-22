@@ -1,4 +1,4 @@
-namespace B3.Umdf.Server;
+namespace B3.Umdf.Book;
 
 /// <summary>Fixed-capacity ring buffer of recent trades for a single security.</summary>
 internal sealed class TradeRingBuffer

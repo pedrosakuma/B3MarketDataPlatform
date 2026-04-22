@@ -1,3 +1,5 @@
+using B3.Umdf.Book;
+
 namespace B3.Umdf.Server.Tests;
 
 public class CandleAggregatorTests

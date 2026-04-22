@@ -2,7 +2,7 @@
 # Profile the B3 UMDF consumer app using dotnet-trace.
 #
 # Usage:
-#   ./tools/profile.sh [pcap-dir]
+#   ./tools/profile/profile.sh [pcap-dir]
 #
 # Requirements:
 #   - dotnet-trace global tool: dotnet tool install -g dotnet-trace
@@ -25,7 +25,7 @@ SNAP=$(find "$PCAP_DIR" -name '*SnapshotRecovery.pcap' | head -1)
 
 if [[ -z "$INCR_A" || -z "$INSTR" || -z "$SNAP" ]]; then
     echo "ERROR: PCAP files not found in $PCAP_DIR"
-    echo "Run ./tools/download-pcaps.sh first."
+    echo "Run ./tools/pcap/download-pcaps.sh first."
     exit 1
 fi
 
