@@ -33,8 +33,7 @@ var price = msg.MdEntryPx.Mantissa;   // direct memory read
 ```
 
 A 52M-packet PCAP replay completes in ~30 s on a single thread (~1.7M
-packets/s) end-to-end through ingest + apply. See [README §
-Performance](../README.md#performance) for the full benchmark.
+packets/s) end-to-end through ingest + apply.
 
 [sbegen]: https://github.com/pedrosakuma/SbeSourceGenerator
 
