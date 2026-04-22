@@ -32,6 +32,7 @@ const D_TITLES   = 0x40;
 const D_ALLINFO  = 0x80;
 const D_TRADES   = 0x100;
 const D_AUCTION  = 0x200;
+const D_OVERLAYS = 0x400;
 let chartFullSwap = false;
 function mark(flags) { dirty |= flags; }
 
@@ -75,7 +76,6 @@ function pickAutoResolution(candles) {
 
 const MAX_GAP_FILL = 600; // max gap-fill candles per gap (covers ~10 min at 1s)
 const MAX_RECENT_TRADES = 50; // trade tape length per subscription
-const VWAP_MIN_INTERVAL_MS = 1000; // minimum spacing between VWAP samples plotted on the chart
 
 // AggressorSide values exposed to the UI:
 //   0 = unknown (mid-price or no top-of-book yet)
@@ -224,14 +224,6 @@ setInterval(() => {
       lastSentCandleTime = 0;
       lastSentCandleClose = 0;
     } else {
-      // Always include the latest VWAP curve and current price bands for the selected sub.
-      // Both are cheap (small arrays / two numbers) and let the chart layer render overlays
-      // without round-tripping for incremental updates.
-      const overlays = {
-        vwap: sub.vwapPoints.length > 0 ? sub.vwapPoints.slice() : null,
-        priceBandLow: sub.info.PriceBandLow ?? null,
-        priceBandHigh: sub.info.PriceBandHigh ?? null,
-      };
       // Compute desired resolution consistently with getChartCandles
       const desiredRes = displayResolution > 0 ? displayResolution : pickAutoResolution(sub.candles);
       const resChanged = desiredRes !== lastSentResolution;
@@ -294,9 +286,27 @@ setInterval(() => {
           }
         }
       }
-      // Attach overlays (vwap line + price-band horizontal lines) to whatever chart
-      // payload we built. App.js applies them on every frame; cost is one array slice.
-      if (frame.chart) frame.chart.overlays = overlays;
+    }
+  }
+
+  if (d & D_OVERLAYS) {
+    const sub = selectedId ? subscriptions.get(selectedId) : null;
+    if (!sub) {
+      frame.overlays = null;
+    } else {
+      const overlay = {
+        priceBandLow: sub.info.PriceBandLow ?? null,
+        priceBandHigh: sub.info.PriceBandHigh ?? null,
+      };
+      if (sub.vwapResetNext) {
+        overlay.vwapFull = sub.vwapPoints.slice();
+        sub.vwapResetNext = false;
+        sub.vwapDelta = null;
+      } else if (sub.vwapDelta) {
+        overlay.vwapAppend = sub.vwapDelta;
+        sub.vwapDelta = null;
+      }
+      frame.overlays = overlay;
     }
   }
 
@@ -313,7 +323,6 @@ setInterval(() => {
       frame.auction = null;
     } else {
       const ts = sub.info.TradingStatus;
-      // B3 SecurityTradingStatus (subset relevant to auction): 2/5/8/21 are pre/post-auction phases.
       const isAuction = ts === 2 || ts === 5 || ts === 8 || ts === 21;
       if (!isAuction) {
         frame.auction = null;
@@ -468,8 +477,9 @@ function handleMessage(msg) {
           orders: new Map(), info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
-          tradesDirty: false, // flips on any push so we send full list once per frame
           vwapPoints: [],     // [{time, value}] — sampled from InfoSnapshot.VwapPrice
+          vwapDelta: null,    // last point pushed since the previous overlays frame
+          vwapResetNext: true,// force a vwapFull on the next D_OVERLAYS frame
           lastVwap: null,
           lastVwapTime: 0,
         });
@@ -477,9 +487,9 @@ function handleMessage(msg) {
       let d = D_SUBS | D_ALLINFO;
       if (!sel) {
         selectedId = id;
-        d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
+        d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
       } else if (sel === id) {
-        d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
+        d |= existing ? D_TITLES : D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
       }
       mark(d);
       log((existing ? 'Subscription refreshed ' : 'Subscribed ') + msg.symbol + ' [' + flagsStr(msg.flags) + ']', 'log-sub-ok');
@@ -496,7 +506,9 @@ function handleMessage(msg) {
         let d = D_SUBS | D_ALLINFO;
         if (sel === id) {
           selectedId = subscriptions.size > 0 ? subscriptions.keys().next().value : null;
-          d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION;
+          d |= D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS;
+          const newSub = selectedId ? subscriptions.get(selectedId) : null;
+          if (newSub) newSub.vwapResetNext = true;
           chartFullSwap = true;
         }
         mark(d);
@@ -522,18 +534,23 @@ function handleMessage(msg) {
         if ('VwapPrice' in msg.fields && msg.fields.VwapPrice !== null && sub.candles.length > 0) {
           const v = msg.fields.VwapPrice;
           const tNow = sub.candles[sub.candles.length - 1].time;
-          if (v !== sub.lastVwap || (tNow - sub.lastVwapTime) * 1000 >= VWAP_MIN_INTERVAL_MS) {
-            // VwapPrice exponent matches OpeningPrice/HighPrice (1e-4); the chart price scale is in mantissa units.
-            sub.vwapPoints.push({ time: tNow, value: v });
-            if (sub.vwapPoints.length > 36000) sub.vwapPoints.shift(); // ~10h at 1s safety bound
+          if (v !== sub.lastVwap || (tNow - sub.lastVwapTime) >= 1) {
+            const point = { time: tNow, value: v };
+            // Lightweight Charts requires strictly increasing timestamps. If the InfoSnapshot
+            // arrives in the same second as the previous sample but with a new value, replace
+            // the last point in place (and overwrite the delta) so app.update() stays valid.
+            const last = sub.vwapPoints.length > 0 ? sub.vwapPoints[sub.vwapPoints.length - 1] : null;
+            if (last && last.time === tNow) last.value = v;
+            else sub.vwapPoints.push(point);
+            if (sub.vwapPoints.length > 36000) sub.vwapPoints.shift();
+            sub.vwapDelta = point;
             sub.lastVwap = v;
             sub.lastVwapTime = tNow;
-            if (sel === id) mark(D_CHART);
+            if (sel === id) mark(D_OVERLAYS);
           }
         }
-        // Price bands and trading status are also chart/auction inputs for the selected sub.
         if (sel === id) {
-          if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields) mark(D_CHART);
+          if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields) mark(D_OVERLAYS);
           if ('TradingStatus' in msg.fields || 'TheoreticalOpeningPrice' in msg.fields
               || 'TheoreticalOpeningSize' in msg.fields || 'AuctionImbalanceSize' in msg.fields) {
             mark(D_AUCTION);
@@ -705,7 +722,11 @@ self.onmessage = (evt) => {
     case 'select':
       selectedId = msg.securityId;
       chartFullSwap = true;
-      mark(D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION);
+      {
+        const sub = selectedId ? subscriptions.get(selectedId) : null;
+        if (sub) sub.vwapResetNext = true;
+      }
+      mark(D_BOOK | D_CHART | D_TITLES | D_TRADES | D_AUCTION | D_OVERLAYS);
       break;
     case 'rankingSubscribe':
       if (ws && ws.readyState === WebSocket.OPEN)

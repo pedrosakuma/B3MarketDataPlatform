@@ -447,6 +447,7 @@ export function renderSubsTable(allInfo, columns, selectedId) {
 
 const MAX_TAPE_ROWS = 50;
 let tradesPool = null;
+let lastRenderedTradeIds = new Array(MAX_TAPE_ROWS);
 
 function getTradesPool() {
   if (tradesPool) return tradesPool;
@@ -483,6 +484,7 @@ export function renderTrades(tradesData) {
   if (!tradesData || !tradesData.items || tradesData.items.length === 0) {
     empty.style.display = '';
     wrap.style.display = 'none';
+    for (let i = 0; i < lastRenderedTradeIds.length; i++) lastRenderedTradeIds[i] = undefined;
     return;
   }
   empty.style.display = 'none';
@@ -490,24 +492,32 @@ export function renderTrades(tradesData) {
 
   const pool = getTradesPool();
   const items = tradesData.items;
-  // Newest first: iterate input from end → start.
   const n = items.length;
   for (let i = 0; i < MAX_TAPE_ROWS; i++) {
     const row = pool.rows[i];
     if (i >= n) {
-      if (row.tr.style.display !== 'none') row.tr.style.display = 'none';
+      if (lastRenderedTradeIds[i] !== undefined) {
+        row.tr.style.display = 'none';
+        lastRenderedTradeIds[i] = undefined;
+      }
       continue;
     }
     const t = items[n - 1 - i];
+    // Skip rows where the trade at this position hasn't shifted — the only churn on
+    // a typical frame is the newest row (i=0). When a single new trade arrives the
+    // tape rotates: previous i-th entry is now at i+1 — so we still re-render most
+    // rows in that case; gain is when no new trade but flag re-fires.
+    if (lastRenderedTradeIds[i] === t.tradeId) continue;
+    lastRenderedTradeIds[i] = t.tradeId;
     if (row.tr.style.display === 'none') row.tr.style.display = '';
     row.tdTime.textContent = formatTimeOfDay(t.time);
     let sideText, sideClass;
     if (t.side === 1)      { sideText = 'BUY';  sideClass = 'trade-buy'; }
     else if (t.side === 2) { sideText = 'SELL'; sideClass = 'trade-sell'; }
     else                   { sideText = '—';    sideClass = 'trade-flat'; }
-    if (row.tdSide.textContent !== sideText) row.tdSide.textContent = sideText;
-    if (row.tdSide.className !== sideClass) row.tdSide.className = sideClass;
-    if (row.tdPrice.className !== sideClass) row.tdPrice.className = sideClass;
+    row.tdSide.textContent = sideText;
+    row.tdSide.className = sideClass;
+    row.tdPrice.className = sideClass;
     row.tdPrice.textContent = formatPrice(t.price, 4);
     row.tdQty.textContent = formatQty(t.qty);
     row.tdId.textContent = String(t.tradeId);

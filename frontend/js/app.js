@@ -102,14 +102,18 @@ function handleChartData(chartData) {
     candleSeries.update(chartData.update);
   }
 
-  // Overlays ride along with the chart frame; worker emits them on every chart-dirty tick.
-  const ov = chartData.overlays;
-  if (ov) {
-    if (ov.vwap && vwapSeries) vwapSeries.setData(ov.vwap);
-    applyPriceBands(ov.priceBandLow, ov.priceBandHigh);
-  }
-
   updateResolutionLabel(chartData.resolution);
+}
+
+// Overlays (VWAP line + price bands) come on their own dirty bit. The worker emits
+// either vwapFull (selection change / fresh subscribe) or vwapAppend (new sample),
+// which lets us avoid a full setData on every InfoSnapshot.
+function handleOverlays(ov) {
+  if (!ov) { clearOverlays(); return; }
+  if (!vwapSeries) return;
+  if (ov.vwapFull) vwapSeries.setData(ov.vwapFull);
+  else if (ov.vwapAppend) vwapSeries.update(ov.vwapAppend);
+  applyPriceBands(ov.priceBandLow, ov.priceBandHigh);
 }
 
 function updateResolutionLabel(resolution) {
@@ -183,8 +187,9 @@ const view = {
   selectedSymbol: null,
   book: null,
   allInfo: null,
-  trades: null,
-  auction: null,
+  overlays: undefined,
+  trades: undefined,
+  auction: undefined,
   rankings: { volume: [], gainers: [], losers: [] },
   stats: { msgs: 0, books: 0, info: 0, orders: 0, trades: 0 },
   connected: false,
@@ -219,6 +224,7 @@ worker.onmessage = (evt) => {
         }
       }
       if (msg.allInfo !== undefined) view.allInfo = msg.allInfo;
+      if (msg.overlays !== undefined) view.overlays = msg.overlays;
       if (msg.trades !== undefined) view.trades = msg.trades;
       if (msg.auction !== undefined) view.auction = msg.auction;
       if (msg.rankings !== undefined) view.rankings = msg.rankings;
@@ -261,9 +267,19 @@ function doRender() {
     const pending = chartQueue.splice(0);
     for (const cd of pending) handleChartData(cd);
   }
+  if (view.overlays !== undefined) {
+    handleOverlays(view.overlays);
+    view.overlays = undefined;
+  }
   renderSubsTable(view.allInfo, visibleColumns, view.selectedId);
-  renderTrades(view.trades);
-  renderAuction(view.auction);
+  if (view.trades !== undefined) {
+    renderTrades(view.trades);
+    view.trades = undefined;
+  }
+  if (view.auction !== undefined) {
+    renderAuction(view.auction);
+    view.auction = undefined;
+  }
   updateStats(view.stats);
   renderRankings(view.rankings, view.rankingsTab, view.connected);
 }
