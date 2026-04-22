@@ -37,6 +37,7 @@ int clientChannelCapacity = settings.ClientChannelCapacity;
 double slowClientThreshold = settings.SlowClientThreshold;
 int slowClientMaxTicks = settings.SlowClientMaxTicks;
 long clientMaxPendingBytes = settings.ClientMaxPendingBytes;
+int clientCoalesceWindowMs = settings.ClientCoalesceWindowMs;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
@@ -492,7 +493,8 @@ if (subscriptionManager is not null)
         clientChannelCapacity: clientChannelCapacity,
         slowClientThreshold: slowClientThreshold,
         slowClientMaxTicks: slowClientMaxTicks,
-        clientMaxPendingBytes: clientMaxPendingBytes);
+        clientMaxPendingBytes: clientMaxPendingBytes,
+        clientCoalesceWindowMs: clientCoalesceWindowMs);
 
     // Wire up feed state and last-packet providers for /health endpoint
     if (multiFeed is not null)

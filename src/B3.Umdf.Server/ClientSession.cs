@@ -28,6 +28,7 @@ public sealed class ClientSession : IDisposable
     private readonly double _slowClientThreshold;
     private readonly int _slowClientMaxTicks;
     private readonly long _maxPendingBytes;
+    private readonly int _coalesceWindowMs;
 
     private long _messagesSent;
     private long _bytesSent;
@@ -59,12 +60,19 @@ public sealed class ClientSession : IDisposable
     /// </summary>
     public long MaxPendingBytes => _maxPendingBytes;
 
+    /// <summary>
+    /// Coalescing window (ms) the write loop waits after a wake-up before draining,
+    /// to accumulate more messages into a single WebSocket frame. 0 = drain immediately.
+    /// </summary>
+    public int CoalesceWindowMs => _coalesceWindowMs;
+
     public ClientSession(
         WebSocket socket,
         int channelCapacity = 4096,
         double slowClientThreshold = 0.75,
         int slowClientMaxTicks = 100,
         long maxPendingBytes = 16L * 1024 * 1024,
+        int coalesceWindowMs = 0,
         ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(socket);
@@ -73,6 +81,7 @@ public sealed class ClientSession : IDisposable
             throw new ArgumentOutOfRangeException(nameof(slowClientThreshold), "Threshold must be in the (0, 1] range.");
         ArgumentOutOfRangeException.ThrowIfLessThan(slowClientMaxTicks, 1);
         ArgumentOutOfRangeException.ThrowIfNegative(maxPendingBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(coalesceWindowMs);
 
         Id = $"client-{Interlocked.Increment(ref _nextId)}";
         Socket = socket;
@@ -80,6 +89,7 @@ public sealed class ClientSession : IDisposable
         _slowClientThreshold = slowClientThreshold;
         _slowClientMaxTicks = slowClientMaxTicks;
         _maxPendingBytes = maxPendingBytes;
+        _coalesceWindowMs = coalesceWindowMs;
         _logger = logger ?? NullLogger.Instance;
         // Lock-free MPSC ring rounds capacity up to the next power of two; the
         // user-facing ChannelCapacity stays as the requested value (used as the
@@ -229,6 +239,14 @@ public sealed class ClientSession : IDisposable
                     // re-checks after publishing the waiting flag, so producers that
                     // raced our last failed TryDequeue are observed without sleeping.
                     await _outbound.WaitForItemsAsync(ct).ConfigureAwait(false);
+                    // Optional coalescing window: sleep briefly to let more producers
+                    // accumulate items so we drain a bigger batch into a single
+                    // WebSocket frame (reduces Kestrel pipe-lock churn).
+                    if (_coalesceWindowMs > 0)
+                    {
+                        try { await Task.Delay(_coalesceWindowMs, ct).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { break; }
+                    }
                     continue;
                 }
 

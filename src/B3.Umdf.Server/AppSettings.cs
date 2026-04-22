@@ -42,6 +42,16 @@ public sealed class AppSettings
     /// </summary>
     public long ClientMaxPendingBytes { get; set; } = 16L * 1024 * 1024;
 
+    /// <summary>
+    /// Coalescing window (milliseconds) the per-client write loop waits AFTER being
+    /// woken on the first item before draining + sending. Larger values produce bigger
+    /// frames + fewer Kestrel pipe-lock acquisitions at the cost of added latency.
+    /// 0 disables (immediate drain). Sweet spot for hundreds of WS clients is 10–20ms;
+    /// beyond ~50ms the per-client pending memory grows materially. CLI: env
+    /// UMDF_CLIENT_COALESCE_WINDOW_MS.
+    /// </summary>
+    public int ClientCoalesceWindowMs { get; set; } = 10;
+
     /// <summary>Graceful shutdown drain timeout in seconds.</summary>
     public int ShutdownDrainSeconds { get; set; } = 5;
 
@@ -118,6 +128,8 @@ public sealed class AppSettings
             SlowClientMaxTicks = slowTicks;
         if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_MAX_PENDING_BYTES"), out var maxPending))
             ClientMaxPendingBytes = maxPending;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_COALESCE_WINDOW_MS"), out var coalesceMs))
+            ClientCoalesceWindowMs = coalesceMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SHUTDOWN_DRAIN_SECONDS"), out var sd))
             ShutdownDrainSeconds = sd;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MULTICAST_MERGE_CAPACITY"), out var mergeCapacity))

@@ -26,6 +26,7 @@ public sealed class WebSocketHost : IAsyncDisposable
     private readonly double _slowClientThreshold;
     private readonly int _slowClientMaxTicks;
     private readonly long _clientMaxPendingBytes;
+    private readonly int _clientCoalesceWindowMs;
 
     /// <summary>Optional provider for feed group states (set before StartAsync).</summary>
     public Func<IReadOnlyDictionary<string, string>>? FeedStateProvider { get; set; }
@@ -40,7 +41,8 @@ public sealed class WebSocketHost : IAsyncDisposable
         int clientChannelCapacity = 4096,
         double slowClientThreshold = 0.75,
         int slowClientMaxTicks = 100,
-        long clientMaxPendingBytes = 16L * 1024 * 1024)
+        long clientMaxPendingBytes = 16L * 1024 * 1024,
+        int clientCoalesceWindowMs = 0)
     {
         _subscriptionManager = subscriptionManager;
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSocketHost>.Instance;
@@ -49,6 +51,7 @@ public sealed class WebSocketHost : IAsyncDisposable
         _slowClientThreshold = slowClientThreshold;
         _slowClientMaxTicks = slowClientMaxTicks;
         _clientMaxPendingBytes = clientMaxPendingBytes;
+        _clientCoalesceWindowMs = clientCoalesceWindowMs;
     }
 
     public async Task StartAsync(int port, CancellationToken ct = default)
@@ -247,6 +250,7 @@ public sealed class WebSocketHost : IAsyncDisposable
                 slowClientThreshold: _slowClientThreshold,
                 slowClientMaxTicks: _slowClientMaxTicks,
                 maxPendingBytes: _clientMaxPendingBytes,
+                coalesceWindowMs: _clientCoalesceWindowMs,
                 logger: _logger);
             _subscriptionManager.RegisterClient(session);
 
