@@ -126,6 +126,44 @@ internal sealed class StatsPrinter
         if (recoveryParts.Count > 0)
             Console.WriteLine($"   recovery: {string.Join("  ", recoveryParts)}");
 
+        // Per-symbol recovery summary (PerSymbol mode only): one line per group
+        // with at least one Stale symbol or non-empty stale buffer. Channel-mode
+        // bookManagers expose null Registry/StaleBuffer and are skipped.
+        var perSymbolParts = new List<string>();
+        long totalAbsorbed = 0;
+        for (int i = 0; i < _bookManagers.Count; i++)
+        {
+            var bm = _bookManagers[i];
+            var reg = bm.StateRegistry;
+            if (reg is null) continue;
+
+            var snap = reg.GetAggregateSnapshot();
+            long buffered = bm.BufferedMboMessages - bm.ReplayedMboMessages;
+            long stalePending = bm.StaleBuffer?.EnqueuedCount - bm.StaleBuffer?.DrainedCount ?? 0;
+            long bufBytes = bm.StaleBuffer?.TotalBytes ?? 0;
+            if (snap.TotalStaleSymbols > 0 || stalePending > 0 || bm.SnapshotsHealed > 0)
+            {
+                perSymbolParts.Add(
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0}");
+            }
+        }
+        if (_multiFeed is not null)
+        {
+            foreach (var (_, h) in _multiFeed.Handlers)
+                totalAbsorbed += h.PerSymbolGapsAbsorbed;
+        }
+        else if (_singleFeed is not null)
+        {
+            totalAbsorbed = _singleFeed.PerSymbolGapsAbsorbed;
+        }
+        if (perSymbolParts.Count > 0 || totalAbsorbed > 0)
+        {
+            var line = "   per-symbol: " + string.Join("  ", perSymbolParts);
+            if (totalAbsorbed > 0)
+                line += (perSymbolParts.Count > 0 ? "  " : "") + $"channelGapsAbsorbed:{totalAbsorbed:N0}";
+            Console.WriteLine(line);
+        }
+
         var crossedParts = new List<string>();
         for (int i = 0; i < _bookManagers.Count; i++)
         {
@@ -173,6 +211,36 @@ internal sealed class StatsPrinter
         Console.WriteLine($"  Books:        {_bookManagers.Sum(bm => bm.Books.Count):N0}");
         Console.WriteLine($"  Instruments:  {_marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
         Console.WriteLine($"  Symbols:      {_symbolRegistry.Count:N0}");
+
+        // PerSymbol mode summary (no-op when all bookManagers are Channel mode).
+        long totalStaleSymbols = 0, totalSymbolsTracked = 0, totalHealed = 0, totalBuffered = 0, totalReplayed = 0, totalDropDup = 0, totalLiveResync = 0, totalAbsorbed = 0;
+        bool anyPerSymbol = false;
+        for (int i = 0; i < _bookManagers.Count; i++)
+        {
+            var reg = _bookManagers[i].StateRegistry;
+            if (reg is null) continue;
+            anyPerSymbol = true;
+            var snap = reg.GetAggregateSnapshot();
+            totalStaleSymbols += snap.TotalStaleSymbols;
+            totalSymbolsTracked += snap.TotalSymbols;
+            totalHealed += _bookManagers[i].SnapshotsHealed;
+            totalBuffered += _bookManagers[i].BufferedMboMessages;
+            totalReplayed += _bookManagers[i].ReplayedMboMessages;
+        }
+        for (int i = 0; i < _marketDataManagers.Count; i++)
+        {
+            totalDropDup += _marketDataManagers[i].DroppedDuplicateStats;
+            totalLiveResync += _marketDataManagers[i].LiveResyncs;
+        }
+        if (_multiFeed is not null)
+            foreach (var (_, h) in _multiFeed.Handlers) totalAbsorbed += h.PerSymbolGapsAbsorbed;
+        else if (_singleFeed is not null) totalAbsorbed = _singleFeed.PerSymbolGapsAbsorbed;
+
+        if (anyPerSymbol)
+        {
+            Console.WriteLine($"  PerSymbol:    stale={totalStaleSymbols}/{totalSymbolsTracked}  healed={totalHealed:N0}  buffered={totalBuffered:N0}  replayed={totalReplayed:N0}");
+            Console.WriteLine($"                dropDup={totalDropDup:N0}  liveResync={totalLiveResync:N0}  channelGapsAbsorbed={totalAbsorbed:N0}");
+        }
     }
 
     private long TotalEvents() =>
