@@ -29,17 +29,72 @@ public sealed class MarketDataManager : IFeedEventHandler
     /// <summary>Number of SBE parse errors encountered.</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
 
-    public MarketDataManager(IMarketDataEventHandler? eventHandler = null, ILogger<MarketDataManager>? logger = null)
+    public MarketDataManager(IMarketDataEventHandler? eventHandler = null, ILogger<MarketDataManager>? logger = null,
+        SymbolStateRegistry? stateRegistry = null,
+        RecoveryMode recoveryMode = RecoveryMode.Channel)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<MarketDataManager>.Instance;
         GapTracker = new SymbolGapTracker(_logger);
+        _recoveryMode = recoveryMode;
+        if (recoveryMode == RecoveryMode.PerSymbol)
+        {
+            _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
+                "SymbolStateRegistry is required when RecoveryMode is PerSymbol.");
+        }
+        else
+        {
+            _stateRegistry = stateRegistry;
+        }
+    }
+
+    private readonly RecoveryMode _recoveryMode;
+    private readonly SymbolStateRegistry? _stateRegistry;
+    private long _droppedDuplicateStats;
+    private long _liveResyncs;
+
+    /// <summary>The recovery mode this MarketDataManager is operating in.</summary>
+    public RecoveryMode RecoveryMode => _recoveryMode;
+
+    /// <summary>Symbol state registry (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
+    public SymbolStateRegistry? StateRegistry => _stateRegistry;
+
+    /// <summary>Stat messages dropped because the registry detected a duplicate (lower-or-equal rptSeq).</summary>
+    public long DroppedDuplicateStats => Volatile.Read(ref _droppedDuplicateStats);
+
+    /// <summary>Stat messages applied across a registry-detected gap (LiveResyncPolicy.NextMessage).</summary>
+    public long LiveResyncs => Volatile.Read(ref _liveResyncs);
+
+    /// <summary>
+    /// Per-stat-kind routing decision. In Channel mode, runs the Phase 0
+    /// shadow tracker and always returns true. In PerSymbol mode, consults
+    /// the registry: returns false if the message is a duplicate (Drop),
+    /// true otherwise (Apply, including across a NextMessage live-resync gap).
+    /// </summary>
+    private bool RouteStat(ulong securityId, SymbolGapKind kind, uint receivedRptSeq, uint priorRptSeq)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol)
+        {
+            GapTracker.Observe(securityId, receivedRptSeq, priorRptSeq, kind);
+            return true;
+        }
+        if (receivedRptSeq == 0) return true; // schema absent; cannot gap-check
+        var result = _stateRegistry!.Observe(securityId, kind, receivedRptSeq);
+        if (result.Action == SymbolStateRegistry.ObserveAction.Drop)
+        {
+            Interlocked.Increment(ref _droppedDuplicateStats);
+            return false;
+        }
+        if (result.GapSize > 0)
+            Interlocked.Increment(ref _liveResyncs);
+        return true;
     }
 
     /// <summary>
     /// Phase 0 shadow tracker for per-symbol rptSeq gaps across all
-    /// statistic message kinds handled here. Read-only — does not influence
-    /// the existing channel-level Recovery state machine.
+    /// statistic message kinds handled here. In Channel mode it is the
+    /// only gap-tracking surface; in PerSymbol mode it remains for
+    /// telemetry but the registry is the source of truth.
     /// </summary>
     public SymbolGapTracker GapTracker { get; }
 
@@ -238,7 +293,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqSecurityStatus, SymbolGapKind.SecurityStatus);
+            if (!RouteStat(securityId, SymbolGapKind.SecurityStatus, (uint)rs, info.LastRptSeqSecurityStatus))
+                return;
             info.LastRptSeqSecurityStatus = (uint)rs;
         }
 
@@ -305,7 +361,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqOpeningPrice, SymbolGapKind.OpeningPrice);
+            if (!RouteStat(securityId, SymbolGapKind.OpeningPrice, (uint)rs, info.LastRptSeqOpeningPrice))
+                return;
             info.LastRptSeqOpeningPrice = (uint)rs;
         }
 
@@ -328,7 +385,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqTheoreticalOpeningPrice, SymbolGapKind.TheoreticalOpeningPrice);
+            if (!RouteStat(securityId, SymbolGapKind.TheoreticalOpeningPrice, (uint)rs, info.LastRptSeqTheoreticalOpeningPrice))
+                return;
             info.LastRptSeqTheoreticalOpeningPrice = (uint)rs;
         }
 
@@ -351,7 +409,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqClosingPrice, SymbolGapKind.ClosingPrice);
+            if (!RouteStat(securityId, SymbolGapKind.ClosingPrice, (uint)rs, info.LastRptSeqClosingPrice))
+                return;
             info.LastRptSeqClosingPrice = (uint)rs;
         }
 
@@ -373,7 +432,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqAuctionImbalance, SymbolGapKind.AuctionImbalance);
+            if (!RouteStat(securityId, SymbolGapKind.AuctionImbalance, (uint)rs, info.LastRptSeqAuctionImbalance))
+                return;
             info.LastRptSeqAuctionImbalance = (uint)rs;
         }
 
@@ -395,7 +455,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqQuantityBand, SymbolGapKind.QuantityBand);
+            if (!RouteStat(securityId, SymbolGapKind.QuantityBand, (uint)rs, info.LastRptSeqQuantityBand))
+                return;
             info.LastRptSeqQuantityBand = (uint)rs;
         }
 
@@ -418,7 +479,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqPriceBand, SymbolGapKind.PriceBand);
+            if (!RouteStat(securityId, SymbolGapKind.PriceBand, (uint)rs, info.LastRptSeqPriceBand))
+                return;
             info.LastRptSeqPriceBand = (uint)rs;
         }
 
@@ -442,7 +504,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqHighPrice, SymbolGapKind.HighPrice);
+            if (!RouteStat(securityId, SymbolGapKind.HighPrice, (uint)rs, info.LastRptSeqHighPrice))
+                return;
             info.LastRptSeqHighPrice = (uint)rs;
         }
 
@@ -464,7 +527,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqLowPrice, SymbolGapKind.LowPrice);
+            if (!RouteStat(securityId, SymbolGapKind.LowPrice, (uint)rs, info.LastRptSeqLowPrice))
+                return;
             info.LastRptSeqLowPrice = (uint)rs;
         }
 
@@ -486,7 +550,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqLastTradePrice, SymbolGapKind.LastTradePrice);
+            if (!RouteStat(securityId, SymbolGapKind.LastTradePrice, (uint)rs, info.LastRptSeqLastTradePrice))
+                return;
             info.LastRptSeqLastTradePrice = (uint)rs;
         }
 
@@ -509,7 +574,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqSettlementPrice, SymbolGapKind.SettlementPrice);
+            if (!RouteStat(securityId, SymbolGapKind.SettlementPrice, (uint)rs, info.LastRptSeqSettlementPrice))
+                return;
             info.LastRptSeqSettlementPrice = (uint)rs;
         }
 
@@ -531,7 +597,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqOpenInterest, SymbolGapKind.OpenInterest);
+            if (!RouteStat(securityId, SymbolGapKind.OpenInterest, (uint)rs, info.LastRptSeqOpenInterest))
+                return;
             info.LastRptSeqOpenInterest = (uint)rs;
         }
 
@@ -553,7 +620,8 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         if (msg.RptSeq is { } rs)
         {
-            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqExecutionStatistics, SymbolGapKind.ExecutionStatistics);
+            if (!RouteStat(securityId, SymbolGapKind.ExecutionStatistics, (uint)rs, info.LastRptSeqExecutionStatistics))
+                return;
             info.LastRptSeqExecutionStatistics = (uint)rs;
         }
 
