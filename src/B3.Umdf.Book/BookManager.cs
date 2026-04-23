@@ -345,6 +345,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 case TradeBust_57Data.MESSAGE_ID:
                     HandleTradeBust(body);
                     break;
+                case SnapshotFullRefresh_Header_30Data.MESSAGE_ID:
+                    HandleSnapshotHeader(body);
+                    break;
                 case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
                     HandleSnapshotOrders(body);
                     break;
@@ -653,6 +656,55 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
     }
 
+    /// <summary>
+     /// Per-symbol pending snapshot lastRptSeq indexed by SecurityID. Populated by
+     /// <see cref="HandleSnapshotHeader"/> and consumed by <see cref="HandleSnapshotOrders"/>
+     /// to drive registry healing in PerSymbol mode. Header_30 always precedes its
+     /// matching 71 body in B3's snapshot stream for the same instrument.
+     /// </summary>
+    private readonly Dictionary<ulong, uint> _pendingSnapshotLastRptSeq = new();
+    private long _snapshotsHealed;
+    private long _snapshotsMissingRptSeq;
+
+    /// <summary>Number of snapshot cycles where the registry was successfully healed.</summary>
+    public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
+    /// <summary>Snapshots received in PerSymbol mode without a usable LastRptSeq (cannot heal).</summary>
+    public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
+
+    private void HandleSnapshotHeader(ReadOnlySpan<byte> body)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol) return;
+        if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader)) return;
+
+        ref readonly var msg = ref reader.Data;
+        RecordSnapshotHeader((ulong)msg.SecurityID, msg.LastRptSeq);
+    }
+
+    /// <summary>
+    /// Cache the per-symbol lastRptSeq from a snapshot header so the next
+    /// matching snapshot body can heal the registry. Exposed internally for
+    /// tests that bypass SBE parsing.
+    /// </summary>
+    internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol) return;
+        if (lastRptSeq is { } v && v > 0)
+            _pendingSnapshotLastRptSeq[securityId] = v;
+        else
+            _pendingSnapshotLastRptSeq.Remove(securityId);
+    }
+
+    /// <summary>
+    /// Run the post-snapshot heal flow for a security: transition the registry
+    /// to Healthy at the cached lastRptSeq baseline and replay any buffered
+    /// messages in the heal window. Exposed internally for tests.
+    /// </summary>
+    internal void HealAfterSnapshotForTest(ulong securityId)
+    {
+        var book = GetOrCreateBook(securityId);
+        HealAfterSnapshot(securityId, book);
+    }
+
     private void HandleSnapshotOrders(ReadOnlySpan<byte> body)
     {
         if (!SnapshotFullRefresh_Orders_MBO_71Data.TryParse(body, out var reader))
@@ -688,6 +740,41 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
             book.GetSide(side).Add(in bookEntry);
         });
+
+        if (_recoveryMode == RecoveryMode.PerSymbol)
+            HealAfterSnapshot(securityId, book);
+    }
+
+    private void HealAfterSnapshot(ulong securityId, OrderBook book)
+    {
+        if (!_pendingSnapshotLastRptSeq.Remove(securityId, out var snapshotRptSeq))
+        {
+            // No header (or no LastRptSeq) — cannot transition to Healthy without a baseline.
+            // Symbol stays Stale; subsequent incremental will continue buffering until next
+            // snapshot cycle delivers a usable header. Counter helps surface schema/feed issues.
+            Interlocked.Increment(ref _snapshotsMissingRptSeq);
+            return;
+        }
+
+        book.LastRptSeq = snapshotRptSeq;
+        var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
+        if (heal.TransitionedToHealthy)
+            Interlocked.Increment(ref _snapshotsHealed);
+
+        if (heal.DrainTo >= heal.DrainFrom)
+        {
+            int replayed = ReplayDeferredMbo(securityId, heal.DrainFrom, heal.DrainTo);
+            if (replayed > 0 && _logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug(
+                    "PerSymbol heal SecID={SecId}: snapshotRpt={Snap} drain=[{From},{To}] replayed={Replayed}",
+                    securityId, snapshotRptSeq, heal.DrainFrom, heal.DrainTo, replayed);
+        }
+        else
+        {
+            // No drain window — every buffered message is at-or-below the snapshot
+            // baseline (already covered). Drop them.
+            _staleBuffer!.Clear(securityId);
+        }
     }
 
     /// <summary>
