@@ -380,17 +380,37 @@ var groupMdHandlers = new Dictionary<int, IFeedEventHandler>();
 
 var bmLogger = loggerFactory.CreateLogger<BookManager>();
 var mdmLogger = loggerFactory.CreateLogger<MarketDataManager>();
+var registryLogger = loggerFactory.CreateLogger<SymbolStateRegistry>();
+var staleBufferLogger = loggerFactory.CreateLogger<StaleMboBuffer>();
+
+// Per-group state — each B3 channel group is an independent feed with its
+// own incremental sequence space and snapshot stream, so each gets its own
+// SymbolStateRegistry + StaleMboBuffer when running in PerSymbol mode.
+var registries = new Dictionary<int, SymbolStateRegistry>();
+var staleBuffers = new Dictionary<int, StaleMboBuffer>();
 
 foreach (var gid in groupIds)
 {
     IBookEventHandler bookHandler;
     IMarketDataEventHandler mdHandler = stats;
 
+    SymbolStateRegistry? groupRegistry = null;
+    StaleMboBuffer? groupStaleBuffer = null;
+    if (settings.RecoveryMode == RecoveryMode.PerSymbol)
+    {
+        groupRegistry = new SymbolStateRegistry(registryLogger);
+        groupStaleBuffer = new StaleMboBuffer(staleBufferLogger);
+        registries[gid] = groupRegistry;
+        staleBuffers[gid] = groupStaleBuffer;
+    }
+
     if (subscriptionManager is not null)
     {
         var gh = subscriptionManager.CreateGroupHandler();
         bookHandler = new CompositeBookEventHandler(stats, gh);
-        var bm = new BookManager(bookHandler, bmLogger);
+        var bm = new BookManager(bookHandler, bmLogger,
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
+            recoveryMode: settings.RecoveryMode);
         mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm);
         gh.SetBookManager(bm);
         gh.StartBroadcaster(gid);
@@ -400,12 +420,16 @@ foreach (var gid in groupIds)
     else
     {
         bookHandler = stats;
-        var bm = new BookManager(bookHandler, bmLogger);
+        var bm = new BookManager(bookHandler, bmLogger,
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
+            recoveryMode: settings.RecoveryMode);
         mdHandler = new CompositeMarketDataEventHandler(stats, bm);
         bookManagers.Add(bm);
     }
 
-    var mm = new MarketDataManager(mdHandler, mdmLogger);
+    var mm = new MarketDataManager(mdHandler, mdmLogger,
+        stateRegistry: groupRegistry,
+        recoveryMode: settings.RecoveryMode);
     marketDataManagers.Add(mm);
 
     var composite = new CompositeFeedHandler(bookManagers[^1], mm, symbolRegistry);
@@ -429,7 +453,8 @@ if (groupIds.Count > 1)
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
             incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
-            groupRingCapacity: groupRingCapacity)
+            groupRingCapacity: groupRingCapacity,
+            recoveryMode: settings.RecoveryMode)
         : new MultiFeedManager(
             packetSource,
             groupFeedHandlers,
@@ -438,7 +463,8 @@ if (groupIds.Count > 1)
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
             incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
-            groupRingCapacity: groupRingCapacity);
+            groupRingCapacity: groupRingCapacity,
+            recoveryMode: settings.RecoveryMode);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }
@@ -446,7 +472,7 @@ else
 {
     if (packetSource is null)
         throw new InvalidOperationException("Single-group live multicast mode is not supported; use multiple groups.");
-    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]], incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity);
+    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]], incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity, recoveryMode: settings.RecoveryMode);
 }
 
 if (subscriptionManager is not null)
