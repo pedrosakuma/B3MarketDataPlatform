@@ -88,6 +88,8 @@
   .subs-table tr:hover td { background: rgba(0,210,255,.06); }
   .subs-table tr.active td { background: rgba(0,210,255,.12); }
   .subs-table tr.active td:first-child { border-left: 2px solid var(--accent); }
+  .subs-table tr.stale td { opacity: .45; }
+  .subs-table tr.stale .sym-cell::after { content: ' \26A0'; color: #ffb84d; opacity: 1; }
   .subs-table .sym-cell { font-weight: 700; color: var(--text); }
   .subs-table .detail-btn { background: none; border: none; color: var(--muted); font-size: .7rem; cursor: pointer; padding: .1rem .3rem; }
   .subs-table .detail-btn:hover { color: var(--accent); background: none; }

@@ -11,6 +11,7 @@ export const MSG = {
   SERVER_STATUS: 0x0050,
   CANDLE_SNAPSHOT: 0x0060,
   CANDLE_UPDATE: 0x0061,
+  SYMBOL_STALE_STATUS: 0x0070,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -204,6 +205,11 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const volume = Number(v.getBigInt64(o, true)); o += 8;
       const avg = Number(v.getBigInt64(o, true));
       return { type: 'CandleUpdate', securityId, resolution, candle: { time, open, high, low, close, volume, avg } };
+    }
+    case MSG.SYMBOL_STALE_STATUS: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const isStale = v.getUint8(o) === 1;
+      return { type: 'SymbolStaleStatus', securityId, isStale };
     }
     default:
       return null;

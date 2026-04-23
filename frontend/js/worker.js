@@ -356,6 +356,7 @@ setInterval(() => {
       frame.allInfo.push({
         id, symbol: sub.symbol, flags: sub.flags,
         info: { ...sub.info },
+        isStale: !!sub.isStale,
       });
     }
   }
@@ -602,6 +603,9 @@ function handleMessage(msg) {
           // Set whenever the trade tape needs a full resync (initial select,
           // resubscribe, sub change). Frame builder honors this.
           tradesNeedFullSync: true,
+          // PerSymbol recovery state: true when the server has notified this
+          // security is currently Stale (awaiting snapshot heal). UI dims rows.
+          isStale: false,
         });
       }
       let d = D_SUBS | D_ALLINFO;
@@ -804,6 +808,16 @@ function handleMessage(msg) {
       postMessage({ type: 'serverReady', ready: msg.ready });
       log('Server ' + (msg.ready ? 'ready' : 'initializing'), msg.ready ? 'log-sub-ok' : 'log-info');
       if (msg.ready && !wasReady) resubscribeAll();
+      break;
+    }
+    case 'SymbolStaleStatus': {
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub && sub.isStale !== msg.isStale) {
+        sub.isStale = msg.isStale;
+        // Re-render the subs table so the dim indicator updates.
+        mark(D_SUBS | D_ALLINFO);
+      }
       break;
     }
   }

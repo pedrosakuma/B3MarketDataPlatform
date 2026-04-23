@@ -33,6 +33,12 @@ public enum MessageType : ushort
 
     /// <summary>Server → Client: single candle update (latest candle changed or new candle).</summary>
     CandleUpdate = 0x0061,
+
+    /// <summary>Server → Client: per-symbol stale-status transition (PerSymbol recovery mode).
+    /// Sent when a subscribed security flips between Healthy and Stale so the UI can dim
+    /// rows / show a stale indicator. Coalesced per security in the conflation buffer:
+    /// the last value within a packet wins.</summary>
+    SymbolStaleStatus = 0x0070,
 }
 
 public enum SubscribeErrorCode : byte
@@ -194,6 +200,20 @@ public static class WireProtocol
         WriteFramingHeader(dest, totalLen, MessageType.BookCleared);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
         dest[12] = clearSide;
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Write SymbolStaleStatus: securityId + isStale byte.
+    /// Total: 13 bytes. Pushed when a subscribed security flips between
+    /// Healthy and Stale in PerSymbol recovery mode.
+    /// </summary>
+    public static int WriteSymbolStaleStatus(Span<byte> dest, ulong securityId, bool isStale)
+    {
+        const ushort totalLen = FramingHeaderSize + 8 + 1; // 13
+        WriteFramingHeader(dest, totalLen, MessageType.SymbolStaleStatus);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
+        dest[12] = isStale ? (byte)1 : (byte)0;
         return totalLen;
     }
 

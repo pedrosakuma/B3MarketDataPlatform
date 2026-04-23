@@ -446,7 +446,9 @@ export function renderSubsTable(allInfo, columns, selectedId) {
     row.tdSym.textContent = item.symbol;
     row.btnDetail.dataset.symbol = item.symbol;
     row.btnUnsub.dataset.id = item.id;
-    row.tr.className = item.id === selectedId ? 'active' : '';
+    let cls = item.id === selectedId ? 'active' : '';
+    if (item.isStale) cls = (cls + ' stale').trim();
+    row.tr.className = cls;
 
     for (const col of columns) {
       const td = row.cells[col];

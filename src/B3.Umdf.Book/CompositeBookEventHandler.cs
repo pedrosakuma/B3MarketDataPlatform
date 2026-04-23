@@ -49,6 +49,11 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
         foreach (var h in _handlers) h.OnExecutionSummary(securityId, lastPx, fillQty);
     }
 
+    public void OnSymbolStaleStatusChanged(ulong securityId, bool isStale)
+    {
+        foreach (var h in _handlers) h.OnSymbolStaleStatusChanged(securityId, isStale);
+    }
+
     public void OnBatchComplete()
     {
         foreach (var h in _handlers) h.OnBatchComplete();

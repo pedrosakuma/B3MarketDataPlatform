@@ -139,6 +139,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (_recoveryMode != RecoveryMode.PerSymbol) return true;
         if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
         var result = _stateRegistry!.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
+        if (result.TransitionedToStale)
+            _eventHandler?.OnSymbolStaleStatusChanged(securityId, isStale: true);
         switch (result.Action)
         {
             case SymbolStateRegistry.ObserveAction.Apply:
@@ -759,7 +761,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         book.LastRptSeq = snapshotRptSeq;
         var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
         if (heal.TransitionedToHealthy)
+        {
             Interlocked.Increment(ref _snapshotsHealed);
+            // Emit a SymbolStaleStatus flip when the symbol is fully recovered
+            // (no other kinds remain Stale). When other kinds are still Stale
+            // the symbol-level status is unchanged so no event is emitted.
+            if (_eventHandler is not null && !_stateRegistry.IsAnyStale(securityId))
+                _eventHandler.OnSymbolStaleStatusChanged(securityId, isStale: false);
+        }
 
         if (heal.DrainTo >= heal.DrainFrom)
         {

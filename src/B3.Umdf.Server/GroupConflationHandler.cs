@@ -22,6 +22,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly Dictionary<ulong, BufferedOrder> _orderBuffer = new();
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
+    // Per-symbol stale-status flips (PerSymbol mode). Coalesced per security:
+    // multiple flips in the same batch collapse to the latest value.
+    private readonly Dictionary<ulong, bool> _staleStatusBuffer = new();
     private byte[] _flushBuf = new byte[4096];
 
     // Per-packet work batch. Dispatch thread rents on first event in a packet, appends
@@ -227,6 +230,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
 
+    public void OnSymbolStaleStatusChanged(ulong securityId, bool isStale)
+    {
+        if (!_parent.IsSubscribed(securityId)) return;
+        _staleStatusBuffer[securityId] = isStale;
+    }
+
     /// <summary>
     /// Returns true if the instrument is in the Open trading phase (or if the phase is unknown).
     /// Trades from auction/pre-open/closing call should not be plotted on the chart.
@@ -291,7 +300,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
         //    no subscriber fan-out, no ArrayPool rentals for client buffers).
-        if (_orderBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0)
+        if (_orderBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
             FlushBuffers();
 
         // 4. Publish the batch to the broadcaster thread. On full ring, drop + schedule
@@ -332,10 +341,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         // Equivalent of FlushBuffers without producing wire bytes — keep the upstream
         // event counter accurate so UpstreamConflated reflects discarded work too.
-        int discarded = _orderBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count;
+        int discarded = _orderBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count + _staleStatusBuffer.Count;
         _orderBuffer.Clear();
         _clearBuffer.Clear();
         _tradeBuffer.Clear();
+        _staleStatusBuffer.Clear();
         _eventsFlushed += discarded;
     }
 
@@ -473,6 +483,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         if (_tradeBuffer.Count > 0)
             flushed += FlushTradeBuffer();
+
+        if (_staleStatusBuffer.Count > 0)
+        {
+            Span<byte> staleTmp = stackalloc byte[16];
+            foreach (var (secId, isStale) in _staleStatusBuffer)
+            {
+                if (!_parent.IsSubscribed(secId)) continue;
+                int len = WireProtocol.WriteSymbolStaleStatus(staleTmp, secId, isStale);
+                AppendEventToBatch(secId, staleTmp[..len], logicalCount: 1);
+                flushed++;
+            }
+            _staleStatusBuffer.Clear();
+        }
 
         _eventsFlushed += flushed;
     }
