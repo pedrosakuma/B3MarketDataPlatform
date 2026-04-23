@@ -3,20 +3,28 @@
 # Drives the replayer with packet-loss injection scenarios and captures logs.
 #
 # Usage: tools/loss-resilience-test.sh <pcap-prefix> [<duration-seconds>]
+# Optional env: MODE=Channel|PerSymbol (default Channel) — sets UMDF_RECOVERY_MODE.
+#               OUT=/tmp/loss-validation (override output directory)
 # Example: tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 20
+#          MODE=PerSymbol tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 20
 #
-# Outputs to /tmp/loss-validation/{scenario}.log. Summary printed to stdout.
+# Outputs to ${OUT}/{scenario}.log (default /tmp/loss-validation-${MODE}/).
+# Summary printed to stdout.
 set -u
 PREFIX="${1:?usage: $0 <pcap-prefix> [<duration-seconds>]}"
 DUR="${2:-20}"
-OUT=/tmp/loss-validation
+MODE="${MODE:-Channel}"
+OUT="${OUT:-/tmp/loss-validation-${MODE}}"
 BIN="dotnet src/B3.Umdf.ConsoleApp/bin/Release/net10.0/B3.Umdf.ConsoleApp.dll"
 mkdir -p "$OUT"
+export UMDF_RECOVERY_MODE="$MODE"
+
+echo "## RecoveryMode=$MODE  output=$OUT"
 
 run() {
   local name="$1"; shift
   echo "=== $name ==="
-  timeout "$DUR" $BIN --pcap-prefix "$PREFIX" --speed 0 "$@" > "$OUT/$name.log" 2>&1 || true
+  timeout -k 5 "$DUR" $BIN --pcap-prefix "$PREFIX" --speed 0 "$@" > "$OUT/$name.log" 2>&1 || true
   echo "  warnings:        $(grep -c 'warn:' "$OUT/$name.log" || true)"
   echo "  state transitions: $(grep -c '→' "$OUT/$name.log" || true)"
   echo "  gaps detected:   $(grep -c 'Gap detected' "$OUT/$name.log" || true)"
@@ -25,6 +33,11 @@ run() {
   [ -n "$last_overflow" ] && echo "  total recovery drops: $last_overflow"
   local final_state=$(grep -E '→ (RealTime|Recovery|CatchUp|WaitSnapshot)' "$OUT/$name.log" | tail -1 | grep -oE '→ \w+' || echo "→ ?")
   echo "  final state:     $final_state"
+  if [ "$MODE" = "PerSymbol" ]; then
+    echo "  channel gaps absorbed: $(grep -c 'absorbed channel gap' "$OUT/$name.log" || true)"
+    local last_per=$(grep 'PerSymbol:' "$OUT/$name.log" | tail -1)
+    [ -n "$last_per" ] && echo "  last per-symbol stats:$(echo "$last_per" | sed -E 's/.*PerSymbol://')"
+  fi
 }
 
 # Baseline + 6 loss scenarios. Seeds fixed for reproducibility.
