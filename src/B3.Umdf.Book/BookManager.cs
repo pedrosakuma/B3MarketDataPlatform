@@ -334,7 +334,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                     HandleEmptyBook(body);
                     break;
                 case ChannelReset_11Data.MESSAGE_ID:
-                    ClearAllBooks();
+                    HandleChannelReset();
                     break;
                 case ForwardTrade_54Data.MESSAGE_ID:
                     HandleForwardTrade(body, header.BlockLength);
@@ -363,7 +363,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     }
 
     public void OnGapDetected(uint expected, uint received) { }
-    public void OnSequenceReset() { ClearAllBooks(); }
+    public void OnSequenceReset() => HandleSequenceReset();
     public void OnSnapshotStart() { }
     public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
@@ -795,5 +795,41 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             book.Clear();
             _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
         }
+    }
+
+    private long _epochResets;
+    private long _epochResetMessagesDropped;
+
+    /// <summary>Number of catastrophic resets (ChannelReset_11 or SequenceReset) seen.</summary>
+    public long EpochResets => Volatile.Read(ref _epochResets);
+    /// <summary>Buffered MBO messages dropped during epoch resets.</summary>
+    public long EpochResetMessagesDropped => Volatile.Read(ref _epochResetMessagesDropped);
+
+    private void HandleChannelReset()
+    {
+        ClearAllBooks();
+        ResetPerSymbolEpoch("ChannelReset_11");
+    }
+
+    private void HandleSequenceReset()
+    {
+        ClearAllBooks();
+        ResetPerSymbolEpoch("SequenceReset");
+    }
+
+    /// <summary>
+    /// In PerSymbol mode, drive the catastrophic-reset path: drop all
+    /// buffered MBO bodies, clear pending snapshot headers, and reset the
+    /// registry epoch (every (symbol, kind) → Unknown). Channel mode is a
+    /// no-op since there is no per-symbol state to reset.
+    /// </summary>
+    private void ResetPerSymbolEpoch(string reason)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol) return;
+        int dropped = _staleBuffer!.ClearAll();
+        _pendingSnapshotLastRptSeq.Clear();
+        _stateRegistry!.ResetEpoch(reason);
+        Interlocked.Add(ref _epochResetMessagesDropped, dropped);
+        Interlocked.Increment(ref _epochResets);
     }
 }
