@@ -21,6 +21,7 @@ internal sealed class StatsPrinter
     private readonly MultiFeedManager? _multiFeed;
     private readonly FeedHandler? _singleFeed;
     private readonly SubscriptionManager? _subscriptionManager;
+    private readonly IReadOnlyList<GroupConflationHandler>? _groupHandlers;
 
     private bool _lastReady;
     private long _prevPackets;
@@ -36,7 +37,8 @@ internal sealed class StatsPrinter
         IReadOnlyList<int> groupIds,
         MultiFeedManager? multiFeed,
         FeedHandler? singleFeed,
-        SubscriptionManager? subscriptionManager)
+        SubscriptionManager? subscriptionManager,
+        IReadOnlyList<GroupConflationHandler>? groupHandlers = null)
     {
         _sw = sw;
         _stats = stats;
@@ -47,6 +49,7 @@ internal sealed class StatsPrinter
         _multiFeed = multiFeed;
         _singleFeed = singleFeed;
         _subscriptionManager = subscriptionManager;
+        _groupHandlers = groupHandlers;
     }
 
     public void PrintPeriodic()
@@ -143,8 +146,10 @@ internal sealed class StatsPrinter
             long bufBytes = bm.StaleBuffer?.TotalBytes ?? 0;
             if (snap.TotalStaleSymbols > 0 || stalePending > 0 || bm.SnapshotsHealed > 0)
             {
+                string gate = (_groupHandlers is not null && i < _groupHandlers.Count && _groupHandlers[i].IsFanoutSuppressed)
+                    ? " gate:on" : "";
                 perSymbolParts.Add(
-                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0}");
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0}{gate}");
             }
         }
         if (_multiFeed is not null)

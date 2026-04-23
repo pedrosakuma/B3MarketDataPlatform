@@ -79,11 +79,29 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingSubscribeRequests = new();
     // Cap of snapshot requests serviced per OnBatchComplete invocation. See AppSettings.
     private readonly int _maxSnapshotRequestsPerBatch;
-    // When true, OnBatchComplete drops accumulated wire events instead of flushing+publishing.
-    // Set during FeedHandler Recovery/CatchUp; cleared on RealTime entry, which also
-    // schedules a fresh book snapshot (Get) for every current Book-flag subscriber so
-    // they recover any state that was suppressed.
+    // Sources that may independently demand fanout suppression. The
+    // effective suppression state is `_suppressionMask != 0`. Keeping each
+    // source separate means a transient stale-ratio spike doesn't release
+    // suppression that was set by the channel still being in Recovery,
+    // and vice-versa.
+    [Flags]
+    public enum SuppressionSource
+    {
+        None = 0,
+        /// <summary>Channel-level FeedState is not RealTime (cold-start, channel Recovery in legacy mode).</summary>
+        ChannelState = 1,
+        /// <summary>PerSymbol mode: too many symbols are Stale relative to the configured threshold.</summary>
+        StaleRatio = 2,
+    }
+
+    private volatile SuppressionSource _suppressionMask;
     private volatile bool _suppressFanout;
+
+    /// <summary>Evaluator invoked at the start of <see cref="OnBatchComplete"/> (after
+    /// pending unsubscribes drain) to refresh dynamic suppression sources such as the
+    /// per-symbol Stale ratio. Null by default. Wired in <c>Bootstrap</c> when
+    /// PerSymbol recovery mode is active.</summary>
+    public Action? PreBatchEvaluator { get; set; }
 
     /// <summary>Enqueue a subscribe/get request routed to this group.</summary>
     internal void EnqueueRequest(string clientId, string? symbol, DataFlags flags, bool isGet)
@@ -251,6 +269,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // 1. Process shared unsubscribe queue (any group, under _subLock)
         _parent.ProcessUnsubscribes();
 
+        // 2. Refresh dynamic suppression sources (e.g. per-symbol stale ratio)
+        //    AFTER unsubscribes drain so a suppression release does not enqueue
+        //    resync requests for clients that just unsubscribed.
+        PreBatchEvaluator?.Invoke();
+
         if (_suppressFanout)
         {
             // Feed is in Recovery/CatchUp: the book is being rebuilt and broadcasting
@@ -280,13 +303,25 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     /// Toggle fanout suppression. When transitioning from suppressed to live, schedules
     /// a fresh book snapshot for every current Book-flag subscriber owned by this group.
     /// Must be called from the dispatch thread (or via FeedHandler StateChanged hook
-    /// that runs on the dispatch thread).
+    /// that runs on the dispatch thread). Routes to the <see cref="SuppressionSource.ChannelState"/>
+    /// source for backward compatibility.
     /// </summary>
     public void SetFanoutSuppressed(bool suppressed)
+        => SetSuppressionSource(SuppressionSource.ChannelState, suppressed);
+
+    /// <summary>
+    /// Set/clear an individual suppression source. Suppression is the OR of
+    /// all sources; the resync hook fires only when the combined mask
+    /// transitions from non-zero to zero (i.e. ALL sources released).
+    /// </summary>
+    public void SetSuppressionSource(SuppressionSource source, bool active)
     {
-        bool wasSuppressed = _suppressFanout;
-        _suppressFanout = suppressed;
-        if (wasSuppressed && !suppressed)
+        var prev = _suppressionMask;
+        var next = active ? (prev | source) : (prev & ~source);
+        if (next == prev) return;
+        _suppressionMask = next;
+        _suppressFanout = next != SuppressionSource.None;
+        if (prev != SuppressionSource.None && next == SuppressionSource.None)
             _parent.RequestResyncForAllSubscribersInGroup(this);
     }
 

@@ -100,6 +100,14 @@ public sealed class SymbolStateRegistry
     private readonly ILogger _logger;
     private long _staleSnapshotIgnored;
 
+    // O(1) cheap aggregates for the fanout backpressure gate. Maintained
+    // atomically on every (symbol, kind) state transition so callers on the
+    // hot path (GroupConflationHandler.OnBatchComplete) avoid scanning
+    // _entries on every batch (ConcurrentDictionary.Count is O(N) under
+    // table lock).
+    private int _knownSymbolCount;
+    private int _staleSymbolCount;
+
     public SymbolStateRegistry(ILogger logger)
     {
         _logger = logger;
@@ -159,7 +167,7 @@ public sealed class SymbolStateRegistry
         if (receivedRptSeq == 0)
             return new ObserveResult(GetState(securityId, kind), ObserveAction.Drop, false, false, 0);
 
-        var entry = _entries.GetOrAdd(securityId, _ => new SymbolEntry());
+        var entry = GetOrAddEntry(securityId);
         int idx = (int)kind;
         var (bootPolicy, livePolicy) = DefaultPolicies[idx];
 
@@ -167,6 +175,7 @@ public sealed class SymbolStateRegistry
         {
             var prev = entry.States[idx];
             uint lastSeen = entry.LastRptSeq[idx];
+            int prevMask = entry.StaleKindMask;
 
             switch (prev)
             {
@@ -208,6 +217,7 @@ public sealed class SymbolStateRegistry
                     entry.States[idx] = SymbolState.Stale;
                     entry.StaleSinceTicks[idx] = Environment.TickCount64;
                     entry.StaleKindMask |= 1 << idx;
+                    if (prevMask == 0) Interlocked.Increment(ref _staleSymbolCount);
                     if (_logger.IsEnabled(LogLevel.Debug))
                         _logger.LogDebug(
                             "SymbolState: secId={SecurityId} kind={Kind} Healthy→Stale (expected={Expected} received={Received} gap={Gap})",
@@ -247,12 +257,13 @@ public sealed class SymbolStateRegistry
     /// </summary>
     public HealResult HealFromSnapshot(ulong securityId, SymbolGapKind kind, uint snapshotRptSeq)
     {
-        var entry = _entries.GetOrAdd(securityId, _ => new SymbolEntry());
+        var entry = GetOrAddEntry(securityId);
         int idx = (int)kind;
         lock (entry.Sync)
         {
             var prev = entry.States[idx];
             uint priorHighWater = entry.LastRptSeq[idx];
+            int prevMask = entry.StaleKindMask;
 
             // Snapshot is authoritative. If snapshot rptSeq is older than what
             // we've already seen live, log it (could indicate a lagging snapshot
@@ -276,6 +287,8 @@ public sealed class SymbolStateRegistry
             {
                 entry.StaleKindMask &= ~(1 << idx);
                 entry.StaleSinceTicks[idx] = 0;
+                if (prevMask != 0 && entry.StaleKindMask == 0)
+                    Interlocked.Decrement(ref _staleSymbolCount);
             }
 
             // Drain window: anything strictly above snapshotRptSeq up to the
@@ -301,6 +314,7 @@ public sealed class SymbolStateRegistry
             var entry = kv.Value;
             lock (entry.Sync)
             {
+                int prevMask = entry.StaleKindMask;
                 for (int i = 0; i < KindCount; i++)
                 {
                     if (entry.States[i] != SymbolState.Unknown) affected++;
@@ -309,6 +323,8 @@ public sealed class SymbolStateRegistry
                     entry.StaleSinceTicks[i] = 0;
                 }
                 entry.StaleKindMask = 0;
+                if (prevMask != 0)
+                    Interlocked.Decrement(ref _staleSymbolCount);
             }
         }
         _logger.LogWarning("SymbolStateRegistry.ResetEpoch: reason={Reason} kindsCleared={Count}", reason, affected);
@@ -329,6 +345,7 @@ public sealed class SymbolStateRegistry
             var entry = kv.Value;
             lock (entry.Sync)
             {
+                int prevMask = entry.StaleKindMask;
                 for (int i = 0; i < KindCount; i++)
                 {
                     if (entry.States[i] == SymbolState.Healthy)
@@ -339,6 +356,8 @@ public sealed class SymbolStateRegistry
                         affected++;
                     }
                 }
+                if (prevMask == 0 && entry.StaleKindMask != 0)
+                    Interlocked.Increment(ref _staleSymbolCount);
             }
         }
         _logger.LogWarning("SymbolStateRegistry.MarkAllStale: reason={Reason} kindsAffected={Count}", reason, affected);
@@ -350,8 +369,29 @@ public sealed class SymbolStateRegistry
     /// </summary>
     public void EnsureRegistered(ulong securityId)
     {
-        _entries.GetOrAdd(securityId, _ => new SymbolEntry());
+        GetOrAddEntry(securityId);
     }
+
+    /// <summary>Centralized entry creator that maintains the cheap <see cref="KnownSymbolCount"/> counter.</summary>
+    private SymbolEntry GetOrAddEntry(ulong securityId)
+    {
+        if (_entries.TryGetValue(securityId, out var existing)) return existing;
+        var fresh = new SymbolEntry();
+        if (_entries.TryAdd(securityId, fresh))
+        {
+            Interlocked.Increment(ref _knownSymbolCount);
+            return fresh;
+        }
+        return _entries[securityId];
+    }
+
+    /// <summary>O(1) symbol count maintained on insert. Safe on the hot path
+    /// (unlike <c>ConcurrentDictionary.Count</c> which acquires the table lock).</summary>
+    public int KnownSymbolCount => Volatile.Read(ref _knownSymbolCount);
+
+    /// <summary>O(1) count of symbols with at least one Stale kind. Maintained
+    /// on every entry's <c>StaleKindMask</c> transition between 0 and non-zero.</summary>
+    public int StaleSymbolCount => Volatile.Read(ref _staleSymbolCount);
 
     public SymbolState GetState(ulong securityId, SymbolGapKind kind)
     {

@@ -198,6 +198,24 @@ public sealed class AppSettings
     /// </summary>
     public RecoveryMode RecoveryMode { get; set; } = RecoveryMode.Channel;
 
+    /// <summary>
+    /// Fraction (0..1) of symbols that must be Stale to engage market-wide fanout
+    /// suppression in PerSymbol mode. When the ratio crosses this high-watermark
+    /// the group's broadcaster stops fanning out updates and clients are
+    /// resync'd once the ratio drops below <see cref="PerSymbolFanoutSuppressLowPct"/>.
+    /// Default 0.50 (suppress when ≥50% of known symbols are Stale). Set
+    /// negative to disable. CLI: env <c>UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT</c>.
+    /// </summary>
+    public double PerSymbolFanoutSuppressHighPct { get; set; } = 0.50;
+
+    /// <summary>
+    /// Hysteresis low-watermark (0..1): fanout suppression engaged via the
+    /// high-watermark releases only after the stale ratio drops at or below
+    /// this value. Must be ≤ <see cref="PerSymbolFanoutSuppressHighPct"/>.
+    /// Default 0.10. CLI: env <c>UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT</c>.
+    /// </summary>
+    public double PerSymbolFanoutSuppressLowPct { get; set; } = 0.10;
+
     /// <summary>Load settings from a JSON file.</summary>
     public static AppSettings LoadFromFile(string path)
     {
@@ -285,6 +303,13 @@ public sealed class AppSettings
         var recoveryMode = Environment.GetEnvironmentVariable("UMDF_RECOVERY_MODE");
         if (!string.IsNullOrWhiteSpace(recoveryMode) && TryParseRecoveryMode(recoveryMode, out var rm))
             RecoveryMode = rm;
+
+        if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT"),
+                System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var psHigh))
+            PerSymbolFanoutSuppressHighPct = psHigh;
+        if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT"),
+                System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var psLow))
+            PerSymbolFanoutSuppressLowPct = psLow;
     }
 
     public static bool TryParseRecoveryMode(string value, out RecoveryMode mode)

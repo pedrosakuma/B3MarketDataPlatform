@@ -465,6 +465,18 @@ static class MetricsBinder
                 new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
             unit: "{gaps}", description: "Channel-level gaps absorbed without entering Recovery (PerSymbol mode)");
 
+        Meter.CreateObservableGauge("b3.umdf.persymbol.fanout_suppressed",
+            () =>
+            {
+                var m = new List<Measurement<int>>(groupHandlers?.Count ?? 0);
+                if (groupHandlers is null) return m;
+                for (int i = 0; i < groupHandlers.Count; i++)
+                    m.Add(new(groupHandlers[i].IsFanoutSuppressed ? 1 : 0,
+                        Tag("group", $"G{groupIds[i]}")));
+                return m;
+            },
+            description: "1 when broadcaster fanout is suppressed for the group (channel-state OR per-symbol stale-ratio gate)");
+
         // ── Book gauges ──
 
         Meter.CreateObservableGauge("b3.umdf.book.active",

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using B3.Umdf.Book;
 using B3.Umdf.Feed;
 using B3.Umdf.PcapReplay;
 using B3.Umdf.Server;
@@ -267,36 +268,62 @@ internal static class ReplaySourcesBuilder
 /// Wires per-group fanout suppression: while a feed group is in
 /// Recovery/CatchUp, the matching <see cref="GroupConflationHandler"/>
 /// suppresses per-client fanout. On RealTime entry it schedules a fresh
-/// snapshot for every Book subscriber in the group.
+/// snapshot for every Book subscriber in the group. In PerSymbol recovery
+/// mode it additionally attaches a <see cref="PerSymbolFanoutGate"/> that
+/// suppresses fanout when too many symbols are Stale.
 /// </summary>
 internal static class FanoutSuppressionWiring
 {
     public static void Wire(
         IReadOnlyList<int> groupIds,
         IReadOnlyList<GroupConflationHandler> groupHandlers,
+        IReadOnlyList<BookManager> bookManagers,
+        AppSettings settings,
         MultiFeedManager? multiFeed,
         FeedHandler? singleFeed)
     {
-        var byGid = new Dictionary<int, GroupConflationHandler>();
-        for (int i = 0; i < groupIds.Count && i < groupHandlers.Count; i++)
-            byGid[groupIds[i]] = groupHandlers[i];
+        var byGid = new Dictionary<int, (GroupConflationHandler Conflation, BookManager Book)>();
+        for (int i = 0; i < groupIds.Count && i < groupHandlers.Count && i < bookManagers.Count; i++)
+            byGid[groupIds[i]] = (groupHandlers[i], bookManagers[i]);
 
         if (multiFeed is not null)
         {
             foreach (var (gid, fh) in multiFeed.Handlers)
-                WireOne(byGid, gid, fh);
+                WireOne(byGid, gid, fh, settings);
         }
         else if (singleFeed is not null && groupIds.Count > 0)
         {
-            WireOne(byGid, groupIds[0], singleFeed);
+            WireOne(byGid, groupIds[0], singleFeed, settings);
         }
     }
 
-    private static void WireOne(Dictionary<int, GroupConflationHandler> byGid, int gid, FeedHandler fh)
+    private static void WireOne(
+        Dictionary<int, (GroupConflationHandler Conflation, BookManager Book)> byGid,
+        int gid,
+        FeedHandler fh,
+        AppSettings settings)
     {
-        if (!byGid.TryGetValue(gid, out var gh)) return;
+        if (!byGid.TryGetValue(gid, out var entry)) return;
+        var gh = entry.Conflation;
         gh.SetFanoutSuppressed(fh.State != FeedState.RealTime);
         fh.StateChanged += (_, newState) =>
             gh.SetFanoutSuppressed(newState != FeedState.RealTime);
+
+        // PerSymbol mode: additionally engage market-wide fanout suppression
+        // when a large fraction of symbols becomes Stale (e.g. ChannelReset_11,
+        // mass loss). The channel-state gate above only fires pre-RealTime;
+        // post-RealTime the per-symbol layer handles gaps without leaving
+        // RealTime, so a separate evaluator is required.
+        var registry = entry.Book.StateRegistry;
+        if (registry is not null)
+        {
+            var gate = new PerSymbolFanoutGate(
+                registry,
+                gh,
+                settings.PerSymbolFanoutSuppressHighPct,
+                settings.PerSymbolFanoutSuppressLowPct);
+            if (gate.Enabled)
+                gh.PreBatchEvaluator = gate.Evaluate;
+        }
     }
 }

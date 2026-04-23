@@ -484,7 +484,8 @@ if (subscriptionManager is not null)
         groupHandlers.ToArray());
 
     // Suppress per-client fanout while the feed for a group is in Recovery/CatchUp.
-    FanoutSuppressionWiring.Wire(groupIds, groupHandlers, multiFeed, singleFeed);
+    // In PerSymbol mode this also engages a market-wide stale-ratio gate.
+    FanoutSuppressionWiring.Wire(groupIds, groupHandlers, bookManagers, settings, multiFeed, singleFeed);
 
     wsHost = new WebSocketHost(
         subscriptionManager,
@@ -528,7 +529,7 @@ if (subscriptionManager is not null)
 // Periodic stats timer
 var sw = Stopwatch.StartNew();
 var statsPrinter = new StatsPrinter(sw, stats, bookManagers, marketDataManagers, symbolRegistry,
-    groupIds, multiFeed, singleFeed, subscriptionManager);
+    groupIds, multiFeed, singleFeed, subscriptionManager, groupHandlers);
 
 // Register OTEL-compatible metrics (System.Diagnostics.Metrics)
 MetricsBinder.Register(stats, bookManagers, marketDataManagers, groupIds,

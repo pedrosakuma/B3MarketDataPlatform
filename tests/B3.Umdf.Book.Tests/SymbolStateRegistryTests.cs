@@ -230,4 +230,90 @@ public class SymbolStateRegistryTests
         r.Observe(1, SymbolGapKind.Mbo, 110); // Stale
         Assert.True(r.IsAnyStale(1));
     }
+
+    // ---- KnownSymbolCount / StaleSymbolCount (cheap aggregates for fanout gate) ----
+
+    [Fact]
+    public void KnownSymbolCount_IncrementsOnFirstObservationAndEnsureRegistered()
+    {
+        var r = NewRegistry();
+        Assert.Equal(0, r.KnownSymbolCount);
+
+        r.EnsureRegistered(1);
+        Assert.Equal(1, r.KnownSymbolCount);
+
+        r.EnsureRegistered(1); // idempotent
+        Assert.Equal(1, r.KnownSymbolCount);
+
+        r.Observe(2, SymbolGapKind.PriceBand, 5);
+        Assert.Equal(2, r.KnownSymbolCount);
+
+        r.HealFromSnapshot(3, SymbolGapKind.Mbo, 100);
+        Assert.Equal(3, r.KnownSymbolCount);
+    }
+
+    [Fact]
+    public void StaleSymbolCount_TracksHealthyToStaleTransitions()
+    {
+        var r = NewRegistry();
+        // Bring two MBO symbols Healthy.
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        r.HealFromSnapshot(2, SymbolGapKind.Mbo, 200);
+        r.Observe(2, SymbolGapKind.Mbo, 201);
+        Assert.Equal(0, r.StaleSymbolCount);
+
+        // Gap → Stale on symbol 1.
+        r.Observe(1, SymbolGapKind.Mbo, 110);
+        Assert.Equal(1, r.StaleSymbolCount);
+
+        // Heal symbol 1 → back to 0.
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 120);
+        Assert.Equal(0, r.StaleSymbolCount);
+    }
+
+    [Fact]
+    public void StaleSymbolCount_DoesNotDoubleCount_PerSymbolAcrossKinds()
+    {
+        // Symbol with both MBO Stale and another kind Stale should count once.
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        // Force MBO Stale.
+        r.Observe(1, SymbolGapKind.Mbo, 110);
+        Assert.Equal(1, r.StaleSymbolCount);
+
+        // Heal MBO; now symbol back to Healthy → 0.
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 120);
+        Assert.Equal(0, r.StaleSymbolCount);
+    }
+
+    [Fact]
+    public void MarkAllStale_IncrementsCountForEachAffectedSymbol()
+    {
+        var r = NewRegistry();
+        for (ulong s = 1; s <= 5; s++)
+        {
+            r.HealFromSnapshot(s, SymbolGapKind.Mbo, 100);
+            r.Observe(s, SymbolGapKind.Mbo, 101);
+        }
+        Assert.Equal(0, r.StaleSymbolCount);
+
+        r.MarkAllStale("test");
+        Assert.Equal(5, r.StaleSymbolCount);
+        Assert.Equal(5, r.KnownSymbolCount);
+    }
+
+    [Fact]
+    public void ResetEpoch_ClearsStaleCount()
+    {
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 110); // Stale
+        Assert.Equal(1, r.StaleSymbolCount);
+
+        r.ResetEpoch("test");
+        Assert.Equal(0, r.StaleSymbolCount);
+        Assert.Equal(1, r.KnownSymbolCount);
+    }
 }
