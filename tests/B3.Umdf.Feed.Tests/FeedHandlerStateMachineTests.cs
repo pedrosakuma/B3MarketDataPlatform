@@ -29,6 +29,29 @@ public class FeedHandlerStateMachineTests
             lease);
     }
 
+    // Build a minimal valid snapshot packet: PacketHeader + 1 framed SBE message
+    // with the given templateId. The body is empty (8-byte SBE MessageHeader only).
+    // DispatchSnapshotMessages doesn't parse the body — it only reads templateId
+    // for OnPacket dispatch — so this is sufficient to test the dispatch wire.
+    private static UmdfPacket MakeSnapshotPacket(uint seqNum, ushort templateId, ushort seqVer = 1)
+    {
+        const int sbeHeaderSize = 8; // BlockLength(2)+TemplateId(2)+SchemaId(2)+Version(2)
+        const int framingSize = 4;   // FramingHeader: MessageLength(2)+EncodingType(2)
+        var buf = new byte[PacketHeader.MESSAGE_SIZE + framingSize + sbeHeaderSize];
+
+        // PacketHeader
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), seqVer);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), seqNum);
+
+        // FramingHeader at offset 16: MessageLength includes framing (4) + sbeHeader (8) = 12
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(PacketHeader.MESSAGE_SIZE), (ushort)(framingSize + sbeHeaderSize));
+
+        // SBE MessageHeader at offset 20: blockLength(0)+templateId+schemaId(0)+version(0)
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(PacketHeader.MESSAGE_SIZE + framingSize + 2), templateId);
+
+        return new UmdfPacket { Data = buf, Channel = ChannelType.SnapshotRecovery, ChannelGroup = 1, ReceivedTimestampTicks = 100L };
+    }
+
     [Fact]
     public void InitialState_IsWaitInstrumentDefinition()
     {
@@ -310,6 +333,55 @@ public class FeedHandlerStateMachineTests
         Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
     }
 
+    [Fact]
+    public void PerSymbolMode_SnapshotRecoveryDuringRealTime_DispatchesMessages()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        // Use Header_30 templateId — DispatchSnapshotMessages does not parse the body,
+        // so any templateId is fine; we just observe the OnPacket fanout.
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(1, tracker.SeenPacketCount);
+        Assert.Equal(headerTemplateId, tracker.LastTemplateId);
+    }
+
+    [Fact]
+    public void ChannelMode_SnapshotRecoveryDuringRealTime_IsIgnored()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.Channel);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(0, tracker.SeenPacketCount);
+    }
+
+    [Fact]
+    public void PerSymbolMode_SnapshotDispatch_BypassesCycleGating()
+    {
+        // Channel mode would skip the first cycle in DispatchAndTrackSnapshot
+        // (waiting for SequenceVersion to flip). PerSymbol mode dispatches the
+        // very first snapshot message immediately so symbols heal without a
+        // ~100s wait. Two packets at the same seqVer must both be dispatched.
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId, seqVer: 7));
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 2, templateId: headerTemplateId, seqVer: 7));
+
+        Assert.Equal(2, tracker.SeenPacketCount);
+    }
+
     private class NopFeedEventHandler : IFeedEventHandler
     {
         public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
@@ -459,8 +531,13 @@ public class FeedHandlerStateMachineTests
     {
         public int PacketProcessedCount;
         public int SeenPacketCount;
+        public ushort LastTemplateId;
         public (uint Expected, uint Received)? LastGap;
-        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) => SeenPacketCount++;
+        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
+        {
+            SeenPacketCount++;
+            LastTemplateId = templateId;
+        }
         public void OnPacketProcessed() => PacketProcessedCount++;
         public void OnGapDetected(uint expected, uint received) => LastGap = (expected, received);
         public void OnSequenceReset() { }

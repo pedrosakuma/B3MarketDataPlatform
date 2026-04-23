@@ -316,8 +316,17 @@ public sealed class FeedHandler : IDisposable
                 // Stale instruments can heal without triggering a channel-wide
                 // Recovery cycle. Channel mode ignores snapshots while in RealTime
                 // (incremental stream is the source of truth).
+                //
+                // We bypass DispatchAndTrackSnapshot's cycle-gating logic here:
+                // per-symbol heal needs Header_30 + Orders_71 for an individual
+                // symbol to land at BookManager as soon as they arrive. A symbol's
+                // snapshot pair is self-consistent regardless of which cycle is in
+                // progress; the Registry's HealFromSnapshot takes the latest
+                // baseline. Cycle-skipping (used by Channel mode to avoid partial
+                // first cycles on join) would force every symbol to wait a full
+                // ~100s cycle before its first heal.
                 if (_recoveryMode == RecoveryMode.PerSymbol)
-                    DispatchAndTrackSnapshot(in packet);
+                    DispatchSnapshotMessages(in packet);
                 break;
         }
     }
@@ -553,6 +562,38 @@ public sealed class FeedHandler : IDisposable
             _snapshotMinSeqNum = lastProcessed;
         if (lastProcessed > _snapshotMaxSeqNum)
             _snapshotMaxSeqNum = lastProcessed;
+    }
+
+    /// <summary>
+    /// PerSymbol mode: dispatch every SBE message in a snapshot packet directly
+    /// to the event handler, bypassing the cycle-skipping state used by
+    /// <see cref="DispatchAndTrackSnapshot"/>. Per-symbol heal does not depend
+    /// on cycle boundaries — each (Header_30, Orders_71) pair is self-contained
+    /// and can heal one instrument at a time.
+    /// </summary>
+    private void DispatchSnapshotMessages(in UmdfPacket packet)
+    {
+        var span = packet.Data.Span;
+        if (!PacketHeader.TryParse(span, out _, out _))
+            return;
+
+        int offset = PacketHeader.MESSAGE_SIZE;
+        while (offset + FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize <= span.Length)
+        {
+            var framingSlice = span[offset..];
+            if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
+                break;
+            if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize)
+                break;
+            if (offset + framing.MessageLength > span.Length)
+                break;
+
+            var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
+            ushort templateId = MemoryMarshal.Read<ushort>(sbeSlice[2..]);
+            _eventHandler.OnPacket(in packet, sbeSlice, templateId);
+
+            offset += framing.MessageLength;
+        }
     }
 
     /// <summary>
