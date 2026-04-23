@@ -246,6 +246,73 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.DeleteNotFound),
             description: "Delete operations on non-existent orders");
 
+        // ── Per-symbol gap detection (Phase 0 — shadow only, no behavior change) ──
+        // Counts gaps detected via per-security rptSeq comparison. Provides
+        // production data to size the upcoming per-symbol recovery refactor.
+        // Channel-level Recovery is unaffected.
+        Meter.CreateObservableCounter("b3.umdf.symbol.gap.detected",
+            () =>
+            {
+                var measurements = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var grp = $"G{groupIds[i]}";
+                    measurements.Add(new(bookManagers[i].GapTracker.GapCount(SymbolGapKind.Mbo),
+                        Tag("group", grp), Tag("kind", "mbo")));
+                    var mdmTracker = marketDataManagers[i].GapTracker;
+                    foreach (SymbolGapKind k in Enum.GetValues<SymbolGapKind>())
+                    {
+                        if (k == SymbolGapKind.Mbo) continue;
+                        measurements.Add(new(mdmTracker.GapCount(k),
+                            Tag("group", grp), Tag("kind", k.ToString())));
+                    }
+                }
+                return measurements;
+            },
+            unit: "{gaps}", description: "Per-symbol rptSeq gap events (shadow tracking, no behavior change)");
+
+        Meter.CreateObservableCounter("b3.umdf.symbol.gap.size",
+            () =>
+            {
+                var measurements = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var grp = $"G{groupIds[i]}";
+                    measurements.Add(new(bookManagers[i].GapTracker.GapSizeSum(SymbolGapKind.Mbo),
+                        Tag("group", grp), Tag("kind", "mbo")));
+                    var mdmTracker = marketDataManagers[i].GapTracker;
+                    foreach (SymbolGapKind k in Enum.GetValues<SymbolGapKind>())
+                    {
+                        if (k == SymbolGapKind.Mbo) continue;
+                        measurements.Add(new(mdmTracker.GapSizeSum(k),
+                            Tag("group", grp), Tag("kind", k.ToString())));
+                    }
+                }
+                return measurements;
+            },
+            unit: "{rptseqs}", description: "Sum of skipped rptSeq counts across all per-symbol gaps");
+
+        Meter.CreateObservableGauge("b3.umdf.symbol.gap.affected",
+            () =>
+            {
+                var measurements = new List<Measurement<int>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var grp = $"G{groupIds[i]}";
+                    measurements.Add(new(bookManagers[i].GapTracker.AffectedSymbolCount(SymbolGapKind.Mbo),
+                        Tag("group", grp), Tag("kind", "mbo")));
+                    var mdmTracker = marketDataManagers[i].GapTracker;
+                    foreach (SymbolGapKind k in Enum.GetValues<SymbolGapKind>())
+                    {
+                        if (k == SymbolGapKind.Mbo) continue;
+                        measurements.Add(new(mdmTracker.AffectedSymbolCount(k),
+                            Tag("group", grp), Tag("kind", k.ToString())));
+                    }
+                }
+                return measurements;
+            },
+            unit: "{symbols}", description: "Distinct symbols that experienced at least one rptSeq gap (per kind, per group)");
+
         Meter.CreateObservableCounter("b3.umdf.book.null_price_skips",
             () => PerGroupBook(bm => bm.NullPriceNewSkips),
             description: "New orders skipped due to null price");

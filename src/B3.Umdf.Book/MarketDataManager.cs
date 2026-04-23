@@ -33,7 +33,15 @@ public sealed class MarketDataManager : IFeedEventHandler
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<MarketDataManager>.Instance;
+        GapTracker = new SymbolGapTracker(_logger);
     }
+
+    /// <summary>
+    /// Phase 0 shadow tracker for per-symbol rptSeq gaps across all
+    /// statistic message kinds handled here. Read-only — does not influence
+    /// the existing channel-level Recovery state machine.
+    /// </summary>
+    public SymbolGapTracker GapTracker { get; }
 
     public void FreezeData()
     {
@@ -228,6 +236,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqSecurityStatus, SymbolGapKind.SecurityStatus);
+            info.LastRptSeqSecurityStatus = (uint)rs;
+        }
+
         int? eventCode = msg.SecurityTradingEvent is { } evt ? (int)evt : null;
         info.TradingEvent = eventCode;
         info.TradSesOpenTime = msg.TradSesOpenTime.Time;
@@ -289,6 +303,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqOpeningPrice, SymbolGapKind.OpeningPrice);
+            info.LastRptSeqOpeningPrice = (uint)rs;
+        }
+
         info.OpeningPrice = msg.MDEntryPx.Mantissa;
         info.NetChangeFromPrevDay = msg.NetChgPrevDay.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
@@ -305,6 +325,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqTheoreticalOpeningPrice, SymbolGapKind.TheoreticalOpeningPrice);
+            info.LastRptSeqTheoreticalOpeningPrice = (uint)rs;
+        }
 
         info.TheoreticalOpeningPrice = msg.MDEntryPx.Mantissa;
         info.TheoreticalOpeningSize = msg.MDEntrySize;
@@ -323,6 +349,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqClosingPrice, SymbolGapKind.ClosingPrice);
+            info.LastRptSeqClosingPrice = (uint)rs;
+        }
+
         info.ClosingPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
@@ -338,6 +370,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqAuctionImbalance, SymbolGapKind.AuctionImbalance);
+            info.LastRptSeqAuctionImbalance = (uint)rs;
+        }
 
         info.AuctionImbalanceSize = msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
@@ -355,6 +393,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqQuantityBand, SymbolGapKind.QuantityBand);
+            info.LastRptSeqQuantityBand = (uint)rs;
+        }
+
         info.AvgDailyTradedQty = msg.AvgDailyTradedQty;
         info.MaxTradeVol = msg.MaxTradeVol;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
@@ -371,6 +415,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqPriceBand, SymbolGapKind.PriceBand);
+            info.LastRptSeqPriceBand = (uint)rs;
+        }
 
         info.PriceBandLow = msg.LowLimitPrice.Mantissa;
         info.PriceBandHigh = msg.HighLimitPrice.Mantissa;
@@ -390,6 +440,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqHighPrice, SymbolGapKind.HighPrice);
+            info.LastRptSeqHighPrice = (uint)rs;
+        }
+
         info.HighPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
@@ -406,6 +462,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqLowPrice, SymbolGapKind.LowPrice);
+            info.LastRptSeqLowPrice = (uint)rs;
+        }
+
         info.LowPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
@@ -421,6 +483,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqLastTradePrice, SymbolGapKind.LastTradePrice);
+            info.LastRptSeqLastTradePrice = (uint)rs;
+        }
 
         info.LastTradePrice = msg.MDEntryPx.Mantissa;
         info.LastTradeSize = (long)msg.MDEntrySize;
@@ -439,6 +507,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqSettlementPrice, SymbolGapKind.SettlementPrice);
+            info.LastRptSeqSettlementPrice = (uint)rs;
+        }
+
         info.SettlementPrice = msg.MDEntryPx.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
@@ -455,6 +529,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqOpenInterest, SymbolGapKind.OpenInterest);
+            info.LastRptSeqOpenInterest = (uint)rs;
+        }
+
         info.OpenInterest = (long)msg.MDEntrySize;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
@@ -470,6 +550,12 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        if (msg.RptSeq is { } rs)
+        {
+            GapTracker.Observe(securityId, (uint)rs, info.LastRptSeqExecutionStatistics, SymbolGapKind.ExecutionStatistics);
+            info.LastRptSeqExecutionStatistics = (uint)rs;
+        }
 
         info.TradeVolume = (long)msg.TradeVolume;
         info.VwapPrice = msg.VwapPx.Mantissa;

@@ -68,6 +68,26 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<BookManager>.Instance;
+        GapTracker = new SymbolGapTracker(_logger);
+    }
+
+    /// <summary>
+    /// Phase 0 shadow tracker for per-symbol rptSeq gaps on MBO/Trade
+    /// messages (which share one rptSeq stream per security in the B3
+    /// schema). Read-only — does not influence the channel-level Recovery
+    /// state machine.
+    /// </summary>
+    public SymbolGapTracker GapTracker { get; }
+
+    /// <summary>
+    /// Records the per-symbol rptSeq gap (if any) and updates the book's
+    /// <see cref="OrderBook.LastRptSeq"/>. Called from every MBO/Trade
+    /// handler instead of writing <c>LastRptSeq</c> directly.
+    /// </summary>
+    private void TrackMboRptSeq(OrderBook book, uint received)
+    {
+        GapTracker.Observe(book.SecurityId, received, book.LastRptSeq, SymbolGapKind.Mbo);
+        book.LastRptSeq = received;
     }
 
     // ── IMarketDataEventHandler ──
@@ -291,7 +311,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             {
                 _nullPriceChangeDeletes++;
                 bookSide.Remove(orderId);
-                if (msg.RptSeq is { } rs) book.LastRptSeq = (uint)rs;
+                if (msg.RptSeq is { } rs) TrackMboRptSeq(book, (uint)rs);
                 _eventHandler?.OnOrderDeleted(book, orderId, side);
             }
             else
@@ -317,7 +337,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 }
 
                 if (msg.RptSeq is { } rptSeq)
-                    book.LastRptSeq = (uint)rptSeq;
+                    TrackMboRptSeq(book, (uint)rptSeq);
 
                 _eventHandler?.OnOrderUpdated(book, in slot);
                 CheckCrossing(book, "UPDATE", orderId, price, side);
@@ -346,7 +366,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             _orderAdds++;
 
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                TrackMboRptSeq(book, (uint)rptSeq);
 
             _eventHandler?.OnOrderAdded(book, in entry);
             CheckCrossing(book, "ADD", orderId, price, side);
@@ -374,7 +394,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             _deleteNotFound++;
 
         if (msg.RptSeq is { } rptSeq)
-            book.LastRptSeq = (uint)rptSeq;
+            TrackMboRptSeq(book, (uint)rptSeq);
 
         _eventHandler?.OnOrderDeleted(book, orderId, side);
     }
@@ -409,7 +429,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
 
         if (msg.RptSeq is { } rptSeq)
-            book.LastRptSeq = (uint)rptSeq;
+            TrackMboRptSeq(book, (uint)rptSeq);
 
         _eventHandler?.OnBookCleared(securityId, clearSide);
     }
@@ -429,7 +449,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                TrackMboRptSeq(book, (uint)rptSeq);
         }
 
         _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs);
@@ -465,7 +485,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                TrackMboRptSeq(book, (uint)rptSeq);
         }
 
         _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs);
@@ -484,7 +504,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                TrackMboRptSeq(book, (uint)rptSeq);
         }
 
         _eventHandler?.OnExecutionSummary(securityId, lastPx, fillQty);
@@ -504,7 +524,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (TryLookupBook(securityId, out var book))
         {
             if (msg.RptSeq is { } rptSeq)
-                book.LastRptSeq = (uint)rptSeq;
+                TrackMboRptSeq(book, (uint)rptSeq);
         }
 
         _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);

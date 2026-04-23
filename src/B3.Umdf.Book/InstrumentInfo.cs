@@ -75,6 +75,24 @@ public sealed class InstrumentInfo
     // Timestamps
     public ulong LastUpdateTimestamp { get; set; }
 
+    // Per-symbol, per-message-kind rptSeq tracking (Phase 0 — shadow only).
+    // 0 means "no message of this kind seen yet"; gap detection should skip
+    // the first observation. Each statistic message has its own independent
+    // rptSeq counter per security in the B3 SBE schema.
+    public uint LastRptSeqOpeningPrice;            // tpl 15
+    public uint LastRptSeqTheoreticalOpeningPrice; // tpl 16
+    public uint LastRptSeqClosingPrice;            // tpl 17
+    public uint LastRptSeqAuctionImbalance;        // tpl 19
+    public uint LastRptSeqQuantityBand;            // tpl 21
+    public uint LastRptSeqPriceBand;               // tpl 22
+    public uint LastRptSeqHighPrice;               // tpl 24
+    public uint LastRptSeqLowPrice;                // tpl 25
+    public uint LastRptSeqLastTradePrice;          // tpl 27
+    public uint LastRptSeqSettlementPrice;         // tpl 28
+    public uint LastRptSeqOpenInterest;            // tpl 29
+    public uint LastRptSeqExecutionStatistics;     // tpl 56
+    public uint LastRptSeqSecurityStatus;          // tpl 3
+
     // SecurityDefinition repeating groups
     public string? SecurityDescription { get; set; }
     public List<UnderlyingInfo>? Underlyings { get; set; }
@@ -127,6 +145,19 @@ public sealed class InstrumentInfo
         NumberOfTrades = null;
         OpenInterest = null;
         LastUpdateTimestamp = 0;
+        LastRptSeqOpeningPrice = 0;
+        LastRptSeqTheoreticalOpeningPrice = 0;
+        LastRptSeqClosingPrice = 0;
+        LastRptSeqAuctionImbalance = 0;
+        LastRptSeqQuantityBand = 0;
+        LastRptSeqPriceBand = 0;
+        LastRptSeqHighPrice = 0;
+        LastRptSeqLowPrice = 0;
+        LastRptSeqLastTradePrice = 0;
+        LastRptSeqSettlementPrice = 0;
+        LastRptSeqOpenInterest = 0;
+        LastRptSeqExecutionStatistics = 0;
+        LastRptSeqSecurityStatus = 0;
         SecurityDescription = null;
         Underlyings = null;
         Legs = null;
