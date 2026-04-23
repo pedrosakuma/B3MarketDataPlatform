@@ -332,18 +332,22 @@ const subsState = { rows: new Map(), columnsKey: '' };
 // Fields that get a directional flash (green for up, red for down).
 // Everything else gets a neutral flash on any change.
 const DIRECTIONAL_FIELDS = new Set(['LastTradePrice', 'NetChange', 'VwapPrice']);
-const FLASH_UP   = 'rgba(38, 166, 91, 0.55)';
-const FLASH_DOWN = 'rgba(220, 67, 67, 0.55)';
-const FLASH_NEUT = 'rgba(140, 160, 200, 0.45)';
+// Inset box-shadow flash: an internal ring around the cell that fades out.
+// Doesn't touch text color, so it stays legible even on cells whose text
+// is already tinted (e.g. NetChange green/red). Works in all modern
+// browsers including on collapsed-border tables.
+const FLASH_UP   = 'rgba(46, 204, 113, 0.95)';
+const FLASH_DOWN = 'rgba(231, 76, 60, 0.95)';
+const FLASH_NEUT = 'rgba(120, 170, 255, 0.85)';
 const FLASH_DURATION_MS = 500;
 
-// Use the Web Animations API: GPU-friendly, auto-cleans, restarts cleanly
-// when called repeatedly on a rapidly-updating cell. Stored on the element
-// so we can cancel a previous animation in-flight without a layout thrash.
 function flashCell(td, color) {
   if (td._flashAnim) td._flashAnim.cancel();
   td._flashAnim = td.animate(
-    [{ backgroundColor: color }, { backgroundColor: 'transparent' }],
+    [
+      { boxShadow: `inset 0 0 0 2px ${color}` },
+      { boxShadow: 'inset 0 0 0 2px rgba(0,0,0,0)' },
+    ],
     { duration: FLASH_DURATION_MS, easing: 'ease-out' }
   );
 }
