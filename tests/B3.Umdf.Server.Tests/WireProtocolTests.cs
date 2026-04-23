@@ -278,4 +278,62 @@ public class WireProtocolTests
         bool ok = WireProtocol.TryReadFramingHeader(buf, out _, out _);
         Assert.False(ok);
     }
+
+    [Fact]
+    public void WriteRecoveryProgress_NoStaleKinds_OnlyTotalsAndZeroKindCount()
+    {
+        var buf = new byte[WireProtocol.RecoveryProgressMaxSize];
+        int len = WireProtocol.WriteRecoveryProgress(buf, totalSymbols: 18000, totalStaleSymbols: 0,
+            staleByKind: ReadOnlySpan<int>.Empty);
+
+        Assert.Equal(13, len); // 4 framing + 4 + 4 + 1
+        var (msgLen, type) = ReadFraming(buf);
+        Assert.Equal(13, msgLen);
+        Assert.Equal(MessageType.RecoveryProgress, type);
+        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(4)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(0, buf[12]); // kindCount
+    }
+
+    [Fact]
+    public void WriteRecoveryProgress_MixedKinds_OnlyEmitsNonZero()
+    {
+        var buf = new byte[WireProtocol.RecoveryProgressMaxSize];
+        Span<int> perKind = stackalloc int[14];
+        perKind[0] = 7;     // MBO
+        perKind[5] = 0;     // skipped
+        perKind[10] = 13;   // SettlementPrice
+
+        int len = WireProtocol.WriteRecoveryProgress(buf, 18000, 20, perKind);
+
+        var (msgLen, type) = ReadFraming(buf);
+        Assert.Equal(len, msgLen);
+        Assert.Equal(MessageType.RecoveryProgress, type);
+        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(4)));
+        Assert.Equal(20u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(2, buf[12]); // kindCount = 2
+
+        int off = 13;
+        Assert.Equal(0, buf[off++]);
+        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off))); off += 4;
+        Assert.Equal(10, buf[off++]);
+        Assert.Equal(13u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off))); off += 4;
+        Assert.Equal(len, off);
+    }
+
+    [Fact]
+    public void WriteRecoveryProgress_AllKindsStale_FitsInMaxSize()
+    {
+        var buf = new byte[WireProtocol.RecoveryProgressMaxSize];
+        Span<int> perKind = stackalloc int[14];
+        for (int i = 0; i < 14; i++) perKind[i] = i + 1;
+
+        int len = WireProtocol.WriteRecoveryProgress(buf, 18000, 99, perKind);
+
+        Assert.Equal(WireProtocol.RecoveryProgressMaxSize, len);
+        var (msgLen, type) = ReadFraming(buf);
+        Assert.Equal(len, msgLen);
+        Assert.Equal(MessageType.RecoveryProgress, type);
+        Assert.Equal(14, buf[12]);
+    }
 }

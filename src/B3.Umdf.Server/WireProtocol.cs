@@ -39,6 +39,14 @@ public enum MessageType : ushort
     /// rows / show a stale indicator. Coalesced per security in the conflation buffer:
     /// the last value within a packet wins.</summary>
     SymbolStaleStatus = 0x0070,
+
+    /// <summary>Server → Client: aggregate recovery progress (PerSymbol recovery mode).
+    /// Periodic broadcast (~250ms) of total stale symbols and per-kind breakdown across
+    /// all channel groups. Stops after totalStale=0 has been broadcast once so clients
+    /// can clear the dashboard banner. Independent of <see cref="SymbolStaleStatus"/>:
+    /// that message targets per-row dimming for subscribed symbols, this one drives the
+    /// global "Recovering N/M symbols" banner.</summary>
+    RecoveryProgress = 0x0080,
 }
 
 public enum SubscribeErrorCode : byte
@@ -215,6 +223,43 @@ public static class WireProtocol
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
         dest[12] = isStale ? (byte)1 : (byte)0;
         return totalLen;
+    }
+
+    /// <summary>
+    /// Max buffer size for RecoveryProgress: header(4) + totals(8) + kindCount(1)
+    /// + 14 kinds × (1 byte id + 4 byte count) = 83 bytes.
+    /// </summary>
+    public const int RecoveryProgressMaxSize = FramingHeaderSize + 4 + 4 + 1 + 14 * 5;
+
+    /// <summary>
+    /// Write RecoveryProgress aggregate: totalSymbols, totalStaleSymbols, then
+    /// (kindId, count) pairs for every kind whose count is non-zero. Caller is
+    /// expected to provide a buffer of at least <see cref="RecoveryProgressMaxSize"/>
+    /// bytes. Returns the number of bytes written.
+    /// </summary>
+    public static int WriteRecoveryProgress(
+        Span<byte> dest,
+        uint totalSymbols,
+        uint totalStaleSymbols,
+        ReadOnlySpan<int> staleByKind)
+    {
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], totalSymbols); offset += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], totalStaleSymbols); offset += 4;
+        int kindCountOffset = offset;
+        offset += 1; // placeholder for kindCount
+        byte kindCount = 0;
+        for (int i = 0; i < staleByKind.Length; i++)
+        {
+            int v = staleByKind[i];
+            if (v <= 0) continue;
+            dest[offset++] = (byte)i;
+            BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], (uint)v); offset += 4;
+            kindCount++;
+        }
+        dest[kindCountOffset] = kindCount;
+        WriteFramingHeader(dest, (ushort)offset, MessageType.RecoveryProgress);
+        return offset;
     }
 
     // --- InfoSnapshot (variable-length, bitmask-driven) ---

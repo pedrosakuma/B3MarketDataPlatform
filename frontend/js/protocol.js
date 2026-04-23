@@ -12,6 +12,7 @@ export const MSG = {
   CANDLE_SNAPSHOT: 0x0060,
   CANDLE_UPDATE: 0x0061,
   SYMBOL_STALE_STATUS: 0x0070,
+  RECOVERY_PROGRESS: 0x0080,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -210,6 +211,18 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const securityId = v.getBigUint64(o, true); o += 8;
       const isStale = v.getUint8(o) === 1;
       return { type: 'SymbolStaleStatus', securityId, isStale };
+    }
+    case MSG.RECOVERY_PROGRESS: {
+      const totalSymbols = v.getUint32(o, true); o += 4;
+      const totalStaleSymbols = v.getUint32(o, true); o += 4;
+      const kindCount = v.getUint8(o); o += 1;
+      const staleByKind = {};
+      for (let i = 0; i < kindCount; i++) {
+        const kindId = v.getUint8(o); o += 1;
+        const count = v.getUint32(o, true); o += 4;
+        staleByKind[kindId] = count;
+      }
+      return { type: 'RecoveryProgress', totalSymbols, totalStaleSymbols, staleByKind };
     }
     default:
       return null;

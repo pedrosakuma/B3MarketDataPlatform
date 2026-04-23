@@ -260,8 +260,38 @@ worker.onmessage = (evt) => {
     case 'log':
       showToast(msg.text, msg.cssClass);
       break;
+    case 'recoveryProgress':
+      renderRecoveryBanner(msg.totalStaleSymbols, msg.totalSymbols, msg.staleByKind);
+      break;
   }
 };
+
+// Per-symbol stale-status kinds (mirrors B3.Umdf.Book.SymbolGapKind).
+const RECOVERY_KIND_NAMES = [
+  'MBO', 'OpeningPrice', 'TheoreticalOpeningPrice', 'ClosingPrice',
+  'AuctionImbalance', 'QuantityBand', 'PriceBand', 'HighPrice',
+  'LowPrice', 'LastTradePrice', 'SettlementPrice', 'OpenInterest',
+  'ExecutionStatistics', 'SecurityStatus',
+];
+
+function renderRecoveryBanner(staleCount, totalCount, staleByKind) {
+  let banner = $('recoveryBanner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'recoveryBanner';
+    banner.className = 'recovery-banner';
+    document.body.appendChild(banner);
+  }
+  if (!staleCount) { banner.style.display = 'none'; return; }
+  const parts = [];
+  for (const [kindId, n] of Object.entries(staleByKind || {})) {
+    const name = RECOVERY_KIND_NAMES[+kindId] || `Kind${kindId}`;
+    parts.push(`${name}:${n}`);
+  }
+  const breakdown = parts.length > 0 ? ` (${parts.join(', ')})` : '';
+  banner.textContent = `\u26A0 Recovering ${staleCount}/${totalCount} symbols${breakdown}`;
+  banner.style.display = 'block';
+}
 
 // ── Render (single rAF per worker frame) ──
 let renderPending = false;

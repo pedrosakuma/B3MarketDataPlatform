@@ -756,14 +756,74 @@ public sealed class SubscriptionManager : IDisposable
             if (_clients.Count > 0)
                 PushRankings();
         }, null, RankingsIntervalMs, RankingsIntervalMs);
+
+        StartRecoveryProgressTimer();
     }
 
     /// <summary>Stop the background rankings timer.</summary>
-    public void StopRankingsTimer() => _rankingsTimer?.Dispose();
+    public void StopRankingsTimer()
+    {
+        _rankingsTimer?.Dispose();
+        _recoveryProgressTimer?.Dispose();
+    }
+
+    // ─── Recovery progress broadcast ────────────────────────────────────────
+    // Aggregates SymbolStateRegistry counters across every BookManager every
+    // 250ms and emits a RecoveryProgress message whenever stale symbols exist.
+    // Sends one last "all clear" message after stale drops to 0 so the UI can
+    // close the recovering banner; then idles until stale > 0 again.
+
+    private Timer? _recoveryProgressTimer;
+    private const long RecoveryProgressIntervalMs = 250;
+    private bool _recoveryProgressLastNonZero;
+
+    private void StartRecoveryProgressTimer()
+    {
+        _recoveryProgressTimer = new Timer(
+            _ => PushRecoveryProgress(),
+            null,
+            RecoveryProgressIntervalMs,
+            RecoveryProgressIntervalMs);
+    }
+
+    private void PushRecoveryProgress()
+    {
+        if (_clients.IsEmpty) return;
+        var managers = _bookManagers;
+        if (managers is null || managers.Length == 0) return;
+
+        Span<int> perKind = stackalloc int[14];
+        perKind.Clear();
+        int totalStale = 0;
+        int totalKnown = 0;
+
+        foreach (var bm in managers)
+        {
+            if (bm?.StateRegistry is not { } reg) continue;
+            var snap = reg.GetAggregateSnapshot();
+            totalStale += snap.TotalStaleSymbols;
+            totalKnown += snap.TotalSymbols;
+            int n = Math.Min(perKind.Length, snap.StaleByKind.Length);
+            for (int i = 0; i < n; i++) perKind[i] += snap.StaleByKind[i];
+        }
+
+        // Edge-triggered idle: when stale falls from >0 to 0 emit one final
+        // all-clear message, then suppress until stale becomes >0 again.
+        bool isNonZero = totalStale > 0;
+        if (!isNonZero && !_recoveryProgressLastNonZero) return;
+        _recoveryProgressLastNonZero = isNonZero;
+
+        Span<byte> buf = stackalloc byte[WireProtocol.RecoveryProgressMaxSize];
+        int len = WireProtocol.WriteRecoveryProgress(buf, (uint)totalKnown, (uint)totalStale, perKind);
+        var payload = new ReadOnlyMemory<byte>(buf[..len].ToArray());
+        foreach (var (_, client) in _clients)
+            client.TryEnqueue(payload);
+    }
 
     public void Dispose()
     {
         _rankingsTimer?.Dispose();
+        _recoveryProgressTimer?.Dispose();
         _outlierSweepTimer?.Dispose();
     }
 

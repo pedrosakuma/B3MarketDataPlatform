@@ -820,6 +820,15 @@ function handleMessage(msg) {
       }
       break;
     }
+    case 'RecoveryProgress': {
+      postMessage({
+        type: 'recoveryProgress',
+        totalSymbols: msg.totalSymbols,
+        totalStaleSymbols: msg.totalStaleSymbols,
+        staleByKind: msg.staleByKind,
+      });
+      break;
+    }
   }
 }
 
