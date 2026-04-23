@@ -1,39 +1,31 @@
 namespace B3.Umdf.Feed;
 
 /// <summary>
-/// State machine for UMDF channel synchronization.
-/// 
-/// WAIT_INSTRUMENT_DEF → WAIT_SNAPSHOT → CATCH_UP → REAL_TIME
-///                                                      ↓ (gap)
-///                                                  RECOVERY → WAIT_SNAPSHOT
+/// Channel-level state machine for UMDF feed bootstrap.
+///
+/// WaitInstrumentDefinition → (all SecDefs received) → Streaming
+///
+/// Per-symbol bootstrap, gap detection, and healing are owned by the
+/// SymbolStateRegistry / BookManager / MarketDataManager layer (Unknown →
+/// Stale → Healthy). The channel-level state machine no longer reacts to
+/// gaps or snapshots: a gap is absorbed (per-symbol routing flips affected
+/// instruments to Stale), and snapshots heal Stale symbols continuously
+/// without interrupting Streaming.
 /// </summary>
 public enum FeedState
 {
     /// <summary>
     /// Initial state. Consuming Instrument Definition stream from start to end.
-    /// Incremental packets are queued but not processed.
+    /// Incremental and snapshot packets received in this window are discarded
+    /// (cannot be decoded without metadata; the snapshot stream will heal each
+    /// symbol once Streaming begins).
     /// </summary>
     WaitInstrumentDefinition,
 
     /// <summary>
-    /// Instrument definitions loaded. Consuming Snapshot Recovery stream from start to end.
-    /// Incremental packets are queued but not processed.
+    /// Universe metadata is loaded. Incremental, snapshot, and instrument
+    /// definition packets are all processed. Per-symbol layer drives bootstrap
+    /// (Unknown → Stale → Healthy as snapshots arrive) and gap recovery.
     /// </summary>
-    WaitSnapshot,
-
-    /// <summary>
-    /// Snapshot consumed. Replaying queued incrementals that have SeqNum > snapshot's LastMsgSeqNumProcessed.
-    /// </summary>
-    CatchUp,
-
-    /// <summary>
-    /// Fully synchronized. Processing incremental packets in real time.
-    /// </summary>
-    RealTime,
-
-    /// <summary>
-    /// Gap detected in incremental stream. Waiting for snapshot to resynchronize.
-    /// Incremental packets are queued.
-    /// </summary>
-    Recovery
+    Streaming,
 }

@@ -103,7 +103,6 @@ public sealed class ChannelHandler : IDisposable
             _inRecovery = true;
             _lastGapExpected = _expectedSeqNum;
             _lastGapReceived = seq;
-            _eventHandler.OnGapDetected(_expectedSeqNum, seq);
             return GapResult.Gap;
         }
 

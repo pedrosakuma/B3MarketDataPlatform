@@ -30,34 +30,21 @@ public sealed class MarketDataManager : IFeedEventHandler
     public long ParseErrors => Volatile.Read(ref _parseErrors);
 
     public MarketDataManager(IMarketDataEventHandler? eventHandler = null, ILogger<MarketDataManager>? logger = null,
-        SymbolStateRegistry? stateRegistry = null,
-        RecoveryMode recoveryMode = RecoveryMode.Channel)
+        SymbolStateRegistry? stateRegistry = null)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<MarketDataManager>.Instance;
         GapTracker = new SymbolGapTracker(_logger);
-        _recoveryMode = recoveryMode;
-        if (recoveryMode == RecoveryMode.PerSymbol)
-        {
-            _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
-                "SymbolStateRegistry is required when RecoveryMode is PerSymbol.");
-        }
-        else
-        {
-            _stateRegistry = stateRegistry;
-        }
+        _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
+            "SymbolStateRegistry is required.");
     }
 
-    private readonly RecoveryMode _recoveryMode;
-    private readonly SymbolStateRegistry? _stateRegistry;
+    private readonly SymbolStateRegistry _stateRegistry;
     private long _droppedDuplicateStats;
     private long _liveResyncs;
 
-    /// <summary>The recovery mode this MarketDataManager is operating in.</summary>
-    public RecoveryMode RecoveryMode => _recoveryMode;
-
-    /// <summary>Symbol state registry (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
-    public SymbolStateRegistry? StateRegistry => _stateRegistry;
+    /// <summary>Symbol state registry (PerSymbol recovery is the only supported mode).</summary>
+    public SymbolStateRegistry StateRegistry => _stateRegistry;
 
     /// <summary>Stat messages dropped because the registry detected a duplicate (lower-or-equal rptSeq).</summary>
     public long DroppedDuplicateStats => Volatile.Read(ref _droppedDuplicateStats);
@@ -66,20 +53,14 @@ public sealed class MarketDataManager : IFeedEventHandler
     public long LiveResyncs => Volatile.Read(ref _liveResyncs);
 
     /// <summary>
-    /// Per-stat-kind routing decision. In Channel mode, runs the Phase 0
-    /// shadow tracker and always returns true. In PerSymbol mode, consults
-    /// the registry: returns false if the message is a duplicate (Drop),
-    /// true otherwise (Apply, including across a NextMessage live-resync gap).
+    /// Per-stat-kind routing decision. Consults the registry: returns false
+    /// if the message is a duplicate (Drop), true otherwise (Apply, including
+    /// across a NextMessage live-resync gap).
     /// </summary>
     private bool RouteStat(ulong securityId, SymbolGapKind kind, uint receivedRptSeq, uint priorRptSeq)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol)
-        {
-            GapTracker.Observe(securityId, receivedRptSeq, priorRptSeq, kind);
-            return true;
-        }
         if (receivedRptSeq == 0) return true; // schema absent; cannot gap-check
-        var result = _stateRegistry!.Observe(securityId, kind, receivedRptSeq);
+        var result = _stateRegistry.Observe(securityId, kind, receivedRptSeq);
         if (result.Action == SymbolStateRegistry.ObserveAction.Drop)
         {
             Interlocked.Increment(ref _droppedDuplicateStats);
@@ -91,10 +72,9 @@ public sealed class MarketDataManager : IFeedEventHandler
     }
 
     /// <summary>
-    /// Phase 0 shadow tracker for per-symbol rptSeq gaps across all
-    /// statistic message kinds handled here. In Channel mode it is the
-    /// only gap-tracking surface; in PerSymbol mode it remains for
-    /// telemetry but the registry is the source of truth.
+    /// Per-symbol rptSeq gap shadow tracker (telemetry only). The registry is
+    /// the source of truth for routing decisions; this counter remains useful
+    /// for breakdown metrics.
     /// </summary>
     public SymbolGapTracker GapTracker { get; }
 
@@ -186,7 +166,6 @@ public sealed class MarketDataManager : IFeedEventHandler
         }
     }
 
-    public void OnGapDetected(uint expected, uint received) { }
     public void OnSequenceReset()
     {
         // Snapshot recovery rebuilds order book state only. Instrument definitions and
@@ -194,9 +173,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         // clearing them here would blank the UI without any authoritative way to restore
         // them immediately. Keep the last known info until fresh updates arrive.
     }
-    public void OnSnapshotStart() { }
-    public void OnSnapshotComplete(uint lastRptSeq) { FreezeData(); }
-    public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeData(); }
 
     private void HandleSecurityDefinition(ReadOnlySpan<byte> body, int blockLength)
     {

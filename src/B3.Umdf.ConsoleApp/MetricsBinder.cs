@@ -86,11 +86,6 @@ static class MetricsBinder
                 new Measurement<long>(h.Handler.InstrDefReceived, Tag("group", h.Label))),
             description: "Instrument definitions received");
 
-        Meter.CreateObservableCounter("b3.umdf.feed.recovery_queue_dropped",
-            () => FeedHandlers().Select(h =>
-                new Measurement<long>(h.Handler.IncrementalQueueDroppedPackets, Tag("group", h.Label))),
-            unit: "{packets}", description: "Packets dropped from the incremental catch-up queue while waiting for snapshot recovery");
-
         Meter.CreateObservableCounter("b3.umdf.feed.reorder_hits",
             () => FeedHandlers().Select(h =>
                 new Measurement<long>(h.Handler.IncrementalHandler.ReorderHits, Tag("group", h.Label))),
@@ -101,17 +96,17 @@ static class MetricsBinder
                 new Measurement<int>(h.Handler.IncrementalHandler.ReorderBufferDepth, Tag("group", h.Label))),
             unit: "{packets}", description: "Current depth of the A/B reorder buffer");
 
-        Meter.CreateObservableCounter("b3.umdf.feed.snapshot_resets_debounced",
+        Meter.CreateObservableCounter("b3.umdf.feed.channel_gaps_absorbed",
             () => FeedHandlers().Select(h =>
-                new Measurement<long>(h.Handler.SnapshotResetsDebounced, Tag("group", h.Label))),
-            description: "Recovery transitions that reused an in-flight snapshot boundary instead of restarting cycle tracking");
+                new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
+            unit: "{gaps}", description: "Channel-level gaps absorbed in Streaming (per-symbol routing healed affected instruments)");
 
         // ── Feed gauges ──
 
         Meter.CreateObservableGauge("b3.umdf.feed.state",
             () => FeedHandlers().Select(h =>
                 new Measurement<int>((int)h.Handler.State, Tag("group", h.Label))),
-            description: "Feed state per group (0=WaitInstrDef, 1=WaitSnapshot, 2=CatchUp, 3=RealTime, 4=Recovery)");
+            description: "Feed state per group (0=WaitInstrumentDefinition, 1=Streaming)");
 
         Meter.CreateObservableGauge("b3.umdf.feed.last_packet_age",
             () => FeedHandlers().Select(h =>
@@ -321,9 +316,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.NullPriceChangeDeletes),
             description: "Order updates with null price converted to deletes");
 
-        // ── Per-symbol recovery (PerSymbol mode only) ──
-        // These instruments only emit when the BookManager was constructed with
-        // RecoveryMode.PerSymbol — Channel-mode managers report 0 for all of them.
+        // ── Per-symbol recovery ──
+        // These instruments report the per-symbol heal pipeline (Stale-symbol
+        // counts, snapshot heal counters). They are always populated since
+        // every BookManager / MarketDataManager owns a SymbolStateRegistry.
 
         Meter.CreateObservableGauge("b3.umdf.persymbol.stale_symbols",
             () =>

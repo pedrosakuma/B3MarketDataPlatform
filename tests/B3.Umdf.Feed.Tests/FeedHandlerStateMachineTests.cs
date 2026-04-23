@@ -6,8 +6,6 @@ namespace B3.Umdf.Feed.Tests;
 
 public class FeedHandlerStateMachineTests
 {
-    // Build a minimal valid packet: 16-byte PacketHeader with the given seqNum.
-    // The packet body is empty so MessageDispatcher finds no messages to dispatch.
     private static UmdfPacket MakePacket(ChannelType channel, uint seqNum, ushort seqVer = 1)
     {
         var buf = new byte[PacketHeader.MESSAGE_SIZE];
@@ -16,39 +14,15 @@ public class FeedHandlerStateMachineTests
         return new UmdfPacket { Data = buf, Channel = channel, ChannelGroup = 1, ReceivedTimestampTicks = 100L };
     }
 
-    private static UmdfPacket MakeOwnedPacket(ChannelType channel, uint seqNum, CountingPacketLease lease, ushort seqVer = 1)
-    {
-        var buf = new byte[PacketHeader.MESSAGE_SIZE];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), seqVer);
-        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), seqNum);
-        return UmdfPacket.CreateOwned(
-            buf,
-            channel,
-            channelGroup: 1,
-            receivedTimestampTicks: 100L,
-            lease);
-    }
-
-    // Build a minimal valid snapshot packet: PacketHeader + 1 framed SBE message
-    // with the given templateId. The body is empty (8-byte SBE MessageHeader only).
-    // DispatchSnapshotMessages doesn't parse the body — it only reads templateId
-    // for OnPacket dispatch — so this is sufficient to test the dispatch wire.
     private static UmdfPacket MakeSnapshotPacket(uint seqNum, ushort templateId, ushort seqVer = 1)
     {
-        const int sbeHeaderSize = 8; // BlockLength(2)+TemplateId(2)+SchemaId(2)+Version(2)
-        const int framingSize = 4;   // FramingHeader: MessageLength(2)+EncodingType(2)
+        const int sbeHeaderSize = 8;
+        const int framingSize = 4;
         var buf = new byte[PacketHeader.MESSAGE_SIZE + framingSize + sbeHeaderSize];
-
-        // PacketHeader
         BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), seqVer);
         BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), seqNum);
-
-        // FramingHeader at offset 16: MessageLength includes framing (4) + sbeHeader (8) = 12
         BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(PacketHeader.MESSAGE_SIZE), (ushort)(framingSize + sbeHeaderSize));
-
-        // SBE MessageHeader at offset 20: blockLength(0)+templateId+schemaId(0)+version(0)
         BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(PacketHeader.MESSAGE_SIZE + framingSize + 2), templateId);
-
         return new UmdfPacket { Data = buf, Channel = ChannelType.SnapshotRecovery, ChannelGroup = 1, ReceivedTimestampTicks = 100L };
     }
 
@@ -60,215 +34,125 @@ public class FeedHandlerStateMachineTests
     }
 
     [Fact]
-    public void CompleteSnapshotCycle_InWrongState_IsNoOp()
+    public void WaitInstrumentDefinition_DiscardsIncrementals()
     {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.RealTime);
-        handler.CompleteSnapshotCycle();
-        Assert.Equal(FeedState.RealTime, handler.State);
-    }
-
-    [Fact]
-    public void CompleteSnapshotCycle_FromWaitSnapshot_TransitionsToRealTime()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.WaitSnapshot);
-        handler.CompleteSnapshotCycle();
-        Assert.Equal(FeedState.RealTime, handler.State);
-    }
-
-    [Fact]
-    public void CompleteSnapshotCycle_FromRecovery_TransitionsToRealTime()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.Recovery);
-        handler.CompleteSnapshotCycle();
-        Assert.Equal(FeedState.RealTime, handler.State);
-    }
-
-    [Fact]
-    public void SequenceGap_InRealTime_TransitionsToRecovery()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.RealTime);
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
 
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        Assert.Equal(FeedState.RealTime, handler.State);
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
 
-        // Jump beyond MaxReorderDistance to bypass the A/B reorder window
-        // and force a real gap.
-        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
-        Assert.Equal(FeedState.Recovery, handler.State);
+        Assert.Equal(FeedState.WaitInstrumentDefinition, handler.State);
+        Assert.Equal(0, tracker.PacketProcessedCount);
     }
 
     [Fact]
-    public void InSequencePackets_DoNotTriggerRecovery()
+    public void Streaming_InSequencePackets_AreDispatched()
     {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.RealTime);
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.Streaming);
 
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3));
 
-        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(FeedState.Streaming, handler.State);
+        Assert.Equal(3, tracker.PacketProcessedCount);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
     }
 
     [Fact]
-    public void Recovery_ThenCompleteSnapshotCycle_ReturnsToRealTime()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture)); // → Recovery
-        Assert.Equal(FeedState.Recovery, handler.State);
-
-        handler.SetSnapshotRangeForTesting(minSeqNum: farFuture - 1u, maxSeqNum: farFuture - 1u);
-        handler.CompleteSnapshotCycle();
-        Assert.Equal(FeedState.RealTime, handler.State);
-    }
-
-    [Fact]
-    public void GapPacket_InRealTime_IsDeferredUntilRecoveryCompletes()
+    public void Streaming_GapBeyondReorderWindow_IsAbsorbedAndCounted()
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        handler.SetStateForTesting(FeedState.Streaming);
 
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
         uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
 
-        Assert.Equal(FeedState.Recovery, handler.State);
-        Assert.Equal(1, tracker.PacketProcessedCount);
-        Assert.NotNull(tracker.LastGap);
-        Assert.Equal((2u, farFuture), tracker.LastGap!.Value);
-
-        handler.SetSnapshotRangeForTesting(minSeqNum: farFuture - 1u, maxSeqNum: farFuture - 1u);
-        handler.CompleteSnapshotCycle();
-
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Equal(2, tracker.PacketProcessedCount);
+        Assert.Equal(FeedState.Streaming, handler.State);
+        Assert.Equal(1L, handler.PerSymbolGapsAbsorbed);
     }
 
     [Fact]
-    public void SmallGap_InRealTime_DoesNotTriggerRecovery_WhenFilledByOtherFeed()
+    public void Streaming_SmallGap_FilledByOtherFeed_NoCount()
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        // A delivers 1, then jumps to 3 — within the reorder window, so the
-        // handler stashes 3 and waits for B (or a late A) to deliver 2.
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3));
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Null(tracker.LastGap);
         Assert.Equal(1, tracker.PacketProcessedCount);
 
-        // B delivers the missing 2 → handler drains 2 then 3 from the buffer.
         handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: 2));
-        Assert.Equal(FeedState.RealTime, handler.State);
+
+        Assert.Equal(FeedState.Streaming, handler.State);
         Assert.Equal(3, tracker.PacketProcessedCount);
         Assert.Equal(4u, handler.IncrementalHandler.ExpectedSequenceNumber);
         Assert.Equal(1, handler.IncrementalHandler.ReorderHits);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
     }
 
     [Fact]
-    public void DuplicateFromOtherFeed_IsCountedAsDuplicate()
+    public void Streaming_DuplicateFromOtherFeed_IsCountedAsDuplicate()
     {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        var handler = new FeedHandler(new NopFeedEventHandler());
+        handler.SetStateForTesting(FeedState.Streaming);
 
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: 1));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: 2));
 
-        Assert.Equal(2, tracker.PacketProcessedCount);
         Assert.Equal(2, handler.IncrementalHandler.DuplicatesSkipped);
     }
 
     [Fact]
-    public void QueuedIncrementals_AreDrainedAndAppliedDuringCatchUp()
+    public void Streaming_SnapshotPacket_IsDispatchedImmediately()
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
-        // State is WaitInstrumentDefinition: incrementals are queued, not applied
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3));
-        Assert.Equal(0, tracker.PacketProcessedCount); // not yet applied
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        handler.SetStateForTesting(FeedState.WaitSnapshot);
-        handler.CompleteSnapshotCycle(); // catch-up drains queue
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
 
-        Assert.Equal(FeedState.RealTime, handler.State);
-        // seqNum=1,2,3 all > snapshotMinSeqNum(0) → all applied via ChannelHandler
-        Assert.Equal(3, tracker.PacketProcessedCount);
+        Assert.Equal(1, tracker.SeenPacketCount);
+        Assert.Equal(headerTemplateId, tracker.LastTemplateId);
     }
 
     [Fact]
-    public void GapDuringCatchUp_ReentersRecoveryWithoutApplyingGapPacket()
+    public void Streaming_TwoSnapshotsSameSeqVer_BothDispatched()
     {
+        // The unified design has no snapshot-cycle gating; every snapshot
+        // packet is dispatched as soon as it arrives so per-symbol heal can
+        // happen progressively.
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        // Use a jump beyond the reorder window so the catch-up loop sees a real gap.
-        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId, seqVer: 7));
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 2, templateId: headerTemplateId, seqVer: 7));
 
-        handler.SetStateForTesting(FeedState.WaitSnapshot);
-        handler.CompleteSnapshotCycle();
-
-        Assert.Equal(FeedState.Recovery, handler.State);
-        Assert.Equal(1, tracker.PacketProcessedCount);
-        Assert.NotNull(tracker.LastGap);
-        Assert.Equal((2u, farFuture), tracker.LastGap!.Value);
+        Assert.Equal(2, tracker.SeenPacketCount);
     }
 
     [Fact]
-    public void SnapshotTooOldForRetainedIncrementals_StaysInRecovery()
+    public void WaitInstrumentDefinition_DiscardsSnapshots()
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
 
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 5));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 6));
+        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
+        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
 
-        handler.SetStateForTesting(FeedState.Recovery);
-        handler.SetSnapshotRangeForTesting(minSeqNum: 2, maxSeqNum: 2);
-        handler.CompleteSnapshotCycle();
-
-        Assert.Equal(FeedState.Recovery, handler.State);
-        Assert.Equal(0, tracker.PacketProcessedCount);
-    }
-
-    [Fact]
-    public void QueuedOwnedIncrementals_AreReleasedAfterCatchUp()
-    {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker);
-        var leases = new[]
-        {
-            new CountingPacketLease(),
-            new CountingPacketLease(),
-            new CountingPacketLease()
-        };
-
-        handler.FeedPacket(MakeOwnedPacket(ChannelType.IncrementalA, seqNum: 1, lease: leases[0]));
-        handler.FeedPacket(MakeOwnedPacket(ChannelType.IncrementalA, seqNum: 2, lease: leases[1]));
-        handler.FeedPacket(MakeOwnedPacket(ChannelType.IncrementalA, seqNum: 3, lease: leases[2]));
-
-        handler.SetStateForTesting(FeedState.WaitSnapshot);
-        handler.CompleteSnapshotCycle();
-
-        Assert.All(leases, lease => Assert.Equal(1, lease.ReleaseCount));
+        Assert.Equal(FeedState.WaitInstrumentDefinition, handler.State);
+        Assert.Equal(0, tracker.SeenPacketCount);
     }
 
     [Fact]
@@ -281,147 +165,15 @@ public class FeedHandlerStateMachineTests
         Assert.Equal(100L, handler.LastPacketTicks);
     }
 
-    [Fact]
-    public void PerSymbolMode_Default_IsChannel()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-        Assert.Equal(RecoveryMode.Channel, handler.RecoveryMode);
-    }
-
-    [Fact]
-    public void PerSymbolMode_Gap_DoesNotTransitionToRecovery()
-    {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
-
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Equal(1L, handler.PerSymbolGapsAbsorbed);
-        // gap was reported to handler (still useful diagnostic) but channel state stays RealTime
-        Assert.NotNull(tracker.LastGap);
-    }
-
-    [Fact]
-    public void ChannelMode_Gap_StillTransitionsToRecovery()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler(), recoveryMode: RecoveryMode.Channel);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
-
-        Assert.Equal(FeedState.Recovery, handler.State);
-        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
-    }
-
-    [Fact]
-    public void PerSymbolMode_NoGap_BehavesNormally()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler(), recoveryMode: RecoveryMode.PerSymbol);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
-        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3));
-
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
-    }
-
-    [Fact]
-    public void PerSymbolMode_SnapshotRecoveryDuringRealTime_DispatchesMessages()
-    {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        // Use Header_30 templateId — DispatchSnapshotMessages does not parse the body,
-        // so any templateId is fine; we just observe the OnPacket fanout.
-        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
-        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
-
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Equal(1, tracker.SeenPacketCount);
-        Assert.Equal(headerTemplateId, tracker.LastTemplateId);
-    }
-
-    [Fact]
-    public void ChannelMode_SnapshotRecoveryDuringRealTime_IsIgnored()
-    {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.Channel);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
-        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId));
-
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Equal(0, tracker.SeenPacketCount);
-    }
-
-    [Fact]
-    public void PerSymbolMode_SnapshotDispatch_BypassesCycleGating()
-    {
-        // Channel mode would skip the first cycle in DispatchAndTrackSnapshot
-        // (waiting for SequenceVersion to flip). PerSymbol mode dispatches the
-        // very first snapshot message immediately so symbols heal without a
-        // ~100s wait. Two packets at the same seqVer must both be dispatched.
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
-        handler.SetStateForTesting(FeedState.RealTime);
-
-        const ushort headerTemplateId = SnapshotFullRefresh_Header_30Data.MESSAGE_ID;
-        handler.FeedPacket(MakeSnapshotPacket(seqNum: 1, templateId: headerTemplateId, seqVer: 7));
-        handler.FeedPacket(MakeSnapshotPacket(seqNum: 2, templateId: headerTemplateId, seqVer: 7));
-
-        Assert.Equal(2, tracker.SeenPacketCount);
-    }
-
-    private class NopFeedEventHandler : IFeedEventHandler
-    {
-        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
-        public void OnGapDetected(uint expected, uint received) { }
-        public void OnSequenceReset() { }
-        public void OnSnapshotStart() { }
-        public void OnSnapshotComplete(uint lastRptSeq) { }
-        public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
-    }
-
-    [Fact]
-    public void TransitionTo_Recovery_TwiceQuickly_DebouncesSnapshotReset()
-    {
-        var handler = new FeedHandler(new NopFeedEventHandler());
-
-        // Simulate the state machine reaching Recovery once (e.g. initial gap),
-        // locking onto the snapshot boundary, then catch-up failing and going
-        // back to Recovery shortly after — the debounce should preserve the
-        // boundary so we don't re-skip a partial cycle.
-        handler.SetStateForTesting(FeedState.RealTime);
-        handler.TransitionToForTesting(FeedState.Recovery);          // first entry resets trackers
-        handler.SetSnapshotBoundaryFoundForTesting();                // simulate boundary lock during the cycle
-        handler.SetStateForTesting(FeedState.CatchUp);
-        handler.TransitionToForTesting(FeedState.Recovery);          // re-enter via catch-up failure
-
-        Assert.Equal(1, handler.SnapshotResetsDebounced);
-        Assert.True(handler.SnapshotBoundaryFoundForTesting);
-    }
-
     // ── A/B reorder stress tests ──
 
     [Fact]
-    public void AbStress_BurstLossOnA_FilledByB_StaysRealTime_NoGapEvent()
+    public void AbStress_BurstLossOnA_FilledByB_StaysStreaming_NoChannelGap()
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        // A delivers 1..10, then loses a burst of 11..30, then resumes at 31..40.
-        // B delivers 11..30 belatedly. The reorder buffer should absorb the gap.
         const uint preBurst = 10;
         const uint burst = 20;
         const uint postBurst = 10;
@@ -429,16 +181,13 @@ public class FeedHandlerStateMachineTests
         for (uint s = 1; s <= preBurst; s++)
             handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: s));
 
-        // A skips the burst entirely.
         for (uint s = preBurst + burst + 1; s <= preBurst + burst + postBurst; s++)
             handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: s));
 
-        // While A waits, no gap event fired and we stayed in RealTime.
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Null(tracker.LastGap);
+        Assert.Equal(FeedState.Streaming, handler.State);
         Assert.Equal((int)preBurst, tracker.PacketProcessedCount);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
 
-        // B fills the burst out of order.
         var burstSeqs = new List<uint>();
         for (uint s = preBurst + 1; s <= preBurst + burst; s++) burstSeqs.Add(s);
         var rng = new Random(1234);
@@ -450,11 +199,11 @@ public class FeedHandlerStateMachineTests
         foreach (var s in burstSeqs)
             handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: s));
 
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Null(tracker.LastGap);
+        Assert.Equal(FeedState.Streaming, handler.State);
         Assert.Equal((int)(preBurst + burst + postBurst), tracker.PacketProcessedCount);
         Assert.Equal(preBurst + burst + postBurst + 1, handler.IncrementalHandler.ExpectedSequenceNumber);
         Assert.True(handler.IncrementalHandler.ReorderHits > 0);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
     }
 
     [Fact]
@@ -462,11 +211,8 @@ public class FeedHandlerStateMachineTests
     {
         var tracker = new TrackingFeedEventHandler();
         var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        // Both feeds deliver 1..200 with random ordering of arrivals on each
-        // channel. Roughly 70% of A arrives "first", 30% of B arrives first;
-        // the late one is always treated as a duplicate.
         const uint total = 200;
         var rng = new Random(7);
         var aArrivals = new List<uint>();
@@ -476,55 +222,50 @@ public class FeedHandlerStateMachineTests
             aArrivals.Add(s);
             bArrivals.Add(s);
         }
-        // Shuffle B (simulates B being reordered relative to A).
         for (int i = bArrivals.Count - 1; i > 0; i--)
         {
             int j = rng.Next(i + 1);
             (bArrivals[i], bArrivals[j]) = (bArrivals[j], bArrivals[i]);
         }
 
-        // Interleave: send one from A, one from B, etc.
         int ai = 0, bi = 0;
         while (ai < aArrivals.Count || bi < bArrivals.Count)
         {
             bool pickA = (rng.NextDouble() < 0.7 && ai < aArrivals.Count) || bi >= bArrivals.Count;
             if (pickA)
-            {
                 handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: aArrivals[ai++]));
-            }
             else
-            {
                 handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: bArrivals[bi++]));
-            }
         }
 
-        Assert.Equal(FeedState.RealTime, handler.State);
-        Assert.Null(tracker.LastGap);
+        Assert.Equal(FeedState.Streaming, handler.State);
         Assert.Equal((int)total, tracker.PacketProcessedCount);
         Assert.Equal(total + 1, handler.IncrementalHandler.ExpectedSequenceNumber);
-        // Every late copy on the slower feed must be flagged as a duplicate.
         Assert.Equal((int)total, handler.IncrementalHandler.DuplicatesSkipped);
     }
 
     [Fact]
-    public void AbStress_BothFeedsLoseSamePacket_TransitionsToRecovery()
+    public void AbStress_BothFeedsLoseSamePacket_AbsorbedAsPerSymbolGap()
     {
-        var tracker = new TrackingFeedEventHandler();
-        var handler = new FeedHandler(tracker);
-        handler.SetStateForTesting(FeedState.RealTime);
+        var handler = new FeedHandler(new NopFeedEventHandler());
+        handler.SetStateForTesting(FeedState.Streaming);
 
-        // Both A and B drop seq=2; both keep delivering well past the reorder
-        // window — the gap can no longer be filled and must escalate to Recovery.
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
         handler.FeedPacket(MakePacket(ChannelType.IncrementalB, seqNum: 1));
-        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(FeedState.Streaming, handler.State);
 
         uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
         handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
-        Assert.Equal(FeedState.Recovery, handler.State);
-        Assert.NotNull(tracker.LastGap);
-        Assert.Equal(2u, tracker.LastGap!.Value.Expected);
-        Assert.Equal(farFuture, tracker.LastGap!.Value.Received);
+        Assert.Equal(FeedState.Streaming, handler.State);
+        Assert.Equal(1L, handler.PerSymbolGapsAbsorbed);
+    }
+
+    private class NopFeedEventHandler : IFeedEventHandler
+    {
+        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
+        public void OnPacketProcessed() { }
+        public void OnSequenceReset() { }
+        public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
     }
 
     private class TrackingFeedEventHandler : IFeedEventHandler
@@ -532,31 +273,13 @@ public class FeedHandlerStateMachineTests
         public int PacketProcessedCount;
         public int SeenPacketCount;
         public ushort LastTemplateId;
-        public (uint Expected, uint Received)? LastGap;
         public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
         {
             SeenPacketCount++;
             LastTemplateId = templateId;
         }
         public void OnPacketProcessed() => PacketProcessedCount++;
-        public void OnGapDetected(uint expected, uint received) => LastGap = (expected, received);
         public void OnSequenceReset() { }
-        public void OnSnapshotStart() { }
-        public void OnSnapshotComplete(uint lastRptSeq) { }
         public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
-    }
-
-    private sealed class CountingPacketLease : UmdfPacketLease
-    {
-        private int _refCount = 1;
-        public int ReleaseCount { get; private set; }
-
-        public override void Retain() => Interlocked.Increment(ref _refCount);
-
-        public override void Release()
-        {
-            if (Interlocked.Decrement(ref _refCount) == 0)
-                ReleaseCount++;
-        }
     }
 }

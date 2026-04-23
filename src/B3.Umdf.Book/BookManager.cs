@@ -66,50 +66,36 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null,
         SymbolStateRegistry? stateRegistry = null,
-        StaleMboBuffer? staleBuffer = null,
-        RecoveryMode recoveryMode = RecoveryMode.Channel)
+        StaleMboBuffer? staleBuffer = null)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<BookManager>.Instance;
         GapTracker = new SymbolGapTracker(_logger);
-        _recoveryMode = recoveryMode;
-        if (recoveryMode == RecoveryMode.PerSymbol)
-        {
-            _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
-                "SymbolStateRegistry is required when RecoveryMode is PerSymbol.");
-            _staleBuffer = staleBuffer ?? throw new ArgumentNullException(nameof(staleBuffer),
-                "StaleMboBuffer is required when RecoveryMode is PerSymbol.");
-        }
-        else
-        {
-            _stateRegistry = stateRegistry;
-            _staleBuffer = staleBuffer;
-        }
+        _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
+            "SymbolStateRegistry is required.");
+        _staleBuffer = staleBuffer ?? throw new ArgumentNullException(nameof(staleBuffer),
+            "StaleMboBuffer is required.");
     }
 
-    private readonly RecoveryMode _recoveryMode;
-    private readonly SymbolStateRegistry? _stateRegistry;
-    private readonly StaleMboBuffer? _staleBuffer;
+    private readonly SymbolStateRegistry _stateRegistry;
+    private readonly StaleMboBuffer _staleBuffer;
     private long _bufferedMboMessages;
     private long _replayedMboMessages;
 
-    /// <summary>The recovery mode this BookManager is operating in.</summary>
-    public RecoveryMode RecoveryMode => _recoveryMode;
+    /// <summary>Symbol state registry (PerSymbol recovery is the only supported mode).</summary>
+    public SymbolStateRegistry StateRegistry => _stateRegistry;
 
-    /// <summary>Symbol state registry (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
-    public SymbolStateRegistry? StateRegistry => _stateRegistry;
-
-    /// <summary>Stale MBO buffer (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
-    public StaleMboBuffer? StaleBuffer => _staleBuffer;
+    /// <summary>Stale MBO buffer (PerSymbol recovery is the only supported mode).</summary>
+    public StaleMboBuffer StaleBuffer => _staleBuffer;
 
     public long BufferedMboMessages => Volatile.Read(ref _bufferedMboMessages);
     public long ReplayedMboMessages => Volatile.Read(ref _replayedMboMessages);
 
     /// <summary>
-    /// Phase 0 shadow tracker for per-symbol rptSeq gaps on MBO/Trade
-    /// messages (which share one rptSeq stream per security in the B3
-    /// schema). Read-only — does not influence the channel-level Recovery
-    /// state machine.
+    /// Per-symbol rptSeq gap shadow tracker (telemetry only). The registry
+    /// is the source of truth for routing decisions; the tracker remains for
+    /// breakdown metrics on instruments without the registry path (e.g.
+    /// boot-time before the registry observes the first message).
     /// </summary>
     public SymbolGapTracker GapTracker { get; }
 
@@ -117,28 +103,25 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// Records the per-symbol rptSeq gap (if any) and updates the book's
     /// <see cref="OrderBook.LastRptSeq"/>. Called from every MBO/Trade
     /// handler instead of writing <c>LastRptSeq</c> directly.
-    /// In PerSymbol mode the registry is the source of truth, so we skip
-    /// the Phase 0 shadow tracker (which would double-count gaps).
+    /// The registry is the source of truth, so we skip the shadow tracker
+    /// (which would double-count gaps).
     /// </summary>
     private void TrackMboRptSeq(OrderBook book, uint received)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol)
-            GapTracker.Observe(book.SecurityId, received, book.LastRptSeq, SymbolGapKind.Mbo);
         book.LastRptSeq = received;
     }
 
     /// <summary>
     /// Per-symbol routing decision for an incoming MBO/Trade message.
-    /// In PerSymbol mode, consults the registry: Apply lets the caller
-    /// proceed; Buffer copies the body into <see cref="_staleBuffer"/> for
-    /// later replay; Drop returns silently. In Channel mode, always Apply.
+    /// Consults the registry: Apply lets the caller proceed; Buffer copies
+    /// the body into <see cref="_staleBuffer"/> for later replay; Drop
+    /// returns silently.
     /// </summary>
     /// <returns><c>true</c> if the caller should proceed with apply logic.</returns>
     private bool RouteMbo(ulong securityId, ushort templateId, uint? rptSeqOpt, ReadOnlySpan<byte> body)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol) return true;
         if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
-        var result = _stateRegistry!.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
+        var result = _stateRegistry.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
         if (result.TransitionedToStale)
             _eventHandler?.OnSymbolStaleStatusChanged(securityId, isStale: true);
         switch (result.Action)
@@ -146,7 +129,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             case SymbolStateRegistry.ObserveAction.Apply:
                 return true;
             case SymbolStateRegistry.ObserveAction.Buffer:
-                if (_staleBuffer!.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body))
+                if (_staleBuffer.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body))
                     Interlocked.Increment(ref _bufferedMboMessages);
                 return false;
             case SymbolStateRegistry.ObserveAction.Drop:
@@ -157,14 +140,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     /// <summary>
     /// Drain and replay the per-symbol stale buffer for one security after
-    /// a snapshot heal. Called by the snapshot handler in PerSymbol mode.
-    /// Messages with <c>rptSeq ∈ [drainFrom, drainTo]</c> are dispatched
-    /// through the same handlers as live messages — the registry will see
-    /// them as Healthy + contiguous and route them through Apply.
+    /// a snapshot heal. Messages with <c>rptSeq ∈ [drainFrom, drainTo]</c>
+    /// are dispatched through the same handlers as live messages — the
+    /// registry will see them as Healthy + contiguous and route them
+    /// through Apply.
     /// </summary>
     internal int ReplayDeferredMbo(ulong securityId, uint drainFrom, uint drainTo)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol || _staleBuffer is null) return 0;
         return _staleBuffer.Drain(securityId, drainFrom, drainTo, m =>
         {
             _currentSendingTimeNs = m.SendingTimeNs;
@@ -364,11 +346,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
     }
 
-    public void OnGapDetected(uint expected, uint received) { }
     public void OnSequenceReset() => HandleSequenceReset();
-    public void OnSnapshotStart() { }
-    public void OnSnapshotComplete(uint lastRptSeq) { FreezeBooks(); }
-    public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
+    public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeBooks(); }
     public void OnPacketProcessed() { _eventHandler?.OnBatchComplete(); }
 
     // Feed thread is the sole writer for all book mutations — no locks needed.
@@ -675,7 +654,6 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     private void HandleSnapshotHeader(ReadOnlySpan<byte> body)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol) return;
         if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader)) return;
 
         ref readonly var msg = ref reader.Data;
@@ -689,7 +667,6 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol) return;
         if (lastRptSeq is { } v && v > 0)
             _pendingSnapshotLastRptSeq[securityId] = v;
         else
@@ -743,8 +720,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             book.GetSide(side).Add(in bookEntry);
         });
 
-        if (_recoveryMode == RecoveryMode.PerSymbol)
-            HealAfterSnapshot(securityId, book);
+        HealAfterSnapshot(securityId, book);
     }
 
     private void HealAfterSnapshot(ulong securityId, OrderBook book)
@@ -834,10 +810,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     private void ResetPerSymbolEpoch(string reason)
     {
-        if (_recoveryMode != RecoveryMode.PerSymbol) return;
-        int dropped = _staleBuffer!.ClearAll();
+        int dropped = _staleBuffer.ClearAll();
         _pendingSnapshotLastRptSeq.Clear();
-        _stateRegistry!.ResetEpoch(reason);
+        _stateRegistry.ResetEpoch(reason);
         Interlocked.Add(ref _epochResetMessagesDropped, dropped);
         Interlocked.Increment(ref _epochResets);
     }

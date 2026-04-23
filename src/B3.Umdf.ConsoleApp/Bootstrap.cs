@@ -93,12 +93,6 @@ internal static class CliArgs
                     settings.LossSeed = ls;
                     break;
 
-                case "--recovery-mode" when i + 1 < args.Length:
-                    if (!AppSettings.TryParseRecoveryMode(args[++i], out var rm))
-                    { error = "Invalid --recovery-mode value. Use 'channel' or 'per-symbol'."; return false; }
-                    settings.RecoveryMode = rm;
-                    break;
-
                 default:
                     positionalArgs.Add(args[i]);
                     break;
@@ -173,7 +167,6 @@ internal static class UsageBanner
         Console.WriteLine("  --loss-burst <n>              Consecutive packets dropped per burst trigger (burst mode, default 1)");
         Console.WriteLine("  --loss-correlated             A and B drop the SAME SeqNum (worst case for arbitration)");
         Console.WriteLine("  --loss-seed <int>             RNG seed for reproducible loss patterns");
-        Console.WriteLine("  --recovery-mode <mode>        Recovery state machine: 'channel' (default) or 'per-symbol' (Phase 2)");
     }
 }
 
@@ -305,15 +298,15 @@ internal static class FanoutSuppressionWiring
     {
         if (!byGid.TryGetValue(gid, out var entry)) return;
         var gh = entry.Conflation;
-        gh.SetFanoutSuppressed(fh.State != FeedState.RealTime);
+        gh.SetFanoutSuppressed(fh.State != FeedState.Streaming);
         fh.StateChanged += (_, newState) =>
-            gh.SetFanoutSuppressed(newState != FeedState.RealTime);
+            gh.SetFanoutSuppressed(newState != FeedState.Streaming);
 
-        // PerSymbol mode: additionally engage market-wide fanout suppression
-        // when a large fraction of symbols becomes Stale (e.g. ChannelReset_11,
-        // mass loss). The channel-state gate above only fires pre-RealTime;
-        // post-RealTime the per-symbol layer handles gaps without leaving
-        // RealTime, so a separate evaluator is required.
+        // Per-symbol fanout gate: additionally engage market-wide fanout
+        // suppression when a large fraction of symbols becomes Stale (e.g.
+        // ChannelReset_11, mass loss). The channel-state gate above only fires
+        // pre-Streaming; post-Streaming the per-symbol layer handles gaps
+        // without leaving Streaming, so a separate evaluator is required.
         var registry = entry.Book.StateRegistry;
         if (registry is not null)
         {

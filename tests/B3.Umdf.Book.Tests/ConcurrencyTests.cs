@@ -1,5 +1,7 @@
 namespace B3.Umdf.Book.Tests;
 
+using Microsoft.Extensions.Logging.Abstractions;
+
 public class ConcurrencyTests
 {
     [Fact]
@@ -7,7 +9,9 @@ public class ConcurrencyTests
     {
         // Verifies that ConcurrentDictionary-based Books can be safely
         // enumerated from one thread while the feed thread adds entries.
-        var bookManager = new BookManager();
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var bookManager = new BookManager(stateRegistry: reg, staleBuffer: buf);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
 
@@ -84,7 +88,8 @@ public class ConcurrencyTests
     [Fact]
     public async Task MarketDataManager_ConcurrentAccess_NoException()
     {
-        var mdm = new MarketDataManager();
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var mdm = new MarketDataManager(stateRegistry: reg);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
 

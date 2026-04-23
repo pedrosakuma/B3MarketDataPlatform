@@ -31,8 +31,7 @@ public class PerSymbolEndToEndTests
     {
         var reg = new SymbolStateRegistry(NullLogger.Instance);
         var buf = new StaleMboBuffer(NullLogger.Instance);
-        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf,
-            recoveryMode: RecoveryMode.PerSymbol);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
         return (bm, reg, buf);
     }
 
@@ -180,13 +179,14 @@ public class PerSymbolEndToEndTests
     }
 
     [Fact]
-    public void Scenario_StatRouting_ChannelMode_AlwaysApplies()
+    public void Scenario_StatRouting_AlwaysApplies()
     {
         var reg = new SymbolStateRegistry(NullLogger.Instance);
-        var mdm = new MarketDataManager(stateRegistry: reg, recoveryMode: RecoveryMode.Channel);
+        var mdm = new MarketDataManager(stateRegistry: reg);
 
-        // Channel mode: stat handler RouteStat short-circuits to Apply regardless
-        // of registry state. Verified indirectly by counter contract.
+        // Stat handler RouteStat short-circuits to Apply when symbol state is
+        // Healthy / Unknown (Stale rerouted via per-symbol layer). Verified
+        // indirectly by counter contract: no drops, no resyncs at construction.
         Assert.Equal(0, mdm.DroppedDuplicateStats);
         Assert.Equal(0, mdm.LiveResyncs);
     }

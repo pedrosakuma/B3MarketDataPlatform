@@ -76,8 +76,8 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         }
     }
 
-    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
-        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, incrementalRecoveryQueueCapacity, groupRingCapacity, recoveryMode)
+    public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, groupRingCapacity)
     {
         _ = feedChannelCapacity; // accepted for API compatibility; no longer used
     }
@@ -86,13 +86,13 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// Live-push constructor: no source / no internal dispatcher. Receive threads (e.g. one per
     /// MulticastPacketSource) must call <see cref="PushPacket(in UmdfPacket)"/> directly.
     /// </summary>
-    public MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
-        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source: null, incrementalRecoveryQueueCapacity, groupRingCapacity, recoveryMode)
+    public MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source: null, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
-    private MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger, IFeedEventHandler? marketDataHandler, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity, int groupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
+    private MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger, IFeedEventHandler? marketDataHandler, ILogger<MultiFeedManager>? logger, IPacketSource? source, int groupRingCapacity)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(groupRingCapacity, 2);
         _source = source;
@@ -101,7 +101,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         int idx = 0;
         foreach (var gid in groupIds)
         {
-            _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler, incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity, recoveryMode: recoveryMode);
+            _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
             _groupIndex[gid] = idx++;
         }
@@ -112,20 +112,20 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// Creates a MultiFeedManager where each group has its own event handler.
     /// Optionally accepts per-group market data handlers for passthrough during non-RealTime states.
     /// </summary>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, incrementalRecoveryQueueCapacity, groupRingCapacity, recoveryMode)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
     /// <summary>Live-push constructor with per-group handlers (no internal dispatcher).</summary>
-    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int incrementalRecoveryQueueCapacity = FeedHandler.DefaultIncrementalRecoveryQueueCapacity, int groupRingCapacity = DefaultGroupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, incrementalRecoveryQueueCapacity, groupRingCapacity, recoveryMode)
+    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
-    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int incrementalRecoveryQueueCapacity, int groupRingCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
+    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int groupRingCapacity)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(groupRingCapacity, 2);
         _source = source;
@@ -136,7 +136,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         {
             IFeedEventHandler? mdHandler = null;
             marketDataHandlers?.TryGetValue(gid, out mdHandler);
-            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler, incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity, recoveryMode: recoveryMode);
+            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
             _groupIndex[gid] = idx++;
         }
@@ -343,7 +343,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     {
         int idx = _groupIndex[groupId];
         var ready = _groupReady;
-        if (Volatile.Read(ref ready[idx]) || handler.State != FeedState.RealTime)
+        if (Volatile.Read(ref ready[idx]) || handler.State != FeedState.Streaming)
             return;
 
         Volatile.Write(ref ready[idx], true);

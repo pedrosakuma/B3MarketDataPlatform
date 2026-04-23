@@ -32,10 +32,13 @@ transitions:
 RealTime → Lost → (recovery available?) → Recovery → CatchUp → RealTime
 ```
 
-**Incremental recovery (UDP)** receives the missing packets via a separate
-multicast group. Recovered packets are queued in an `_incrementalQueue` (cap
-**`UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY`**, default 200 000) and replayed
-in order on the dispatch thread.
+**Per-symbol recovery (unified)** — when a per-security `rptSeq` gap is
+detected, only the affected SecurityID flips to `Stale` while the channel
+keeps consuming RealTime. Subsequent incrementals for that symbol are
+buffered by `StaleMboBuffer` (per-symbol cap) and replayed in order once
+a `SnapshotFullRefresh_Header_30` carrying a fresh `lastRptSeq` brings the
+book back to a known baseline. There is no longer a channel-level
+recovery queue.
 
 **Snapshot recovery (TCP)** is used when the gap is too wide for
 incremental recovery. The snapshot client has bounded retry with
@@ -44,9 +47,10 @@ exponential backoff and emits `b3.umdf.recovery.snapshot.attempts`.
 Recovery progress is observable via metrics:
 
 ```
-b3.umdf.feed.state                  # 0=Init,1=RealTime,2=Lost,3=Recovery,4=CatchUp
-b3.umdf.feed.gaps                   # gauge of currently-tracked gaps
-b3.umdf.recovery.incremental.queued
+b3.umdf.feed.state                  # 0=WaitInstrumentDefinition, 1=Streaming
+b3.umdf.feed.gaps                   # channel-level network-loss diagnostic
+b3.umdf.feed.channel_gaps_absorbed  # gaps absorbed without leaving Streaming
+b3.umdf.persymbol.stale_symbols     # per-symbol Stale gauge by kind
 b3.umdf.recovery.snapshot.attempts
 ```
 
@@ -203,7 +207,7 @@ Total consumer memory has hard upper bounds at every layer:
 | Per-client outbound (bytes) | `UMDF_CLIENT_MAX_PENDING_BYTES` | 4 MiB |
 | Per-group dispatch ring (packets) | `UMDF_DISPATCH_RING_CAPACITY` | 65 536 |
 | Per-group broadcaster ring (work batches) | compile-time | 256 |
-| Per-group recovery queue (packets) | `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | 200 000 |
+| Per-symbol stale MBO buffer | compile-time | 256 messages × N symbols |
 | Per-security candle buffer | compile-time (`MaxRetainedCandles`) | 36 000 (10 h @ 1 s) |
 | Pinned UDP buffer pool | compile-time | sized to recvmmsg batch × N groups |
 

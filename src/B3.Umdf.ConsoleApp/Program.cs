@@ -36,7 +36,6 @@ int maxSnapshotRequestsPerBatch = settings.MaxSnapshotRequestsPerBatch;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
-int incrementalRecoveryQueueCapacity = settings.IncrementalRecoveryQueueCapacity;
 int groupRingCapacity = settings.GroupRingCapacity;
 var logLevel = LogLevelParser.Parse(settings.LogLevel);
 
@@ -394,23 +393,17 @@ foreach (var gid in groupIds)
     IBookEventHandler bookHandler;
     IMarketDataEventHandler mdHandler = stats;
 
-    SymbolStateRegistry? groupRegistry = null;
-    StaleMboBuffer? groupStaleBuffer = null;
-    if (settings.RecoveryMode == RecoveryMode.PerSymbol)
-    {
-        groupRegistry = new SymbolStateRegistry(registryLogger);
-        groupStaleBuffer = new StaleMboBuffer(staleBufferLogger);
-        registries[gid] = groupRegistry;
-        staleBuffers[gid] = groupStaleBuffer;
-    }
+    var groupRegistry = new SymbolStateRegistry(registryLogger);
+    var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger);
+    registries[gid] = groupRegistry;
+    staleBuffers[gid] = groupStaleBuffer;
 
     if (subscriptionManager is not null)
     {
         var gh = subscriptionManager.CreateGroupHandler();
         bookHandler = new CompositeBookEventHandler(stats, gh);
         var bm = new BookManager(bookHandler, bmLogger,
-            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
-            recoveryMode: settings.RecoveryMode);
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
         mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm);
         gh.SetBookManager(bm);
         gh.StartBroadcaster(gid);
@@ -421,15 +414,13 @@ foreach (var gid in groupIds)
     {
         bookHandler = stats;
         var bm = new BookManager(bookHandler, bmLogger,
-            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
-            recoveryMode: settings.RecoveryMode);
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
         mdHandler = new CompositeMarketDataEventHandler(stats, bm);
         bookManagers.Add(bm);
     }
 
     var mm = new MarketDataManager(mdHandler, mdmLogger,
-        stateRegistry: groupRegistry,
-        recoveryMode: settings.RecoveryMode);
+        stateRegistry: groupRegistry);
     marketDataManagers.Add(mm);
 
     var composite = new CompositeFeedHandler(bookManagers[^1], mm, symbolRegistry);
@@ -452,9 +443,7 @@ if (groupIds.Count > 1)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
-            groupRingCapacity: groupRingCapacity,
-            recoveryMode: settings.RecoveryMode)
+            groupRingCapacity: groupRingCapacity)
         : new MultiFeedManager(
             packetSource,
             groupFeedHandlers,
@@ -462,9 +451,7 @@ if (groupIds.Count > 1)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity,
-            groupRingCapacity: groupRingCapacity,
-            recoveryMode: settings.RecoveryMode);
+            groupRingCapacity: groupRingCapacity);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
 }
@@ -472,7 +459,7 @@ else
 {
     if (packetSource is null)
         throw new InvalidOperationException("Single-group live multicast mode is not supported; use multiple groups.");
-    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]], incrementalRecoveryQueueCapacity: incrementalRecoveryQueueCapacity, recoveryMode: settings.RecoveryMode);
+    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]]);
 }
 
 if (subscriptionManager is not null)
@@ -549,33 +536,11 @@ if (liveMulticastSources is not null && multiFeed is not null)
     var manager = multiFeed;
     var sources = liveMulticastSources;
 
-    // Build per-group lookup of "recovery-only" sources (Snap + InstrDef) so we can leave/rejoin
-    // their multicast memberships in sync with the feed state machine. In RealTime these channels
-    // are useless and just consume kernel buffer + CPU; B3 publishes new instruments mid-day via
-    // the incremental stream, so InstrDef is also dispensable once we've reached RealTime.
-    var recoverySourcesByGroup = sources
-        .Where(s => s.ChannelType is ChannelType.SnapshotRecovery or ChannelType.InstrumentDefinition)
-        .GroupBy(s => s.ChannelGroup)
-        .ToDictionary(g => g.Key, g => g.ToArray());
-
-    foreach (var (gid, handler) in manager.Handlers)
-    {
-        if (!recoverySourcesByGroup.TryGetValue(gid, out var groupRecoverySources))
-            continue;
-        var capturedSources = groupRecoverySources;
-        var capturedGid = gid;
-        handler.StateChanged += (oldState, newState) =>
-        {
-            if (newState == FeedState.RealTime && oldState != FeedState.RealTime)
-            {
-                foreach (var src in capturedSources) src.LeaveMulticastGroup();
-            }
-            else if (oldState == FeedState.RealTime && newState != FeedState.RealTime)
-            {
-                foreach (var src in capturedSources) src.RejoinMulticastGroup();
-            }
-        };
-    }
+    // NOTE: previously we left the SnapshotRecovery and InstrumentDefinition
+    // multicast groups when the channel reached RealTime to save kernel buffer
+    // / CPU. With the unified per-symbol design those streams must stay joined
+    // for the entire session: snapshots heal individual Stale symbols on
+    // demand, and instrument-definition packets carry mid-session new listings.
 
     liveReceiveThreads = new Thread[sources.Count];
     for (int i = 0; i < sources.Count; i++)

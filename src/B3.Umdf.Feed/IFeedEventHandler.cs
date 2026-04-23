@@ -5,10 +5,19 @@ namespace B3.Umdf.Feed;
 public interface IFeedEventHandler
 {
     void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId);
-    void OnGapDetected(uint expected, uint received);
+
+    /// <summary>
+    /// Channel-level catastrophic reset (SequenceReset_1 / ChannelReset_11):
+    /// flips every per-symbol entry to Stale so the next snapshot cycle
+    /// re-Healthifies symbols progressively.
+    /// </summary>
     void OnSequenceReset();
-    void OnSnapshotStart();
-    void OnSnapshotComplete(uint lastRptSeq);
+
+    /// <summary>
+    /// Fired once when all instrument definitions have been received and the
+    /// channel transitions to Streaming. Used by managers to freeze metadata
+    /// dictionaries (FreezeBooks / FreezeData).
+    /// </summary>
     void OnInstrumentDefinitionsComplete(int instrumentCount);
 
     /// <summary>

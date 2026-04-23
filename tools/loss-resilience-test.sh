@@ -3,23 +3,19 @@
 # Drives the replayer with packet-loss injection scenarios and captures logs.
 #
 # Usage: tools/loss-resilience-test.sh <pcap-prefix> [<duration-seconds>]
-# Optional env: MODE=Channel|PerSymbol (default Channel) — sets UMDF_RECOVERY_MODE.
-#               OUT=/tmp/loss-validation (override output directory)
+# Optional env: OUT=/tmp/loss-validation (override output directory)
 # Example: tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 20
-#          MODE=PerSymbol tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 20
 #
-# Outputs to ${OUT}/{scenario}.log (default /tmp/loss-validation-${MODE}/).
+# Outputs to ${OUT}/{scenario}.log (default /tmp/loss-validation/).
 # Summary printed to stdout.
 set -u
 PREFIX="${1:?usage: $0 <pcap-prefix> [<duration-seconds>]}"
 DUR="${2:-20}"
-MODE="${MODE:-Channel}"
-OUT="${OUT:-/tmp/loss-validation-${MODE}}"
+OUT="${OUT:-/tmp/loss-validation}"
 BIN="dotnet src/B3.Umdf.ConsoleApp/bin/Release/net10.0/B3.Umdf.ConsoleApp.dll"
 mkdir -p "$OUT"
-export UMDF_RECOVERY_MODE="$MODE"
 
-echo "## RecoveryMode=$MODE  output=$OUT"
+echo "## per-symbol recovery (unified)  output=$OUT"
 
 run() {
   local name="$1"; shift

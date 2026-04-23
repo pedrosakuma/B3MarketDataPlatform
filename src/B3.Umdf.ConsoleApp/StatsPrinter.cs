@@ -66,7 +66,7 @@ internal sealed class StatsPrinter
         }
         else if (_singleFeed is not null)
         {
-            ready = _singleFeed.State == FeedState.RealTime;
+            ready = _singleFeed.State == FeedState.Streaming;
             packets = _singleFeed.PacketCount;
             stateStr = _singleFeed.State.ToString();
         }
@@ -108,20 +108,22 @@ internal sealed class StatsPrinter
         var recoveryParts = new List<string>();
         if (_singleFeed is not null)
         {
-            if (_singleFeed.State == FeedState.Recovery || _singleFeed.IncrementalQueueDroppedPackets > 0)
+            long absorbed = _singleFeed.PerSymbolGapsAbsorbed;
+            if (absorbed > 0)
             {
                 recoveryParts.Add(
-                    $"G{_groupIds[0]}={_singleFeed.State} gap={_singleFeed.IncrementalHandler.LastGapExpected}->{_singleFeed.IncrementalHandler.LastGapReceived} catchupDropped={_singleFeed.IncrementalQueueDroppedPackets:N0}");
+                    $"G{_groupIds[0]} absorbedChannelGaps={absorbed:N0} lastGap={_singleFeed.IncrementalHandler.LastGapExpected}->{_singleFeed.IncrementalHandler.LastGapReceived}");
             }
         }
         else if (_multiFeed is not null)
         {
             foreach (var (gid, handler) in _multiFeed.Handlers.OrderBy(h => h.Key))
             {
-                if (handler.State == FeedState.Recovery || handler.IncrementalQueueDroppedPackets > 0)
+                long absorbed = handler.PerSymbolGapsAbsorbed;
+                if (absorbed > 0)
                 {
                     recoveryParts.Add(
-                        $"G{gid}={handler.State} gap={handler.IncrementalHandler.LastGapExpected}->{handler.IncrementalHandler.LastGapReceived} catchupDropped={handler.IncrementalQueueDroppedPackets:N0}");
+                        $"G{gid} absorbedChannelGaps={absorbed:N0} lastGap={handler.IncrementalHandler.LastGapExpected}->{handler.IncrementalHandler.LastGapReceived}");
                 }
             }
         }

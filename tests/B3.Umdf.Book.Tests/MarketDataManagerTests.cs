@@ -1,4 +1,5 @@
 using B3.Umdf.Book;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Book.Tests;
 
@@ -7,7 +8,8 @@ public class MarketDataManagerTests
     [Fact]
     public void OnSequenceReset_PreservesInstrumentInfo()
     {
-        var manager = new MarketDataManager();
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var manager = new MarketDataManager(stateRegistry: reg);
         var info = manager.GetOrCreateInfo(123);
 
         info.Symbol = "PETR4";

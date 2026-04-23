@@ -20,28 +20,10 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
             handler.OnPacket(in packet, sbePayload, templateId);
     }
 
-    public void OnGapDetected(uint expected, uint received)
-    {
-        foreach (var handler in _handlers)
-            handler.OnGapDetected(expected, received);
-    }
-
     public void OnSequenceReset()
     {
         foreach (var handler in _handlers)
             handler.OnSequenceReset();
-    }
-
-    public void OnSnapshotStart()
-    {
-        foreach (var handler in _handlers)
-            handler.OnSnapshotStart();
-    }
-
-    public void OnSnapshotComplete(uint lastRptSeq)
-    {
-        foreach (var handler in _handlers)
-            handler.OnSnapshotComplete(lastRptSeq);
     }
 
     public void OnInstrumentDefinitionsComplete(int instrumentCount)

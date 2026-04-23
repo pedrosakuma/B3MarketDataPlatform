@@ -83,11 +83,7 @@ public sealed class SymbolRegistry : IFeedEventHandler
         }
     }
 
-    public void OnGapDetected(uint expected, uint received) { }
     public void OnSequenceReset() { }
-    public void OnSnapshotStart() { }
-
-    public void OnSnapshotComplete(uint lastRptSeq) { }
 
     public void OnInstrumentDefinitionsComplete(int instrumentCount)
     {

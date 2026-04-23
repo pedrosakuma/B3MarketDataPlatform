@@ -10,8 +10,7 @@ public class BookManagerSnapshotHealTests
     {
         var reg = new SymbolStateRegistry(NullLogger.Instance);
         var buf = new StaleMboBuffer(NullLogger.Instance);
-        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf,
-            recoveryMode: RecoveryMode.PerSymbol);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
         return (bm, reg, buf);
     }
 
@@ -102,13 +101,4 @@ public class BookManagerSnapshotHealTests
         Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, next.Action);
     }
 
-    [Fact]
-    public void ChannelMode_RecordSnapshotHeader_IsNoOp()
-    {
-        var bm = new BookManager(); // Channel mode default
-        bm.RecordSnapshotHeader(1, lastRptSeq: 100);
-        // No throw, no state changes possible (no registry).
-        Assert.Equal(0, bm.SnapshotsHealed);
-        Assert.Equal(0, bm.SnapshotsMissingRptSeq);
-    }
 }

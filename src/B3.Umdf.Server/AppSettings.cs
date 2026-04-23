@@ -127,20 +127,6 @@ public sealed class AppSettings
     public int FeedChannelCapacity { get; set; } = 250_000;
 
     /// <summary>
-    /// Cap of the per-group recovery bridge buffer (incrementals deferred while a snapshot
-    /// cycle completes). Must be sized to outlast the wall-time of one snapshot cycle:
-    /// if the earliest packet retained when the snapshot completes is newer than
-    /// (snapshot.MinSeqNum + 1), the catch-up step has nothing to bridge with and the
-    /// FeedHandler waits for another cycle — re-overflowing the queue with the same
-    /// ratio and producing a permanent recovery loop. Empirically, a B3 snapshot for
-    /// ~18k symbols takes ~12 s of wall-time; at ~4.5k incrementals/s per group that
-    /// requires ~55k slots minimum. Default 200,000 gives ~45 s of head-room. Memory
-    /// cost: ~MTU × capacity × groups (200k × 1.5 KiB × 2 ≈ 600 MiB worst case;
-    /// typically half that since average B3 packet is ~700 B). CLI: env
-    /// UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY.
-    /// </summary>
-    public int IncrementalRecoveryQueueCapacity { get; set; } = 200_000;
-
     /// <summary>
     /// Per-group MPSC dispatch ring capacity (slots). Default 65 536. Producers (recv
     /// threads) drop newest packets when full; downstream gap detection triggers
@@ -183,23 +169,6 @@ public sealed class AppSettings
 
     /// <summary>RNG seed for reproducible loss patterns. 0 = nondeterministic. CLI: <c>--loss-seed</c>. Env: <c>UMDF_LOSS_SEED</c>.</summary>
     public int LossSeed { get; set; }
-
-    // ── Recovery mode (Phase 2 unified per-symbol recovery) ──
-
-    /// <summary>
-    /// Selects the recovery state machine. <c>Channel</c> (default) keeps the
-    /// legacy channel-level Recovery: a single gap pauses the whole group while
-    /// a snapshot cycle bridges the catch-up window. <c>PerSymbol</c> uses the
-    /// new <see cref="B3.Umdf.Book.SymbolStateRegistry"/> so a gap only marks
-    /// the affected symbols Stale; book/info applies for every other symbol
-    /// continue uninterrupted. Defaults to <see cref="RecoveryMode.PerSymbol"/>
-    /// after Phase 2c cutover (see commits ed97868/239ed33/ab9bce3 for the
-    /// validation harness comparison). To roll back to the legacy channel-wide
-    /// recovery state machine, set <c>UMDF_RECOVERY_MODE=channel</c> or pass
-    /// <c>--recovery-mode channel</c>.
-    /// CLI: <c>--recovery-mode</c>. Env: <c>UMDF_RECOVERY_MODE</c>.
-    /// </summary>
-    public RecoveryMode RecoveryMode { get; set; } = RecoveryMode.PerSymbol;
 
     /// <summary>
     /// Fraction (0..1) of symbols that must be Stale to engage market-wide fanout
@@ -277,8 +246,6 @@ public sealed class AppSettings
             MulticastMergeCapacity = mergeCapacity;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FEED_CHANNEL_CAPACITY"), out var feedCapacity))
             FeedChannelCapacity = feedCapacity;
-        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY"), out var recCapacity))
-            IncrementalRecoveryQueueCapacity = recCapacity;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_GROUP_RING_CAPACITY"), out var ringCapacity))
             GroupRingCapacity = ringCapacity;
         var logLevel = Environment.GetEnvironmentVariable("UMDF_LOG_LEVEL");
@@ -303,35 +270,12 @@ public sealed class AppSettings
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_LOSS_SEED"), out var lossSeed))
             LossSeed = lossSeed;
 
-        var recoveryMode = Environment.GetEnvironmentVariable("UMDF_RECOVERY_MODE");
-        if (!string.IsNullOrWhiteSpace(recoveryMode) && TryParseRecoveryMode(recoveryMode, out var rm))
-            RecoveryMode = rm;
-
         if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT"),
                 System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var psHigh))
             PerSymbolFanoutSuppressHighPct = psHigh;
         if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT"),
                 System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var psLow))
             PerSymbolFanoutSuppressLowPct = psLow;
-    }
-
-    public static bool TryParseRecoveryMode(string value, out RecoveryMode mode)
-    {
-        switch (value.Trim().ToLowerInvariant())
-        {
-            case "channel":
-            case "legacy":
-                mode = RecoveryMode.Channel;
-                return true;
-            case "per-symbol":
-            case "persymbol":
-            case "symbol":
-                mode = RecoveryMode.PerSymbol;
-                return true;
-            default:
-                mode = RecoveryMode.Channel;
-                return false;
-        }
     }
 
     private static bool TryParseBoolean(string? value, out bool result)

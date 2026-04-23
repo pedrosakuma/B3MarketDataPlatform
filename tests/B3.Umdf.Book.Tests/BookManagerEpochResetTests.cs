@@ -10,8 +10,7 @@ public class BookManagerEpochResetTests
     {
         var reg = new SymbolStateRegistry(NullLogger.Instance);
         var buf = new StaleMboBuffer(NullLogger.Instance);
-        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf,
-            recoveryMode: RecoveryMode.PerSymbol);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
         return (bm, reg, buf);
     }
 
@@ -46,16 +45,4 @@ public class BookManagerEpochResetTests
         Assert.Equal(1, bm.SnapshotsMissingRptSeq);
     }
 
-    [Fact]
-    public void OnSequenceReset_Channel_OnlyClearsBooks()
-    {
-        var bm = new BookManager(); // Channel mode
-        var book = bm.GetOrCreateBook(42);
-        book.LastRptSeq = 99;
-
-        bm.OnSequenceReset();
-
-        Assert.Equal(0, bm.EpochResets); // PerSymbol-specific counter
-        Assert.Equal(0, bm.EpochResetMessagesDropped);
-    }
 }
