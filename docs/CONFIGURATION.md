@@ -49,6 +49,10 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | `UMDF_FEED_CHANNEL_CAPACITY` | — | `250000` | Capacity of each per-group feed queue behind the dispatcher |
 | `UMDF_INCREMENTAL_RECOVERY_QUEUE_CAPACITY` | — | `200000` | Per-group cap on incrementals retained during a snapshot cycle (drop-oldest on overflow) |
 | `UMDF_GROUP_RING_CAPACITY` | — | `65536` | Per-group MPSC dispatch ring capacity (drop-newest on overflow) |
+| **Recovery** | | | |
+| `UMDF_RECOVERY_MODE` | `--recovery-mode` | `PerSymbol` | Gap-recovery strategy. `PerSymbol` (default) flips only the affected instruments to a Stale state and heals them via incremental SnapshotFullRefresh while the channel keeps consuming RealTime. `Channel` (legacy) takes the whole feed into a Recovery state machine; only useful for rollback during a release window. |
+| `UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT` | — | `0.50` | PerSymbol fanout backpressure: fraction of known symbols that must be Stale to suppress client fanout. Set negative to disable. |
+| `UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT` | — | `0.10` | Hysteresis low-watermark for fanout suppression release. |
 
 Docker-specific helpers consumed by `docker-entrypoint.sh`:
 

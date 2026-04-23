@@ -192,11 +192,14 @@ public sealed class AppSettings
     /// a snapshot cycle bridges the catch-up window. <c>PerSymbol</c> uses the
     /// new <see cref="B3.Umdf.Book.SymbolStateRegistry"/> so a gap only marks
     /// the affected symbols Stale; book/info applies for every other symbol
-    /// continue uninterrupted. Defaults to <see cref="RecoveryMode.Channel"/>
-    /// during Phase 2a/2b validation; flipped to PerSymbol in Phase 2c.
+    /// continue uninterrupted. Defaults to <see cref="RecoveryMode.PerSymbol"/>
+    /// after Phase 2c cutover (see commits ed97868/239ed33/ab9bce3 for the
+    /// validation harness comparison). To roll back to the legacy channel-wide
+    /// recovery state machine, set <c>UMDF_RECOVERY_MODE=channel</c> or pass
+    /// <c>--recovery-mode channel</c>.
     /// CLI: <c>--recovery-mode</c>. Env: <c>UMDF_RECOVERY_MODE</c>.
     /// </summary>
-    public RecoveryMode RecoveryMode { get; set; } = RecoveryMode.Channel;
+    public RecoveryMode RecoveryMode { get; set; } = RecoveryMode.PerSymbol;
 
     /// <summary>
     /// Fraction (0..1) of symbols that must be Stale to engage market-wide fanout

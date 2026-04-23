@@ -149,8 +149,10 @@ public class CliArgsTests
     }
 
     [Fact]
-    public void RecoveryMode_DefaultsToChannel()
+    public void RecoveryMode_DefaultsToPerSymbol()
     {
-        Assert.Equal(RecoveryMode.Channel, new AppSettings().RecoveryMode);
+        // Phase 2c cutover: PerSymbol is the default. To roll back, set
+        // UMDF_RECOVERY_MODE=channel or pass --recovery-mode channel.
+        Assert.Equal(RecoveryMode.PerSymbol, new AppSettings().RecoveryMode);
     }
 }
