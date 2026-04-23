@@ -118,4 +118,37 @@ public class CliArgsTests
         Assert.True(ok);
         Assert.Equal(2.5, settings.Speed);
     }
+
+    [Theory]
+    [InlineData("channel", RecoveryMode.Channel)]
+    [InlineData("Channel", RecoveryMode.Channel)]
+    [InlineData("legacy", RecoveryMode.Channel)]
+    [InlineData("per-symbol", RecoveryMode.PerSymbol)]
+    [InlineData("PerSymbol", RecoveryMode.PerSymbol)]
+    [InlineData("symbol", RecoveryMode.PerSymbol)]
+    public void TryApply_RecoveryMode_AcceptsAliases(string value, RecoveryMode expected)
+    {
+        var settings = new AppSettings();
+        var ok = CliArgs.TryApply(new[] { "--recovery-mode", value }, settings, new List<string>(), out _);
+
+        Assert.True(ok);
+        Assert.Equal(expected, settings.RecoveryMode);
+    }
+
+    [Fact]
+    public void TryApply_RecoveryMode_InvalidReturnsError()
+    {
+        var settings = new AppSettings();
+        var ok = CliArgs.TryApply(new[] { "--recovery-mode", "garbage" }, settings, new List<string>(), out var error);
+
+        Assert.False(ok);
+        Assert.NotNull(error);
+        Assert.Contains("--recovery-mode", error);
+    }
+
+    [Fact]
+    public void RecoveryMode_DefaultsToChannel()
+    {
+        Assert.Equal(RecoveryMode.Channel, new AppSettings().RecoveryMode);
+    }
 }

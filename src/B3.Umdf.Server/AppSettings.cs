@@ -182,6 +182,20 @@ public sealed class AppSettings
     /// <summary>RNG seed for reproducible loss patterns. 0 = nondeterministic. CLI: <c>--loss-seed</c>. Env: <c>UMDF_LOSS_SEED</c>.</summary>
     public int LossSeed { get; set; }
 
+    // ── Recovery mode (Phase 2 unified per-symbol recovery) ──
+
+    /// <summary>
+    /// Selects the recovery state machine. <c>Channel</c> (default) keeps the
+    /// legacy channel-level Recovery: a single gap pauses the whole group while
+    /// a snapshot cycle bridges the catch-up window. <c>PerSymbol</c> uses the
+    /// new <see cref="B3.Umdf.Book.SymbolStateRegistry"/> so a gap only marks
+    /// the affected symbols Stale; book/info applies for every other symbol
+    /// continue uninterrupted. Defaults to <see cref="RecoveryMode.Channel"/>
+    /// during Phase 2a/2b validation; flipped to PerSymbol in Phase 2c.
+    /// CLI: <c>--recovery-mode</c>. Env: <c>UMDF_RECOVERY_MODE</c>.
+    /// </summary>
+    public RecoveryMode RecoveryMode { get; set; } = RecoveryMode.Channel;
+
     /// <summary>Load settings from a JSON file.</summary>
     public static AppSettings LoadFromFile(string path)
     {
@@ -265,6 +279,29 @@ public sealed class AppSettings
             LossCorrelated = lossCorr;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_LOSS_SEED"), out var lossSeed))
             LossSeed = lossSeed;
+
+        var recoveryMode = Environment.GetEnvironmentVariable("UMDF_RECOVERY_MODE");
+        if (!string.IsNullOrWhiteSpace(recoveryMode) && TryParseRecoveryMode(recoveryMode, out var rm))
+            RecoveryMode = rm;
+    }
+
+    public static bool TryParseRecoveryMode(string value, out RecoveryMode mode)
+    {
+        switch (value.Trim().ToLowerInvariant())
+        {
+            case "channel":
+            case "legacy":
+                mode = RecoveryMode.Channel;
+                return true;
+            case "per-symbol":
+            case "persymbol":
+            case "symbol":
+                mode = RecoveryMode.PerSymbol;
+                return true;
+            default:
+                mode = RecoveryMode.Channel;
+                return false;
+        }
     }
 
     private static bool TryParseBoolean(string? value, out bool result)
@@ -304,3 +341,12 @@ public sealed class AppSettings
     ReadCommentHandling = JsonCommentHandling.Skip,
     AllowTrailingCommas = true)]
 internal partial class AppSettingsJsonContext : JsonSerializerContext;
+
+/// <summary>Recovery state-machine selection. See <see cref="AppSettings.RecoveryMode"/>.</summary>
+public enum RecoveryMode
+{
+    /// <summary>Legacy channel-level Recovery (snapshot cycle bridges full group).</summary>
+    Channel = 0,
+    /// <summary>Phase 2 unified per-symbol Recovery via <see cref="B3.Umdf.Book.SymbolStateRegistry"/>.</summary>
+    PerSymbol = 1,
+}

@@ -92,6 +92,12 @@ internal static class CliArgs
                     settings.LossSeed = ls;
                     break;
 
+                case "--recovery-mode" when i + 1 < args.Length:
+                    if (!AppSettings.TryParseRecoveryMode(args[++i], out var rm))
+                    { error = "Invalid --recovery-mode value. Use 'channel' or 'per-symbol'."; return false; }
+                    settings.RecoveryMode = rm;
+                    break;
+
                 default:
                     positionalArgs.Add(args[i]);
                     break;
@@ -166,6 +172,7 @@ internal static class UsageBanner
         Console.WriteLine("  --loss-burst <n>              Consecutive packets dropped per burst trigger (burst mode, default 1)");
         Console.WriteLine("  --loss-correlated             A and B drop the SAME SeqNum (worst case for arbitration)");
         Console.WriteLine("  --loss-seed <int>             RNG seed for reproducible loss patterns");
+        Console.WriteLine("  --recovery-mode <mode>        Recovery state machine: 'channel' (default) or 'per-symbol' (Phase 2)");
     }
 }
 
