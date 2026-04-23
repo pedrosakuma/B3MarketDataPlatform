@@ -1,4 +1,4 @@
-namespace B3.Umdf.Book;
+namespace B3.Umdf.Feed;
 
 /// <summary>
 /// Recovery state-machine selection. <c>Channel</c> is the legacy

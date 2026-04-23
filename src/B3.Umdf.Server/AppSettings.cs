@@ -1,3 +1,4 @@
+using B3.Umdf.Feed;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using B3.Umdf.Book;

@@ -1,3 +1,4 @@
+using B3.Umdf.Feed;
 using B3.Umdf.Book;
 using Microsoft.Extensions.Logging.Abstractions;
 

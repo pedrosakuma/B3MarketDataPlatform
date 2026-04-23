@@ -137,6 +137,55 @@ public sealed class ChannelHandler : IDisposable
         return list;
     }
 
+    /// <summary>
+    /// PerSymbol mode helper: when a real gap is declared (distance > MaxReorderDistance),
+    /// dispatch the gapped packet, advance the expected SeqNum past it, and dispatch any
+    /// reorder-buffered packets ahead in SeqNum order. Returns without entering
+    /// channel-level Recovery — per-symbol routing handles healing on a per-instrument basis.
+    /// </summary>
+    public void AcceptGapAndAdvance(in UmdfPacket packet)
+    {
+        var span = packet.Data.Span;
+        if (!PacketHeader.TryParse(span, out var header, out _))
+            return;
+        uint seq = header.SequenceNumber;
+
+        _packetsProcessed++;
+        MessageDispatcher.Dispatch(in packet, span, _eventHandler);
+        _eventHandler.OnPacketProcessed();
+        _expectedSeqNum = seq + 1;
+        _inRecovery = false;
+
+        if (_reorderBuffer.Count > 0)
+        {
+            var ordered = _reorderBuffer.Values.OrderBy(static p =>
+            {
+                PacketHeader.TryParse(p.Data.Span, out var h, out _);
+                return h.SequenceNumber;
+            }).ToList();
+            _reorderBuffer.Clear();
+
+            foreach (var p in ordered)
+            {
+                try
+                {
+                    if (!PacketHeader.TryParse(p.Data.Span, out var ph, out _))
+                        continue;
+                    if (ph.SequenceNumber < _expectedSeqNum)
+                        continue; // covered by current packet (shouldn't happen, defensive)
+                    _packetsProcessed++;
+                    MessageDispatcher.Dispatch(in p, p.Data.Span, _eventHandler);
+                    _eventHandler.OnPacketProcessed();
+                    _expectedSeqNum = ph.SequenceNumber + 1;
+                }
+                finally
+                {
+                    p.Release();
+                }
+            }
+        }
+    }
+
     public void Reset()
     {
         DiscardReorderBuffer();

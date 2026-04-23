@@ -258,6 +258,58 @@ public class FeedHandlerStateMachineTests
         Assert.Equal(100L, handler.LastPacketTicks);
     }
 
+    [Fact]
+    public void PerSymbolMode_Default_IsChannel()
+    {
+        var handler = new FeedHandler(new NopFeedEventHandler());
+        Assert.Equal(RecoveryMode.Channel, handler.RecoveryMode);
+    }
+
+    [Fact]
+    public void PerSymbolMode_Gap_DoesNotTransitionToRecovery()
+    {
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker, recoveryMode: RecoveryMode.PerSymbol);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
+        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(1L, handler.PerSymbolGapsAbsorbed);
+        // gap was reported to handler (still useful diagnostic) but channel state stays RealTime
+        Assert.NotNull(tracker.LastGap);
+    }
+
+    [Fact]
+    public void ChannelMode_Gap_StillTransitionsToRecovery()
+    {
+        var handler = new FeedHandler(new NopFeedEventHandler(), recoveryMode: RecoveryMode.Channel);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
+        uint farFuture = 2u + (uint)ChannelHandler.MaxReorderDistance + 1u;
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: farFuture));
+
+        Assert.Equal(FeedState.Recovery, handler.State);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
+    }
+
+    [Fact]
+    public void PerSymbolMode_NoGap_BehavesNormally()
+    {
+        var handler = new FeedHandler(new NopFeedEventHandler(), recoveryMode: RecoveryMode.PerSymbol);
+        handler.SetStateForTesting(FeedState.RealTime);
+
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3));
+
+        Assert.Equal(FeedState.RealTime, handler.State);
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
+    }
+
     private class NopFeedEventHandler : IFeedEventHandler
     {
         public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
@@ -406,8 +458,9 @@ public class FeedHandlerStateMachineTests
     private class TrackingFeedEventHandler : IFeedEventHandler
     {
         public int PacketProcessedCount;
+        public int SeenPacketCount;
         public (uint Expected, uint Received)? LastGap;
-        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
+        public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) => SeenPacketCount++;
         public void OnPacketProcessed() => PacketProcessedCount++;
         public void OnGapDetected(uint expected, uint received) => LastGap = (expected, received);
         public void OnSequenceReset() { }

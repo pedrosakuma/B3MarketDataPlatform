@@ -77,7 +77,7 @@ public sealed class FeedHandler : IDisposable
     /// <summary>TickCount64 (milliseconds since process start) of the last packet processed. 0 if none yet.</summary>
     public long LastPacketTicks => Volatile.Read(ref _lastPacketTicks);
 
-    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity)
+    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(incrementalRecoveryQueueCapacity, 1);
         _source = source;
@@ -86,13 +86,14 @@ public sealed class FeedHandler : IDisposable
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
         _maxIncrementalQueueSize = incrementalRecoveryQueueCapacity;
+        _recoveryMode = recoveryMode;
     }
 
     /// <summary>
     /// Creates a FeedHandler for external feeding (no owned source).
     /// Use FeedPacket() to push packets from an external loop.
     /// </summary>
-    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity)
+    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null, int incrementalRecoveryQueueCapacity = DefaultIncrementalRecoveryQueueCapacity, RecoveryMode recoveryMode = RecoveryMode.Channel)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(incrementalRecoveryQueueCapacity, 1);
         _source = null;
@@ -101,7 +102,21 @@ public sealed class FeedHandler : IDisposable
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
         _incrementalHandler = new ChannelHandler(eventHandler);
         _maxIncrementalQueueSize = incrementalRecoveryQueueCapacity;
+        _recoveryMode = recoveryMode;
     }
+
+    private readonly RecoveryMode _recoveryMode;
+    private long _perSymbolGapsAbsorbed;
+
+    /// <summary>The recovery mode this FeedHandler is operating in.</summary>
+    public RecoveryMode RecoveryMode => _recoveryMode;
+
+    /// <summary>
+    /// PerSymbol mode only: number of channel-level gaps that were absorbed
+    /// by advancing past the missing SeqNum without entering Recovery state.
+    /// Per-symbol routing is responsible for healing affected instruments.
+    /// </summary>
+    public long PerSymbolGapsAbsorbed => Volatile.Read(ref _perSymbolGapsAbsorbed);
 
     public Task StartAsync(CancellationToken ct = default)
     {
@@ -256,6 +271,25 @@ public sealed class FeedHandler : IDisposable
                 var result = _incrementalHandler.HandlePacket(in packet);
                 if (result == GapResult.Gap)
                 {
+                    if (_recoveryMode == RecoveryMode.PerSymbol)
+                    {
+                        // Channel-level gap is absorbed: dispatch the packet so its
+                        // contents reach the per-symbol gating layer, then advance
+                        // past the missing SeqNum. Symbols affected by the missing
+                        // packet will go Stale via SymbolStateRegistry and self-heal
+                        // when the next snapshot for them arrives. Channel state
+                        // remains RealTime (continuous snapshot consumption below).
+                        _incrementalHandler.AcceptGapAndAdvance(in packet);
+                        Interlocked.Increment(ref _perSymbolGapsAbsorbed);
+                        if (_logger.IsEnabled(LogLevel.Information))
+                            _logger.LogInformation(
+                                "PerSymbol: absorbed channel gap on {Channel} (expected={Expected} received={Received}); per-symbol routing will heal affected instruments.",
+                                packet.Channel,
+                                _incrementalHandler.LastGapExpected,
+                                _incrementalHandler.LastGapReceived);
+                        break;
+                    }
+
                     EnqueueCopy(in packet);
                     // Reorder buffer was holding future packets that now belong
                     // to the catch-up window; transfer them into the deferred
@@ -277,7 +311,14 @@ public sealed class FeedHandler : IDisposable
                 _eventHandler.OnPacketProcessed();
                 break;
 
-            // SnapshotRecovery: ignore during RealTime — incremental stream is source of truth
+            case ChannelType.SnapshotRecovery:
+                // PerSymbol mode keeps the snapshot stream always-on so individual
+                // Stale instruments can heal without triggering a channel-wide
+                // Recovery cycle. Channel mode ignores snapshots while in RealTime
+                // (incremental stream is the source of truth).
+                if (_recoveryMode == RecoveryMode.PerSymbol)
+                    DispatchAndTrackSnapshot(in packet);
+                break;
         }
     }
 
