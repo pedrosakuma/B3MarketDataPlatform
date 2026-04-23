@@ -321,6 +321,150 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.NullPriceChangeDeletes),
             description: "Order updates with null price converted to deletes");
 
+        // ── Per-symbol recovery (PerSymbol mode only) ──
+        // These instruments only emit when the BookManager was constructed with
+        // RecoveryMode.PerSymbol — Channel-mode managers report 0 for all of them.
+
+        Meter.CreateObservableGauge("b3.umdf.persymbol.stale_symbols",
+            () =>
+            {
+                var m = new List<Measurement<int>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var reg = bookManagers[i].StateRegistry;
+                    if (reg is null) continue;
+                    var grp = $"G{groupIds[i]}";
+                    var snap = reg.GetAggregateSnapshot();
+                    m.Add(new(snap.TotalStaleSymbols, Tag("group", grp), Tag("kind", "any")));
+                    foreach (SymbolGapKind k in Enum.GetValues<SymbolGapKind>())
+                        m.Add(new(snap.StaleOf(k), Tag("group", grp), Tag("kind", k.ToString())));
+                }
+                return m;
+            },
+            unit: "{symbols}", description: "Symbols currently in Stale state awaiting snapshot heal (PerSymbol mode)");
+
+        Meter.CreateObservableGauge("b3.umdf.persymbol.tracked_symbols",
+            () =>
+            {
+                var m = new List<Measurement<int>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var reg = bookManagers[i].StateRegistry;
+                    if (reg is null) continue;
+                    m.Add(new(reg.GetAggregateSnapshot().TotalSymbols,
+                        Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{symbols}", description: "Symbols tracked by SymbolStateRegistry (PerSymbol mode)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.lagging_snapshots",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var reg = bookManagers[i].StateRegistry;
+                    if (reg is null) continue;
+                    m.Add(new(reg.LaggingSnapshotCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{snapshots}", description: "Snapshot heals where snapshotRptSeq lagged the live high-water (ignored)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_healed",
+            () => PerGroupBook(bm => bm.SnapshotsHealed),
+            unit: "{snapshots}", description: "Per-symbol snapshots that successfully transitioned a symbol to Healthy");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_missing_rptseq",
+            () => PerGroupBook(bm => bm.SnapshotsMissingRptSeq),
+            unit: "{snapshots}", description: "Snapshot Orders_71 received without a matching Header_30 LastRptSeq baseline");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_buffered",
+            () => PerGroupBook(bm => bm.BufferedMboMessages),
+            unit: "{messages}", description: "MBO messages enqueued into per-symbol stale buffer awaiting heal");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_replayed",
+            () => PerGroupBook(bm => bm.ReplayedMboMessages),
+            unit: "{messages}", description: "MBO messages replayed from stale buffer after snapshot heal");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.epoch_resets",
+            () => PerGroupBook(bm => bm.EpochResets),
+            unit: "{events}", description: "ChannelReset/SequenceReset events that bumped the per-symbol epoch");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.epoch_reset_messages_dropped",
+            () => PerGroupBook(bm => bm.EpochResetMessagesDropped),
+            unit: "{messages}", description: "Stale-buffer messages dropped during per-symbol epoch reset");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stats_dropped_duplicate",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < marketDataManagers.Count; i++)
+                    m.Add(new(marketDataManagers[i].DroppedDuplicateStats,
+                        Tag("group", $"G{groupIds[i]}")));
+                return m;
+            },
+            unit: "{messages}", description: "Per-symbol stat messages dropped as duplicates (rptSeq <= last seen)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stats_live_resyncs",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < marketDataManagers.Count; i++)
+                    m.Add(new(marketDataManagers[i].LiveResyncs,
+                        Tag("group", $"G{groupIds[i]}")));
+                return m;
+            },
+            unit: "{events}", description: "Per-symbol stat live resyncs (gap on Healthy applied via NextMessage policy)");
+
+        Meter.CreateObservableGauge("b3.umdf.persymbol.stale_buffer_bytes",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.TotalBytes, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "By", description: "Bytes currently held by per-symbol stale MBO buffers (ArrayPool-backed)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_dropped_persymbol_cap",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.DroppedPerSymbolCapCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{messages}", description: "Stale-buffer enqueues rejected because the per-symbol message cap was reached");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_dropped_global_cap",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.DroppedGlobalCapCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{messages}", description: "Stale-buffer enqueues rejected because the global byte cap was reached");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.channel_gaps_absorbed",
+            () => FeedHandlers().Select(h =>
+                new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
+            unit: "{gaps}", description: "Channel-level gaps absorbed without entering Recovery (PerSymbol mode)");
+
         // ── Book gauges ──
 
         Meter.CreateObservableGauge("b3.umdf.book.active",
