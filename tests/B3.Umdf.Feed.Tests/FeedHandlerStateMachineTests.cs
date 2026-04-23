@@ -27,6 +27,24 @@ public class FeedHandlerStateMachineTests
     }
 
     [Fact]
+    public void Streaming_FirstPacketAtHighSeq_SeedsBaselineWithoutGap()
+    {
+        // Cold-start scenario: live multicast is mid-stream, so the first
+        // observed seq is far above the initial _expectedSeqNum=1. Must not
+        // count as a channel gap — per-symbol layer heals via snapshot.
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.Streaming);
+
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 85037));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 85038));
+
+        Assert.Equal(0L, handler.PerSymbolGapsAbsorbed);
+        Assert.Equal(2, tracker.PacketProcessedCount);
+        Assert.Equal(85039u, handler.IncrementalHandler.ExpectedSequenceNumber);
+    }
+
+    [Fact]
     public void InitialState_IsWaitInstrumentDefinition()
     {
         var handler = new FeedHandler(new NopFeedEventHandler());

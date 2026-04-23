@@ -77,6 +77,19 @@ public sealed class ChannelHandler : IDisposable
 
         uint seq = header.SequenceNumber;
 
+        // Cold-start: if the very first packet is far above the initial
+        // _expectedSeqNum=1 (live multicast joined mid-stream), seed the
+        // baseline from this seq rather than treating it as a giant gap.
+        // The per-symbol layer heals via snapshot, so the channel just needs
+        // a sane baseline. Bounded by MaxReorderDistance so legitimate small
+        // start-from-1 scenarios (tests, replay) keep the existing behavior.
+        if (_packetsProcessed == 0 && _reorderBuffer.Count == 0
+            && seq > _expectedSeqNum
+            && seq - _expectedSeqNum > MaxReorderDistance)
+        {
+            _expectedSeqNum = seq;
+        }
+
         // Already past expected — duplicate from the other feed (or already
         // filled by reorder drain).
         if (seq < _expectedSeqNum)
