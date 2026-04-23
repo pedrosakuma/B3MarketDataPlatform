@@ -329,6 +329,25 @@ export function showToast(text, cssClass) {
 
 const subsState = { rows: new Map(), columnsKey: '' };
 
+// Fields that get a directional flash (green for up, red for down).
+// Everything else gets a neutral flash on any change.
+const DIRECTIONAL_FIELDS = new Set(['LastTradePrice', 'NetChange', 'VwapPrice']);
+const FLASH_UP   = 'rgba(38, 166, 91, 0.55)';
+const FLASH_DOWN = 'rgba(220, 67, 67, 0.55)';
+const FLASH_NEUT = 'rgba(140, 160, 200, 0.45)';
+const FLASH_DURATION_MS = 500;
+
+// Use the Web Animations API: GPU-friendly, auto-cleans, restarts cleanly
+// when called repeatedly on a rapidly-updating cell. Stored on the element
+// so we can cancel a previous animation in-flight without a layout thrash.
+function flashCell(td, color) {
+  if (td._flashAnim) td._flashAnim.cancel();
+  td._flashAnim = td.animate(
+    [{ backgroundColor: color }, { backgroundColor: 'transparent' }],
+    { duration: FLASH_DURATION_MS, easing: 'ease-out' }
+  );
+}
+
 function tradingStatusName(v) {
   const names = { 2: 'Paused', 4: 'Closed', 17: 'Open', 18: 'Forbidden', 20: 'Unknown', 21: 'Auction', 101: 'FinalClosing' };
   return names[v] || ('(' + v + ')');
@@ -414,7 +433,9 @@ export function renderSubsTable(allInfo, columns, selectedId) {
       tr.appendChild(tdAct);
 
       tbody.appendChild(tr);
-      row = { tr, tdSym, cells, btnDetail, btnUnsub };
+      // prev: last numeric value per column, used for change detection +
+      // direction (no flash on the row's first appearance).
+      row = { tr, tdSym, cells, btnDetail, btnUnsub, prev: {} };
       subsState.rows.set(item.id, row);
     }
 
@@ -427,9 +448,24 @@ export function renderSubsTable(allInfo, columns, selectedId) {
       const td = row.cells[col];
       if (!td) continue;
       const val = item.info[col];
-      td.textContent = formatField(col, val);
-      if (col === 'NetChange' && val != null) {
-        td.className = val > 0 ? 'bid-price' : val < 0 ? 'ask-price' : '';
+      const prev = row.prev[col];
+      const changed = prev !== val;
+      if (changed) {
+        td.textContent = formatField(col, val);
+        if (col === 'NetChange' && val != null) {
+          td.className = val > 0 ? 'bid-price' : val < 0 ? 'ask-price' : '';
+        }
+        // Skip flashing on the row's first render (prev === undefined and
+        // it's the initial population) to avoid a flash storm on subscribe.
+        if (prev !== undefined && val != null) {
+          if (DIRECTIONAL_FIELDS.has(col) && typeof val === 'number' && typeof prev === 'number') {
+            if (val > prev) flashCell(td, FLASH_UP);
+            else if (val < prev) flashCell(td, FLASH_DOWN);
+          } else {
+            flashCell(td, FLASH_NEUT);
+          }
+        }
+        row.prev[col] = val;
       }
     }
   }
