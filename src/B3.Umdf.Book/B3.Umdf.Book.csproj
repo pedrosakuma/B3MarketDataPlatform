@@ -16,6 +16,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="B3.Umdf.Server" />
     <InternalsVisibleTo Include="B3.Umdf.Server.Tests" />
+    <InternalsVisibleTo Include="B3.Umdf.Book.Tests" />
   </ItemGroup>
 
 </Project>

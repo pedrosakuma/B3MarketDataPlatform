@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using B3.Umdf.Book;
 
 namespace B3.Umdf.Server;
 
@@ -341,12 +342,3 @@ public sealed class AppSettings
     ReadCommentHandling = JsonCommentHandling.Skip,
     AllowTrailingCommas = true)]
 internal partial class AppSettingsJsonContext : JsonSerializerContext;
-
-/// <summary>Recovery state-machine selection. See <see cref="AppSettings.RecoveryMode"/>.</summary>
-public enum RecoveryMode
-{
-    /// <summary>Legacy channel-level Recovery (snapshot cycle bridges full group).</summary>
-    Channel = 0,
-    /// <summary>Phase 2 unified per-symbol Recovery via <see cref="B3.Umdf.Book.SymbolStateRegistry"/>.</summary>
-    PerSymbol = 1,
-}

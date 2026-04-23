@@ -64,12 +64,46 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long CurrentlyLockedBooks => Volatile.Read(ref _currentlyLockedBooks);
 
 
-    public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null)
+    public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null,
+        SymbolStateRegistry? stateRegistry = null,
+        StaleMboBuffer? staleBuffer = null,
+        RecoveryMode recoveryMode = RecoveryMode.Channel)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<BookManager>.Instance;
         GapTracker = new SymbolGapTracker(_logger);
+        _recoveryMode = recoveryMode;
+        if (recoveryMode == RecoveryMode.PerSymbol)
+        {
+            _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
+                "SymbolStateRegistry is required when RecoveryMode is PerSymbol.");
+            _staleBuffer = staleBuffer ?? throw new ArgumentNullException(nameof(staleBuffer),
+                "StaleMboBuffer is required when RecoveryMode is PerSymbol.");
+        }
+        else
+        {
+            _stateRegistry = stateRegistry;
+            _staleBuffer = staleBuffer;
+        }
     }
+
+    private readonly RecoveryMode _recoveryMode;
+    private readonly SymbolStateRegistry? _stateRegistry;
+    private readonly StaleMboBuffer? _staleBuffer;
+    private long _bufferedMboMessages;
+    private long _replayedMboMessages;
+
+    /// <summary>The recovery mode this BookManager is operating in.</summary>
+    public RecoveryMode RecoveryMode => _recoveryMode;
+
+    /// <summary>Symbol state registry (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
+    public SymbolStateRegistry? StateRegistry => _stateRegistry;
+
+    /// <summary>Stale MBO buffer (non-null only when <see cref="RecoveryMode"/> is PerSymbol).</summary>
+    public StaleMboBuffer? StaleBuffer => _staleBuffer;
+
+    public long BufferedMboMessages => Volatile.Read(ref _bufferedMboMessages);
+    public long ReplayedMboMessages => Volatile.Read(ref _replayedMboMessages);
 
     /// <summary>
     /// Phase 0 shadow tracker for per-symbol rptSeq gaps on MBO/Trade
@@ -83,11 +117,67 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// Records the per-symbol rptSeq gap (if any) and updates the book's
     /// <see cref="OrderBook.LastRptSeq"/>. Called from every MBO/Trade
     /// handler instead of writing <c>LastRptSeq</c> directly.
+    /// In PerSymbol mode the registry is the source of truth, so we skip
+    /// the Phase 0 shadow tracker (which would double-count gaps).
     /// </summary>
     private void TrackMboRptSeq(OrderBook book, uint received)
     {
-        GapTracker.Observe(book.SecurityId, received, book.LastRptSeq, SymbolGapKind.Mbo);
+        if (_recoveryMode != RecoveryMode.PerSymbol)
+            GapTracker.Observe(book.SecurityId, received, book.LastRptSeq, SymbolGapKind.Mbo);
         book.LastRptSeq = received;
+    }
+
+    /// <summary>
+    /// Per-symbol routing decision for an incoming MBO/Trade message.
+    /// In PerSymbol mode, consults the registry: Apply lets the caller
+    /// proceed; Buffer copies the body into <see cref="_staleBuffer"/> for
+    /// later replay; Drop returns silently. In Channel mode, always Apply.
+    /// </summary>
+    /// <returns><c>true</c> if the caller should proceed with apply logic.</returns>
+    private bool RouteMbo(ulong securityId, ushort templateId, uint? rptSeqOpt, ReadOnlySpan<byte> body)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol) return true;
+        if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
+        var result = _stateRegistry!.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
+        switch (result.Action)
+        {
+            case SymbolStateRegistry.ObserveAction.Apply:
+                return true;
+            case SymbolStateRegistry.ObserveAction.Buffer:
+                if (_staleBuffer!.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body))
+                    Interlocked.Increment(ref _bufferedMboMessages);
+                return false;
+            case SymbolStateRegistry.ObserveAction.Drop:
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// Drain and replay the per-symbol stale buffer for one security after
+    /// a snapshot heal. Called by the snapshot handler in PerSymbol mode.
+    /// Messages with <c>rptSeq ∈ [drainFrom, drainTo]</c> are dispatched
+    /// through the same handlers as live messages — the registry will see
+    /// them as Healthy + contiguous and route them through Apply.
+    /// </summary>
+    internal int ReplayDeferredMbo(ulong securityId, uint drainFrom, uint drainTo)
+    {
+        if (_recoveryMode != RecoveryMode.PerSymbol || _staleBuffer is null) return 0;
+        return _staleBuffer.Drain(securityId, drainFrom, drainTo, m =>
+        {
+            _currentSendingTimeNs = m.SendingTimeNs;
+            switch (m.TemplateId)
+            {
+                case Order_MBO_50Data.MESSAGE_ID: HandleOrder(m.Span); break;
+                case DeleteOrder_MBO_51Data.MESSAGE_ID: HandleDeleteOrder(m.Span); break;
+                case MassDeleteOrders_MBO_52Data.MESSAGE_ID: HandleMassDelete(m.Span); break;
+                case Trade_53Data.MESSAGE_ID: HandleTrade(m.Span, Trade_53Data.MESSAGE_SIZE); break;
+                case ForwardTrade_54Data.MESSAGE_ID: HandleForwardTrade(m.Span, ForwardTrade_54Data.MESSAGE_SIZE); break;
+                case ExecutionSummary_55Data.MESSAGE_ID: HandleExecutionSummary(m.Span); break;
+                case TradeBust_57Data.MESSAGE_ID: HandleTradeBust(m.Span); break;
+            }
+            Interlocked.Increment(ref _replayedMboMessages);
+        });
     }
 
     // ── IMarketDataEventHandler ──
@@ -295,6 +385,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, Order_MBO_50Data.MESSAGE_ID,
+                msg.RptSeq is { } orderRs ? (uint)orderRs : null, body))
+            return;
+
         var book = GetOrCreateBook(securityId);
 
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
@@ -381,6 +476,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
+        if (!RouteMbo(securityId, DeleteOrder_MBO_51Data.MESSAGE_ID,
+                msg.RptSeq is { } delRs ? (uint)delRs : null, body))
+            return;
+
         if (!TryLookupBook(securityId, out var book))
             return;
 
@@ -406,6 +505,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, MassDeleteOrders_MBO_52Data.MESSAGE_ID,
+                msg.RptSeq is { } mdRs ? (uint)mdRs : null, body))
+            return;
 
         if (!TryLookupBook(securityId, out var book))
             return;
@@ -441,6 +544,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, Trade_53Data.MESSAGE_ID,
+                msg.RptSeq is { } trRs ? (uint)trRs : null, body))
+            return;
+
         long price = msg.MDEntryPx.Mantissa;
         long quantity = (long)msg.MDEntrySize;
         long tradeId = (long)(uint)msg.TradeID;
@@ -477,6 +585,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, ForwardTrade_54Data.MESSAGE_ID,
+                msg.RptSeq is { } fwdRs ? (uint)fwdRs : null, body))
+            return;
+
         long price = msg.MDEntryPx.Mantissa;
         long quantity = (long)msg.MDEntrySize;
         long tradeId = (long)(uint)msg.TradeID;
@@ -498,6 +611,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, ExecutionSummary_55Data.MESSAGE_ID,
+                msg.RptSeq is { } exRs ? (uint)exRs : null, body))
+            return;
+
         long lastPx = msg.LastPx.Mantissa;
         long fillQty = (long)msg.FillQty;
 
@@ -517,6 +635,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        if (!RouteMbo(securityId, TradeBust_57Data.MESSAGE_ID,
+                msg.RptSeq is { } tbRs ? (uint)tbRs : null, body))
+            return;
+
         long price = msg.MDEntryPx.Mantissa;
         long quantity = (long)msg.MDEntrySize;
         long tradeId = (long)(uint)msg.TradeID;
