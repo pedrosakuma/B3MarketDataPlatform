@@ -376,6 +376,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotsMissingRptSeq),
             unit: "{snapshots}", description: "Snapshot Orders_71 received without a matching Header_30 LastRptSeq baseline");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshot_chunks_orphaned",
+            () => PerGroupBook(bm => bm.SnapshotChunksOrphaned),
+            unit: "{chunks}", description: "Snapshot Orders_71 chunks dropped because no Header_30 was seen first for that securityID");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_buffered",
             () => PerGroupBook(bm => bm.BufferedMboMessages),
             unit: "{messages}", description: "MBO messages enqueued into per-symbol stale buffer awaiting heal");

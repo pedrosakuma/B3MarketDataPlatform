@@ -638,39 +638,130 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     }
 
     /// <summary>
-     /// Per-symbol pending snapshot lastRptSeq indexed by SecurityID. Populated by
-     /// <see cref="HandleSnapshotHeader"/> and consumed by <see cref="HandleSnapshotOrders"/>
-     /// to drive registry healing in PerSymbol mode. Header_30 always precedes its
-     /// matching 71 body in B3's snapshot stream for the same instrument.
-     /// </summary>
-    private readonly Dictionary<ulong, uint> _pendingSnapshotLastRptSeq = new();
+    /// Per-symbol pending snapshot state indexed by SecurityID. A B3 MBO snapshot for one
+    /// instrument arrives as 1× Header_30 followed by N× Orders_71 chunks ("Partial list of
+    /// orders"); the sum of order entries across chunks equals
+    /// <c>TotNumBids + TotNumOffers</c> from the header. The book is cleared once on
+    /// Header_30, every Orders_71 chunk appends to the same book, and the symbol is healed
+    /// only when all expected entries have been received.
+    /// </summary>
+    private readonly Dictionary<ulong, PendingSnapshot> _pendingSnapshots = new();
+    private struct PendingSnapshot
+    {
+        public uint LastRptSeq;        // 0 if no usable rptSeq baseline
+        public uint OrdersExpected;    // TotNumBids + TotNumOffers from Header_30
+        public uint OrdersReceived;    // accumulated across Orders_71 chunks
+        public bool HasRptSeq;         // whether LastRptSeq is usable
+    }
     private long _snapshotsHealed;
     private long _snapshotsMissingRptSeq;
+    private long _snapshotChunksOrphaned;
 
     /// <summary>Number of snapshot cycles where the registry was successfully healed.</summary>
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     /// <summary>Snapshots received in PerSymbol mode without a usable LastRptSeq (cannot heal).</summary>
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
+    /// <summary>Orders_71 chunks dropped because no Header_30 was seen first for that securityID.</summary>
+    public long SnapshotChunksOrphaned => Volatile.Read(ref _snapshotChunksOrphaned);
 
     private void HandleSnapshotHeader(ReadOnlySpan<byte> body)
     {
         if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader)) return;
 
         ref readonly var msg = ref reader.Data;
-        RecordSnapshotHeader((ulong)msg.SecurityID, msg.LastRptSeq);
+        ulong secId = (ulong)msg.SecurityID;
+        uint expected = msg.TotNumBids + msg.TotNumOffers;
+        bool hasRpt = msg.LastRptSeq is { } v && v > 0;
+
+        // Begin a fresh snapshot for this instrument: clear the book and reset counters.
+        // If a previous snapshot for this same instrument was still in progress (incomplete
+        // chunks), it gets superseded — chunks from the prior snapshot are abandoned.
+        var book = GetOrCreateBook(secId);
+        book.Clear();
+        _pendingSnapshots[secId] = new PendingSnapshot
+        {
+            LastRptSeq = hasRpt ? msg.LastRptSeq!.Value : 0u,
+            OrdersExpected = expected,
+            OrdersReceived = 0,
+            HasRptSeq = hasRpt,
+        };
+
+        // Empty book snapshot (no Orders_71 chunks will follow): heal immediately.
+        if (expected == 0)
+            CompleteSnapshot(secId, book);
     }
 
     /// <summary>
-    /// Cache the per-symbol lastRptSeq from a snapshot header so the next
-    /// matching snapshot body can heal the registry. Exposed internally for
-    /// tests that bypass SBE parsing.
+    /// Test helper: simulate a Header_30 + N Orders_71 chunked snapshot. The book is
+    /// cleared, expected orders is set, and heal fires only once
+    /// <paramref name="ordersExpected"/> entries have been recorded via
+    /// <see cref="RecordSnapshotChunkForTest"/>.
+    /// </summary>
+    internal void BeginChunkedSnapshotForTest(ulong securityId, uint lastRptSeq, uint ordersExpected)
+    {
+        var book = GetOrCreateBook(securityId);
+        book.Clear();
+        _pendingSnapshots[securityId] = new PendingSnapshot
+        {
+            LastRptSeq = lastRptSeq,
+            OrdersExpected = ordersExpected,
+            OrdersReceived = 0,
+            HasRptSeq = lastRptSeq > 0,
+        };
+        if (ordersExpected == 0 && lastRptSeq > 0)
+            CompleteSnapshot(securityId, book);
+    }
+
+    /// <summary>
+    /// Test helper: simulate one Orders_71 chunk carrying <paramref name="ordersInChunk"/>
+    /// entries. Heal fires automatically once the running total meets the expected count
+    /// from <see cref="BeginChunkedSnapshotForTest"/>.
+    /// </summary>
+    internal void RecordSnapshotChunkForTest(ulong securityId, uint ordersInChunk)
+    {
+        if (!_pendingSnapshots.ContainsKey(securityId))
+        {
+            Interlocked.Increment(ref _snapshotChunksOrphaned);
+            return;
+        }
+        var book = GetOrCreateBook(securityId);
+        ref var pending = ref System.Runtime.InteropServices.CollectionsMarshal
+            .GetValueRefOrNullRef(_pendingSnapshots, securityId);
+        pending.OrdersReceived += ordersInChunk;
+        if (pending.OrdersReceived >= pending.OrdersExpected)
+            CompleteSnapshot(securityId, book);
+    }
+
+    /// <summary>
+    /// Test helper: cache an snapshot baseline for a single security as if a header had
+    /// arrived. Sets OrdersExpected=0 so a subsequent <see cref="HealAfterSnapshotForTest"/>
+    /// completes the snapshot and triggers heal even without dispatched Orders_71 chunks.
     /// </summary>
     internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)
     {
-        if (lastRptSeq is { } v && v > 0)
-            _pendingSnapshotLastRptSeq[securityId] = v;
+        bool hasRpt = lastRptSeq is { } v && v > 0;
+        if (hasRpt)
+        {
+            _pendingSnapshots[securityId] = new PendingSnapshot
+            {
+                LastRptSeq = lastRptSeq!.Value,
+                OrdersExpected = 0,
+                OrdersReceived = 0,
+                HasRptSeq = true,
+            };
+        }
         else
-            _pendingSnapshotLastRptSeq.Remove(securityId);
+        {
+            // null/0 rptSeq: keep an entry so HealAfterSnapshotForTest exercises the
+            // "missing baseline" path (counter increments, no transition).
+            _pendingSnapshots[securityId] = new PendingSnapshot
+            {
+                LastRptSeq = 0,
+                OrdersExpected = 0,
+                OrdersReceived = 0,
+                HasRptSeq = false,
+            };
+        }
     }
 
     /// <summary>
@@ -681,7 +772,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     internal void HealAfterSnapshotForTest(ulong securityId)
     {
         var book = GetOrCreateBook(securityId);
-        HealAfterSnapshot(securityId, book);
+        CompleteSnapshot(securityId, book);
     }
 
     private void HandleSnapshotOrders(ReadOnlySpan<byte> body)
@@ -691,15 +782,25 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        // An Orders_71 chunk must be preceded by a Header_30 for the same instrument.
+        // If not (lost packet, out-of-order), drop the chunk — applying it would corrupt
+        // the book (we would not know whether to clear first or how to know completion).
+        if (!_pendingSnapshots.ContainsKey(securityId))
+        {
+            Interlocked.Increment(ref _snapshotChunksOrphaned);
+            return;
+        }
+
         var book = GetOrCreateBook(securityId);
 
-        book.Clear();
-
+        uint added = 0;
         reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
         {
+            added++;
             long? rawPrice = entry.MDEntryPx.Mantissa;
             if (rawPrice is null)
-                return; // Market orders have no price — skip
+                return; // Market orders have no price — counted toward expected but not added to book
 
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
             long price = rawPrice.Value;
@@ -720,20 +821,35 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             book.GetSide(side).Add(in bookEntry);
         });
 
-        HealAfterSnapshot(securityId, book);
+        ref var pending = ref System.Runtime.InteropServices.CollectionsMarshal
+            .GetValueRefOrNullRef(_pendingSnapshots, securityId);
+        // pending cannot be null-ref here: ContainsKey check above + single-threaded access.
+        pending.OrdersReceived += added;
+
+        if (pending.OrdersReceived >= pending.OrdersExpected)
+            CompleteSnapshot(securityId, book);
     }
 
-    private void HealAfterSnapshot(ulong securityId, OrderBook book)
+    private void CompleteSnapshot(ulong securityId, OrderBook book)
     {
-        if (!_pendingSnapshotLastRptSeq.Remove(securityId, out var snapshotRptSeq))
+        if (!_pendingSnapshots.Remove(securityId, out var pending))
         {
-            // No header (or no LastRptSeq) — cannot transition to Healthy without a baseline.
+            // No header recorded — cannot transition to Healthy without a baseline.
             // Symbol stays Stale; subsequent incremental will continue buffering until next
-            // snapshot cycle delivers a usable header. Counter helps surface schema/feed issues.
+            // snapshot cycle delivers a usable header.
             Interlocked.Increment(ref _snapshotsMissingRptSeq);
             return;
         }
 
+        if (!pending.HasRptSeq)
+        {
+            // Header arrived but had no usable LastRptSeq (null/0). Same outcome as above:
+            // we can't anchor the symbol to a known incremental boundary.
+            Interlocked.Increment(ref _snapshotsMissingRptSeq);
+            return;
+        }
+
+        uint snapshotRptSeq = pending.LastRptSeq;
         book.LastRptSeq = snapshotRptSeq;
         var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
         if (heal.TransitionedToHealthy)
@@ -811,7 +927,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private void ResetPerSymbolEpoch(string reason)
     {
         int dropped = _staleBuffer.ClearAll();
-        _pendingSnapshotLastRptSeq.Clear();
+        _pendingSnapshots.Clear();
         _stateRegistry.ResetEpoch(reason);
         Interlocked.Add(ref _epochResetMessagesDropped, dropped);
         Interlocked.Increment(ref _epochResets);
