@@ -56,6 +56,42 @@ internal static class CliArgs
                     settings.ReplayToMulticast = true;
                     break;
 
+                case "--loss-targets" when i + 1 < args.Length:
+                    settings.LossTargets = args[++i];
+                    break;
+
+                case "--loss-rate" when i + 1 < args.Length:
+                    if (!double.TryParse(args[++i],
+                            System.Globalization.NumberStyles.Any,
+                            System.Globalization.CultureInfo.InvariantCulture,
+                            out var lr) || lr < 0 || lr > 1)
+                    {
+                        error = "Invalid --loss-rate value. Must be in [0, 1].";
+                        return false;
+                    }
+                    settings.LossRate = lr;
+                    break;
+
+                case "--loss-mode" when i + 1 < args.Length:
+                    settings.LossMode = args[++i];
+                    break;
+
+                case "--loss-burst" when i + 1 < args.Length:
+                    if (!int.TryParse(args[++i], out var lb) || lb < 1)
+                    { error = "Invalid --loss-burst value. Must be >= 1."; return false; }
+                    settings.LossBurstSize = lb;
+                    break;
+
+                case "--loss-correlated":
+                    settings.LossCorrelated = true;
+                    break;
+
+                case "--loss-seed" when i + 1 < args.Length:
+                    if (!int.TryParse(args[++i], out var ls))
+                    { error = "Invalid --loss-seed value."; return false; }
+                    settings.LossSeed = ls;
+                    break;
+
                 default:
                     positionalArgs.Add(args[i]);
                     break;
@@ -124,6 +160,12 @@ internal static class UsageBanner
         Console.WriteLine("  --pcap-prefix <prefix>        Channel group PCAP prefix (repeatable for multi-channel)");
         Console.WriteLine("  --multicast-config <file>     JSON config with multicast group addresses/ports");
         Console.WriteLine("  --replay-to-multicast         Publish replayed PCAP payloads to multicast instead of consuming them");
+        Console.WriteLine("  --loss-targets <list>         Channel classes to drop on (A,B,AB,Snap,InstrDef,All). Enables loss injection");
+        Console.WriteLine("  --loss-rate <0..1>            Drop probability per eligible packet (default 0)");
+        Console.WriteLine("  --loss-mode <random|burst>    Loss pattern (default random)");
+        Console.WriteLine("  --loss-burst <n>              Consecutive packets dropped per burst trigger (burst mode, default 1)");
+        Console.WriteLine("  --loss-correlated             A and B drop the SAME SeqNum (worst case for arbitration)");
+        Console.WriteLine("  --loss-seed <int>             RNG seed for reproducible loss patterns");
     }
 }
 

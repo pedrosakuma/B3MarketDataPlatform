@@ -219,7 +219,11 @@ if (replayToMulticast)
     Console.WriteLine($"  Publish batching: {(publishBatchSize > 1 ? $"sendmmsg, batch={publishBatchSize}" : "off (per-datagram sendto)")}");
     Console.WriteLine();
 
-    using var replay = new TimestampMergedReplayer(replaySources!, new ReplayOptions { SpeedMultiplier = speed });
+    var lossPolicy = LossPolicyFactory.FromSettings(settings);
+    if (lossPolicy is not null)
+        Console.WriteLine($"  Loss injection: {LossPolicyFactory.Describe(lossPolicy)}");
+
+    using var replay = new TimestampMergedReplayer(replaySources!, new ReplayOptions { SpeedMultiplier = speed, Loss = lossPolicy });
     using var publisher = new MulticastPacketPublisher(
         publishConfigs,
         loggerFactory.CreateLogger<MulticastPacketPublisher>(),
@@ -339,7 +343,11 @@ else
 {
     Console.WriteLine($"  Mode: PCAP replay");
 
-    packetSource = new TimestampMergedReplayer(replaySources!, new ReplayOptions { SpeedMultiplier = speed });
+    var lossPolicy = LossPolicyFactory.FromSettings(settings);
+    if (lossPolicy is not null)
+        Console.WriteLine($"  Loss injection: {LossPolicyFactory.Describe(lossPolicy)}");
+
+    packetSource = new TimestampMergedReplayer(replaySources!, new ReplayOptions { SpeedMultiplier = speed, Loss = lossPolicy });
 }
 
 Console.WriteLine($"  Speed: {(speed == 0 ? "max" : $"{speed}x")}");

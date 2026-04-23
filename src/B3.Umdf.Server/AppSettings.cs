@@ -157,6 +157,31 @@ public sealed class AppSettings
     /// <summary>Multicast config JSON path. CLI: --multicast-config</summary>
     public string? MulticastConfig { get; set; }
 
+    // ── Replay loss injection (resilience testing) ──
+
+    /// <summary>
+    /// Comma-separated list of channel classes to drop on. Valid tokens:
+    /// <c>A</c>, <c>B</c>, <c>AB</c> (incrementals), <c>Snap</c>, <c>InstrDef</c>,
+    /// <c>All</c>, <c>None</c>. Empty / null disables loss injection.
+    /// CLI: <c>--loss-targets</c>. Env: <c>UMDF_LOSS_TARGETS</c>.
+    /// </summary>
+    public string? LossTargets { get; set; }
+
+    /// <summary>Drop probability per eligible packet (0..1). CLI: <c>--loss-rate</c>. Env: <c>UMDF_LOSS_RATE</c>.</summary>
+    public double LossRate { get; set; }
+
+    /// <summary><c>random</c> (default) or <c>burst</c>. CLI: <c>--loss-mode</c>. Env: <c>UMDF_LOSS_MODE</c>.</summary>
+    public string LossMode { get; set; } = "random";
+
+    /// <summary>Consecutive packets dropped per burst trigger (burst mode only). CLI: <c>--loss-burst</c>. Env: <c>UMDF_LOSS_BURST</c>.</summary>
+    public int LossBurstSize { get; set; } = 1;
+
+    /// <summary>When true, A and B drop the SAME SeqNum (worst case for A/B arbitration). CLI: <c>--loss-correlated</c>. Env: <c>UMDF_LOSS_CORRELATED</c>.</summary>
+    public bool LossCorrelated { get; set; }
+
+    /// <summary>RNG seed for reproducible loss patterns. 0 = nondeterministic. CLI: <c>--loss-seed</c>. Env: <c>UMDF_LOSS_SEED</c>.</summary>
+    public int LossSeed { get; set; }
+
     /// <summary>Load settings from a JSON file.</summary>
     public static AppSettings LoadFromFile(string path)
     {
@@ -225,6 +250,21 @@ public sealed class AppSettings
         var multicast = Environment.GetEnvironmentVariable("UMDF_MULTICAST_CONFIG");
         if (!string.IsNullOrEmpty(multicast))
             MulticastConfig = multicast;
+
+        var lossTargets = Environment.GetEnvironmentVariable("UMDF_LOSS_TARGETS");
+        if (!string.IsNullOrEmpty(lossTargets))
+            LossTargets = lossTargets;
+        if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_LOSS_RATE"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var lossRate))
+            LossRate = lossRate;
+        var lossMode = Environment.GetEnvironmentVariable("UMDF_LOSS_MODE");
+        if (!string.IsNullOrEmpty(lossMode))
+            LossMode = lossMode;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_LOSS_BURST"), out var lossBurst))
+            LossBurstSize = lossBurst;
+        if (TryParseBoolean(Environment.GetEnvironmentVariable("UMDF_LOSS_CORRELATED"), out var lossCorr))
+            LossCorrelated = lossCorr;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_LOSS_SEED"), out var lossSeed))
+            LossSeed = lossSeed;
     }
 
     private static bool TryParseBoolean(string? value, out bool result)

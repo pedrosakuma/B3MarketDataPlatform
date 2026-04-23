@@ -17,13 +17,19 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     private readonly int[] _cachedUdpOffset;
     private readonly long[] _groupTimeOffset;
     private readonly ReplayOptions _options;
+    private readonly LossInjector? _loss;
     private long? _firstTimestampMicros;
     private readonly System.Diagnostics.Stopwatch _stopwatch = System.Diagnostics.Stopwatch.StartNew();
     private bool _disposed;
+    private long _droppedPackets;
+
+    /// <summary>Number of packets suppressed by the loss policy. 0 when no policy.</summary>
+    public long DroppedPackets => System.Threading.Volatile.Read(ref _droppedPackets);
 
     public TimestampMergedReplayer(IReadOnlyList<PcapChannelSource> sources, ReplayOptions? options = null)
     {
         _options = options ?? new ReplayOptions();
+        _loss = _options.Loss is { } p ? new LossInjector(p) : null;
         _cachedUdpOffset = new int[sources.Count];
         _groupTimeOffset = new long[sources.Count];
 
@@ -64,57 +70,69 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     /// </summary>
     public bool TryReceive(out UmdfPacket packet)
     {
-        if (!_pq.TryDequeue(out var item, out long normalizedTimestamp))
+        // Loop so that a dropped packet immediately advances to the next without
+        // returning false (which the caller interprets as end-of-stream).
+        while (true)
         {
-            packet = default;
-            return false;
-        }
-
-        if (_options.SpeedMultiplier > 0)
-        {
-            _firstTimestampMicros ??= normalizedTimestamp;
-            // Sub-millisecond pacing: target elapsed time using Stopwatch ticks (typically 100 ns resolution).
-            // Coarse Thread.Sleep is replaced by a 3-tier wait that preserves microbursts of inter-packet gaps:
-            //   - long delay (>= 2 ms): Thread.Sleep((int)(delayMs - 1)) for OS-scheduled wait
-            //   - medium delay (>= 50 us): Thread.SpinWait + Yield to avoid kernel scheduling jitter
-            //   - tiny delay: tight Thread.SpinWait (sub-microsecond)
-            double targetElapsedMicros = (normalizedTimestamp - _firstTimestampMicros.Value) / _options.SpeedMultiplier;
-            long targetElapsedTicks = (long)(targetElapsedMicros * System.Diagnostics.Stopwatch.Frequency / 1_000_000.0);
-            long delayTicks = targetElapsedTicks - _stopwatch.ElapsedTicks;
-
-            if (delayTicks > 0)
+            if (!_pq.TryDequeue(out var item, out long normalizedTimestamp))
             {
-                long ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000;
-                if (delayTicks > ticksPerMs * 2)
+                packet = default;
+                return false;
+            }
+
+            if (_options.SpeedMultiplier > 0)
+            {
+                _firstTimestampMicros ??= normalizedTimestamp;
+                // Sub-millisecond pacing: target elapsed time using Stopwatch ticks (typically 100 ns resolution).
+                // Coarse Thread.Sleep is replaced by a 3-tier wait that preserves microbursts of inter-packet gaps:
+                //   - long delay (>= 2 ms): Thread.Sleep((int)(delayMs - 1)) for OS-scheduled wait
+                //   - medium delay (>= 50 us): Thread.SpinWait + Yield to avoid kernel scheduling jitter
+                //   - tiny delay: tight Thread.SpinWait (sub-microsecond)
+                double targetElapsedMicros = (normalizedTimestamp - _firstTimestampMicros.Value) / _options.SpeedMultiplier;
+                long targetElapsedTicks = (long)(targetElapsedMicros * System.Diagnostics.Stopwatch.Frequency / 1_000_000.0);
+                long delayTicks = targetElapsedTicks - _stopwatch.ElapsedTicks;
+
+                if (delayTicks > 0)
                 {
-                    int sleepMs = (int)(delayTicks / ticksPerMs) - 1;
-                    if (sleepMs > 0) Thread.Sleep(sleepMs);
-                }
-                while (_stopwatch.ElapsedTicks < targetElapsedTicks)
-                {
-                    long remaining = targetElapsedTicks - _stopwatch.ElapsedTicks;
-                    if (remaining <= 0) break;
-                    if (remaining > ticksPerMs / 20) Thread.Yield();
-                    else Thread.SpinWait(20);
+                    long ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000;
+                    if (delayTicks > ticksPerMs * 2)
+                    {
+                        int sleepMs = (int)(delayTicks / ticksPerMs) - 1;
+                        if (sleepMs > 0) Thread.Sleep(sleepMs);
+                    }
+                    while (_stopwatch.ElapsedTicks < targetElapsedTicks)
+                    {
+                        long remaining = targetElapsedTicks - _stopwatch.ElapsedTicks;
+                        if (remaining <= 0) break;
+                        if (remaining > ticksPerMs / 20) Thread.Yield();
+                        else Thread.SpinWait(20);
+                    }
                 }
             }
+
+            var (reader, channel, group) = _readers[item.ReaderIndex];
+            var payload = item.Packet.Data.Slice(_cachedUdpOffset[item.ReaderIndex]);
+
+            // Always advance the reader regardless of drop decision so the
+            // priority queue stays full and per-reader ordering is preserved.
+            if (reader.TryReadNext(out var next))
+                _pq.Enqueue((next, item.ReaderIndex), next.TimestampMicros - _groupTimeOffset[item.ReaderIndex]);
+
+            if (_loss is not null && _loss.ShouldDrop(channel, payload.Span))
+            {
+                System.Threading.Interlocked.Increment(ref _droppedPackets);
+                continue; // simulate UDP loss: skip without delivering
+            }
+
+            packet = new UmdfPacket
+            {
+                Data = payload,
+                Channel = channel,
+                ChannelGroup = group,
+                ReceivedTimestampTicks = Environment.TickCount64
+            };
+            return true;
         }
-
-        var (reader, channel, group) = _readers[item.ReaderIndex];
-        var payload = item.Packet.Data.Slice(_cachedUdpOffset[item.ReaderIndex]);
-
-        packet = new UmdfPacket
-        {
-            Data = payload,
-            Channel = channel,
-            ChannelGroup = group,
-            ReceivedTimestampTicks = Environment.TickCount64
-        };
-
-        if (reader.TryReadNext(out var next))
-            _pq.Enqueue((next, item.ReaderIndex), next.TimestampMicros - _groupTimeOffset[item.ReaderIndex]);
-
-        return true;
     }
 
     /// <summary>
