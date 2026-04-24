@@ -100,32 +100,33 @@ public class SymbolStateRegistryTests
     }
 
     [Fact]
-    public void ForcedHeal_AfterStaleTimeout_AcceptsOldSnapshotAndSkipsGap()
+    public void StaleSymbol_RejectsLaggingSnapshotIndefinitely_NoForcedHeal()
     {
-        var r = new SymbolStateRegistry(NullLogger.Instance) { ForcedHealAfter = TimeSpan.FromMilliseconds(50) };
+        // Without forced-heal, a Stale symbol stays Stale until a snapshot
+        // arrives with rptSeq >= MinHeal. Even after long elapsed time we
+        // never silently corrupt the book by accepting a lagging snapshot.
+        var r = new SymbolStateRegistry(NullLogger.Instance);
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
-        r.Observe(1, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109, high-water=110
+        r.Observe(1, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109
         r.Observe(1, SymbolGapKind.Mbo, 200); // buffer keeps tracking high-water=200
 
-        // Snapshot at 50 (way below MinHeal=109) — would normally be rejected.
-        // Before timeout: rejected.
         var early = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
         Assert.False(early.Accepted);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
 
-        // Wait past ForcedHealAfter and try again: forced accept.
+        // Even after a long wait, an old snapshot is still rejected.
         Thread.Sleep(75);
-        var forced = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
-        Assert.True(forced.Accepted);
-        Assert.True(forced.ForcedSkipGap);
-        Assert.True(forced.TransitionedToHealthy);
-        Assert.Equal((uint)200, forced.NewBaselineRptSeq); // baseline = priorHighWater
-        Assert.Equal(1, r.ForcedHealSkippedGapCount);
-        Assert.Equal(SymbolState.Healthy, r.GetState(1, SymbolGapKind.Mbo));
+        var stillRejected = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
+        Assert.False(stillRejected.Accepted);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+        Assert.Equal(2, r.LaggingSnapshotCount);
 
-        // Next contiguous live message (201) applies cleanly.
-        var live = r.Observe(1, SymbolGapKind.Mbo, 201);
-        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, live.Action);
-        Assert.Equal((uint)0, live.GapSize);
+        // A snapshot fresh enough to bridge the gap is accepted normally.
+        var fresh = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 150);
+        Assert.True(fresh.Accepted);
+        Assert.True(fresh.TransitionedToHealthy);
+        Assert.Equal(151u, fresh.DrainFrom);
+        Assert.Equal(200u, fresh.DrainTo);
     }
 
     [Fact]

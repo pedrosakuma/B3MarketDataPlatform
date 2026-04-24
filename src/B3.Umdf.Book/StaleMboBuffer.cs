@@ -18,13 +18,21 @@ namespace B3.Umdf.Book;
 /// SendingTime. Copies are unavoidable because the source span is owned by
 /// the receive batch and recycled immediately after dispatch.</para>
 ///
-/// <para><b>Caps.</b> Per-symbol queue depth is capped (default 8192) so
-/// one pathological symbol cannot exhaust memory. Global byte cap (default
-/// 256 MiB) protects against many symbols filling buffers simultaneously.
-/// When either cap trips, the newest message is dropped and the overflow
-/// counter increments; subsequent drain may produce a gap mid-window that
-/// re-flips the symbol Stale, which is the correct behavior — we wait for
-/// the next snapshot cycle to heal cleanly.</para>
+/// <para><b>Two-tier per-symbol cap.</b> Each symbol starts with the normal
+/// cap (default 8192 messages). The first time a symbol's buffer is about
+/// to overflow, it is permanently promoted to the hot cap (default 65536).
+/// This sizes the buffer for the snapshot-rotation latency of high-rate
+/// symbols (mini-index futures ~10k msg/s × ~6s rotation ≈ 60k msgs)
+/// without overcommitting memory for the long tail of inactive symbols.
+/// Once a symbol is at the hot cap, further overflows fall back to
+/// drop-oldest (preserving the freshest window for the next snapshot heal).</para>
+///
+/// <para><b>Caps.</b> Global byte cap (default 256 MiB) protects against
+/// many symbols filling buffers simultaneously. When the global cap trips,
+/// the newest message is dropped and the overflow counter increments;
+/// subsequent drain may produce a gap mid-window that re-flips the symbol
+/// Stale, which is the correct behavior — we wait for the next snapshot
+/// cycle to heal cleanly.</para>
 ///
 /// <para><b>Concurrency.</b> The feed thread is the sole writer per group;
 /// outer dictionary is concurrent so multiple groups can share one buffer
@@ -36,6 +44,7 @@ public sealed class StaleMboBuffer
     private readonly ConcurrentDictionary<ulong, PerSymbolQueue> _queues = new();
     private readonly ILogger _logger;
     private readonly int _perSymbolCap;
+    private readonly int _hotPerSymbolCap;
     private readonly long _globalByteCap;
 
     private long _totalBytes;
@@ -47,11 +56,13 @@ public sealed class StaleMboBuffer
     private long _droppedGlobalCap;
 
     private long _evictedPerSymbolCap;
+    private long _hotPromotions;
 
-    public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024)
+    public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024, int hotPerSymbolCap = 65536)
     {
         _logger = logger;
         _perSymbolCap = perSymbolCap;
+        _hotPerSymbolCap = Math.Max(perSymbolCap, hotPerSymbolCap);
         _globalByteCap = globalByteCap;
     }
 
@@ -60,8 +71,10 @@ public sealed class StaleMboBuffer
     public long DrainedCount => Volatile.Read(ref _drained);
     public long DroppedPerSymbolCapCount => Volatile.Read(ref _droppedPerSymbolCap);
     public long DroppedGlobalCapCount => Volatile.Read(ref _droppedGlobalCap);
-    /// <summary>Count of oldest messages evicted (drop-oldest policy under per-symbol cap pressure).</summary>
+    /// <summary>Count of oldest messages evicted (drop-oldest policy after a symbol is already at hot cap).</summary>
     public long EvictedPerSymbolCapCount => Volatile.Read(ref _evictedPerSymbolCap);
+    /// <summary>Count of symbols that were promoted from the normal cap to the hot cap on first overflow.</summary>
+    public long HotPromotionCount => Volatile.Read(ref _hotPromotions);
 
     /// <summary>
     /// One stored message. <see cref="Body"/> is rented from
@@ -83,19 +96,27 @@ public sealed class StaleMboBuffer
     {
         internal readonly Lock Sync = new();
         internal readonly Queue<DeferredMboMsg> Items = new();
+        // Per-symbol cap. Starts at the normal tier; promoted to the hot tier
+        // on first overflow. One-way ratchet — never demoted.
+        internal int Cap;
     }
 
     /// <summary>
     /// Buffer a message body. Copies <paramref name="body"/> into a pooled
     /// array. Returns true on success, false if the global cap tripped
-    /// (message dropped). When the per-symbol cap is reached, the OLDEST
-    /// buffered message is evicted to make room — the buffer always
-    /// retains the most-recent <c>perSymbolCap</c> messages so the next
-    /// snapshot heal reflects the freshest possible state. The caller
-    /// receives the evicted message's rptSeq via <paramref name="onEvictedOldest"/>
-    /// so it can advance its <see cref="SymbolStateRegistry.BumpMinHeal"/>
-    /// baseline accordingly (rejecting future snapshots that would leave
-    /// a hole between the snapshot and the new buffer earliest).
+    /// (message dropped). Two-tier behavior:
+    /// <list type="number">
+    ///   <item>Normal tier: when the buffer reaches the normal cap, the symbol
+    ///   is permanently promoted to the hot cap; no message is evicted.</item>
+    ///   <item>Hot tier: when the buffer is already at the hot cap, the OLDEST
+    ///   buffered message is evicted to make room — the buffer always retains
+    ///   the most-recent <c>hotPerSymbolCap</c> messages so the next snapshot
+    ///   heal reflects the freshest possible state. The caller receives the
+    ///   evicted message's rptSeq via <paramref name="onEvictedOldest"/> so it
+    ///   can advance its <see cref="SymbolStateRegistry.BumpMinHeal"/> baseline
+    ///   accordingly (rejecting future snapshots that would leave a hole between
+    ///   the snapshot and the new buffer earliest).</item>
+    /// </list>
     /// </summary>
     public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null)
     {
@@ -107,15 +128,22 @@ public sealed class StaleMboBuffer
             return false;
         }
 
-        var queue = _queues.GetOrAdd(securityId, static _ => new PerSymbolQueue());
+        var queue = _queues.GetOrAdd(securityId, _ => new PerSymbolQueue { Cap = _perSymbolCap });
         long evictedBytes = 0;
         uint evictedRptSeq = 0;
         bool evicted = false;
+        bool promoted = false;
         lock (queue.Sync)
         {
-            if (queue.Items.Count >= _perSymbolCap)
+            if (queue.Items.Count >= queue.Cap)
             {
-                if (queue.Items.TryDequeue(out var old))
+                if (queue.Cap < _hotPerSymbolCap)
+                {
+                    // First overflow: promote to hot cap, no eviction.
+                    queue.Cap = _hotPerSymbolCap;
+                    promoted = true;
+                }
+                else if (queue.Items.TryDequeue(out var old))
                 {
                     evictedBytes = old.BodyLength;
                     evictedRptSeq = old.RptSeq;
@@ -130,6 +158,14 @@ public sealed class StaleMboBuffer
         }
         Interlocked.Add(ref _totalBytes, body.Length - evictedBytes);
         Interlocked.Increment(ref _enqueued);
+        if (promoted)
+        {
+            Interlocked.Increment(ref _hotPromotions);
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation(
+                    "StaleMboBuffer: symbol {SecurityId} promoted to hot cap ({HotCap}); normal cap {NormalCap} exceeded",
+                    securityId, _hotPerSymbolCap, _perSymbolCap);
+        }
         if (evicted) onEvictedOldest?.Invoke(evictedRptSeq);
         return true;
     }

@@ -5,8 +5,8 @@ namespace B3.Umdf.Book.Tests;
 
 public class StaleMboBufferTests
 {
-    private static StaleMboBuffer NewBuffer(int perSymbolCap = 1024, long globalByteCap = 64L * 1024 * 1024)
-        => new(NullLogger.Instance, perSymbolCap, globalByteCap);
+    private static StaleMboBuffer NewBuffer(int perSymbolCap = 1024, long globalByteCap = 64L * 1024 * 1024, int hotPerSymbolCap = 65536)
+        => new(NullLogger.Instance, perSymbolCap, globalByteCap, hotPerSymbolCap);
 
     [Fact]
     public void Enqueue_StoresMessageBody()
@@ -75,18 +75,54 @@ public class StaleMboBufferTests
     }
 
     [Fact]
-    public void PerSymbolCap_EvictsOldest_RetainsNewest()
+    public void FirstOverflow_PromotesToHotCap_NoEviction()
     {
-        var buf = NewBuffer(perSymbolCap: 2);
+        // Two-tier buffer: the first overflow at the normal cap must NOT evict —
+        // the symbol is promoted to the hot cap and the in-flight message is
+        // simply enqueued. This protects hot symbols (mini-index futures, etc.)
+        // whose throughput outpaces the snapshot rotation; their buffer needs to
+        // span the rotation latency without losing operations.
+        var buf = NewBuffer(perSymbolCap: 2, hotPerSymbolCap: 4);
         uint? evicted = null;
         Assert.True(buf.Enqueue(1, 50, 10, 0, new byte[] { 1 }));
         Assert.True(buf.Enqueue(1, 50, 11, 0, new byte[] { 2 }));
-        // Cap reached: oldest (rptSeq=10) evicted, newest enqueued.
+        // Third message hits normal cap → promote to hot cap, no eviction.
+        Assert.True(buf.Enqueue(1, 50, 12, 0, new byte[] { 3 }, e => evicted = e));
+        Assert.Null(evicted);
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(1, buf.HotPromotionCount);
+        Assert.Equal(3, buf.DepthOf(1));
+
+        // Fill up to hot cap (4) — still no eviction.
+        Assert.True(buf.Enqueue(1, 50, 13, 0, new byte[] { 4 }, e => evicted = e));
+        Assert.Null(evicted);
+        Assert.Equal(4, buf.DepthOf(1));
+
+        // Drain confirms all four retained in arrival order.
+        var seen = new List<uint>();
+        buf.Drain(1, 10, 13, m => seen.Add(m.RptSeq));
+        Assert.Equal(new uint[] { 10, 11, 12, 13 }, seen);
+    }
+
+    [Fact]
+    public void HotCapOverflow_EvictsOldest_RetainsNewest()
+    {
+        // After promotion to the hot tier, subsequent overflows fall back to
+        // drop-oldest with onEvictedOldest invoked so the caller can advance
+        // its MinHeal baseline (rejecting future snapshots that can't bridge).
+        var buf = NewBuffer(perSymbolCap: 1, hotPerSymbolCap: 2);
+        uint? evicted = null;
+        Assert.True(buf.Enqueue(1, 50, 10, 0, new byte[] { 1 }));
+        // First overflow → promote to hot cap (2), no eviction.
+        Assert.True(buf.Enqueue(1, 50, 11, 0, new byte[] { 2 }, e => evicted = e));
+        Assert.Null(evicted);
+        Assert.Equal(1, buf.HotPromotionCount);
+        // Now at hot cap; next enqueue evicts oldest (rptSeq=10).
         Assert.True(buf.Enqueue(1, 50, 12, 0, new byte[] { 3 }, e => evicted = e));
         Assert.Equal((uint)10, evicted);
         Assert.Equal(1, buf.EvictedPerSymbolCapCount);
         Assert.Equal(2, buf.DepthOf(1));
-        // Drain confirms only [11, 12] retained.
+
         var seen = new List<uint>();
         buf.Drain(1, 11, 12, m => seen.Add(m.RptSeq));
         Assert.Equal(new uint[] { 11, 12 }, seen);

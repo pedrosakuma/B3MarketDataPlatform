@@ -246,6 +246,203 @@ public class BookManagerSnapshotHealTests
         Assert.Equal(100u, live.LastRptSeq);
     }
 
+    // ===== Complex scenarios =====
+
+    [Fact]
+    public void SnapshotSuperseded_MidFlight_LiveBookIntact_NoCorruption()
+    {
+        // Cenário 1: Header_30(rpt=100, expects=3) chega, 1 chunk staged, depois
+        // novo Header_30(rpt=200, expects=2) chega antes do staging anterior fechar.
+        // O staging antigo deve ser descartado em silêncio; o novo deve substituí-lo
+        // e completar limpo. Live book não pode ser tocado em momento algum até o
+        // CompleteSnapshot do segundo ciclo.
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var clears = 0;
+        var handler = new ClearCountingHandler(() => clears++);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf, eventHandler: handler);
+
+        // Sym Stale com baseline 100 → gap 200 → Stale, MinHeal=199.
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 700, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(700, SymbolGapKind.Mbo, 100);
+        reg.Observe(securityId: 700, SymbolGapKind.Mbo, 300); // gap → Stale, MinHeal=299
+        var live = bm.GetOrCreateBook(700);
+        live.Bids.Add(new OrderBookEntry { OrderId = 1, Price = 100, Quantity = 10, SecurityId = 700, Side = BookSideType.Bid });
+        live.LastRptSeq = 100;
+
+        // Primeiro snapshot (rpt=150 — também < MinHeal=299, será rejeitado de qualquer forma)
+        bm.BeginChunkedSnapshotForTest(700, lastRptSeq: 150, ordersExpected: 3);
+        bm.StageSnapshotEntryForTest(700, BookSideType.Bid, orderId: 90, price: 50, quantity: 1);
+        // Não chega chunk completo: novo Header chega supersedendo.
+        bm.BeginChunkedSnapshotForTest(700, lastRptSeq: 350, ordersExpected: 2);
+        bm.StageSnapshotEntryForTest(700, BookSideType.Bid, orderId: 91, price: 95, quantity: 5);
+        bm.StageSnapshotEntryForTest(700, BookSideType.Ask, orderId: 92, price: 105, quantity: 7);
+        // Segundo snapshot completou (MinHeal=299, snap=350 → aceito)
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(1, clears); // exatamente UMA limpeza (do segundo snapshot, não do primeiro)
+        Assert.Equal(1, live.Bids.OrderCount);
+        Assert.Equal(1, live.Asks.OrderCount);
+        Assert.True(live.Bids.TryGetOrder(91, out _));
+        Assert.True(live.Asks.TryGetOrder(92, out _));
+        // Order 90 (do primeiro staging abandonado) NÃO está no book.
+        Assert.False(live.Bids.TryGetOrder(90, out _));
+        // Order 1 original foi removida pelo swap (heal aceito).
+        Assert.False(live.Bids.TryGetOrder(1, out _));
+        Assert.Equal(350u, live.LastRptSeq);
+    }
+
+    [Fact]
+    public void Orphan_OrdersChunk_WithoutHeader_LiveBookIntact()
+    {
+        // Cenário 2: Orders_71 chunk chega para um símbolo sem _pendingSnapshots
+        // (header anterior nunca chegou ou já foi consumido). Deve incrementar
+        // SnapshotChunksOrphaned e NÃO mutar o book vivo.
+        var (bm, reg, _) = CreatePerSymbol();
+        // Não há Header_30 — chamar diretamente RecordSnapshotChunkForTest.
+        bm.RecordSnapshotChunkForTest(securityId: 800, ordersInChunk: 5);
+        Assert.Equal(1, bm.SnapshotChunksOrphaned);
+        Assert.Equal(0, bm.SnapshotsHealed);
+        Assert.False(bm.Books.ContainsKey(800));
+    }
+
+    [Fact]
+    public void Snapshot_AcceptedAtBoundary_S_EqualsMinHeal()
+    {
+        // Cenário 3: snapshot exatamente em S = MinHeal deve ser aceito (>=, não >).
+        // Drain window = [S+1, highWater] = [MinHeal+1, highWater].
+        var (bm, reg, _) = CreatePerSymbol();
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 900, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(900, SymbolGapKind.Mbo, 100);
+        reg.Observe(securityId: 900, SymbolGapKind.Mbo, 200); // gap → Stale; MinHeal=199, highWater=200
+
+        // Snapshot exatamente em 199 — boundary case.
+        bm.BeginChunkedSnapshotForTest(900, lastRptSeq: 199, ordersExpected: 0);
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(0, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(900, SymbolGapKind.Mbo));
+        Assert.Equal(199u, bm.Books[900].LastRptSeq);
+    }
+
+    [Fact]
+    public void Snapshot_RejectedJustBelowBoundary_S_EqualsMinHealMinusOne()
+    {
+        // Cenário 3b: snapshot em S = MinHeal-1 deve ser REJEITADO (deixaria buraco).
+        var (bm, reg, _) = CreatePerSymbol();
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 901, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(901, SymbolGapKind.Mbo, 100);
+        reg.Observe(securityId: 901, SymbolGapKind.Mbo, 200); // MinHeal=199
+
+        bm.BeginChunkedSnapshotForTest(901, lastRptSeq: 198, ordersExpected: 0);
+
+        Assert.Equal(0, bm.SnapshotsHealed);
+        Assert.Equal(1, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Stale, reg.GetState(901, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void HotPromotion_ThenEviction_AdvancesMinHeal_SubsequentSnapshotRejected()
+    {
+        // Cenário 5: encher cap normal → promoção para hot cap (sem evict);
+        // encher hot cap → drop-oldest com BumpMinHeal; snapshot mais antigo
+        // que o evicted rptSeq deve ser rejeitado.
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
+
+        // Boot: gap → Stale com MinHeal pequeno.
+        for (uint r = 1; r <= 5; r++)
+            reg.Observe(securityId: 1100, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(1100, SymbolGapKind.Mbo, 5);
+        reg.Observe(securityId: 1100, SymbolGapKind.Mbo, 10); // gap, MinHeal=9
+
+        // Buffer enfileira mensagens 10..15 via wire path (HandleOrder seria o real).
+        // Como teste, chama Enqueue direto via callback do Observe.Buffer:
+        for (uint r = 10; r <= 15; r++)
+        {
+            var act = reg.Observe(1100, SymbolGapKind.Mbo, r);
+            if (act.Action == SymbolStateRegistry.ObserveAction.Buffer)
+                buf.Enqueue(1100, 50, r, 0, new byte[] { (byte)r },
+                    onEvictedOldest: ev => reg.BumpMinHeal(1100, SymbolGapKind.Mbo, ev));
+        }
+
+        // 6 mensagens entraram: r=10,11 (cap normal), r=12 promove (3 itens, hot=4),
+        // r=13 (4 itens, no hot cap), r=14 evict r=10 → MinHeal=10, r=15 evict r=11 → MinHeal=11.
+        Assert.Equal(1, buf.HotPromotionCount);
+        Assert.True(buf.EvictedPerSymbolCapCount >= 1);
+        // Snapshot em rpt=10 (== evicted antigo) deve ser rejeitado, MinHeal já avançou.
+        bm.BeginChunkedSnapshotForTest(1100, lastRptSeq: 10, ordersExpected: 0);
+        Assert.Equal(1, bm.SnapshotsRejectedTooOld);
+
+        // Snapshot em rpt = MinHeal atual deve ser aceito.
+        var minHealNow = (uint)buf.EvictedPerSymbolCapCount + 9; // rough; just use observed: re-fetch.
+        // Em vez disso, use snapshot bem alto que com certeza passa.
+        bm.BeginChunkedSnapshotForTest(1100, lastRptSeq: 100, ordersExpected: 0);
+        Assert.Equal(1, bm.SnapshotsHealed);
+    }
+
+    [Fact]
+    public void HealthySymbol_SeesNewerSnapshot_SkipsThenNextIncrementalDetectsGap()
+    {
+        // Cenário 6: símbolo Healthy idle vê snapshot mais recente (snap > priorHighWater).
+        // Hoje pulamos via SnapshotsSkippedHealthyAhead (defensive guard); confirmar que
+        // a próxima incremental fora-de-ordem (que excede priorHighWater+1) re-Stale
+        // o símbolo, e o ciclo Stale/heal recupera.
+        var (bm, reg, _) = CreatePerSymbol();
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 1300, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(1300, SymbolGapKind.Mbo, 100);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(1300, SymbolGapKind.Mbo));
+        var live = bm.GetOrCreateBook(1300);
+        live.LastRptSeq = 100;
+
+        // Snapshot rotacionado em rpt=150 (mais novo que nosso highWater=100).
+        // Use BeginSnapshotHeader (não o atalho BeginChunkedSnapshotForTest)
+        // para exercitar o guard "Skip Healthy Ahead".
+        bm.BeginSnapshotHeader(secId: 1300, lastRptSeq: 150, hasRptSeq: true, ordersExpected: 0);
+        Assert.Equal(1, bm.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(0, bm.SnapshotsHealed);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(1300, SymbolGapKind.Mbo));
+        Assert.Equal(100u, live.LastRptSeq);
+
+        // Próxima incremental que pula buraco confirma o gap silencioso (rpt=160 vs esperado=101).
+        var obs = reg.Observe(1300, SymbolGapKind.Mbo, 160);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Buffer, obs.Action);
+        Assert.Equal(SymbolState.Stale, reg.GetState(1300, SymbolGapKind.Mbo));
+
+        // Próximo snapshot fresco (rpt >= 159) cura corretamente.
+        bm.BeginChunkedSnapshotForTest(1300, lastRptSeq: 159, ordersExpected: 0);
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(1300, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void Snapshot_WithZeroEntries_HealsImmediately_NoCorruption()
+    {
+        // Cenário 7: TotNumBids+TotNumOffers = 0 (book vazio do publisher) deve
+        // disparar CompleteSnapshot direto no Header_30 — sem aguardar Orders_71.
+        var (bm, reg, _) = CreatePerSymbol();
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 1400, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(1400, SymbolGapKind.Mbo, 100);
+        reg.Observe(securityId: 1400, SymbolGapKind.Mbo, 200); // Stale, MinHeal=199
+
+        // Snapshot vazio em rpt=210 (>= MinHeal). BeginChunkedSnapshotForTest com
+        // ordersExpected=0 chama CompleteSnapshot na hora.
+        bm.BeginChunkedSnapshotForTest(1400, lastRptSeq: 210, ordersExpected: 0);
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(1400, SymbolGapKind.Mbo));
+        var live = bm.Books[1400];
+        Assert.Equal(0, live.Bids.OrderCount);
+        Assert.Equal(0, live.Asks.OrderCount);
+        Assert.Equal(210u, live.LastRptSeq);
+    }
+
     private sealed class ClearCountingHandler : IBookEventHandler
     {
         private readonly Action _onCleared;

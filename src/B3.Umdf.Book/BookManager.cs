@@ -1102,20 +1102,6 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 _eventHandler.OnSymbolStaleStatusChanged(securityId, isStale: false);
         }
 
-        if (heal.ForcedSkipGap)
-        {
-            // Forced heal: the snapshot couldn't bridge the buffered gap, but the
-            // symbol was Stale longer than the registry's tolerance. Drop the
-            // entire buffered window — its content is unreplayable on top of the
-            // snapshot baseline (snap+1..highWater are gone). Subscribers will
-            // re-snapshot via OnSymbolStaleStatusChanged → request resync.
-            // Align book.LastRptSeq to the registry's new baseline so the next
-            // live message is contiguous (received == lastSeen+1) and applies cleanly.
-            book.LastRptSeq = heal.NewBaselineRptSeq;
-            _staleBuffer!.Clear(securityId);
-            return;
-        }
-
         if (heal.DrainTo >= heal.DrainFrom)
         {
             int replayed = ReplayDeferredMbo(securityId, heal.DrainFrom, heal.DrainTo);
