@@ -143,8 +143,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 currentMax = Volatile.Read(ref _mboStaleGapSizeMax);
                 if (gap <= currentMax) break;
             } while (Interlocked.CompareExchange(ref _mboStaleGapSizeMax, gap, currentMax) != currentMax);
-            if (_logger.IsEnabled(LogLevel.Information))
-                _logger.LogInformation(
+            if (_logger.IsEnabled(LogLevel.Debug))
+                _logger.LogDebug(
                     "PerSymbol Healthy→Stale secId={SecurityId} templateId={TemplateId} rptSeq={RptSeq} gap={Gap}",
                     securityId, templateId, rptSeq, gap);
             _eventHandler?.OnSymbolStaleStatusChanged(securityId, isStale: true);
