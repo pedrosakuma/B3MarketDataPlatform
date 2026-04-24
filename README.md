@@ -23,6 +23,13 @@ straight from the B3 SBE XML schema.
   simultaneously, each with its own per-group hot path (zero locks).
 - **Gap detection & snapshot recovery** — gaps trigger snapshot recovery,
   catch-up, and back to real-time without losing client state.
+- **Per-instrument heal (differentiator)** — exploits B3's unified
+  per-`SecurityID` `rptSeq` (validated against PCAP: 175 116 cross-template
+  advances, zero violations) so a single-symbol gap stales **only that
+  symbol**, not the whole channel. The channel keeps streaming for
+  every other instrument while one heals via snapshot. Eliminates the
+  30 – 100 s blanket Recovery cycles that group-wide recovery imposes
+  on liquid feeds. See [RESILIENCE.md §2](./docs/RESILIENCE.md#2-per-instrument-recovery-unified-rptseq).
 - **WebSocket subscription server** — compact binary protocol with `Book`
   and `Info` channels, unary `Get`, candle history (10 h of 1 s candles),
   and 2 s rankings broadcast.

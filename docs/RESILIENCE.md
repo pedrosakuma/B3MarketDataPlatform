@@ -25,6 +25,17 @@ invariant.
 
 ## 2. Per-instrument recovery (unified `rptSeq`)
 
+> **Differentiator.** Conventional UMDF consumers treat any sequence-number
+> gap as a channel-level fault and escalate the entire group to
+> `Lost → Recovery → CatchUp`, blanking every subscriber for 30 – 100 s
+> while a fresh snapshot stream is consumed for *all* symbols. This
+> consumer instead exploits B3's per-`SecurityID` `rptSeq` invariant to
+> stale **only the affected symbol(s)** and heal each one independently
+> from the always-on snapshot rotation, leaving every other instrument
+> in the same channel streaming uninterrupted. Channel-level recovery
+> still exists as a catastrophic-case fallback (see § 2.6) but no longer
+> dominates the resilience budget on real loss patterns.
+
 The B3 UMDF spec — confirmed by PCAP analysis (200 k packets, 175 116
 cross-template `rptSeq` advances with gap = 0, 0 violations) — defines
 **one `rptSeq` counter per `SecurityID`** that is monotonic across **all**
