@@ -61,6 +61,14 @@ public sealed class InstrumentInfo
     // Bands
     public long? PriceBandLow { get; set; }
     public long? PriceBandHigh { get; set; }
+    /// <summary>
+    /// SBE PriceLimitType (tag 1306): 0=PRICE_UNIT (limits are absolute prices),
+    /// 1=TICKS (limits are tick offsets vs. TradingReferencePrice combined with
+    /// MinPriceIncrement), 2=PERCENTAGE (limits are % offsets vs. TradingReferencePrice).
+    /// Required to interpret <see cref="PriceBandLow"/> / <see cref="PriceBandHigh"/>
+    /// correctly — without it, displays show raw mantissa as if absolute price.
+    /// </summary>
+    public byte? PriceLimitType { get; set; }
     public long? TradingReferencePrice { get; set; }
     public long? AvgDailyTradedQty { get; set; }
     public long? MaxTradeVol { get; set; }
@@ -136,6 +144,7 @@ public sealed class InstrumentInfo
         AuctionImbalanceSize = null;
         PriceBandLow = null;
         PriceBandHigh = null;
+        PriceLimitType = null;
         TradingReferencePrice = null;
         AvgDailyTradedQty = null;
         MaxTradeVol = null;

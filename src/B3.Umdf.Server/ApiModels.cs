@@ -53,6 +53,7 @@ public sealed class InstrumentInfoResponse
     public long? AuctionImbalanceSize { get; set; }
     public long? PriceBandLow { get; set; }
     public long? PriceBandHigh { get; set; }
+    public byte? PriceLimitType { get; set; }
     public long? TradingReferencePrice { get; set; }
     public long? AvgDailyTradedQty { get; set; }
     public long? MaxTradeVol { get; set; }

@@ -106,10 +106,51 @@ function handleChartData(chartData) {
   updateResolutionLabel(chartData.resolution);
 }
 
+// Compute effective price band horizontals from raw SBE mantissa values.
+// PriceLimitType is the discriminator from B3 schema (tag 1306):
+//   0 = PRICE_UNIT  → limits ARE absolute prices in PriceOptional units (exp -4)
+//   1 = TICKS       → limits are tick offsets vs. TradingReferencePrice combined with MinPriceIncrement
+//   2 = PERCENTAGE  → limits are percentage offsets vs. TradingReferencePrice (e.g. ±1.0000 = ±1%)
+// All inputs/outputs are mantissa values (chart price coordinates use exp -4 like LastTradePrice).
+// TradingReferencePrice and MinPriceIncrement use Fixed8 (exp -8) per the schema.
+function computeEffectiveBands(lowOff, highOff, type, refPrice, minIncr) {
+  if (type == null || type === 0) {
+    // PRICE_UNIT: limits are already absolute prices in the chart's exp (-4).
+    return { low: lowOff, high: highOff };
+  }
+  if (refPrice == null) return { low: null, high: null };
+  const refDecimal = refPrice / 1e8; // Fixed8 → decimal price units
+  if (type === 2) {
+    // PERCENTAGE: offset / 1e4 = percent (e.g. 10000 → 1.0%). Effective = ref * (1 + pct/100).
+    const lowPct = lowOff != null ? lowOff / 1e4 : null;
+    const highPct = highOff != null ? highOff / 1e4 : null;
+    return {
+      low: lowPct != null ? Math.round(refDecimal * (1 + lowPct / 100) * 1e4) : null,
+      high: highPct != null ? Math.round(refDecimal * (1 + highPct / 100) * 1e4) : null,
+    };
+  }
+  if (type === 1) {
+    // TICKS: offset / 1e4 = tick count, mpi / 1e8 = price step. Effective = ref + ticks * mpi.
+    if (minIncr == null) return { low: null, high: null };
+    const mpi = minIncr / 1e8;
+    const lowT = lowOff != null ? lowOff / 1e4 : null;
+    const highT = highOff != null ? highOff / 1e4 : null;
+    return {
+      low: lowT != null ? Math.round((refDecimal + lowT * mpi) * 1e4) : null,
+      high: highT != null ? Math.round((refDecimal + highT * mpi) * 1e4) : null,
+    };
+  }
+  return { low: null, high: null };
+}
+
 // Overlay frame carries only price bands now; VWAP is derived per-candle by handleChartData.
 function handleOverlays(ov) {
   if (!ov) { applyPriceBands(null, null); return; }
-  applyPriceBands(ov.priceBandLow, ov.priceBandHigh);
+  const eff = computeEffectiveBands(
+    ov.priceBandLow, ov.priceBandHigh,
+    ov.priceLimitType, ov.tradingReferencePrice, ov.minPriceIncrement,
+  );
+  applyPriceBands(eff.low, eff.high);
 }
 
 function updateResolutionLabel(resolution) {
@@ -524,6 +565,7 @@ const TRADING_STATUS_NAMES = {
   2:'Paused',4:'Closed',17:'Open',18:'Forbidden',20:'Unknown',21:'Auction',101:'FinalClosing',
 };
 const TRADING_EVENT_NAMES = { 0:'None',1:'Change',4:'NewStatus',101:'PriceBand' };
+const PRICE_LIMIT_TYPE_NAMES = { 0:'Price Unit', 1:'Ticks', 2:'Percentage' };
 
 const CFI_CATEGORY = { E:'Equity',D:'Debt',R:'Right/Warrant',O:'Option',F:'Future',M:'Others(Multileg)',S:'Swap' };
 const CFI_EQUITY_GROUP = { S:'Common/Ordinary',P:'Preferred',C:'Convertible',F:'Preference',L:'Limited Partnership',D:'Depositary Receipt',Y:'Structured Instrument',M:'Others' };
@@ -637,6 +679,7 @@ function renderModal(body, d) {
       ['Auction Imbalance', fmtQ(d.auctionImbalanceSize)],
       ['Band Low', fmtP(d.priceBandLow)],
       ['Band High', fmtP(d.priceBandHigh)],
+      ['Band Type', enumLabel(PRICE_LIMIT_TYPE_NAMES, d.priceLimitType)],
       ['Trading Reference', fmtP8(d.tradingReferencePrice)],
     ]},
     { title: 'Statistics', fields: [

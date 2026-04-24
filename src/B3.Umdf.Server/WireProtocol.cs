@@ -288,9 +288,11 @@ public static class WireProtocol
     public const int FieldMaxTradeVol = 19;
     public const int FieldTradingStatus = 20;
     public const int FieldTradingEvent = 21;
+    public const int FieldPriceLimitType = 22;
+    public const int FieldMinPriceIncrement = 23;
 
-    /// <summary>Max buffer size for InfoSnapshot: header + securityId + mask + 22 fields × 8.</summary>
-    public const int InfoSnapshotMaxSize = FramingHeaderSize + 8 + 4 + 22 * 8; // 192
+    /// <summary>Max buffer size for InfoSnapshot: header + securityId + mask + 24 fields × 8.</summary>
+    public const int InfoSnapshotMaxSize = FramingHeaderSize + 8 + 4 + 24 * 8; // 208
 
     /// <summary>
     /// Write InfoSnapshot: securityId + u32 field bitmask + i64 values for present fields.
@@ -323,6 +325,10 @@ public static class WireProtocol
         if (info.MaxTradeVol is { } v19) { mask |= 1u << FieldMaxTradeVol; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v19); offset += 8; }
         if (info.TradingStatus is { } v20) { mask |= 1u << FieldTradingStatus; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v20); offset += 8; }
         if (info.TradingEvent is { } v21) { mask |= 1u << FieldTradingEvent; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v21); offset += 8; }
+        // PriceLimitType is a u8 enum; we widen to i64 to keep the wire format
+        // homogeneous (one slot = 8 bytes). Decoder reads low 8 bits.
+        if (info.PriceLimitType is { } v22) { mask |= 1u << FieldPriceLimitType; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v22); offset += 8; }
+        if (info.MinPriceIncrement is { } v23) { mask |= 1u << FieldMinPriceIncrement; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v23); offset += 8; }
 
         // Write framing header, securityId, and mask
         ushort totalLen = (ushort)offset;

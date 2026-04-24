@@ -183,6 +183,7 @@ public sealed class WebSocketHost : IAsyncDisposable
                 AuctionImbalanceSize = info.AuctionImbalanceSize,
                 PriceBandLow = info.PriceBandLow,
                 PriceBandHigh = info.PriceBandHigh,
+                PriceLimitType = info.PriceLimitType,
                 TradingReferencePrice = info.TradingReferencePrice,
                 AvgDailyTradedQty = info.AvgDailyTradedQty,
                 MaxTradeVol = info.MaxTradeVol,

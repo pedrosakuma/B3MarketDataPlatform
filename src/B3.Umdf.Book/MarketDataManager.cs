@@ -463,6 +463,10 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.PriceBandLow = msg.LowLimitPrice.Mantissa;
         info.PriceBandHigh = msg.HighLimitPrice.Mantissa;
+        // PriceLimitType is required for the consumer to interpret the band values
+        // (PRICE_UNIT vs TICKS vs PERCENTAGE). For futures/percentages B3 sends e.g.
+        // ±1.0000 as PERCENTAGE, which is meaningless without this discriminator.
+        info.PriceLimitType = msg.PriceLimitType is { } plt ? (byte)plt : (byte?)null;
         info.TradingReferencePrice = msg.TradingReferencePrice.Mantissa;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();

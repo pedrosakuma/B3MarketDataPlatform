@@ -307,9 +307,15 @@ setInterval(() => {
     if (!sub) {
       frame.overlays = null;
     } else {
+      // Send the raw band offsets together with the discriminator and the
+      // reference price / min-price-increment needed to compute the effective
+      // band on the chart. PriceLimitType: 0=PRICE_UNIT, 1=TICKS, 2=PERCENTAGE.
       frame.overlays = {
         priceBandLow: sub.info.PriceBandLow ?? null,
         priceBandHigh: sub.info.PriceBandHigh ?? null,
+        priceLimitType: sub.info.PriceLimitType ?? null,
+        tradingReferencePrice: sub.info.TradingReferencePrice ?? null,
+        minPriceIncrement: sub.info.MinPriceIncrement ?? null,
       };
     }
   }
@@ -665,7 +671,9 @@ function handleMessage(msg) {
       if (sub) {
         Object.assign(sub.info, msg.fields);
         if (sel === id) {
-          if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields) mark(D_OVERLAYS);
+          if ('PriceBandLow' in msg.fields || 'PriceBandHigh' in msg.fields
+              || 'PriceLimitType' in msg.fields || 'TradingReferencePrice' in msg.fields
+              || 'MinPriceIncrement' in msg.fields) mark(D_OVERLAYS);
           if ('TradingStatus' in msg.fields || 'TheoreticalOpeningPrice' in msg.fields
               || 'TheoreticalOpeningSize' in msg.fields || 'AuctionImbalanceSize' in msg.fields) {
             mark(D_AUCTION);
