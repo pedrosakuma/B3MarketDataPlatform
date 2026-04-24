@@ -100,19 +100,76 @@ public class SymbolStateRegistryTests
     }
 
     [Fact]
-    public void Mbo_LaggingSnapshot_AcceptedButCounted()
+    public void Mbo_LaggingSnapshot_BelowMinHeal_Rejected()
     {
         var r = NewRegistry();
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
-        r.Observe(1, SymbolGapKind.Mbo, 105);  // gap → Stale, high-water=105
+        r.Observe(1, SymbolGapKind.Mbo, 105);  // gap → Stale, MinHealRptSeq=104, high-water=105
         r.Observe(1, SymbolGapKind.Mbo, 108);  // buffered, high-water=108
 
-        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 103); // lags high-water
+        // Snapshot at 103 cannot bridge: drain would be [104, 108] but buffer has only 105+,
+        // leaving rptSeq 104 as a hole. Must be rejected; symbol stays Stale.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 103);
 
-        Assert.True(heal.TransitionedToHealthy);
-        Assert.Equal(104u, heal.DrainFrom);
-        Assert.Equal(108u, heal.DrainTo);
+        Assert.False(heal.Accepted);
+        Assert.False(heal.TransitionedToHealthy);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
         Assert.Equal(1, r.LaggingSnapshotCount);
+    }
+
+    [Fact]
+    public void Mbo_LaggingSnapshot_AtMinHeal_Accepted()
+    {
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 105);  // gap → Stale, MinHealRptSeq=104
+        r.Observe(1, SymbolGapKind.Mbo, 108);
+
+        // Snapshot at exactly MinHealRptSeq (104): drain [105, 108] aligns with first
+        // buffered entry. Accepted.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 104);
+
+        Assert.True(heal.Accepted);
+        Assert.True(heal.TransitionedToHealthy);
+        Assert.Equal(105u, heal.DrainFrom);
+        Assert.Equal(108u, heal.DrainTo);
+    }
+
+    [Fact]
+    public void Mbo_ColdStart_LaggingSnapshot_Rejected()
+    {
+        var r = NewRegistry();
+        // Cold start: first observation at 5005 (Unknown→Buffer). MinHealRptSeq=5004.
+        r.Observe(1, SymbolGapKind.Mbo, 5005);
+        r.Observe(1, SymbolGapKind.Mbo, 5006);
+
+        // Snapshot at 4999 (older than first observed - 1) cannot bridge.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 4999);
+
+        Assert.False(heal.Accepted);
+        Assert.Equal(SymbolState.Unknown, r.GetState(1, SymbolGapKind.Mbo));
+
+        // Snapshot at 5004 (= first observed - 1) bridges cleanly.
+        heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 5004);
+        Assert.True(heal.Accepted);
+        Assert.True(heal.TransitionedToHealthy);
+        Assert.Equal(5005u, heal.DrainFrom);
+        Assert.Equal(5006u, heal.DrainTo);
+    }
+
+    [Fact]
+    public void Mbo_AcceptedHeal_ClearsMinHeal_NextHealAtAnyRptSeqAccepted()
+    {
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 105);  // Stale, MinHealRptSeq=104
+        var first = r.HealFromSnapshot(1, SymbolGapKind.Mbo, 104);
+        Assert.True(first.Accepted);
+
+        // After accepted heal, MinHealRptSeq must be cleared. A subsequent heal with
+        // any (even older) rptSeq before another stale event should be accepted.
+        var second = r.HealFromSnapshot(1, SymbolGapKind.Mbo, 50);
+        Assert.True(second.Accepted);
     }
 
     // ---- ResetEpoch (catastrophic, lower-numbered rptSeq accepted) ----

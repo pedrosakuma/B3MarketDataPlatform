@@ -121,6 +121,18 @@ public sealed class SymbolStateRegistry
         internal readonly uint[] LastRptSeq = new uint[KindCount];
         internal readonly long[] StaleSinceTicks = new long[KindCount];
 
+        // Lower bound for snapshot rptSeq accepted by HealFromSnapshot. Set whenever
+        // we transition into a state where our buffer cannot reconstruct history
+        // before some rptSeq:
+        //   - Unknown→Buffer (cold-start): set to (firstObserved - 1). A snapshot
+        //     older than this would leave a gap between snapshotRptSeq+1 and our
+        //     first observed rptSeq that we never saw and cannot replay.
+        //   - Healthy→Stale (mid-session gap): set to lastSeenBeforeStale. A snapshot
+        //     older than this would re-discard already-applied state and leave a gap
+        //     in the pre-stale rptSeq range.
+        // 0 means "no constraint" (any snapshot accepted).
+        internal readonly uint[] MinHealRptSeq = new uint[KindCount];
+
         // Mask of kinds currently Stale — maintained inside the lock for
         // O(1) IsAnyStale lookups and aggregate counting without scanning
         // all 14 slots.
@@ -190,6 +202,11 @@ public sealed class SymbolStateRegistry
                     // RequireSnapshot: track high-water for post-heal drain, buffer the message.
                     if (receivedRptSeq > lastSeen)
                         entry.LastRptSeq[idx] = receivedRptSeq;
+                    // Anchor the minimum acceptable snapshot baseline to (firstObserved - 1)
+                    // so a snapshot older than our first live observation is rejected
+                    // (we cannot replay messages we never saw).
+                    if (entry.MinHealRptSeq[idx] == 0 && receivedRptSeq > 0)
+                        entry.MinHealRptSeq[idx] = receivedRptSeq - 1;
                     return new ObserveResult(SymbolState.Unknown, ObserveAction.Buffer, false, false, 0);
 
                 case SymbolState.Healthy:
@@ -203,6 +220,15 @@ public sealed class SymbolStateRegistry
                     }
                     // Gap detected.
                     uint gapSize = receivedRptSeq - expected;
+                    // Pin the minimum acceptable heal baseline to (receivedRptSeq - 1).
+                    // Rationale: when the snapshot eventually arrives at rptSeq=S, the
+                    // caller drains the per-symbol buffer for [S+1, highWater]. The
+                    // buffer's earliest entry is `receivedRptSeq` (this message — first
+                    // observed after the gap). For the drain to leave NO HOLE, we need
+                    // S+1 <= receivedRptSeq, i.e. S >= receivedRptSeq - 1. Snapshots
+                    // older than that would silently leave gap [S+1, receivedRptSeq-1]
+                    // unfilled, corrupting book state.
+                    entry.MinHealRptSeq[idx] = receivedRptSeq - 1;
                     entry.LastRptSeq[idx] = receivedRptSeq;
                     if (livePolicy == LiveResyncPolicy.NextMessage)
                     {
@@ -238,13 +264,18 @@ public sealed class SymbolStateRegistry
     }
 
     /// <summary>
-    /// Outcome of <see cref="HealFromSnapshot"/>. <see cref="DrainFrom"/> is
-    /// the rptSeq immediately after the snapshot baseline; <see cref="DrainTo"/>
-    /// is the highest rptSeq observed while Stale/Unknown. Caller drains its
-    /// per-symbol buffer for entries with <c>rptSeq ∈ (DrainFrom-1, DrainTo]</c>
-    /// — i.e. <c>rptSeq &gt; SnapshotRptSeq</c>.
+    /// Outcome of <see cref="HealFromSnapshot"/>.
+    /// <see cref="Accepted"/> is false when the snapshot was rejected because its
+    /// <see cref="SnapshotRptSeq"/> is older than the symbol's
+    /// <c>MinHealRptSeq</c> (caller must not transition state nor drain buffer in
+    /// that case — symbol stays Stale/Unknown awaiting a fresher snapshot).
+    /// When accepted, <see cref="DrainFrom"/> is the rptSeq immediately after the
+    /// snapshot baseline; <see cref="DrainTo"/> is the highest rptSeq observed
+    /// while Stale/Unknown. Caller drains its per-symbol buffer for entries with
+    /// <c>rptSeq ∈ [DrainFrom, DrainTo]</c>.
     /// </summary>
     public readonly record struct HealResult(
+        bool Accepted,
         bool TransitionedToHealthy,
         uint SnapshotRptSeq,
         uint DrainFrom,
@@ -253,7 +284,8 @@ public sealed class SymbolStateRegistry
     /// <summary>
     /// Snapshot path: forces (secId, kind) to <see cref="SymbolState.Healthy"/>
     /// at the given rptSeq. Caller must drain its per-symbol buffer using
-    /// the returned <see cref="HealResult"/>.
+    /// the returned <see cref="HealResult"/> when <see cref="HealResult.Accepted"/>
+    /// is true.
     /// </summary>
     public HealResult HealFromSnapshot(ulong securityId, SymbolGapKind kind, uint snapshotRptSeq)
     {
@@ -263,24 +295,32 @@ public sealed class SymbolStateRegistry
         {
             var prev = entry.States[idx];
             uint priorHighWater = entry.LastRptSeq[idx];
+            uint minHeal = entry.MinHealRptSeq[idx];
             int prevMask = entry.StaleKindMask;
 
-            // Snapshot is authoritative. If snapshot rptSeq is older than what
-            // we've already seen live, log it (could indicate a lagging snapshot
-            // stream) but accept the heal — the snapshot rebuilds book state
-            // and live messages > snapshot will replay from the buffer.
-            if (snapshotRptSeq < priorHighWater)
+            // Reject snapshots too old to bridge the gap between the snapshot's
+            // last covered rptSeq and our first live observation (Unknown bootstrap)
+            // or our last good rptSeq before going Stale (mid-session gap). Healing
+            // anyway would leave a hole in the book — corrupt state that surfaces
+            // as crossed BBOs and ghost orders. Symbol stays in its current state;
+            // caller leaves the snapshot bytes already applied to the book in place
+            // (book state == snapshot state) and continues buffering live
+            // incrementals until a fresher snapshot arrives.
+            if (minHeal > 0 && snapshotRptSeq < minHeal)
             {
                 Interlocked.Increment(ref _staleSnapshotIgnored);
                 if (_logger.IsEnabled(LogLevel.Debug))
                     _logger.LogDebug(
-                        "SymbolState: lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} priorHighWater={High}",
-                        securityId, kind, snapshotRptSeq, priorHighWater);
+                        "SymbolState: rejected lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High}",
+                        securityId, kind, snapshotRptSeq, minHeal, priorHighWater);
+                return new HealResult(Accepted: false, TransitionedToHealthy: false,
+                    SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
             }
 
             uint newBaseline = Math.Max(snapshotRptSeq, priorHighWater);
             entry.LastRptSeq[idx] = newBaseline;
             entry.States[idx] = SymbolState.Healthy;
+            entry.MinHealRptSeq[idx] = 0; // baseline restored — no constraint until next stale event
 
             bool transitioned = prev != SymbolState.Healthy;
             if (transitioned)
@@ -295,7 +335,8 @@ public sealed class SymbolStateRegistry
             // observed high-water mark must be replayed by the caller.
             uint drainFrom = snapshotRptSeq + 1;
             uint drainTo = priorHighWater > snapshotRptSeq ? priorHighWater : snapshotRptSeq;
-            return new HealResult(transitioned, snapshotRptSeq, drainFrom, drainTo);
+            return new HealResult(Accepted: true, TransitionedToHealthy: transitioned,
+                SnapshotRptSeq: snapshotRptSeq, DrainFrom: drainFrom, DrainTo: drainTo);
         }
     }
 
@@ -321,6 +362,7 @@ public sealed class SymbolStateRegistry
                     entry.States[i] = SymbolState.Unknown;
                     entry.LastRptSeq[i] = 0;
                     entry.StaleSinceTicks[i] = 0;
+                    entry.MinHealRptSeq[i] = 0;
                 }
                 entry.StaleKindMask = 0;
                 if (prevMask != 0)
@@ -353,6 +395,10 @@ public sealed class SymbolStateRegistry
                         entry.States[i] = SymbolState.Stale;
                         entry.StaleSinceTicks[i] = now;
                         entry.StaleKindMask |= 1 << i;
+                        // Pin the heal threshold to the current LastRptSeq so a stale
+                        // snapshot from before this MarkAllStale event won't re-heal
+                        // with a hole.
+                        entry.MinHealRptSeq[i] = entry.LastRptSeq[i];
                         affected++;
                     }
                 }

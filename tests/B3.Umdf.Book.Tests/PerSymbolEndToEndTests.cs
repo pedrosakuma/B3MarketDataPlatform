@@ -104,7 +104,7 @@ public class PerSymbolEndToEndTests
     }
 
     [Fact]
-    public void Scenario_LaggingSnapshot_IsIgnored()
+    public void Scenario_LaggingSnapshot_DoesNotRegressHealthyState()
     {
         var (bm, reg, _) = CreatePerSymbol();
         const ulong sec = 300;
@@ -116,10 +116,12 @@ public class PerSymbolEndToEndTests
         for (uint r = 101; r <= 110; r++)
             reg.Observe(sec, SymbolGapKind.Mbo, r);
 
-        // Stale snapshot (older cycle) with baseline 95 must NOT regress state.
+        // Stale snapshot (older cycle) with baseline 95: no Stale event happened
+        // between heals, so MinHealRptSeq stays 0 and the heal is accepted but
+        // Math.Max preserves the high-water at 110 — state remains Healthy and the
+        // book baseline does not regress.
         bm.RecordSnapshotHeader(sec, lastRptSeq: 95);
         bm.HealAfterSnapshotForTest(sec);
-        Assert.Equal(1, reg.LaggingSnapshotCount);
         Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
     }
 

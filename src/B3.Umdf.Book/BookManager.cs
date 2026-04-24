@@ -656,6 +656,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _snapshotsHealed;
     private long _snapshotsMissingRptSeq;
     private long _snapshotChunksOrphaned;
+    private long _snapshotsRejectedTooOld;
 
     /// <summary>Number of snapshot cycles where the registry was successfully healed.</summary>
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
@@ -663,6 +664,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
     /// <summary>Orders_71 chunks dropped because no Header_30 was seen first for that securityID.</summary>
     public long SnapshotChunksOrphaned => Volatile.Read(ref _snapshotChunksOrphaned);
+    /// <summary>Snapshots rejected because their LastRptSeq is older than the symbol's MinHealRptSeq
+    /// (would leave a hole between the snapshot baseline and our first observed/last good rptSeq).
+    /// Symbol stays Stale awaiting a fresher snapshot.</summary>
+    public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
 
     private void HandleSnapshotHeader(ReadOnlySpan<byte> body)
     {
@@ -850,8 +855,24 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
 
         uint snapshotRptSeq = pending.LastRptSeq;
-        book.LastRptSeq = snapshotRptSeq;
         var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
+
+        if (!heal.Accepted)
+        {
+            // Snapshot too old to bridge our gap. The book bytes already applied
+            // (Header_30 cleared + Orders_71 chunks repopulated) reflect a valid
+            // state at snapshotRptSeq, but applying it as the symbol's working
+            // book would discard already-buffered live messages we cannot
+            // reconcile. Roll the book back: clear it so the symbol stays Stale
+            // and the next-fresh-enough snapshot will rebuild it cleanly. Keep
+            // the buffered live messages so they can drain on that next heal.
+            book.Clear();
+            book.LastRptSeq = 0;
+            Interlocked.Increment(ref _snapshotsRejectedTooOld);
+            return;
+        }
+
+        book.LastRptSeq = snapshotRptSeq;
         if (heal.TransitionedToHealthy)
         {
             Interlocked.Increment(ref _snapshotsHealed);

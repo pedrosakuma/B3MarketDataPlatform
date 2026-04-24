@@ -380,6 +380,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotChunksOrphaned),
             unit: "{chunks}", description: "Snapshot Orders_71 chunks dropped because no Header_30 was seen first for that securityID");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_too_old",
+            () => PerGroupBook(bm => bm.SnapshotsRejectedTooOld),
+            unit: "{snapshots}", description: "Snapshots rejected because LastRptSeq is older than the symbol's MinHealRptSeq (would leave a hole)");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_buffered",
             () => PerGroupBook(bm => bm.BufferedMboMessages),
             unit: "{messages}", description: "MBO messages enqueued into per-symbol stale buffer awaiting heal");
