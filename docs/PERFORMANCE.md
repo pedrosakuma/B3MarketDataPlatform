@@ -236,7 +236,112 @@ Recommended trace types: `gc-collect`, `cpu-sampling`, `database-async`
 | `SO_REUSEPORT` with N receive sockets per channel | Linux multicast delivers a copy to each socket — multiplies CPU without enlarging effective `SO_RCVBUF` |
 | AOT vs JIT for runtime perf | Both produce ~25 – 27 k msgs/s in the regime we tested; AOT used for startup time + container size, not throughput |
 
-## 14. Summary
+## 14. Profile snapshot (PCAP replay)
+
+The numbers below come from `dotnet-trace` + `dotnet-counters` against the
+real consumer pipeline (no synthetic micro-bench). Two PCAPs are used:
+
+| Capture | Symbols | Duration | Pkts (max-burst) | Events | Time |
+| ------- | ------- | -------- | ---------------- | ------ | ---- |
+| `20250331_MBO_084_EQT*` | 18,380 | 5 min | 5.8 M | 5.2 M | 5 s |
+| `20250929_MBO_072_DRV*` |     16 | full   | 27 M+ buffered | n/a | 5 s |
+
+Reproduce with:
+
+```sh
+dotnet-trace collect --format speedscope -o /tmp/perf/trace-eqt.nettrace \
+  --providers Microsoft-DotNETCore-SampleProfiler --duration 00:00:30 \
+  -- dotnet src/B3.Umdf.ConsoleApp/bin/Release/net10.0/B3.Umdf.ConsoleApp.dll \
+     --pcap-prefix pcap/20250331_MBO_084_EQT --speed 0
+dotnet-trace report /tmp/perf/trace-eqt.nettrace topN -n 25
+```
+
+For runtime counters (alloc rate, GC, working-set):
+
+```sh
+nohup dotnet …ConsoleApp.dll --pcap-prefix pcap/…_EQT --speed 0 &
+dotnet-counters collect --process-id $! --duration 00:00:08 --format csv \
+  --counters B3.Umdf.Consumer,System.Runtime -o /tmp/perf/counters.csv
+```
+
+### 14.1 Top exclusive frames (CPU sample profile)
+
+Exclusive percentages are of total trace wall-time. Active CPU was
+≈ 14.5 % of wall (replayer finished in 5 s of a 30 s trace), so multiply by
+≈ 7 to get share of *active* CPU.
+
+| Frame | EQT base | EQT loss 1 % corr. | DRV base |
+| ----- | --------:| ------------------:| --------:|
+| Wait/semaphore (idle thread-pool)         | 85.6 % | 85.2 % | 85.4 % |
+| `Thread.PollGCWorker`                     |  9.7 % |  9.0 % | 12.3 % |
+| `MarketDataManager.HandleSecurityGroupPhase` | 2.6 % | 1.8 % | – |
+| `Monitor.Enter_Slowpath`                  |  1.8 % |  3.2 % |  1.1 % |
+| `TimestampMergedReplayer.TryReceive` (incl) | 8.5 % | 5.7 % | 13.2 % |
+
+Observations:
+
+- **GC poll dominates active CPU** (60 – 85 % of active depending on
+  capture). PollGC fires at runtime safepoints in proportion to
+  allocation pressure; the level here matches the 70 MB/s sustained
+  allocation rate seen in counters (§14.2).
+- **Lock contention nearly doubles under loss** (1.8 % → 3.2 %
+  exclusive). The recovery path (`StaleMboBuffer.Drain`,
+  per-symbol epoch handoff) takes additional locks per affected
+  symbol. It is still small absolute but is a cheap optimisation
+  target because the hot-path handlers are otherwise lock-free.
+- **DRV is PCAP-read-bound**: `TryReceive` is 13 % wall = 91 % of
+  active feed-thread time. With only 16 symbols there is very little
+  per-symbol work, so the merged replayer’s timestamp arbitration and
+  buffer copy dominate. Live UDP would not show this.
+
+### 14.2 Runtime counters (8 s burst, EQT)
+
+| Counter | Value |
+| ------- | ----- |
+| Packets/s                              | 1.2 – 1.3 M |
+| Events/s                               | 0.87 M      |
+| `feed.duplicates` (A/B redundancy)     | 0.5 – 0.65 M/s |
+| Allocation rate (`gc.heap.total_allocated`) | ~70 MB/s |
+| GC pause time                           | ~30 ms/s (3 % wall) |
+| Gen0/Gen1/Gen2 collections              | 1 / 1 / 0 in 7 s |
+| Working-set growth                      | 567 MB → 2.1 GB in 7 s (+220 MB/s) |
+| `monitor.lock_contentions`              | 0 / s (no contended waits) |
+| `snapshots_skipped_healthy_ahead`       | 30 – 90 k/s |
+| `mbo_stale_transitions`                 | 0/s (no spurious stales) |
+
+### 14.3 Bottlenecks identified
+
+1. **Allocation pressure (~70 MB/s)** drives GC poll overhead. The
+   working-set climbs ~220 MB/s during burst replay because every
+   1-second candle is retained for 10 h × 18,380 symbols (§9 of this
+   doc covers the candle store). This is by design for the dashboard
+   but means a long live session needs ≥ 4 GB headroom.
+2. **`MarketDataManager.HandleSecurityGroupPhase` 2.6 % exclusive** is
+   the biggest non-runtime hot frame. It currently does a `switch` on
+   the SBE template id and routes to the per-kind handler; opportunity
+   to inline the small handlers and eliminate the boxing of the
+   `IMarketDataEventHandler` callback (`OnMarketDataUpdated` shows up
+   at 0.08 % excl as well).
+3. **Recovery-path locks** (`Monitor.Enter_Slowpath` doubling under
+   loss) point at `StaleMboBuffer` / `SymbolStateRegistry`; converting
+   the per-symbol mutex to a copy-on-write epoch swap would eliminate
+   the contention without changing semantics.
+4. **DRV PCAP read path** is dominant in DRV measurements. Not a
+   live-path concern (UDP source is different code) but worth fixing
+   for replay-driven CI: `TimestampMergedReplayer` allocates per
+   call (the 0.93 % exclusive in `TryReceive` includes
+   `Buffer.MemmoveInternal`). A pre-warmed batch read would amortise.
+
+### 14.4 What is *not* a problem
+
+- **No spurious stales**, no replay overflow, no channel-gap absorbs
+  in either capture — Phase A correctness work holds under load.
+- **Thread-pool queue length stays at 0** — the pipeline never
+  back-pressures the OS thread pool.
+- **JIT cost is one-shot** (~0.5 s total in first 3 s) and falls to
+  near zero after warmup; not worth AOT-ing for throughput.
+
+## 15. Summary
 
 The throughput envelope is achieved by a small set of repeated patterns:
 
