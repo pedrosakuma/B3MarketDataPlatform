@@ -25,4 +25,14 @@ public interface IFeedEventHandler
     /// Used as a batch boundary for upstream conflation.
     /// </summary>
     void OnPacketProcessed() { }
+
+    /// <summary>
+    /// Fired when the channel observes a SequenceVersion increment in the
+    /// PacketHeader (B3 spec §6.5.5.1 — weekly rollover or failover event).
+    /// SequenceNumber resets to 1 in the new version, so per-symbol epoch
+    /// state must be reset (books cleared, state registry reset, stat
+    /// rptSeq watermarks zeroed). Implementations should treat this as
+    /// equivalent to <see cref="OnSequenceReset"/>.
+    /// </summary>
+    void OnSequenceVersionChanged(ushort newVersion) { }
 }

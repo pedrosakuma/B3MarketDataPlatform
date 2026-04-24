@@ -173,6 +173,43 @@ public sealed class InstrumentInfo
         InstrAttribs = null;
         BumpVersion();
     }
+
+    /// <summary>
+    /// Per B3 spec §14.3 — TRADING_SESSION_CHANGE (SecurityTradingEvent=4):
+    /// "end of day trading statistics reset". Clears LastTradePrice,
+    /// ExecutionStatistics (VWAP, TradeVolume, NumberOfTrades),
+    /// OpeningPrice, TheoreticalOpeningPrice, HighPrice, LowPrice and the
+    /// related rptSeq watermarks so the first post-reset stat at rptSeq=1
+    /// is accepted by <see cref="SymbolStateRegistry"/>'s gap routing.
+    /// Identity, instrument metadata, status and book state are preserved.
+    /// </summary>
+    public void ResetSessionStatistics()
+    {
+        LastTradePrice = null;
+        LastTradeSize = null;
+        OpeningPrice = null;
+        TheoreticalOpeningPrice = null;
+        TheoreticalOpeningSize = null;
+        ClosingPrice = null;
+        HighPrice = null;
+        LowPrice = null;
+        TradeVolume = null;
+        VwapPrice = null;
+        NumberOfTrades = null;
+        NetChangeFromPrevDay = null;
+        AuctionImbalanceSize = null;
+
+        LastRptSeqOpeningPrice = 0;
+        LastRptSeqTheoreticalOpeningPrice = 0;
+        LastRptSeqClosingPrice = 0;
+        LastRptSeqAuctionImbalance = 0;
+        LastRptSeqHighPrice = 0;
+        LastRptSeqLowPrice = 0;
+        LastRptSeqLastTradePrice = 0;
+        LastRptSeqExecutionStatistics = 0;
+
+        BumpVersion();
+    }
 }
 
 public sealed class UnderlyingInfo

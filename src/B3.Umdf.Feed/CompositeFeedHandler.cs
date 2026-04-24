@@ -37,4 +37,10 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
         foreach (var handler in _handlers)
             handler.OnPacketProcessed();
     }
+
+    public void OnSequenceVersionChanged(ushort newVersion)
+    {
+        foreach (var handler in _handlers)
+            handler.OnSequenceVersionChanged(newVersion);
+    }
 }

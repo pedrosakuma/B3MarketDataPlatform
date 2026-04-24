@@ -278,6 +278,56 @@ public class FeedHandlerStateMachineTests
         Assert.Equal(1L, handler.PerSymbolGapsAbsorbed);
     }
 
+    [Fact]
+    public void SequenceVersionChange_ResetsExpectedSeqAndFiresCallback()
+    {
+        // Spec §6.5.5.1: SequenceVersion increments on weekly rollover or
+        // failover; SequenceNumber resets to 1 in the new version. The
+        // post-rollover seq=1 must NOT be discarded as a duplicate of
+        // pre-rollover seq=N.
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.Streaming);
+
+        // Process several packets in version=1.
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1, seqVer: 1));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2, seqVer: 1));
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 3, seqVer: 1));
+        Assert.Equal(4u, handler.IncrementalHandler.ExpectedSequenceNumber);
+        Assert.Equal(0L, handler.IncrementalHandler.SequenceVersionResets);
+        Assert.Equal(0, tracker.SequenceVersionChangedCount);
+
+        // Failover: version bumps to 2, seq restarts at 1.
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1, seqVer: 2));
+
+        Assert.Equal(2, handler.IncrementalHandler.CurrentSequenceVersion);
+        Assert.Equal(2u, handler.IncrementalHandler.ExpectedSequenceNumber);
+        Assert.Equal(1L, handler.IncrementalHandler.SequenceVersionResets);
+        Assert.Equal(0L, handler.IncrementalHandler.DuplicatesSkipped);
+        Assert.Equal(1, tracker.SequenceVersionChangedCount);
+        Assert.Equal((ushort)2, tracker.LastSequenceVersion);
+
+        // Subsequent packets in the new version flow normally.
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 2, seqVer: 2));
+        Assert.Equal(3u, handler.IncrementalHandler.ExpectedSequenceNumber);
+    }
+
+    [Fact]
+    public void InitialBootstrap_AdoptsFirstSequenceVersionWithoutCallback()
+    {
+        // The very first packet establishes the baseline version — no
+        // OnSequenceVersionChanged callback should fire.
+        var tracker = new TrackingFeedEventHandler();
+        var handler = new FeedHandler(tracker);
+        handler.SetStateForTesting(FeedState.Streaming);
+
+        handler.FeedPacket(MakePacket(ChannelType.IncrementalA, seqNum: 1, seqVer: 7));
+
+        Assert.Equal(7, handler.IncrementalHandler.CurrentSequenceVersion);
+        Assert.Equal(0L, handler.IncrementalHandler.SequenceVersionResets);
+        Assert.Equal(0, tracker.SequenceVersionChangedCount);
+    }
+
     private class NopFeedEventHandler : IFeedEventHandler
     {
         public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId) { }
@@ -291,6 +341,8 @@ public class FeedHandlerStateMachineTests
         public int PacketProcessedCount;
         public int SeenPacketCount;
         public ushort LastTemplateId;
+        public int SequenceVersionChangedCount;
+        public ushort LastSequenceVersion;
         public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
         {
             SeenPacketCount++;
@@ -299,5 +351,10 @@ public class FeedHandlerStateMachineTests
         public void OnPacketProcessed() => PacketProcessedCount++;
         public void OnSequenceReset() { }
         public void OnInstrumentDefinitionsComplete(int instrumentCount) { }
+        public void OnSequenceVersionChanged(ushort newVersion)
+        {
+            SequenceVersionChangedCount++;
+            LastSequenceVersion = newVersion;
+        }
     }
 }

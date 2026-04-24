@@ -35,6 +35,7 @@ internal sealed class SnapshotApplier
     private readonly IBookEventHandler? _eventHandler;
     private readonly ILogger _logger;
     private readonly Func<ulong, uint, uint, int> _replayDeferredMbo;
+    private readonly Func<ushort> _currentSequenceVersion;
 
     private readonly Dictionary<ulong, PendingSnapshot> _pendingSnapshots = new();
 
@@ -43,12 +44,20 @@ internal sealed class SnapshotApplier
     private long _snapshotChunksOrphaned;
     private long _snapshotsRejectedTooOld;
     private long _snapshotsSkippedHealthyAhead;
+    private long _snapshotsRejectedStaleVersion;
 
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
     public long SnapshotChunksOrphaned => Volatile.Read(ref _snapshotChunksOrphaned);
     public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
     public long SnapshotsSkippedHealthyAhead => Volatile.Read(ref _snapshotsSkippedHealthyAhead);
+    /// <summary>
+    /// Snapshots silently skipped because their <c>LastSequenceVersion</c>
+    /// was older than the channel's current SequenceVersion (B3 spec §7.2).
+    /// Chunks for skipped snapshots are absorbed without polluting the
+    /// orphan counter.
+    /// </summary>
+    public long SnapshotsRejectedStaleVersion => Volatile.Read(ref _snapshotsRejectedStaleVersion);
 
     public SnapshotApplier(
         BookStore bookStore,
@@ -56,7 +65,8 @@ internal sealed class SnapshotApplier
         StaleMboBuffer staleBuffer,
         IBookEventHandler? eventHandler,
         ILogger logger,
-        Func<ulong, uint, uint, int> replayDeferredMbo)
+        Func<ulong, uint, uint, int> replayDeferredMbo,
+        Func<ushort>? currentSequenceVersion = null)
     {
         _bookStore = bookStore;
         _stateRegistry = stateRegistry;
@@ -64,6 +74,7 @@ internal sealed class SnapshotApplier
         _eventHandler = eventHandler;
         _logger = logger;
         _replayDeferredMbo = replayDeferredMbo;
+        _currentSequenceVersion = currentSequenceVersion ?? (static () => (ushort)0);
     }
 
     /// <summary>
@@ -76,6 +87,29 @@ internal sealed class SnapshotApplier
         ref readonly var msg = ref reader.Data;
         ulong secId = (ulong)msg.SecurityID;
         uint expected = msg.TotNumBids + msg.TotNumOffers;
+
+        // Spec §7.2: "If a client encounters a snapshot whose
+        // lastSequenceVersion is less than the sequence version coming from
+        // the incremental feed, it is recommended to not process that
+        // snapshot and wait for the updated version to avoid incurring
+        // inconsistent state of the internal book." We absorb the chunks
+        // silently (Skipped path) so the orphan counter is not polluted.
+        ushort currentVersion = _currentSequenceVersion();
+        if (currentVersion != 0
+            && msg.LastSequenceVersion is { } snapVer
+            && snapVer != 0
+            && snapVer < currentVersion)
+        {
+            _pendingSnapshots[secId] = new PendingSnapshot
+            {
+                OrdersExpected = expected,
+                OrdersReceived = 0,
+                Skipped = true,
+            };
+            Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
+            return;
+        }
+
         bool hasRpt = msg.LastRptSeq is { } v && v > 0;
         uint lastRpt = hasRpt ? msg.LastRptSeq!.Value : 0u;
 
@@ -315,6 +349,31 @@ internal sealed class SnapshotApplier
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Test helper: mirrors the wire <see cref="OnHeader"/> path, including
+    /// the spec §7.2 stale-version gate. Set <paramref name="lastSequenceVersion"/>
+    /// to null/0 to bypass the version check.
+    /// </summary>
+    internal void OnHeaderForTest(ulong secId, uint lastRptSeq, uint ordersExpected, ushort? lastSequenceVersion)
+    {
+        ushort currentVersion = _currentSequenceVersion();
+        if (currentVersion != 0
+            && lastSequenceVersion is { } snapVer
+            && snapVer != 0
+            && snapVer < currentVersion)
+        {
+            _pendingSnapshots[secId] = new PendingSnapshot
+            {
+                OrdersExpected = ordersExpected,
+                OrdersReceived = 0,
+                Skipped = true,
+            };
+            Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
+            return;
+        }
+        BeginHeader(secId, lastRptSeq, lastRptSeq > 0, ordersExpected);
+    }
 
     /// <summary>
     /// Test helper: simulate a Header_30 + N Orders_71 chunked snapshot.

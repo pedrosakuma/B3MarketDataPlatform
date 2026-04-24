@@ -40,17 +40,33 @@ public sealed class ChannelHandler : IDisposable
 
     private uint _expectedSeqNum = 1;
 
+    /// <summary>
+    /// Last observed SequenceVersion from the incremental stream PacketHeader.
+    /// 0 means "no packet observed yet" (pre-bootstrap). When a packet
+    /// arrives with a different non-zero version, the channel resets
+    /// (B3 spec §6.5.5.1 — weekly rollover or failover).
+    /// </summary>
+    private ushort _currentSequenceVersion;
+
     private long _packetsProcessed;
     private long _duplicatesSkipped;
     private long _gapsDetected;
     private long _reorderHits;
+    private long _sequenceVersionResets;
     private volatile uint _lastGapExpected;
     private volatile uint _lastGapReceived;
 
     public uint ExpectedSequenceNumber => _expectedSeqNum;
+    /// <summary>Current SequenceVersion observed on this channel; 0 before first packet.</summary>
+    public ushort CurrentSequenceVersion => _currentSequenceVersion;
     public long PacketsProcessed => Volatile.Read(ref _packetsProcessed);
     public long DuplicatesSkipped => Volatile.Read(ref _duplicatesSkipped);
     public long GapsDetected => Volatile.Read(ref _gapsDetected);
+    /// <summary>
+    /// Count of channel-wide resets triggered by a SequenceVersion change
+    /// in the PacketHeader (B3 spec §6.5.5.1).
+    /// </summary>
+    public long SequenceVersionResets => Volatile.Read(ref _sequenceVersionResets);
     /// <summary>
     /// Count of packets that arrived out-of-order and were later drained from the
     /// reorder buffer (i.e. saved a recovery cycle thanks to A/B arbitration).
@@ -73,6 +89,22 @@ public sealed class ChannelHandler : IDisposable
             return GapResult.InSequence;
 
         uint seq = header.SequenceNumber;
+
+        // Spec §6.5.5.1: SequenceVersion increments on weekly rollover or
+        // failover; SequenceNumber resets to 1 in the new version. Detect
+        // the version change before any seq comparison so we don't treat
+        // post-rollover seq=1 as a "duplicate" of pre-rollover seq=N.
+        ushort version = header.SequenceVersion;
+        if (_currentSequenceVersion == 0)
+        {
+            _currentSequenceVersion = version;
+        }
+        else if (version != _currentSequenceVersion)
+        {
+            HandleSequenceVersionChange(version, seq);
+            // Fall through with the post-reset _expectedSeqNum so this
+            // packet (the first of the new version) is processed normally.
+        }
 
         // Cold-start: if the very first packet is far above the initial
         // _expectedSeqNum=1 (live multicast joined mid-stream), seed the
@@ -180,6 +212,23 @@ public sealed class ChannelHandler : IDisposable
     public void Dispose()
     {
         DiscardReorderBuffer();
+    }
+
+    /// <summary>
+    /// Reset to follow a new SequenceVersion. Discards any reorder-buffered
+    /// packets (they belonged to the previous version's seq space) and
+    /// re-baselines <see cref="_expectedSeqNum"/> to the first observed seq
+    /// of the new version. Notifies the event handler so per-symbol /
+    /// per-instrument state can be reset by upstream managers.
+    /// </summary>
+    private void HandleSequenceVersionChange(ushort newVersion, uint firstSeqOfNewVersion)
+    {
+        DiscardReorderBuffer();
+        _currentSequenceVersion = newVersion;
+        _expectedSeqNum = firstSeqOfNewVersion;
+        Interlocked.Increment(ref _sequenceVersionResets);
+        try { _eventHandler.OnSequenceVersionChanged(newVersion); }
+        catch { /* event handler exceptions must not destabilize the channel; counters still reflect the reset */ }
     }
 
     private void ProcessAndAdvance(in UmdfPacket packet, ReadOnlySpan<byte> span)

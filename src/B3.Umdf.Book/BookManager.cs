@@ -27,6 +27,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _deleteNotFound;
     private long _nullPriceNewSkips;
     private long _nullPriceChangeDeletes;
+    private long _tradesFilteredNonReportable;
 
     /// <summary>
     /// Packet-level SendingTime (nanoseconds since epoch) for the message currently being processed.
@@ -48,6 +49,29 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long DeleteNotFound => Volatile.Read(ref _deleteNotFound);
     public long NullPriceNewSkips => Volatile.Read(ref _nullPriceNewSkips);
     public long NullPriceChangeDeletes => Volatile.Read(ref _nullPriceChangeDeletes);
+
+    /// <summary>
+    /// Trades suppressed from <see cref="IBookEventHandler.OnTrade"/> /
+    /// <see cref="IBookEventHandler.OnForwardTrade"/> because they are
+    /// flagged as non-reportable per B3 spec §18 (TradeCondition.OutOfSequence
+    /// or TrdSubType=LEG_TRADE). The rptSeq stream is still advanced for
+    /// these messages — only downstream fanout (trade tape, candles, last
+    /// price) is gated.
+    /// </summary>
+    public long TradesFilteredNonReportable => Volatile.Read(ref _tradesFilteredNonReportable);
+
+    /// <summary>
+    /// B3 spec §18: trades flagged as out-of-sequence or as leg trades of a
+    /// strategy/UDS combo must NOT contribute to the outright instrument's
+    /// last-trade price, candles, or aggregated trade tape — they are
+    /// reported separately for transparency. Returns false for those.
+    /// </summary>
+    internal static bool IsReportableTrade(TradeCondition condition, TrdSubType? subType)
+    {
+        if ((condition & TradeCondition.OutOfSequence) != 0) return false;
+        if (subType == TrdSubType.LEG_TRADE) return false;
+        return true;
+    }
 
     private long _crossingTransitions;
     private long _currentlyCrossedBooks;
@@ -88,7 +112,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             _staleBuffer,
             _eventHandler,
             _logger,
-            ReplayDeferredMbo);
+            ReplayDeferredMbo,
+            () => CurrentSequenceVersion);
     }
 
     private readonly SymbolStateRegistry _stateRegistry;
@@ -389,6 +414,31 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeBooks(); }
     public void OnPacketProcessed() { _eventHandler?.OnBatchComplete(); }
 
+    /// <summary>
+    /// Spec §6.5.5.1 — SequenceVersion increment (weekly rollover / failover):
+    /// the upstream feed restarts with SequenceNumber=1 in the new version.
+    /// Treat as a full epoch reset (drop books, clear pending snapshots,
+    /// reset registry). The new <paramref name="newVersion"/> is forwarded
+    /// to <see cref="SnapshotApplier"/> so subsequent snapshots whose
+    /// LastSequenceVersion is older are silently skipped (spec §7.2).
+    /// </summary>
+    public void OnSequenceVersionChanged(ushort newVersion)
+    {
+        Volatile.Write(ref _currentSequenceVersion, newVersion);
+        ClearAllBooks();
+        ResetPerSymbolEpoch($"SequenceVersionChanged → {newVersion}");
+    }
+
+    private int _currentSequenceVersion;
+
+    /// <summary>
+    /// Last SequenceVersion observed on the incremental stream and propagated
+    /// here via <see cref="OnSequenceVersionChanged"/>. Read by
+    /// <see cref="SnapshotApplier"/> to gate stale-version snapshots.
+    /// 0 means "no version observed yet"; in that case no gating is applied.
+    /// </summary>
+    internal ushort CurrentSequenceVersion => (ushort)Volatile.Read(ref _currentSequenceVersion);
+
     // Feed thread is the sole writer for all book mutations — no locks needed.
     // Callbacks are inline (same thread) so no race condition exists.
 
@@ -583,6 +633,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 TrackMboRptSeq(book, (uint)rptSeq);
         }
 
+        // Spec §18: filter non-reportable trades (out-of-sequence / leg trades)
+        // out of last-trade / candle / tape fanout. RptSeq already advanced.
+        if (!IsReportableTrade(msg.TradeCondition, msg.TrdSubType))
+        {
+            Interlocked.Increment(ref _tradesFilteredNonReportable);
+            return;
+        }
+
         _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs);
     }
 
@@ -632,6 +690,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         {
             if (msg.RptSeq is { } rptSeq)
                 TrackMboRptSeq(book, (uint)rptSeq);
+        }
+
+        // Spec §18 filter applies to forward trades as well.
+        if (!IsReportableTrade(msg.TradeCondition, msg.TrdSubType))
+        {
+            Interlocked.Increment(ref _tradesFilteredNonReportable);
+            return;
         }
 
         _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs);
@@ -698,6 +763,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotsRejectedTooOld => _snapshotApplier.SnapshotsRejectedTooOld;
     /// <summary>Snapshots ignored at Header_30 because the symbol is already Healthy with a more recent baseline.</summary>
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
+    /// <summary>Snapshots silently skipped because their LastSequenceVersion is older than the channel's current SequenceVersion (B3 spec §7.2).</summary>
+    public long SnapshotsRejectedStaleVersion => _snapshotApplier.SnapshotsRejectedStaleVersion;
 
     private void HandleSnapshotHeader(ReadOnlySpan<byte> body) => _snapshotApplier.OnHeader(body);
     private void HandleSnapshotOrders(ReadOnlySpan<byte> body) => _snapshotApplier.OnOrdersChunk(body);
@@ -709,6 +776,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         => _snapshotApplier.BeginChunkedSnapshotForTest(securityId, lastRptSeq, ordersExpected);
     internal void RecordSnapshotChunkForTest(ulong securityId, uint ordersInChunk)
         => _snapshotApplier.RecordSnapshotChunkForTest(securityId, ordersInChunk);
+    // Exposed internally for tests: simulates a wire snapshot Header_30 with an
+    // explicit LastSequenceVersion, so the version-gate path can be exercised
+    // without forging raw SBE bytes.
+    internal void OnSnapshotHeaderForTest(ulong securityId, uint lastRptSeq, uint ordersExpected, ushort? lastSequenceVersion)
+        => _snapshotApplier.OnHeaderForTest(securityId, lastRptSeq, ordersExpected, lastSequenceVersion);
     internal void StageSnapshotEntryForTest(ulong securityId, BookSideType side, ulong orderId, long price, long quantity)
         => _snapshotApplier.StageSnapshotEntryForTest(securityId, side, orderId, price, quantity);
     internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)

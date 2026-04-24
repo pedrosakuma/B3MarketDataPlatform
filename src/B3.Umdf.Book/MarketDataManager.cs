@@ -26,6 +26,7 @@ public sealed class MarketDataManager : IFeedEventHandler
     private readonly IMarketDataEventHandler? _eventHandler;
     private readonly ILogger<MarketDataManager> _logger;
     private long _parseErrors;
+    private long _tradingSessionResets;
 
     /// <summary>
     /// Thread-safe dictionary of all instrument data.
@@ -35,6 +36,12 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     /// <summary>Number of SBE parse errors encountered.</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
+
+    /// <summary>
+    /// Count of TRADING_SESSION_CHANGE (SecurityTradingEvent=4) resets applied
+    /// to instruments — see B3 spec §14.3 (end-of-day stats reset).
+    /// </summary>
+    public long TradingSessionResets => Volatile.Read(ref _tradingSessionResets);
 
     public MarketDataManager(IMarketDataEventHandler? eventHandler = null, ILogger<MarketDataManager>? logger = null,
         SymbolStateRegistry? stateRegistry = null)
@@ -180,6 +187,35 @@ public sealed class MarketDataManager : IFeedEventHandler
         // clearing them here would blank the UI without any authoritative way to restore
         // them immediately. Keep the last known info until fresh updates arrive.
     }
+
+    /// <summary>
+    /// Spec §6.5.5.1 — SequenceVersion increment (weekly rollover / failover).
+    /// Per-instrument rptSeq watermarks for each stat kind must be reset
+    /// to 0 so the first post-version stat at rptSeq=1 is accepted by
+    /// <see cref="SymbolStateRegistry"/>'s gap routing. Stat values
+    /// themselves are preserved (UI keeps the last known value until the
+    /// new session's first refresh arrives, mirroring
+    /// <see cref="OnSequenceReset"/>'s rationale).
+    /// </summary>
+    public void OnSequenceVersionChanged(ushort newVersion)
+    {
+        foreach (var info in _data.Values)
+        {
+            info.LastRptSeqOpeningPrice = 0;
+            info.LastRptSeqTheoreticalOpeningPrice = 0;
+            info.LastRptSeqClosingPrice = 0;
+            info.LastRptSeqAuctionImbalance = 0;
+            info.LastRptSeqQuantityBand = 0;
+            info.LastRptSeqPriceBand = 0;
+            info.LastRptSeqHighPrice = 0;
+            info.LastRptSeqLowPrice = 0;
+            info.LastRptSeqLastTradePrice = 0;
+            info.LastRptSeqSettlementPrice = 0;
+            info.LastRptSeqOpenInterest = 0;
+            info.LastRptSeqExecutionStatistics = 0;
+            info.LastRptSeqSecurityStatus = 0;
+        }
+    }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeData(); }
 
     private void HandleSecurityDefinition(ReadOnlySpan<byte> body, int blockLength)
@@ -289,6 +325,16 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.TradingEvent = eventCode;
         info.TradSesOpenTime = msg.TradSesOpenTime.Time;
         info.LastUpdateTimestamp = msg.TransactTime.Time ?? 0;
+
+        // Per B3 spec §14.3: SecurityTradingEvent == 4 (TRADING_SESSION_CHANGE)
+        // is the "end of day trading statistics reset" signal. Clear session
+        // stats and stat-rptSeq watermarks so the next trading session starts
+        // clean and post-reset stats at rptSeq=1 are accepted.
+        if (eventCode == 4)
+        {
+            info.ResetSessionStatistics();
+            Interlocked.Increment(ref _tradingSessionResets);
+        }
 
         if (eventCode == 102) // SECURITY_REJOINS_SECURITY_GROUP_STATUS
         {
