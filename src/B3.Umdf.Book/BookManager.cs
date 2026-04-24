@@ -855,7 +855,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         else
         {
             // null/0 rptSeq: keep an entry so HealAfterSnapshotForTest exercises the
-            // "missing baseline" path (counter increments, no transition).
+            // illiquid auto-promote path (B3 spec §7.4) — Unknown/Stale-without-gap
+            // symbols transition to Healthy at baseline=0; the missing-baseline
+            // counter only increments when the heal is rejected (e.g., genuine gap).
             _pendingSnapshots[securityId] = new PendingSnapshot
             {
                 LastRptSeq = 0,
@@ -966,9 +968,37 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         if (!pending.HasRptSeq)
         {
-            // Header arrived but had no usable LastRptSeq (null/0). Same outcome as above:
-            // we can't anchor the symbol to a known incremental boundary.
-            Interlocked.Increment(ref _snapshotsMissingRptSeq);
+            // Illiquid instrument case (B3 spec §7.4): LastRptSeq is omitted from the
+            // snapshot header when the instrument has not received any incremental
+            // updates yet from the incremental stream. Spec explicitly states:
+            // "the client system can process the incremental messages related to
+            // that instrument without discarding them."
+            //
+            // Treat the absent LastRptSeq as "anchor at rptSeq=0": promote the
+            // symbol to Healthy with baseline=0, so the first incremental that
+            // arrives (rptSeq=1) is contiguous (lastSeen+1 == received) and is
+            // applied. Without this, illiquid symbols stayed Stale forever and
+            // every subsequent live message went into the per-symbol buffer.
+            //
+            // HealFromSnapshot's defensive Healthy-ahead guard still protects
+            // already-Healthy symbols (prev=Healthy + snap=0 <= priorHighWater
+            // would reject). Stale symbols with minHeal>0 (genuine gap) also
+            // get rejected (snap=0 < minHeal>0), correctly leaving them Stale.
+            var illiquidHeal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 0);
+            if (illiquidHeal.Accepted)
+            {
+                book.LastRptSeq = 0;
+                if (illiquidHeal.TransitionedToHealthy)
+                {
+                    Interlocked.Increment(ref _snapshotsHealed);
+                    if (_eventHandler is not null && !_stateRegistry.IsAnyStale(securityId))
+                        _eventHandler.OnSymbolStaleStatusChanged(securityId, isStale: false);
+                }
+            }
+            else
+            {
+                Interlocked.Increment(ref _snapshotsMissingRptSeq);
+            }
             return;
         }
 

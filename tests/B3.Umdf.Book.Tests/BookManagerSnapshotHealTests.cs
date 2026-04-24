@@ -46,25 +46,39 @@ public class BookManagerSnapshotHealTests
     }
 
     [Fact]
-    public void Header_NullLastRptSeq_PreventsHeal()
+    public void Header_RptSeqZero_IlliquidAutoPromote()
     {
+        // B3 spec §7.4: snapshot with no LastRptSeq (null/0) means an illiquid
+        // instrument that hasn't yet received any incremental updates. The
+        // client is explicitly allowed to process incoming incrementals without
+        // discarding them. We auto-promote Unknown symbols to Healthy at
+        // baseline=0 so the first live message at rptSeq=1 is accepted as
+        // contiguous.
+        var (bm, reg, _) = CreatePerSymbol();
+
+        bm.RecordSnapshotHeader(50, lastRptSeq: 0);
+        bm.HealAfterSnapshotForTest(50);
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(0, bm.SnapshotsMissingRptSeq);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(50, SymbolGapKind.Mbo));
+        Assert.Equal(0u, bm.Books[50].LastRptSeq);
+
+        // First live incremental at rptSeq=1 must be accepted (Healthy.Apply).
+        var observe = reg.Observe(50, SymbolGapKind.Mbo, 1);
+        Assert.Equal(B3.Umdf.Book.SymbolStateRegistry.ObserveAction.Apply, observe.Action);
+    }
+    [Fact]
+    public void Header_RptSeqZero_HealthyAlready_NoRegression()
+    {
+        // Defensive: if symbol is already Healthy at some baseline, an illiquid-style
+        // snapshot (LastRptSeq=null) MUST NOT regress it. Defensive Healthy-ahead
+        // guard in HealFromSnapshot rejects snap=0 <= priorHighWater.
         var (bm, reg, _) = CreatePerSymbol();
         reg.Observe(99, SymbolGapKind.Mbo, 100);
 
         bm.RecordSnapshotHeader(99, lastRptSeq: null);
         bm.HealAfterSnapshotForTest(99);
-
-        Assert.Equal(0, bm.SnapshotsHealed);
-        Assert.Equal(1, bm.SnapshotsMissingRptSeq);
-    }
-
-    [Fact]
-    public void Header_RptSeqZero_TreatedAsNull()
-    {
-        var (bm, _, _) = CreatePerSymbol();
-
-        bm.RecordSnapshotHeader(50, lastRptSeq: 0);
-        bm.HealAfterSnapshotForTest(50);
 
         Assert.Equal(0, bm.SnapshotsHealed);
         Assert.Equal(1, bm.SnapshotsMissingRptSeq);
