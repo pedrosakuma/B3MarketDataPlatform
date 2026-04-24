@@ -585,6 +585,16 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             book.Clear();
             _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
         }
+
+        // Per B3 spec ("EmptyBook resets RptSeq to 1"): the wire restarts
+        // this instrument's RptSeq counter at 1 immediately after EmptyBook.
+        // Drop any stale buffered messages from the prior epoch (their rptSeq
+        // values are now meaningless under the new epoch) and reset the
+        // registry baseline so the next Order at rptSeq=1 is contiguous.
+        // Without this, the next Order would hit Healthy.Drop (1 <= lastSeen)
+        // and the symbol would silently lose every subsequent update.
+        _staleBuffer?.Clear(securityId);
+        _stateRegistry?.ResetSymbolEpoch(securityId, SymbolGapKind.Mbo);
     }
 
     private void HandleForwardTrade(ReadOnlySpan<byte> body, int blockLength)
@@ -848,6 +858,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         var book = GetOrCreateBook(securityId);
         CompleteSnapshot(securityId, book);
     }
+
+    /// <summary>Test helper: invoke the EmptyBook_9 dispatch path without forging a SBE header.</summary>
+    internal void HandleEmptyBookForTest(ReadOnlySpan<byte> body) => HandleEmptyBook(body);
 
     private void HandleSnapshotOrders(ReadOnlySpan<byte> body)
     {

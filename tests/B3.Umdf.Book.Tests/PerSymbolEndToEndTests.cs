@@ -1,5 +1,6 @@
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
+using B3.Umdf.Mbo.Sbe.V16;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Book.Tests;
@@ -153,6 +154,45 @@ public class PerSymbolEndToEndTests
         // through the drain to 115, not stuck at 109.
         Assert.Equal(SymbolStateRegistry.ObserveAction.Apply,
             reg.Observe(sec, SymbolGapKind.Mbo, 116).Action);
+    }
+
+    [Fact]
+    public void Scenario_EmptyBookResetsRegistryAndBuffer_NextRptSeq1IsContiguous()
+    {
+        // EmptyBook resets the wire's per-instrument RptSeq to 1. Without
+        // ResetSymbolEpoch, the registry would still hold lastSeen=N from
+        // before EmptyBook and the next live Order at rptSeq=1 would hit
+        // the Healthy.Drop branch (received <= lastSeen), silently losing
+        // every subsequent update for that symbol.
+        var (bm, reg, buf) = CreatePerSymbol();
+        const ulong sec = 800;
+
+        // Heal at 100, advance to 105.
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        for (uint r = 101; r <= 105; r++)
+            reg.Observe(sec, SymbolGapKind.Mbo, r);
+
+        // Stale buffer some unrelated entries (simulating a transient gap).
+        buf.Enqueue(sec, BUFFERED_TEMPLATE_ID, rptSeq: 200, sendingTimeNs: 0, DummyBody);
+        Assert.True(buf.DepthOf(sec) > 0);
+
+        // Build EmptyBook_9 wire bytes (struct size 20, only SecurityID matters
+        // for our handler).
+        Span<byte> body = stackalloc byte[EmptyBook_9Data.MESSAGE_SIZE];
+        var msg = new EmptyBook_9Data { SecurityID = (SecurityID)sec };
+        msg.TryEncode(body, out _);
+
+        bm.HandleEmptyBookForTest(body);
+
+        // Buffer cleared (prior-epoch rptSeqs are meaningless).
+        Assert.Equal(0, buf.DepthOf(sec));
+        // Registry: Healthy at baseline=0, MinHeal cleared.
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        // Next Order at rptSeq=1 must be contiguous, not dropped.
+        var r1 = reg.Observe(sec, SymbolGapKind.Mbo, 1);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, r1.Action);
     }
 
     [Fact]

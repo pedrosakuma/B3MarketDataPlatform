@@ -442,6 +442,36 @@ public sealed class SymbolStateRegistry
     }
 
     /// <summary>
+    /// Per-symbol epoch reset, triggered by EmptyBook_9 on the live wire.
+    /// EmptyBook is a per-instrument provable empty-state event after which
+    /// the B3 wire restarts that instrument's RptSeq counter at 1 (per spec
+    /// "EmptyBook resets RptSeq to 1"). Without this reset, the registry
+    /// would still hold lastRptSeq=N and the next live message at rptSeq=1
+    /// would hit the Healthy.Drop branch (received &lt;= lastSeen), silently
+    /// losing every subsequent update for that symbol.
+    ///
+    /// Sets the symbol/kind to Healthy at baseline=0 so the next message
+    /// (rptSeq=1) is contiguous via expected = lastSeen + 1 = 1.
+    /// </summary>
+    public void ResetSymbolEpoch(ulong securityId, SymbolGapKind kind)
+    {
+        if (!_entries.TryGetValue(securityId, out var entry))
+            return;
+        int idx = (int)kind;
+        lock (entry.Sync)
+        {
+            int prevMask = entry.StaleKindMask;
+            entry.States[idx] = SymbolState.Healthy;
+            entry.LastRptSeq[idx] = 0;
+            entry.StaleSinceTicks[idx] = 0;
+            entry.MinHealRptSeq[idx] = 0;
+            entry.StaleKindMask &= ~(1 << idx);
+            if (prevMask != 0 && entry.StaleKindMask == 0)
+                Interlocked.Decrement(ref _staleSymbolCount);
+        }
+    }
+
+    /// <summary>
     /// Pre-populate an entry on SecurityDefinition so the cold-start path
     /// avoids racing GetOrAdd on the feed thread. Idempotent.
     /// </summary>
