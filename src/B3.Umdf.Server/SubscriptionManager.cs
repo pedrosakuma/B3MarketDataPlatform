@@ -143,7 +143,7 @@ public sealed class SubscriptionManager : IDisposable
         MetricsRegistry.WsConnectionsActive.Add(1);
 
         // Immediately tell the client whether the server is ready
-        SendServerStatus(session, _ready);
+        SnapshotEmitter.SendServerStatus(session, _ready);
     }
 
     /// <summary>Unregister a client and remove all its subscriptions.</summary>
@@ -504,11 +504,7 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     private static void SendError(ClientSession session, SubscribeErrorCode code, string symbol)
-    {
-        var buf = new byte[WireProtocol.FramingHeaderSize + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
-        int len = WireProtocol.WriteSubscribeError(buf, code, symbol);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-    }
+        => SnapshotEmitter.SendError(session, code, symbol);
 
     private void SendSnapshots(ClientSession session, ulong securityId, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group)
@@ -516,24 +512,20 @@ public sealed class SubscriptionManager : IDisposable
         if (flags.HasFlag(DataFlags.Book))
         {
             if (bookManager.Books.TryGetValue(securityId, out var book))
-                SendMboSnapshot(session, book);
+                SnapshotEmitter.SendMboSnapshot(session, book);
             else
-            {
-                var emptyBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
-                WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
-                session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
-            }
+                SnapshotEmitter.SendEmptyBookSnapshot(session, securityId);
 
             // Send recent trade history from the owning group's ring buffer
             if (group.RecentTrades.TryGetValue(securityId, out var trades))
-                SendTradeHistory(session, securityId, trades);
+                SnapshotEmitter.SendTradeHistory(session, securityId, trades);
 
             // Send candle history from the owning group's aggregator.
             // Always send a CandleSnapshot (even empty) so the frontend knows the snapshot phase is complete.
             if (group.Candles.TryGetValue(securityId, out var agg))
-                SendCandleHistory(session, securityId, agg);
+                SnapshotEmitter.SendCandleHistory(session, securityId, agg);
             else
-                SendEmptyCandleSnapshot(session, securityId);
+                SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId);
         }
 
         if (flags.HasFlag(DataFlags.Info))
@@ -545,7 +537,7 @@ public sealed class SubscriptionManager : IDisposable
                 {
                     if (mdm.InstrumentData.TryGetValue(securityId, out var info))
                     {
-                        SendInfoSnapshot(session, securityId, info);
+                        SnapshotEmitter.SendInfoSnapshot(session, securityId, info);
                         break;
                     }
                 }
@@ -625,58 +617,7 @@ public sealed class SubscriptionManager : IDisposable
             MetricsRegistry.WsSubscriptions.Add(-removedSubscriptions);
     }
 
-    // --- Snapshot serialization ---
-
-    private static void SendMboSnapshot(ClientSession session, OrderBook book)
-    {
-        ulong securityId = book.SecurityId;
-        uint lastRptSeq = book.LastRptSeq;
-        var bidOrders = CopyOrderData(book.Bids);
-        var askOrders = CopyOrderData(book.Asks);
-
-        int headerSize = WireProtocol.BookSnapshotSize(0, 0);
-        int totalOrders = bidOrders.Length + askOrders.Length;
-        int needed = headerSize + totalOrders * 37;
-        var buf = ArrayPool<byte>.Shared.Rent(needed);
-
-        WireProtocol.WriteBookSnapshotHeader(buf, securityId, lastRptSeq, 0, 0);
-        int offset = headerSize;
-
-        SerializeOrderArray(buf, ref offset, securityId, bidOrders);
-        SerializeOrderArray(buf, ref offset, securityId, askOrders);
-
-        // ClientSession.TryEnqueueCore returns the pooled buffer on enqueue failure
-        // (overflow / disconnect), so we don't need a manual return here.
-        session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
-    }
-
-    private static (ulong OrderId, byte Side, long Price, long Quantity)[] CopyOrderData(BookSide side)
-    {
-        var orders = side.Orders;
-        var result = new (ulong, byte, long, long)[orders.Count];
-        int i = 0;
-        foreach (var entry in orders.Values)
-            result[i++] = (entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
-        return result;
-    }
-
-    private static void SerializeOrderArray(byte[] buf, ref int offset, ulong securityId,
-        (ulong OrderId, byte Side, long Price, long Quantity)[] orders)
-    {
-        foreach (var (orderId, side, price, quantity) in orders)
-        {
-            int len = WireProtocol.WriteOrderEvent(buf.AsSpan(offset), MessageType.OrderAdded,
-                securityId, orderId, side, price, quantity);
-            offset += len;
-        }
-    }
-
-    private static void SendInfoSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
-    {
-        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
-        int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-    }
+    // --- Snapshot serialization moved to SnapshotEmitter ---
 
     // --- Rankings ---
 
@@ -853,13 +794,6 @@ public sealed class SubscriptionManager : IDisposable
         }
     }
 
-    private static void SendServerStatus(ClientSession session, bool ready)
-    {
-        var buf = new byte[5];
-        WireProtocol.WriteServerStatus(buf, ready);
-        session.TryEnqueue(buf);
-    }
-
     private void BroadcastServerStatus(bool ready)
     {
         var buf = new byte[5];
@@ -867,53 +801,5 @@ public sealed class SubscriptionManager : IDisposable
         var payload = new ReadOnlyMemory<byte>(buf);
         foreach (var (_, client) in _clients)
             client.TryEnqueue(payload);
-    }
-
-    private static void SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
-    {
-        foreach (var (price, qty, tradeId) in ring.AsSpan())
-        {
-            var buf = new byte[36];
-            int len = WireProtocol.WriteTrade(buf, securityId, price, qty, tradeId);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-    }
-
-    private static void SendCandleHistory(ClientSession session, ulong securityId, CandleAggregator agg)
-    {
-        var candles = agg.GetCandles();
-        if (candles.Length == 0)
-        {
-            SendEmptyCandleSnapshot(session, securityId);
-            return;
-        }
-
-        int maxPerBatch = WireProtocol.MaxCandlesPerSnapshot;
-        for (int i = 0; i < candles.Length; i += maxPerBatch)
-        {
-            int count = Math.Min(maxPerBatch, candles.Length - i);
-            byte flags = 0;
-            if (i == 0)
-                flags |= WireProtocol.CandleFlagFirst;
-            if (i + count >= candles.Length)
-                flags |= WireProtocol.CandleFlagLast;
-
-            var batch = candles.AsSpan(i, count);
-            var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2 + count * WireProtocol.CandleSize];
-            int len = WireProtocol.WriteCandleSnapshot(buf, securityId, agg.Resolution, flags, batch);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
-        }
-    }
-
-    private static void SendEmptyCandleSnapshot(ClientSession session, ulong securityId)
-    {
-        var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2];
-        int len = WireProtocol.WriteCandleSnapshot(
-            buf,
-            securityId,
-            1,
-            (byte)(WireProtocol.CandleFlagFirst | WireProtocol.CandleFlagLast),
-            ReadOnlySpan<Candle>.Empty);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 }
