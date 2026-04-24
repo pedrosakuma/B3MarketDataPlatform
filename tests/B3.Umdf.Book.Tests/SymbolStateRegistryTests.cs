@@ -158,7 +158,7 @@ public class SymbolStateRegistryTests
     }
 
     [Fact]
-    public void Mbo_AcceptedHeal_ClearsMinHeal_NextHealAtAnyRptSeqAccepted()
+    public void Mbo_AcceptedHeal_ClearsMinHeal_LaggingHealRejectedForHealthy()
     {
         var r = NewRegistry();
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
@@ -166,10 +166,13 @@ public class SymbolStateRegistryTests
         var first = r.HealFromSnapshot(1, SymbolGapKind.Mbo, 104);
         Assert.True(first.Accepted);
 
-        // After accepted heal, MinHealRptSeq must be cleared. A subsequent heal with
-        // any (even older) rptSeq before another stale event should be accepted.
+        // After accepted heal, MinHealRptSeq is cleared. But the symbol is now
+        // Healthy at baseline=104 (drain would advance further in real flow). A
+        // lagging snapshot at rptSeq=50 must be REJECTED by the defensive
+        // Healthy-ahead guard — accepting it would silently regress the baseline
+        // and drop every subsequent live message in [105..104].
         var second = r.HealFromSnapshot(1, SymbolGapKind.Mbo, 50);
-        Assert.True(second.Accepted);
+        Assert.False(second.Accepted);
     }
 
     // ---- ResetEpoch (catastrophic, lower-numbered rptSeq accepted) ----

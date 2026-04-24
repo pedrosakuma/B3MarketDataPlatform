@@ -62,6 +62,14 @@ public class PerSymbolEndToEndTests
         Assert.Equal(0, buf.DepthOf(sec)); // drained
         Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
 
+        // In the real wire path, the drain dispatch parses each replayed body and
+        // calls RouteMbo → Observe, which advances baseline contiguously. Here
+        // DummyBody fails TryParse so RouteMbo is never reached and baseline
+        // stays at the snapshot value (10). Simulate the Observe call the
+        // dispatch would have made for rptSeq=11 to mirror real behavior.
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply,
+            reg.Observe(sec, SymbolGapKind.Mbo, 11).Action);
+
         // Next contiguous message Apply.
         var r3 = reg.Observe(sec, SymbolGapKind.Mbo, 12);
         Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, r3.Action);
@@ -101,6 +109,75 @@ public class PerSymbolEndToEndTests
         Assert.Equal(replayedBefore + 2, bm.ReplayedMboMessages);
         Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
         Assert.Equal(0, buf.DepthOf(sec));
+    }
+
+    [Fact]
+    public void Scenario_StaleHeal_DrainReplayActuallyAdvancesBaseline()
+    {
+        // Regression test for the silent drain no-op: previously HealFromSnapshot
+        // set baseline = max(snap, priorHighWater). For Stale healing with snap <
+        // priorHighWater this meant baseline=priorHighWater, so every drain replay
+        // (which re-enters Observe) hit the "received <= lastSeen → DROP" branch
+        // and the book stayed at snapshot state, losing operations [snap+1..high].
+        //
+        // After the fix: baseline = snap. Drain messages enter the contiguous Apply
+        // branch and advance the baseline message-by-message.
+        var (bm, reg, _) = CreatePerSymbol();
+        const ulong sec = 700;
+
+        // Bring symbol Healthy at 100, then go Stale via gap to 110 and accumulate
+        // observed live messages 110..115 (registry tracks high-water=115).
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        reg.Observe(sec, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109, high-water=110
+        for (uint r = 111; r <= 115; r++)
+            reg.Observe(sec, SymbolGapKind.Mbo, r); // Stale path advances high-water to 115
+        Assert.Equal(SymbolState.Stale, reg.GetState(sec, SymbolGapKind.Mbo));
+
+        // Snapshot at 109 (= MinHeal). Heal accepts.
+        var heal = reg.HealFromSnapshot(sec, SymbolGapKind.Mbo, snapshotRptSeq: 109);
+        Assert.True(heal.Accepted);
+        Assert.Equal(110u, heal.DrainFrom);
+        Assert.Equal(115u, heal.DrainTo);
+
+        // Simulate the drain dispatch: caller replays buffered msgs which re-enter
+        // Observe. With the fix, each one is contiguous from baseline=109.
+        for (uint r = heal.DrainFrom; r <= heal.DrainTo; r++)
+        {
+            var res = reg.Observe(sec, SymbolGapKind.Mbo, r);
+            Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, res.Action);
+        }
+
+        // Next live message (116) must be contiguous — proves baseline advanced
+        // through the drain to 115, not stuck at 109.
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply,
+            reg.Observe(sec, SymbolGapKind.Mbo, 116).Action);
+    }
+
+    [Fact]
+    public void Scenario_HealthyAhead_HealRejected_NoBaselineRegression()
+    {
+        // Defensive: HealFromSnapshot must refuse to set baseline below current
+        // priorHighWater for a Healthy symbol (BeginSnapshotHeader fast-path
+        // normally prevents this; the registry adds belt-and-suspenders).
+        var (bm, reg, _) = CreatePerSymbol();
+        const ulong sec = 710;
+
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        for (uint r = 101; r <= 200; r++)
+            reg.Observe(sec, SymbolGapKind.Mbo, r);
+
+        long ignoredBefore = reg.LaggingSnapshotCount;
+        var heal = reg.HealFromSnapshot(sec, SymbolGapKind.Mbo, snapshotRptSeq: 150);
+        Assert.False(heal.Accepted);
+        Assert.Equal(ignoredBefore + 1, reg.LaggingSnapshotCount);
+
+        // Baseline preserved: live 201 must still be contiguous from 200.
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply,
+            reg.Observe(sec, SymbolGapKind.Mbo, 201).Action);
     }
 
     [Fact]
@@ -171,12 +248,17 @@ public class PerSymbolEndToEndTests
             reg.Observe(sec, SymbolGapKind.Mbo, r);
 
         // Stale snapshot (older cycle) with baseline 95: no Stale event happened
-        // between heals, so MinHealRptSeq stays 0 and the heal is accepted but
-        // Math.Max preserves the high-water at 110 — state remains Healthy and the
-        // book baseline does not regress.
+        // between heals (MinHealRptSeq=0), but priorHighWater=110 > snap. The
+        // defensive Healthy-ahead guard in HealFromSnapshot rejects the heal so
+        // the registry baseline does not regress (would otherwise silently drop
+        // every subsequent live message in [111..95-impossible] — but the more
+        // important invariant is monotonicity of Healthy baseline).
         bm.RecordSnapshotHeader(sec, lastRptSeq: 95);
         bm.HealAfterSnapshotForTest(sec);
         Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        // Live message 111 must still be contiguous (baseline preserved at 110).
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply,
+            reg.Observe(sec, SymbolGapKind.Mbo, 111).Action);
     }
 
     [Fact]

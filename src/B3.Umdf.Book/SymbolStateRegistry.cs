@@ -317,8 +317,40 @@ public sealed class SymbolStateRegistry
                     SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
             }
 
-            uint newBaseline = Math.Max(snapshotRptSeq, priorHighWater);
-            entry.LastRptSeq[idx] = newBaseline;
+            // Defensive: never regress a Healthy symbol whose live stream is already
+            // ahead of the snapshot. The BeginSnapshotHeader fast-path (Skipped guard)
+            // normally catches this before the snapshot bytes touch the book; this
+            // double-check ensures the registry baseline cannot regress even if a
+            // future caller forgets the fast-path. Without it, setting baseline=snap
+            // (below) would silently drop every subsequent live message in
+            // [priorHighWater+1 .. snap] until the live stream catches up.
+            if (prev == SymbolState.Healthy && snapshotRptSeq <= priorHighWater)
+            {
+                Interlocked.Increment(ref _staleSnapshotIgnored);
+                if (_logger.IsEnabled(LogLevel.Debug))
+                    _logger.LogDebug(
+                        "SymbolState: ignored Healthy-ahead snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} priorHighWater={High}",
+                        securityId, kind, snapshotRptSeq, priorHighWater);
+                return new HealResult(Accepted: false, TransitionedToHealthy: false,
+                    SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
+            }
+
+            // CRITICAL: baseline = snapshotRptSeq (NOT max(snap, highWater)).
+            //
+            // The snapshot rebuilt the book at state-as-of-snap. The caller now drains
+            // the per-symbol buffer for [snap+1 .. highWater]. Each replayed message
+            // re-enters Observe via the dispatch path (HandleOrder → RouteMbo →
+            // Observe). For replay to reach the Apply branch, baseline must equal
+            // snap — then snap+1 is contiguous, snap+2 is contiguous, and so on,
+            // advancing the baseline naturally to the highest replayed rptSeq.
+            //
+            // The previous Math.Max(snap, highWater) implementation set baseline to
+            // highWater immediately, causing every replayed message to satisfy
+            // received <= lastSeen → DROP path in Observe. The drain became a silent
+            // no-op: book stayed at snapshot state, all buffered operations
+            // [snap+1 .. highWater] were lost. This corrupted the book whenever a
+            // symbol healed from Stale (the most common heal scenario).
+            entry.LastRptSeq[idx] = snapshotRptSeq;
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0; // baseline restored — no constraint until next stale event
 
