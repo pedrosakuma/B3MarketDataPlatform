@@ -123,6 +123,24 @@ public sealed class AppSettings
     /// <summary>Capacity of the live multicast merge queue shared across sockets.</summary>
     public int MulticastMergeCapacity { get; set; } = 1_000_000;
 
+    /// <summary>
+    /// Per-group <see cref="StaleMboBuffer"/> global byte cap, in MiB. Default 512.
+    /// Sum of all per-symbol queue payloads across one group cannot exceed this;
+    /// when reached, drop-newest kicks in (worst-case eviction). Sized so that 2-3
+    /// ultra-hot symbols can simultaneously hold ~1M msgs (~150 MB each) during
+    /// long heal cycles. CLI: env <c>UMDF_STALE_BUFFER_GLOBAL_MB</c>.
+    /// </summary>
+    public int StaleBufferGlobalMib { get; set; } = 512;
+
+    /// <summary>
+    /// Per-group <see cref="StaleMboBuffer"/> per-symbol cap ladder. One-way ratchet:
+    /// each symbol starts at index 0; on overflow it promotes one tier (level 1 always
+    /// allowed; higher levels gated when global byte budget &gt; 70%). Default
+    /// <c>[8192, 65536, 262144, 1048576]</c> — sized for ultra-hot futures bursts.
+    /// CLI: env <c>UMDF_STALE_BUFFER_CAP_LEVELS</c> (comma-separated, strictly increasing).
+    /// </summary>
+    public int[] StaleBufferCapLevels { get; set; } = new[] { 8_192, 65_536, 262_144, 1_048_576 };
+
     /// <summary>Capacity of each per-group feed queue behind the dispatcher.</summary>
     public int FeedChannelCapacity { get; set; } = 250_000;
 
@@ -259,6 +277,21 @@ public sealed class AppSettings
             FeedChannelCapacity = feedCapacity;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_GROUP_RING_CAPACITY"), out var ringCapacity))
             GroupRingCapacity = ringCapacity;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_STALE_BUFFER_GLOBAL_MB"), out var staleGlobalMib) && staleGlobalMib > 0)
+            StaleBufferGlobalMib = staleGlobalMib;
+        var staleCapLevels = Environment.GetEnvironmentVariable("UMDF_STALE_BUFFER_CAP_LEVELS");
+        if (!string.IsNullOrWhiteSpace(staleCapLevels))
+        {
+            var parts = staleCapLevels.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var parsed = new int[parts.Length];
+            bool ok = parts.Length > 0;
+            for (int i = 0; i < parts.Length && ok; i++)
+            {
+                if (!int.TryParse(parts[i], out parsed[i]) || parsed[i] <= 0) ok = false;
+                if (i > 0 && parsed[i] <= parsed[i - 1]) ok = false;
+            }
+            if (ok) StaleBufferCapLevels = parsed;
+        }
         var logLevel = Environment.GetEnvironmentVariable("UMDF_LOG_LEVEL");
         if (!string.IsNullOrEmpty(logLevel))
             LogLevel = logLevel;

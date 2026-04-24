@@ -48,6 +48,8 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | `UMDF_MULTICAST_MERGE_CAPACITY` | — | `1000000` | Capacity of the shared live-UDP merge queue |
 | `UMDF_FEED_CHANNEL_CAPACITY` | — | `250000` | Capacity of each per-group feed queue behind the dispatcher |
 | `UMDF_GROUP_RING_CAPACITY` | — | `65536` | Per-group MPSC dispatch ring capacity (drop-newest on overflow) |
+| `UMDF_STALE_BUFFER_GLOBAL_MB` | — | `512` | Per-group `StaleMboBuffer` global byte budget in MiB. Sum of payloads across all per-symbol queues. Drop-newest when exceeded. Sized for 2-3 ultra-hot symbols holding ~1M msgs (~150 MB each) simultaneously during long heal cycles. |
+| `UMDF_STALE_BUFFER_CAP_LEVELS` | — | `8192,65536,262144,1048576` | Per-symbol cap ladder (one-way ratchet). Symbols start at index 0; on overflow they promote one tier (level 1 always allowed; higher tiers gated when global byte budget > 70%). Comma-separated, strictly increasing positive integers. |
 | **Recovery** | | | |
 | `UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT` | — | `0.50` | Per-symbol fanout backpressure: fraction of known symbols that must be Stale to suppress client fanout. Set negative to disable. |
 | `UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT` | — | `0.10` | Hysteresis low-watermark for fanout suppression release. |

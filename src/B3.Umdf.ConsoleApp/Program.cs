@@ -397,11 +397,11 @@ foreach (var gid in groupIds)
     {
         StaleEscapeTimeoutMs = settings.StaleEscapeTimeoutMs,
     };
-    // Multi-tier dynamic-grow cap ladder: base 8k → 64k (legacy hot, always
-    // allowed) → 256k → 1M (gated by global byte budget for upper tiers).
-    // Sized for ultra-hot futures (winv25-class) during long heal windows.
+    // Multi-tier dynamic-grow cap ladder + global byte cap come from AppSettings.
+    // Defaults: [8k, 64k, 256k, 1M] per-symbol ladder, 512 MB global per group.
     var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger,
-        capLevels: new[] { 8192, 65536, 262144, 1048576 });
+        capLevels: settings.StaleBufferCapLevels,
+        globalByteCap: (long)settings.StaleBufferGlobalMib * 1024L * 1024L);
     registries[gid] = groupRegistry;
     staleBuffers[gid] = groupStaleBuffer;
 
