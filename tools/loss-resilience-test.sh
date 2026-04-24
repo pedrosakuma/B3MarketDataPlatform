@@ -12,6 +12,7 @@ set -u
 PREFIX="${1:?usage: $0 <pcap-prefix> [<duration-seconds>]}"
 DUR="${2:-20}"
 OUT="${OUT:-/tmp/loss-validation}"
+MODE="${MODE:-PerSymbol}"
 BIN="dotnet src/B3.Umdf.ConsoleApp/bin/Release/net10.0/B3.Umdf.ConsoleApp.dll"
 mkdir -p "$OUT"
 

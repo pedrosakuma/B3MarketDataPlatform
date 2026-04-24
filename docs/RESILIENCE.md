@@ -23,26 +23,101 @@ invariant.
 | Container OOM | POH fragmentation from pinned UDP buffers | Pinned-buffer pool sized to expected concurrency |
 | Publisher crash | shared `network_mode: service:consumer` | Health endpoint + restart policy in compose |
 
-## 2. Gap detection and recovery
+## 2. Per-instrument recovery (unified `rptSeq`)
 
-`FeedHandler` tracks `MsgSeqNum` per channel. On a sequence gap it
-transitions:
+The B3 UMDF spec — confirmed by PCAP analysis (200 k packets, 175 116
+cross-template `rptSeq` advances with gap = 0, 0 violations) — defines
+**one `rptSeq` counter per `SecurityID`** that is monotonic across **all**
+message templates (MBO, Trade, SecurityStatus, PriceBand, ExecStat, …).
+The consumer enforces this invariant in `SymbolStateRegistry`.
+
+### 2.1 State per symbol
+
+For each `SecurityID` the registry tracks:
+
+- `ObservedRptSeq` — max `rptSeq` ever seen on **any** kind. Wire-truth.
+- `LastRptSeq[kind]` — last applied `rptSeq` per bucket (one shared `Mbo`
+  bucket; one bucket per stat template — SecurityStatus, PriceBand, etc.).
+- `States[kind]` ∈ {Unknown, Healthy, Stale}.
+- `MinHealRptSeq[Mbo]` — lower bound for an acceptable snapshot.
+- `StaleKindMask` — bitmask of kinds currently Stale (drives the symbol-level
+  `IsAnyStale` gate).
+
+### 2.2 Observe — global-gap-first dispatch
+
+For every incoming `(secId, kind, receivedRptSeq)`:
 
 ```
-RealTime → Lost → (recovery available?) → Recovery → CatchUp → RealTime
+globalGap = ObservedRptSeq > 0 && receivedRptSeq > ObservedRptSeq + 1
 ```
 
-**Per-symbol recovery (unified)** — when a per-security `rptSeq` gap is
-detected, only the affected SecurityID flips to `Stale` while the channel
-keeps consuming RealTime. Subsequent incrementals for that symbol are
-buffered by `StaleMboBuffer` (per-symbol cap) and replayed in order once
-a `SnapshotFullRefresh_Header_30` carrying a fresh `lastRptSeq` brings the
-book back to a known baseline. There is no longer a channel-level
-recovery queue.
+- **`globalGap = true`** → the wire counter jumped. The Mbo bucket is
+  conservatively forced `Healthy → Stale` (the lost rptSeqs *could* have
+  been MBO messages). `MinHealRptSeq[Mbo]` is pinned to `received - 1`
+  on the transition. The triggering kind itself still applies (stats are
+  allowed to live-resync).
+- **No global gap** → per-kind dispatch proceeds: duplicate is dropped,
+  forward delivery is applied, and the kind is rebaselined to `received`.
 
-**Snapshot recovery (TCP)** is used when the gap is too wide for
-incremental recovery. The snapshot client has bounded retry with
-exponential backoff and emits `b3.umdf.recovery.snapshot.attempts`.
+The shared `Mbo` bucket means seven templates (`Order_50`, `DeleteOrder_51`,
+`MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecSummary_55`,
+`TradeBust_57`) share one state — without this, a Trade between two MBOs
+would otherwise expose an artificial per-kind gap.
+
+### 2.3 Why global-gap dispatch matters
+
+Earlier per-kind tracking caused **false-positive Stales** whenever a stat
+advanced the wire counter between MBOs. On hot symbols with many stat
+templates this triggered repeated 30-100 s snapshot-heal cycles that were
+purely an artifact of the bookkeeping model — no actual MBO loss had
+occurred. Unification eliminated this entire class of spurious recovery.
+
+### 2.4 Heal flow
+
+```
+Observe (gap)
+    │
+    ▼
+Mbo[secId] = Stale; MinHeal = received - 1; mask |= Mbo bit
+    │
+    ▼
+Subsequent Mbo messages → buffered in StaleMboBuffer (cap 256 / symbol);
+buffer eviction calls BumpMinHeal so MinHeal stays consistent with
+the oldest still-buffered rptSeq.
+    │
+    ▼
+Snapshot arrives → BookManager.CompleteSnapshot
+    │
+    ├── snapshotRptSeq < MinHeal → REJECT (lagging snapshot, stays Stale,
+    │                              counts b3.umdf.persymbol.snapshots_rejected_too_old)
+    │
+    └── snapshotRptSeq >= MinHeal → ACCEPT
+            │
+            ▼
+        ApplySnapshotStaging → live book swapped
+        Heal returns DrainFrom = snap+1, DrainTo = high-water
+        BookManager replays buffered messages in [DrainFrom, DrainTo]
+        Mbo state ← Healthy; mask &= ~Mbo bit
+        If StaleKindMask becomes 0 → fire OnSymbolStaleStatusChanged(false)
+```
+
+### 2.5 Stale → Healthy event surfacing
+
+`OnSymbolStaleStatusChanged` is fired by the registry callback (wired in
+`BookManager`'s constructor) so the event surfaces **regardless of which
+kind exposed the gap**: a stat-revealed loss flips the symbol's stale flag
+to clients exactly as an MBO-revealed one would. The callback only fires
+on real `Stale ↔ Healthy` transitions (Unknown → Healthy bootstrap is not
+counted).
+
+### 2.6 Channel-level fallback
+
+A wide channel-level gap (more than the 256-packet A/B reorder window) still
+escalates the channel's `FeedHandler` to `Lost → Recovery → CatchUp →
+RealTime` and triggers the resnapshot-all-subscribers path described in
+§ 4. Per-instrument and per-channel recovery are complementary: per-instrument
+absorbs the common case (a few symbols affected); per-channel handles the
+catastrophic case (the entire group fell behind).
 
 Recovery progress is observable via metrics:
 
@@ -51,6 +126,8 @@ b3.umdf.feed.state                  # 0=WaitInstrumentDefinition, 1=Streaming
 b3.umdf.feed.gaps                   # channel-level network-loss diagnostic
 b3.umdf.feed.channel_gaps_absorbed  # gaps absorbed without leaving Streaming
 b3.umdf.persymbol.stale_symbols     # per-symbol Stale gauge by kind
+b3.umdf.persymbol.snapshots_healed
+b3.umdf.persymbol.snapshots_rejected_too_old
 b3.umdf.recovery.snapshot.attempts
 ```
 
@@ -253,6 +330,70 @@ in the session checkpoints:
   `OutlierSweep_DoesNotDisconnect_WhenAggregatePressureBelowGate`,
   `OutlierSweep_DisconnectsOutliers_UnderPressure`,
   `OutlierSweep_RespectsMinBytesFloor_EvenUnderPressure`.
+
+### 11.1 Loss-injection harness
+
+`tools/loss-resilience-test.sh` drives the replayer with PCAP-replayed
+multicast traffic and seeded packet-loss injection across 7 scenarios.
+
+```sh
+# Build Release once.
+dotnet build -c Release
+
+# Per-PCAP run (30 s per scenario; outputs to /tmp/loss-validation/<scenario>.log).
+OUT=/tmp/loss-validation-eqt tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 30
+OUT=/tmp/loss-validation-drv tools/loss-resilience-test.sh pcap/20250929_MBO_072_DRV 30
+```
+
+Scenarios (all reproducible — fixed `--loss-seed 42`):
+
+| # | Name | Targets | Rate | Mode | Purpose |
+|---|------|---------|------|------|---------|
+| 00 | baseline | – | – | – | Sanity / no-loss reference |
+| 01 | A-only 5 % | A | 5 % | indep | Confirms B-feed redundancy fully covers A loss |
+| 02 | B-only 5 % | B | 5 % | indep | Confirms A-feed redundancy fully covers B loss |
+| 03 | AB indep 2 % | A+B | 2 % | indep | Both feeds losing independently |
+| 04 | AB corr 1 % | A+B | 1 % | correlated | Same packet dropped on both feeds (genuine loss) |
+| 05 | AB burst 50 corr 0.5 % | A+B | 0.5 % | burst-50 corr | Long correlated bursts (worst case) |
+| 06 | AB corr 0.001 % | A+B | 0.001 % | correlated | Long-tail rare loss |
+
+### 11.2 Latest results (post per-instrument unification)
+
+| Scenario | EQT (18 382 sym) | DRV (16 sym, high density) |
+|----------|------------------|----------------------------|
+| 00 baseline | 0 stale | 0 stale |
+| 01 A-only 5 % | **0 stale** (B covers 100 %) | **0 stale** |
+| 02 B-only 5 % | **0 stale** (A covers 100 %) | **0 stale** |
+| 03 AB indep 2 % | 1 448 stale, 78 776 healed, 26 974 replayed | 3 stale, 304 heal cycles, 637 764 replayed |
+| 04 AB corr 1 % | 814 stale, 57 763 healed | 4 stale, 284 heal cycles |
+| 05 burst 50 corr 0.5 % | 1 598 stale, 146 874 healed | 4 stale, 413 heal cycles |
+| 06 AB corr 0.001 % | 147 stale, 27 107 healed | 3 stale, 162 heal cycles |
+
+Across **all** scenarios:
+
+- **Zero** `recovery queue overflow`.
+- **Zero** uncaught exceptions (no `error:` / stack traces).
+- Up to **27 M buffered messages** during DRV burst, fully replayed without
+  silent drop.
+- `LOCKED` / `CROSSED` book diagnostics fire **exactly when expected**
+  (during the loss window before snapshot heal arrives) and clear afterwards
+  — confirming that book-state validation is active, not just decorative.
+
+### 11.3 Acceptance criteria
+
+A run is considered passing when:
+
+1. Single-feed loss scenarios (01, 02) end with `stale = 0` for every
+   symbol — A/B redundancy is doing its job.
+2. Correlated-loss scenarios (03 – 06) end with most symbols Healthy;
+   the residual stale count is bounded by snapshot-availability of the
+   PCAP slice (the recovery feed in the captures is finite).
+3. No `recovery queue overflow` line in any log.
+4. No `error:` / unhandled exception in any log.
+5. Replayed-message count is non-zero in every loss scenario (proves the
+   buffer-and-drain path is being exercised).
+
+Failure of any of these criteria should block release.
 
 ## 12. Summary
 
