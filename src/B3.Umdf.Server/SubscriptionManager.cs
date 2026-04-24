@@ -36,7 +36,6 @@ public sealed class SubscriptionManager : IDisposable
     // Pending unsubscribe requests from WebSocket threads (processed by any group)
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingUnsubscribes = new();
 
-    private const int RankingsTopN = 10;
     internal const int MaxRecentTrades = 50;
 
     private volatile GroupConflationHandler[]? _groupHandlers;
@@ -59,6 +58,8 @@ public sealed class SubscriptionManager : IDisposable
 
     private readonly long _clientMaxPendingBytes;
     private readonly OutlierSweeper _outlierSweeper;
+    private readonly RankingsPublisher _rankingsPublisher;
+    private readonly RecoveryProgressPublisher _recoveryProgressPublisher;
 
     public SubscriptionManager(
         ILogger<SubscriptionManager>? logger = null,
@@ -80,6 +81,13 @@ public sealed class SubscriptionManager : IDisposable
             outlierPressurePct,
             outlierIntervalMs,
             _logger);
+        _rankingsPublisher = new RankingsPublisher(
+            () => _marketDataManagers,
+            () => _symbolRegistry,
+            _clients);
+        _recoveryProgressPublisher = new RecoveryProgressPublisher(
+            () => _bookManagers,
+            _clients);
     }
 
     public bool IsReady => _ready;
@@ -509,148 +517,31 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     // --- Snapshot serialization moved to SnapshotEmitter ---
+    // --- Rankings broadcast moved to RankingsPublisher ---
+    // --- Recovery progress broadcast moved to RecoveryProgressPublisher ---
 
-    // --- Rankings ---
-
-    private void PushRankings()
-    {
-        if (_marketDataManagers is null || _symbolRegistry is null) return;
-
-        var volumeList = new List<RankingEntry>();
-        var gainerList = new List<RankingEntry>();
-        var loserList = new List<RankingEntry>();
-
-        // Aggregate across all per-group MarketDataManagers
-        foreach (var mdm in _marketDataManagers)
-        {
-            foreach (var (secId, info) in mdm.InstrumentData)
-            {
-                if (!_symbolRegistry.TryGetSymbol(secId, out var sym)) continue;
-
-                if (info.TradeVolume is { } vol and > 0)
-                    volumeList.Add(new RankingEntry(secId, vol, sym));
-
-                if (info.NetChangeFromPrevDay is { } chg)
-                {
-                    if (chg > 0) gainerList.Add(new RankingEntry(secId, chg, sym));
-                    else if (chg < 0) loserList.Add(new RankingEntry(secId, chg, sym));
-                }
-            }
-        }
-
-        volumeList.Sort((a, b) => b.Value.CompareTo(a.Value));
-        gainerList.Sort((a, b) => b.Value.CompareTo(a.Value));
-        loserList.Sort((a, b) => a.Value.CompareTo(b.Value));
-
-        var volume = TopN(volumeList, RankingsTopN);
-        var gainers = TopN(gainerList, RankingsTopN);
-        var losers = TopN(loserList, RankingsTopN);
-
-        var buf = new byte[WireProtocol.RankingsUpdateMaxSize];
-        int len = WireProtocol.WriteRankingsUpdate(buf, volume, gainers, losers);
-        var payload = new ReadOnlyMemory<byte>(buf, 0, len);
-
-        foreach (var (_, client) in _clients)
-            client.TryEnqueue(payload);
-    }
-
-    /// <summary>Take the first <paramref name="n"/> elements (caller has pre-sorted).</summary>
-    private static RankingEntry[] TopN(List<RankingEntry> sorted, int n)
-        => sorted.Count > n ? sorted.GetRange(0, n).ToArray() : sorted.ToArray();
-
-    /// <summary>Called when feed enters RealTime state. Enables subscriptions and starts background rankings.</summary>
+    /// <summary>Called when feed enters RealTime state. Enables subscriptions and starts background broadcasters.</summary>
     public void SetReady()
     {
         if (_ready) return;
 
         _ready = true;
         BroadcastServerStatus(true);
-        StartRankingsTimer();
+        _rankingsPublisher.Start();
+        _recoveryProgressPublisher.Start();
     }
 
-    private Timer? _rankingsTimer;
-    private const long RankingsIntervalMs = 2000;
-    private int _rankingsTick;
-    private const int PromoteEveryNTicks = 15; // ~30s at 2000ms interval
-
-    private void StartRankingsTimer()
-    {
-        _rankingsTimer = new Timer(_ =>
-        {
-            if (++_rankingsTick % PromoteEveryNTicks == 0)
-                _symbolRegistry?.TryPromote();
-
-            if (_clients.Count > 0)
-                PushRankings();
-        }, null, RankingsIntervalMs, RankingsIntervalMs);
-
-        StartRecoveryProgressTimer();
-    }
-
-    /// <summary>Stop the background rankings timer.</summary>
+    /// <summary>Stop background broadcasters (rankings + recovery progress).</summary>
     public void StopRankingsTimer()
     {
-        _rankingsTimer?.Dispose();
-        _recoveryProgressTimer?.Dispose();
-    }
-
-    // ─── Recovery progress broadcast ────────────────────────────────────────
-    // Aggregates SymbolStateRegistry counters across every BookManager every
-    // 250ms and emits a RecoveryProgress message whenever stale symbols exist.
-    // Sends one last "all clear" message after stale drops to 0 so the UI can
-    // close the recovering banner; then idles until stale > 0 again.
-
-    private Timer? _recoveryProgressTimer;
-    private const long RecoveryProgressIntervalMs = 250;
-    private bool _recoveryProgressLastNonZero;
-
-    private void StartRecoveryProgressTimer()
-    {
-        _recoveryProgressTimer = new Timer(
-            _ => PushRecoveryProgress(),
-            null,
-            RecoveryProgressIntervalMs,
-            RecoveryProgressIntervalMs);
-    }
-
-    private void PushRecoveryProgress()
-    {
-        if (_clients.IsEmpty) return;
-        var managers = _bookManagers;
-        if (managers is null || managers.Length == 0) return;
-
-        Span<int> perKind = stackalloc int[14];
-        perKind.Clear();
-        int totalStale = 0;
-        int totalKnown = 0;
-
-        foreach (var bm in managers)
-        {
-            if (bm?.StateRegistry is not { } reg) continue;
-            var snap = reg.GetAggregateSnapshot();
-            totalStale += snap.TotalStaleSymbols;
-            totalKnown += snap.TotalSymbols;
-            int n = Math.Min(perKind.Length, snap.StaleByKind.Length);
-            for (int i = 0; i < n; i++) perKind[i] += snap.StaleByKind[i];
-        }
-
-        // Edge-triggered idle: when stale falls from >0 to 0 emit one final
-        // all-clear message, then suppress until stale becomes >0 again.
-        bool isNonZero = totalStale > 0;
-        if (!isNonZero && !_recoveryProgressLastNonZero) return;
-        _recoveryProgressLastNonZero = isNonZero;
-
-        Span<byte> buf = stackalloc byte[WireProtocol.RecoveryProgressMaxSize];
-        int len = WireProtocol.WriteRecoveryProgress(buf, (uint)totalKnown, (uint)totalStale, perKind);
-        var payload = new ReadOnlyMemory<byte>(buf[..len].ToArray());
-        foreach (var (_, client) in _clients)
-            client.TryEnqueue(payload);
+        _rankingsPublisher.Dispose();
+        _recoveryProgressPublisher.Dispose();
     }
 
     public void Dispose()
     {
-        _rankingsTimer?.Dispose();
-        _recoveryProgressTimer?.Dispose();
+        _rankingsPublisher.Dispose();
+        _recoveryProgressPublisher.Dispose();
         _outlierSweeper.Dispose();
     }
 
