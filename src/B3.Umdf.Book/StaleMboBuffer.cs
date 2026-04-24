@@ -1,5 +1,5 @@
 using System.Buffers;
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 
 namespace B3.Umdf.Book;
@@ -34,14 +34,18 @@ namespace B3.Umdf.Book;
 /// Stale, which is the correct behavior — we wait for the next snapshot
 /// cycle to heal cleanly.</para>
 ///
-/// <para><b>Concurrency.</b> The feed thread is the sole writer per group;
-/// outer dictionary is concurrent so multiple groups can share one buffer
-/// instance if ever needed. Per-symbol queue mutations are guarded by an
-/// entry-local lock.</para>
+/// <para><b>Concurrency.</b> Single-writer, owned by the per-group feed
+/// thread (each group has its own buffer instance — see
+/// <c>Program.cs</c>). All mutating methods (<see cref="Enqueue"/>,
+/// <see cref="Drain"/>, <see cref="Clear"/>, <see cref="ClearAll"/>) must
+/// be called from that single thread. Cross-thread observers are limited
+/// to the atomic counter properties (<see cref="TotalBytes"/>,
+/// <see cref="EnqueuedCount"/>, etc.); they MUST NOT enumerate the inner
+/// per-symbol queues.</para>
 /// </remarks>
 public sealed class StaleMboBuffer
 {
-    private readonly ConcurrentDictionary<ulong, PerSymbolQueue> _queues = new();
+    private readonly Dictionary<ulong, PerSymbolQueue> _queues = new();
     private readonly ILogger _logger;
     private readonly int _perSymbolCap;
     private readonly int _hotPerSymbolCap;
@@ -94,7 +98,6 @@ public sealed class StaleMboBuffer
 
     private sealed class PerSymbolQueue
     {
-        internal readonly Lock Sync = new();
         internal readonly Queue<DeferredMboMsg> Items = new();
         // Per-symbol cap. Starts at the normal tier; promoted to the hot tier
         // on first overflow. One-way ratchet — never demoted.
@@ -121,46 +124,47 @@ public sealed class StaleMboBuffer
     public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null)
     {
         // Global byte cap: check before allocating.
-        long postEnqueueBytes = Interlocked.Read(ref _totalBytes) + body.Length;
+        long postEnqueueBytes = Volatile.Read(ref _totalBytes) + body.Length;
         if (postEnqueueBytes > _globalByteCap)
         {
-            Interlocked.Increment(ref _droppedGlobalCap);
+            _droppedGlobalCap++;
             return false;
         }
 
-        var queue = _queues.GetOrAdd(securityId, _ => new PerSymbolQueue { Cap = _perSymbolCap });
+        if (!_queues.TryGetValue(securityId, out var queue))
+        {
+            queue = new PerSymbolQueue { Cap = _perSymbolCap };
+            _queues[securityId] = queue;
+        }
         long evictedBytes = 0;
         uint evictedRptSeq = 0;
         bool evicted = false;
         bool promoted = false;
-        lock (queue.Sync)
+        if (queue.Items.Count >= queue.Cap)
         {
-            if (queue.Items.Count >= queue.Cap)
+            if (queue.Cap < _hotPerSymbolCap)
             {
-                if (queue.Cap < _hotPerSymbolCap)
-                {
-                    // First overflow: promote to hot cap, no eviction.
-                    queue.Cap = _hotPerSymbolCap;
-                    promoted = true;
-                }
-                else if (queue.Items.TryDequeue(out var old))
-                {
-                    evictedBytes = old.BodyLength;
-                    evictedRptSeq = old.RptSeq;
-                    evicted = true;
-                    old.Release();
-                    Interlocked.Increment(ref _evictedPerSymbolCap);
-                }
+                // First overflow: promote to hot cap, no eviction.
+                queue.Cap = _hotPerSymbolCap;
+                promoted = true;
             }
-            var rented = ArrayPool<byte>.Shared.Rent(body.Length);
-            body.CopyTo(rented);
-            queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length));
+            else if (queue.Items.TryDequeue(out var old))
+            {
+                evictedBytes = old.BodyLength;
+                evictedRptSeq = old.RptSeq;
+                evicted = true;
+                old.Release();
+                _evictedPerSymbolCap++;
+            }
         }
-        Interlocked.Add(ref _totalBytes, body.Length - evictedBytes);
-        Interlocked.Increment(ref _enqueued);
+        var rented = ArrayPool<byte>.Shared.Rent(body.Length);
+        body.CopyTo(rented);
+        queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length));
+        Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) + body.Length - evictedBytes);
+        _enqueued++;
         if (promoted)
         {
-            Interlocked.Increment(ref _hotPromotions);
+            _hotPromotions++;
             if (_logger.IsEnabled(LogLevel.Information))
                 _logger.LogInformation(
                     "StaleMboBuffer: symbol {SecurityId} promoted to hot cap ({HotCap}); normal cap {NormalCap} exceeded",
@@ -184,43 +188,40 @@ public sealed class StaleMboBuffer
 
         int applied = 0;
         long releasedBytes = 0;
-        lock (queue.Sync)
+        // Single linear pass: items in queue are in arrival order, not rptSeq
+        // order (A/B reorder may have shuffled them). We collect+sort applies
+        // to preserve causal apply order, then re-enqueue out-of-window items.
+        var matches = new List<DeferredMboMsg>();
+        var future = new List<DeferredMboMsg>();
+        while (queue.Items.TryDequeue(out var item))
         {
-            // Single linear pass: items in queue are in arrival order, not rptSeq
-            // order (A/B reorder may have shuffled them). We collect+sort applies
-            // to preserve causal apply order, then re-enqueue out-of-window items.
-            var matches = new List<DeferredMboMsg>();
-            var future = new List<DeferredMboMsg>();
-            while (queue.Items.TryDequeue(out var item))
+            if (item.RptSeq < drainFrom)
             {
-                if (item.RptSeq < drainFrom)
-                {
-                    // Below snapshot baseline → covered, drop.
-                    releasedBytes += item.BodyLength;
-                    item.Release();
-                    continue;
-                }
-                if (item.RptSeq > drainTo)
-                {
-                    future.Add(item);
-                    continue;
-                }
-                matches.Add(item);
+                // Below snapshot baseline → covered, drop.
+                releasedBytes += item.BodyLength;
+                item.Release();
+                continue;
             }
-
-            matches.Sort(static (a, b) => a.RptSeq.CompareTo(b.RptSeq));
-            foreach (var m in matches)
+            if (item.RptSeq > drainTo)
             {
-                apply(m);
-                releasedBytes += m.BodyLength;
-                m.Release();
-                applied++;
+                future.Add(item);
+                continue;
             }
-            // Restore future items for the next drain.
-            foreach (var f in future) queue.Items.Enqueue(f);
+            matches.Add(item);
         }
-        Interlocked.Add(ref _totalBytes, -releasedBytes);
-        Interlocked.Add(ref _drained, applied);
+
+        matches.Sort(static (a, b) => a.RptSeq.CompareTo(b.RptSeq));
+        foreach (var m in matches)
+        {
+            apply(m);
+            releasedBytes += m.BodyLength;
+            m.Release();
+            applied++;
+        }
+        // Restore future items for the next drain.
+        foreach (var f in future) queue.Items.Enqueue(f);
+        Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) - releasedBytes);
+        _drained += applied;
         return applied;
     }
 
@@ -233,16 +234,13 @@ public sealed class StaleMboBuffer
         if (!_queues.TryGetValue(securityId, out var queue)) return 0;
         int count = 0;
         long releasedBytes = 0;
-        lock (queue.Sync)
+        while (queue.Items.TryDequeue(out var item))
         {
-            while (queue.Items.TryDequeue(out var item))
-            {
-                releasedBytes += item.BodyLength;
-                item.Release();
-                count++;
-            }
+            releasedBytes += item.BodyLength;
+            item.Release();
+            count++;
         }
-        Interlocked.Add(ref _totalBytes, -releasedBytes);
+        Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) - releasedBytes);
         return count;
     }
 
@@ -250,8 +248,11 @@ public sealed class StaleMboBuffer
     public int ClearAll()
     {
         int total = 0;
-        foreach (var kv in _queues)
-            total += Clear(kv.Key);
+        // Snapshot keys first to avoid mutating-while-enumerating risk.
+        ulong[] keys = new ulong[_queues.Count];
+        int i = 0;
+        foreach (var kv in _queues) keys[i++] = kv.Key;
+        foreach (var k in keys) total += Clear(k);
         return total;
     }
 

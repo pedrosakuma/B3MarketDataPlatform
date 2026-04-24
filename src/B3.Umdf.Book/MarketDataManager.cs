@@ -16,6 +16,13 @@ public sealed class MarketDataManager : IFeedEventHandler
     private readonly ConcurrentDictionary<ulong, InstrumentInfo> _data = new(Environment.ProcessorCount, 4096);
     private volatile FrozenDictionary<ulong, InstrumentInfo>? _frozenData;
     private readonly ConcurrentDictionary<string, int> _groupStatus = new(StringComparer.Ordinal);
+    /// <summary>
+    /// Index of instruments by SecurityGroup for O(group-size) dispatch in
+    /// <see cref="HandleSecurityGroupPhase"/>. Mutated only on the feed thread
+    /// (single-writer, owned by this manager) when SecurityDefinition assigns
+    /// or re-assigns a group; the inner lists are also feed-thread-only.
+    /// </summary>
+    private readonly Dictionary<string, List<KeyValuePair<ulong, InstrumentInfo>>> _groupMembers = new(StringComparer.Ordinal);
     private readonly IMarketDataEventHandler? _eventHandler;
     private readonly ILogger<MarketDataManager> _logger;
     private long _parseErrors;
@@ -184,7 +191,10 @@ public sealed class MarketDataManager : IFeedEventHandler
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
 
-        info.SecurityGroup = msg.SecurityGroup.ToString().Trim();
+        string? oldGroup = info.SecurityGroup;
+        string newGroup = msg.SecurityGroup.ToString().Trim();
+        info.SecurityGroup = newGroup;
+        UpdateGroupMembership(securityId, info, oldGroup, newGroup);
         info.Symbol = msg.Symbol.ToString().Trim();
         info.Asset = msg.Asset.ToString().Trim();
         info.CfiCode = msg.CfiCode.ToString().Trim();
@@ -309,22 +319,99 @@ public sealed class MarketDataManager : IFeedEventHandler
             return;
 
         ref readonly var msg = ref reader.Data;
-        string group = msg.SecurityGroup.ToString().Trim();
+        ReadOnlySpan<byte> groupBytes = msg.SecurityGroup.AsSpan();
         int status = (int)msg.TradingSessionSubID;
+
+        // Intern the group string from the dictionary keys to avoid the
+        // ToString().Trim() allocation on the hot path. New groups (cache
+        // miss) fall back to the legacy normalization to preserve identity
+        // with whatever HandleSecurityDefinition stored.
+        string group = InternGroup(groupBytes) ?? msg.SecurityGroup.ToString().Trim();
 
         _groupStatus[group] = status;
 
-        // Propagate to all instruments following this group
-        foreach (var kvp in _data)
+        // Propagate to instruments following this group — O(group-size)
+        // instead of O(_data) by using the pre-built membership index.
+        if (_groupMembers.TryGetValue(group, out var members))
         {
-            var info = kvp.Value;
-            if (info.FollowsGroupStatus && info.SecurityGroup == group)
+            foreach (var kv in members)
             {
-                info.TradingStatus = status;
-                info.BumpVersion();
-                _eventHandler?.OnMarketDataUpdated(kvp.Key, info);
+                var info = kv.Value;
+                if (info.FollowsGroupStatus)
+                {
+                    info.TradingStatus = status;
+                    info.BumpVersion();
+                    _eventHandler?.OnMarketDataUpdated(kv.Key, info);
+                }
             }
         }
+    }
+
+    /// <summary>
+    /// Lookup an existing interned group string by its raw SBE bytes
+    /// (3-byte ASCII, possibly null/space padded). Returns null on miss
+    /// so the caller can fall back to allocating + normalizing a new key.
+    /// Linear scan is fine: there are typically &lt;50 distinct groups.
+    /// </summary>
+    private string? InternGroup(ReadOnlySpan<byte> bytes)
+    {
+        foreach (var key in _groupMembers.Keys)
+        {
+            if (KeyMatchesBytes(key, bytes)) return key;
+        }
+        foreach (var key in _groupStatus.Keys)
+        {
+            if (KeyMatchesBytes(key, bytes)) return key;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Compare an already-trimmed string key to raw SBE bytes. Mirrors the
+    /// canonicalization used by <c>msg.SecurityGroup.ToString().Trim()</c>:
+    /// trailing 0x00 (SBE pad) and 0x20 (ASCII space) are ignored.
+    /// </summary>
+    private static bool KeyMatchesBytes(string key, ReadOnlySpan<byte> bytes)
+    {
+        int len = bytes.Length;
+        while (len > 0 && (bytes[len - 1] == 0 || bytes[len - 1] == (byte)' ')) len--;
+        if (key.Length != len) return false;
+        for (int i = 0; i < len; i++)
+            if (key[i] != (char)bytes[i]) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Maintain <see cref="_groupMembers"/> when an instrument's
+    /// SecurityGroup is assigned or re-assigned (cold path: instrument-def
+    /// phase). Single-writer (feed thread).
+    /// </summary>
+    private void UpdateGroupMembership(ulong securityId, InstrumentInfo info, string? oldGroup, string newGroup)
+    {
+        if (oldGroup == newGroup) return;
+
+        if (oldGroup is not null && _groupMembers.TryGetValue(oldGroup, out var oldList))
+        {
+            for (int i = 0; i < oldList.Count; i++)
+            {
+                if (oldList[i].Key == securityId)
+                {
+                    oldList.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+
+        if (!_groupMembers.TryGetValue(newGroup, out var newList))
+        {
+            newList = new List<KeyValuePair<ulong, InstrumentInfo>>();
+            _groupMembers[newGroup] = newList;
+        }
+        // Defensive: avoid duplicate membership if HandleSecurityDefinition
+        // re-fires with the same group for the same id.
+        for (int i = 0; i < newList.Count; i++)
+            if (newList[i].Key == securityId) return;
+        newList.Add(new KeyValuePair<ulong, InstrumentInfo>(securityId, info));
     }
 
     private void HandleOpeningPrice(ReadOnlySpan<byte> body)
