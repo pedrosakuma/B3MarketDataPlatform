@@ -220,14 +220,23 @@ The reorder window size is configurable; the default is sized to absorb
 The most subtle failure we observed in stress testing was a
 **self-reinforcing recovery loop**:
 
+```mermaid
+flowchart TD
+    A[slow client] --> B[fanout slows]
+    B --> C[dispatch backs up]
+    C --> D[MpscPacketRing fills]
+    D --> E[recv thread drops UDP packets]
+    E --> F[sequence gap]
+    F --> G[Recovery]
+    G --> H["recovery enqueues into _incrementalQueue<br/>(processed on the dispatch thread!)"]
+    H --> C
+    G --> I[POH churn from snapshot allocations<br/>on every state transition]
+    I --> J[OOM ~2.3 GiB]
 ```
-slow client → fanout slows → dispatch backs up → MpscPacketRing fills
-   → recv thread drops UDP packets → sequence gap → Recovery
-   → recovery enqueues into _incrementalQueue (which is also processed
-     on the dispatch thread!) → dispatch even slower → more drops
-   → POH churn from snapshot allocations on every state transition
-   → OOM ~2.3 GiB
-```
+
+The arrow from **H back to C** is the self-reinforcing edge: recovery
+work piles onto the same thread that's already saturated, so dispatch
+never catches up.
 
 The trigger is fanout pressure but the **amplifier** is doing client
 fanout *while* the group is recovering. Recovery is by definition a CPU

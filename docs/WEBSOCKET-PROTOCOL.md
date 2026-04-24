@@ -172,22 +172,26 @@ of `CandleSnapshot` frames:
 
 ## Subscription flow
 
-```
-Client                          Server (feed thread)
-  │                                │
-  │─── Subscribe(BEEF3, Book+Info) │
-  │                                │── ProcessPendingRequests()
-  │◄── SubscribeOk(id, flags)      │
-  │◄── BookSnapshot(levels)        │   ← book is stable (feed thread)
-  │◄── InfoSnapshot(fields)        │   ← no concurrent mutations
-  │◄── CandleSnapshot(first…last)  │   ← 10 h of 1 s candles, chunked
-  │                                │── activate subscription
-  │◄── OrderAdded / Trade / …      │   ← incrementals start flowing
-  │◄── InfoSnapshot (updates)      │
-  │◄── CandleUpdate                │
-  │    …                           │
-  │─── Unsubscribe(id)             │
-  │◄── Unsubscribed(id)            │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server (feed thread)
+
+    C->>S: Subscribe(BEEF3, Book+Info)
+    Note right of S: ProcessPendingRequests()
+    S-->>C: SubscribeOk(id, flags)
+    S-->>C: BookSnapshot(levels)
+    Note right of S: book is stable<br/>(feed thread, no concurrent mutations)
+    S-->>C: InfoSnapshot(fields)
+    S-->>C: CandleSnapshot(first…last)
+    Note right of S: 10 h of 1 s candles, chunked
+    Note right of S: activate subscription
+    S-->>C: OrderAdded / Trade / …
+    S-->>C: InfoSnapshot (updates)
+    S-->>C: CandleUpdate
+    C->>S: Unsubscribe(id)
+    S-->>C: Unsubscribed(id)
 ```
 
 Snapshot delivery happens **on the feed thread** before activating the
@@ -195,16 +199,20 @@ subscription, guaranteeing no race between snapshot and incrementals.
 
 ## Reconnect / recovery flow
 
-```
-Client                                   Server
-  │                                       │
-  │  (TCP/WS drop)                        │
-  │  reconnect, exponential backoff       │
-  │─── (open) ──────────────────────────► │
-  │◄── ServerStatus(ready=1)              │   ← or 0 while a group is recovering
-  │─── Subscribe(symA, flags)             │
-  │─── Subscribe(symB, flags)             │
-  │    …                                  │   ← client re-subscribes its full set
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant S as Server
+
+    Note over C,S: TCP/WS drop
+    Note left of C: reconnect, exponential backoff
+    C->>S: (open)
+    S-->>C: ServerStatus(ready=1)
+    Note right of S: or ready=0 while a group is recovering
+    C->>S: Subscribe(symA, flags)
+    C->>S: Subscribe(symB, flags)
+    Note left of C: client re-subscribes its full set
 ```
 
 While any group is in `Recovery` / `CatchUp`, **fanout to subscribers of
