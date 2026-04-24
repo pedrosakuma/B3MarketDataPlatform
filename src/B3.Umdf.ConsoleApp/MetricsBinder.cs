@@ -337,7 +337,7 @@ static class MetricsBinder
                 }
                 return m;
             },
-            unit: "{symbols}", description: "Symbols currently in Stale state awaiting snapshot heal (PerSymbol mode)");
+            unit: "{symbols}", description: "Symbols currently in Stale state awaiting snapshot heal");
 
         Meter.CreateObservableGauge("b3.umdf.persymbol.tracked_symbols",
             () =>
@@ -352,7 +352,7 @@ static class MetricsBinder
                 }
                 return m;
             },
-            unit: "{symbols}", description: "Symbols tracked by SymbolStateRegistry (PerSymbol mode)");
+            unit: "{symbols}", description: "Symbols tracked by SymbolStateRegistry");
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.lagging_snapshots",
             () =>
@@ -539,7 +539,7 @@ static class MetricsBinder
         Meter.CreateObservableCounter("b3.umdf.persymbol.channel_gaps_absorbed",
             () => FeedHandlers().Select(h =>
                 new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
-            unit: "{gaps}", description: "Channel-level gaps absorbed without entering Recovery (PerSymbol mode)");
+            unit: "{gaps}", description: "Channel-level gaps absorbed without entering Recovery (per-symbol healing)");
 
         Meter.CreateObservableGauge("b3.umdf.persymbol.fanout_suppressed",
             () =>

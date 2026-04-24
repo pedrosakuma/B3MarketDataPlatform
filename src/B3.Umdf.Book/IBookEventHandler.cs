@@ -21,8 +21,8 @@ public interface IBookEventHandler
     void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
 
     /// <summary>
-    /// Per-symbol recovery state transition (PerSymbol mode only). Emitted when
-    /// a security flips between Healthy and Stale (any-kind aggregated). Fanout
+    /// Per-symbol heal-state transition. Emitted when a security flips
+    /// between Healthy and Stale (any-kind aggregated). Fanout
     /// implementations should buffer and coalesce per security so multiple
     /// flips within a packet collapse to the latest value.
     /// </summary>

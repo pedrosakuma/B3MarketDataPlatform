@@ -3,19 +3,18 @@ using B3.Umdf.Book;
 namespace B3.Umdf.Server;
 
 /// <summary>
-/// Per-group hysteretic gate that suppresses client fanout in PerSymbol
-/// recovery mode when a market-wide event leaves a substantial fraction of
-/// symbols Stale (e.g. ChannelReset_11, mass loss, prolonged outage).
+/// Per-group hysteretic gate that suppresses client fanout when a
+/// market-wide event leaves a substantial fraction of symbols Stale
+/// (e.g. ChannelReset_11, mass loss, prolonged outage).
 /// </summary>
 /// <remarks>
-/// <para><b>Rationale.</b> In Channel mode the FeedHandler enters Recovery
-/// on a single channel-level gap and that already drives
-/// <see cref="GroupConflationHandler.SetFanoutSuppressed"/>. PerSymbol mode
-/// keeps the channel in RealTime and absorbs gaps as per-symbol Stale
-/// transitions, so the channel-state gate never fires past cold-start.
-/// Without this helper a market-wide stale event would still publish a
-/// flood of <c>SymbolStaleStatus</c> flips and partial book updates
-/// to clients with no useful aggregate view.</para>
+/// <para><b>Rationale.</b> Per-symbol healing keeps the channel in
+/// RealTime and absorbs gaps as per-symbol Stale transitions, so the
+/// channel-state gate (driven by <see cref="GroupConflationHandler.SetFanoutSuppressed"/>
+/// when <c>FeedState != Streaming</c>) only fires pre-Streaming. Without
+/// this helper a market-wide stale event would still publish a flood of
+/// <c>SymbolStaleStatus</c> flips and partial book updates to clients
+/// with no useful aggregate view.</para>
 ///
 /// <para><b>Hysteresis.</b> Engages when <c>StaleSymbolCount/KnownSymbolCount</c>
 /// crosses the configured high-watermark; releases only when the ratio

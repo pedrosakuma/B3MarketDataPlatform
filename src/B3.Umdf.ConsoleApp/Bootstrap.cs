@@ -261,9 +261,9 @@ internal static class ReplaySourcesBuilder
 /// Wires per-group fanout suppression: while a feed group is in
 /// Recovery/CatchUp, the matching <see cref="GroupConflationHandler"/>
 /// suppresses per-client fanout. On RealTime entry it schedules a fresh
-/// snapshot for every Book subscriber in the group. In PerSymbol recovery
-/// mode it additionally attaches a <see cref="PerSymbolFanoutGate"/> that
-/// suppresses fanout when too many symbols are Stale.
+/// snapshot for every Book subscriber in the group. It additionally
+/// attaches a <see cref="PerSymbolFanoutGate"/> that suppresses fanout
+/// when too many symbols are Stale.
 /// </summary>
 internal static class FanoutSuppressionWiring
 {
@@ -307,16 +307,12 @@ internal static class FanoutSuppressionWiring
         // ChannelReset_11, mass loss). The channel-state gate above only fires
         // pre-Streaming; post-Streaming the per-symbol layer handles gaps
         // without leaving Streaming, so a separate evaluator is required.
-        var registry = entry.Book.StateRegistry;
-        if (registry is not null)
-        {
-            var gate = new PerSymbolFanoutGate(
-                registry,
-                gh,
-                settings.PerSymbolFanoutSuppressHighPct,
-                settings.PerSymbolFanoutSuppressLowPct);
-            if (gate.Enabled)
-                gh.PreBatchEvaluator = gate.Evaluate;
-        }
+        var gate = new PerSymbolFanoutGate(
+            entry.Book.StateRegistry,
+            gh,
+            settings.PerSymbolFanoutSuppressHighPct,
+            settings.PerSymbolFanoutSuppressLowPct);
+        if (gate.Enabled)
+            gh.PreBatchEvaluator = gate.Evaluate;
     }
 }

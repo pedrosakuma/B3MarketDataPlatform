@@ -171,8 +171,8 @@ public sealed class AppSettings
     public int LossSeed { get; set; }
 
     /// <summary>
-    /// Fraction (0..1) of symbols that must be Stale to engage market-wide fanout
-    /// suppression in PerSymbol mode. When the ratio crosses this high-watermark
+    /// Fraction (0..1) of symbols that must be Stale to engage market-wide
+    /// fanout suppression. When the ratio crosses this high-watermark
     /// the group's broadcaster stops fanning out updates and clients are
     /// resync'd once the ratio drops below <see cref="PerSymbolFanoutSuppressLowPct"/>.
     /// Default 0.50 (suppress when ≥50% of known symbols are Stale). Set

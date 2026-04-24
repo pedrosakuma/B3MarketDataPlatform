@@ -50,7 +50,7 @@ public sealed class MarketDataManager : IFeedEventHandler
     private long _droppedDuplicateStats;
     private long _liveResyncs;
 
-    /// <summary>Symbol state registry (PerSymbol recovery is the only supported mode).</summary>
+    /// <summary>Per-symbol heal-state registry (one per group).</summary>
     public SymbolStateRegistry StateRegistry => _stateRegistry;
 
     /// <summary>Stat messages dropped because the registry detected a duplicate (lower-or-equal rptSeq).</summary>

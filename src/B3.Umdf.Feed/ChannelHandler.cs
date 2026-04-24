@@ -128,10 +128,12 @@ public sealed class ChannelHandler : IDisposable
     }
 
     /// <summary>
-    /// PerSymbol mode helper: when a real gap is declared (distance > MaxReorderDistance),
-    /// dispatch the gapped packet, advance the expected SeqNum past it, and dispatch any
-    /// reorder-buffered packets ahead in SeqNum order. Per-symbol routing handles healing
-    /// on a per-instrument basis — there is no channel-level Recovery to enter.
+    /// Helper for the per-symbol heal path: when a real gap is declared
+    /// (distance &gt; <see cref="MaxReorderDistance"/>), dispatch the gapped
+    /// packet, advance the expected SeqNum past it, and dispatch any
+    /// reorder-buffered packets ahead in SeqNum order. Per-symbol routing
+    /// handles healing on a per-instrument basis — there is no channel-level
+    /// Recovery to enter.
     /// </summary>
     public void AcceptGapAndAdvance(in UmdfPacket packet)
     {

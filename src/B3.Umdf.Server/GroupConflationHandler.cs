@@ -22,7 +22,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly Dictionary<ulong, BufferedOrder> _orderBuffer = new();
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
-    // Per-symbol stale-status flips (PerSymbol mode). Coalesced per security:
+    // Per-symbol stale-status flips. Coalesced per security:
     // multiple flips in the same batch collapse to the latest value.
     private readonly Dictionary<ulong, bool> _staleStatusBuffer = new();
     private byte[] _flushBuf = new byte[4096];
@@ -91,9 +91,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public enum SuppressionSource
     {
         None = 0,
-        /// <summary>Channel-level FeedState is not RealTime (cold-start, channel Recovery in legacy mode).</summary>
+        /// <summary>Channel-level FeedState is not RealTime (cold-start, channel Recovery).</summary>
         ChannelState = 1,
-        /// <summary>PerSymbol mode: too many symbols are Stale relative to the configured threshold.</summary>
+        /// <summary>Too many symbols are Stale relative to the configured threshold.</summary>
         StaleRatio = 2,
     }
 
@@ -102,8 +102,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     /// <summary>Evaluator invoked at the start of <see cref="OnBatchComplete"/> (after
     /// pending unsubscribes drain) to refresh dynamic suppression sources such as the
-    /// per-symbol Stale ratio. Null by default. Wired in <c>Bootstrap</c> when
-    /// PerSymbol recovery mode is active.</summary>
+    /// per-symbol Stale ratio. Null by default. Wired in <c>Bootstrap</c>.</summary>
     public Action? PreBatchEvaluator { get; set; }
 
     /// <summary>Enqueue a subscribe/get request routed to this group.</summary>

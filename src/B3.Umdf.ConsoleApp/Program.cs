@@ -384,7 +384,7 @@ var staleBufferLogger = loggerFactory.CreateLogger<StaleMboBuffer>();
 
 // Per-group state — each B3 channel group is an independent feed with its
 // own incremental sequence space and snapshot stream, so each gets its own
-// SymbolStateRegistry + StaleMboBuffer when running in PerSymbol mode.
+// SymbolStateRegistry + StaleMboBuffer.
 var registries = new Dictionary<int, SymbolStateRegistry>();
 var staleBuffers = new Dictionary<int, StaleMboBuffer>();
 
@@ -474,7 +474,7 @@ if (subscriptionManager is not null)
         groupHandlers.ToArray());
 
     // Suppress per-client fanout while the feed for a group is in Recovery/CatchUp.
-    // In PerSymbol mode this also engages a market-wide stale-ratio gate.
+    // Also engages a market-wide stale-ratio gate (see PerSymbolFanoutGate).
     FanoutSuppressionWiring.Wire(groupIds, groupHandlers, bookManagers, settings, multiFeed, singleFeed);
 
     wsHost = new WebSocketHost(

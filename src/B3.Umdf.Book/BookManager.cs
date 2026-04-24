@@ -100,10 +100,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _mboStaleGapSizeSum;
     private long _mboStaleGapSizeMax;
 
-    /// <summary>Symbol state registry (PerSymbol recovery is the only supported mode).</summary>
+    /// <summary>Per-symbol heal-state registry (one per group).</summary>
     public SymbolStateRegistry StateRegistry => _stateRegistry;
 
-    /// <summary>Stale MBO buffer (PerSymbol recovery is the only supported mode).</summary>
+    /// <summary>Per-symbol Stale-window MBO buffer (one per group).</summary>
     public StaleMboBuffer StaleBuffer => _staleBuffer;
 
     public long BufferedMboMessages => Volatile.Read(ref _bufferedMboMessages);
@@ -754,10 +754,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     }
 
     /// <summary>
-    /// In PerSymbol mode, drive the catastrophic-reset path: drop all
-    /// buffered MBO bodies, clear pending snapshot headers, and reset the
-    /// registry epoch (every (symbol, kind) → Unknown). Channel mode is a
-    /// no-op since there is no per-symbol state to reset.
+    /// Catastrophic-reset path: drop all buffered MBO bodies, clear pending
+    /// snapshot headers, and reset the registry epoch (every (symbol, kind)
+    /// → Unknown).
     /// </summary>
     private void ResetPerSymbolEpoch(string reason)
     {
