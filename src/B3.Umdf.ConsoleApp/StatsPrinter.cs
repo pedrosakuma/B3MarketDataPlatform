@@ -151,7 +151,7 @@ internal sealed class StatsPrinter
                 string gate = (_groupHandlers is not null && i < _groupHandlers.Count && _groupHandlers[i].IsFanoutSuppressed)
                     ? " gate:on" : "";
                 perSymbolParts.Add(
-                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0}{gate}");
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}");
             }
         }
         if (_multiFeed is not null)

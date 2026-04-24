@@ -756,7 +756,25 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // (The pre-per-symbol channel-recovery model never had this problem
         // because snapshots were only consumed during channel-wide Recovery
         // state; Healthy symbols were never touched.)
-        if (hasRptSeq && _stateRegistry is not null)
+        // Snapshot Skipped guard for Healthy symbols. Applies regardless of whether
+        // the snapshot has LastRptSeq:
+        //
+        // - hasRptSeq=true: rotating snapshot at some moment T. Whether snap is
+        //   ahead of or behind our priorHighWater, applying it would corrupt
+        //   live state (Clear+repopulate clobbers in-flight live; lagging snap
+        //   would leave [snap+1..pH] unapplied because dispatch drops them via
+        //   Healthy.Drop).
+        //
+        // - hasRptSeq=false (illiquid marker): source has zero incrementals for
+        //   this instrument so far. But we are Healthy at priorHighWater>0
+        //   meaning we DO have applied incrementals. The two views are
+        //   inconsistent (likely the snapshot was queued before any incremental
+        //   landed at the publisher, then served later). Treat as a no-op for
+        //   us — applying would book.Clear() then HealFromSnapshot(0) rejects
+        //   via the Healthy-ahead defensive guard, leaving the book EMPTY.
+        //   That's the WINV25 phantom-asks regression: an illiquid-marker snap
+        //   for an active instrument wiped the book between snapshot rotations.
+        if (_stateRegistry is not null)
         {
             var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
             if (state == SymbolState.Healthy)
@@ -768,7 +786,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                     LastRptSeq = lastRptSeq,
                     OrdersExpected = ordersExpected,
                     OrdersReceived = 0,
-                    HasRptSeq = true,
+                    HasRptSeq = hasRptSeq,
                     Skipped = true,
                 };
                 Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);

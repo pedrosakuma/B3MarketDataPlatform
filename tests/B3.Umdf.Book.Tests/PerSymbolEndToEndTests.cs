@@ -252,6 +252,51 @@ public class PerSymbolEndToEndTests
     }
 
     [Fact]
+    public void Scenario_AlwaysOnSnapshot_HealthySymbol_IlliquidMarker_BookNotWiped()
+    {
+        // REGRESSION: Healthy symbol receives a !hasRptSeq snapshot (illiquid
+        // marker — source has zero incrementals for instrument). Previously the
+        // Skipped guard required hasRptSeq, so this path fell through to
+        // book.Clear() + ordersExpected=0 → CompleteSnapshot → HealFromSnapshot(0)
+        // → defensive Healthy-ahead reject → book left EMPTY. That wiped active
+        // books like WINV25 between rotations, producing crossed BBOs / phantom
+        // asks (only the next live increment refilled — but only NEW orders,
+        // pre-existing orders were lost).
+        //
+        // Fix: Healthy guard applies regardless of hasRptSeq. The illiquid marker
+        // is a no-op for us.
+        var (bm, reg, _) = CreatePerSymbol();
+        const ulong sec = 365;
+
+        // Bring symbol to Healthy with a populated book.
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        var book = bm.GetOrCreateBook(sec);
+        var entry = new B3.Umdf.Book.OrderBookEntry
+        {
+            OrderId = 7777, Price = 14721000, Quantity = 5, EnteringFirm = 0,
+            SecurityId = sec, Side = B3.Umdf.Book.BookSideType.Bid,
+        };
+        book.GetSide(B3.Umdf.Book.BookSideType.Bid).Add(in entry);
+        Assert.Equal(1, book.Bids.OrderCount);
+
+        long skippedBefore = bm.SnapshotsSkippedHealthyAhead;
+        long missingBefore = bm.SnapshotsMissingRptSeq;
+
+        // Always-on rotation delivers an illiquid-marker snapshot (no LastRptSeq,
+        // ordersExpected=0). For our actively-quoting symbol, this is a no-op.
+        bm.BeginSnapshotHeader(sec, lastRptSeq: 0, hasRptSeq: false, ordersExpected: 0);
+
+        // Skipped, not processed.
+        Assert.Equal(skippedBefore + 1, bm.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(missingBefore, bm.SnapshotsMissingRptSeq);
+        // Book NOT wiped.
+        Assert.Equal(1, book.Bids.OrderCount);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
     public void Scenario_AlwaysOnSnapshot_HealthySnapAhead_IsSkipped_BookNotClobbered()
     {
         // REGRESSION: previously Skipped guard only fired when book.LastRptSeq >= snap.
