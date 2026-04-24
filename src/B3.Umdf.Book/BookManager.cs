@@ -1067,46 +1067,59 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         _staleBuffer!.ClearProtectedFloor(securityId);
 
         if (!pending.HasRptSeq)
+            CompleteIlliquidSnapshot(securityId, book, pending);
+        else
+            CompleteNormalSnapshot(securityId, book, pending);
+    }
+
+    /// <summary>
+    /// Illiquid instrument case (B3 spec §7.4): LastRptSeq is omitted from the
+    /// snapshot header when the instrument has not received any incremental
+    /// updates yet from the incremental stream. Spec explicitly states:
+    /// "the client system can process the incremental messages related to
+    /// that instrument without discarding them."
+    /// <para>Treat the absent LastRptSeq as "anchor at rptSeq=0": promote the
+    /// symbol to Healthy with baseline=0, so the first incremental that
+    /// arrives (rptSeq=1) is contiguous (lastSeen+1 == received) and applied.
+    /// Without this, illiquid symbols stayed Stale forever and every subsequent
+    /// live message went into the per-symbol buffer.</para>
+    /// <para><see cref="SymbolStateRegistry.HealFromSnapshot"/>'s defensive
+    /// Healthy-ahead guard still protects already-Healthy symbols (prev=Healthy
+    /// + snap=0 ≤ priorHighWater would reject). Stale symbols with minHeal&gt;0
+    /// (genuine gap) also get rejected (snap=0 &lt; minHeal&gt;0), correctly
+    /// leaving them Stale.</para>
+    /// </summary>
+    private void CompleteIlliquidSnapshot(ulong securityId, OrderBook book, PendingSnapshot pending)
+    {
+        var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 0);
+        if (!heal.Accepted)
         {
-            // Illiquid instrument case (B3 spec §7.4): LastRptSeq is omitted from the
-            // snapshot header when the instrument has not received any incremental
-            // updates yet from the incremental stream. Spec explicitly states:
-            // "the client system can process the incremental messages related to
-            // that instrument without discarding them."
-            //
-            // Treat the absent LastRptSeq as "anchor at rptSeq=0": promote the
-            // symbol to Healthy with baseline=0, so the first incremental that
-            // arrives (rptSeq=1) is contiguous (lastSeen+1 == received) and is
-            // applied. Without this, illiquid symbols stayed Stale forever and
-            // every subsequent live message went into the per-symbol buffer.
-            //
-            // HealFromSnapshot's defensive Healthy-ahead guard still protects
-            // already-Healthy symbols (prev=Healthy + snap=0 <= priorHighWater
-            // would reject). Stale symbols with minHeal>0 (genuine gap) also
-            // get rejected (snap=0 < minHeal>0), correctly leaving them Stale.
-            var illiquidHeal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 0);
-            if (illiquidHeal.Accepted)
-            {
-                // Empty-book illiquid snapshot: the staging is empty (TotNumBids+TotNumOffers=0
-                // for illiquid case), so nothing to swap. Live book stays at its prior state
-                // (which for a fresh symbol is empty).
-                ApplySnapshotStaging(book, pending);
-                book.LastRptSeq = 0;
-                if (illiquidHeal.TransitionedToHealthy)
-                {
-                    Interlocked.Increment(ref _snapshotsHealed);
-                    // Stale→Healthy event surfaces via the SymbolStateRegistry callback
-                    // wired in the BookManager constructor.
-                }
-            }
-            else
-            {
-                // Reject: discard staging, leave live book intact, emit no events.
-                Interlocked.Increment(ref _snapshotsMissingRptSeq);
-            }
+            // Reject: discard staging, leave live book intact, emit no events.
+            Interlocked.Increment(ref _snapshotsMissingRptSeq);
             return;
         }
 
+        // Empty-book illiquid snapshot: the staging is empty (TotNumBids+TotNumOffers=0
+        // for illiquid case), so nothing to swap. Live book stays at its prior state
+        // (which for a fresh symbol is empty).
+        ApplySnapshotStaging(book, pending);
+        book.LastRptSeq = 0;
+        if (heal.TransitionedToHealthy)
+        {
+            // Stale→Healthy event surfaces via the SymbolStateRegistry callback
+            // wired in the BookManager constructor.
+            Interlocked.Increment(ref _snapshotsHealed);
+        }
+    }
+
+    /// <summary>
+    /// Normal heal path: snapshot carries a concrete LastRptSeq that bridges
+    /// the per-symbol gap. Either accepted (drain buffer for the post-snapshot
+    /// window) or rejected as too-old (live book untouched; symbol stays Stale
+    /// awaiting a fresher snapshot).
+    /// </summary>
+    private void CompleteNormalSnapshot(ulong securityId, OrderBook book, PendingSnapshot pending)
+    {
         uint snapshotRptSeq = pending.LastRptSeq;
         var heal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
 
@@ -1128,10 +1141,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         book.LastRptSeq = snapshotRptSeq;
         if (heal.TransitionedToHealthy)
         {
-            Interlocked.Increment(ref _snapshotsHealed);
             // Stale→Healthy event surfaces via the SymbolStateRegistry callback
             // wired in the BookManager constructor (only fires when StaleKindMask
             // becomes 0, matching the prior IsAnyStale gate semantics).
+            Interlocked.Increment(ref _snapshotsHealed);
         }
 
         if (heal.DrainTo >= heal.DrainFrom)
@@ -1145,7 +1158,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         else
         {
             // No drain window — every buffered message is at-or-below the snapshot
-            // baseline (already covered). Drop them.
+            // baseline (already covered) OR the authoritative-reset escape fired
+            // (un-bridgeable tail). Either way, drop them — see HealResult contract.
             _staleBuffer!.Clear(securityId);
         }
     }
