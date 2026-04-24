@@ -384,6 +384,20 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotsRejectedTooOld),
             unit: "{snapshots}", description: "Snapshots rejected because LastRptSeq is older than the symbol's MinHealRptSeq (would leave a hole)");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_authoritative_reset",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var reg = bookManagers[i].StateRegistry;
+                    if (reg is null) continue;
+                    m.Add(new(reg.StaleAuthoritativeResetCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{snapshots}", description: "Snapshots accepted as authoritative reset (stuck-Stale escape after StaleEscapeTimeoutMs); buffered tail discarded");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_skipped_healthy_ahead",
             () => PerGroupBook(bm => bm.SnapshotsSkippedHealthyAhead),
             unit: "{snapshots}", description: "Snapshots ignored because symbol is already Healthy with a more recent book.LastRptSeq than the snapshot baseline (always-on snapshot stream noise)");

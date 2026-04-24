@@ -252,6 +252,7 @@ internal sealed class StatsPrinter
         if (anyPerSymbol)
         {
             long totalEvictUnsafe = 0, totalEvictSafe = 0, totalHotProm = 0, totalDropPSCap = 0, totalDropGCap = 0;
+            long totalAuthReset = 0;
             for (int i = 0; i < _bookManagers.Count; i++)
             {
                 var sb = _bookManagers[i].StaleBuffer;
@@ -261,10 +262,12 @@ internal sealed class StatsPrinter
                 totalHotProm += sb.HotPromotionCount;
                 totalDropPSCap += sb.DroppedPerSymbolCapCount;
                 totalDropGCap += sb.DroppedGlobalCapCount;
+                var reg = _bookManagers[i].StateRegistry;
+                if (reg is not null) totalAuthReset += reg.StaleAuthoritativeResetCount;
             }
             Console.WriteLine($"  PerSymbol:    stale={totalStaleSymbols}/{totalSymbolsTracked}  healed={totalHealed:N0}  buffered={totalBuffered:N0}  replayed={totalReplayed:N0}");
             Console.WriteLine($"                dropDup={totalDropDup:N0}  liveResync={totalLiveResync:N0}  channelGapsAbsorbed={totalAbsorbed:N0}");
-            Console.WriteLine($"                floorPin: hotProm={totalHotProm:N0} evictSafe={totalEvictSafe:N0} evictUnsafe={totalEvictUnsafe:N0}  drop[psCap={totalDropPSCap:N0} gCap={totalDropGCap:N0}]");
+            Console.WriteLine($"                floorPin: hotProm={totalHotProm:N0} evictSafe={totalEvictSafe:N0} evictUnsafe={totalEvictUnsafe:N0}  drop[psCap={totalDropPSCap:N0} gCap={totalDropGCap:N0}]  authReset={totalAuthReset:N0}");
         }
     }
 

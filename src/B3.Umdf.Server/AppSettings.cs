@@ -188,6 +188,17 @@ public sealed class AppSettings
     /// </summary>
     public double PerSymbolFanoutSuppressLowPct { get; set; } = 0.10;
 
+    /// <summary>
+    /// Stuck-Stale escape valve (milliseconds). When a per-symbol Stale interval
+    /// exceeds this and the next snapshot would be rejected as too-old, the
+    /// snapshot is accepted as authoritative reset (buffered tail discarded,
+    /// MinHeal cleared). 0 disables (legacy strict-reject behavior). Default
+    /// 60 000 ms = 60 s. Surfaces metric
+    /// <c>b3.umdf.persymbol.snapshots_authoritative_reset</c> and a warn-level
+    /// log per occurrence. CLI: env <c>UMDF_STALE_ESCAPE_TIMEOUT_MS</c>.
+    /// </summary>
+    public long StaleEscapeTimeoutMs { get; set; } = 60_000;
+
     /// <summary>Load settings from a JSON file.</summary>
     public static AppSettings LoadFromFile(string path)
     {
@@ -276,6 +287,8 @@ public sealed class AppSettings
         if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT"),
                 System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var psLow))
             PerSymbolFanoutSuppressLowPct = psLow;
+        if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_STALE_ESCAPE_TIMEOUT_MS"), out var staleEscapeMs))
+            StaleEscapeTimeoutMs = staleEscapeMs;
     }
 
     private static bool TryParseBoolean(string? value, out bool result)

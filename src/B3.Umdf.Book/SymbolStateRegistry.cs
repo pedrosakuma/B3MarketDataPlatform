@@ -100,6 +100,17 @@ public sealed class SymbolStateRegistry
     private readonly ILogger _logger;
     private Action<ulong, bool>? _onMboStaleStatusChanged;
     private long _staleSnapshotIgnored;
+    private long _staleAuthoritativeReset;
+
+    /// <summary>
+    /// Stuck-Stale escape valve: when a symbol has been Stale longer than this
+    /// many milliseconds AND a snapshot arrives that would be rejected as
+    /// too-old (snapshotRptSeq &lt; MinHeal), accept it as authoritative reset
+    /// instead — discard the buffered tail (caller's drain window will be
+    /// empty) and rebuild from the snapshot. 0 disables the escape (legacy
+    /// behavior: always reject too-old snapshots). Default 60 000 ms.
+    /// </summary>
+    public long StaleEscapeTimeoutMs { get; set; }
 
     // O(1) cheap aggregates for the fanout backpressure gate. Maintained
     // atomically on every (symbol, kind) state transition so callers on the
@@ -384,15 +395,42 @@ public sealed class SymbolStateRegistry
             // caller leaves the snapshot bytes already applied to the book in place
             // (book state == snapshot state) and continues buffering live
             // incrementals until a fresher snapshot arrives.
+            //
+            // Escape valve: if the symbol has been Stale longer than
+            // StaleEscapeTimeoutMs (default 60 s), accept the snapshot as an
+            // authoritative reset instead. The buffered tail is presumed
+            // un-bridgeable (the floor pin's evict-unsafe path proved we lost
+            // data in the drain window) — drop it and rebuild from the
+            // snapshot. This breaks the stuck-Stale loop at the cost of
+            // discarding the buffered messages between snapshotRptSeq+1 and
+            // the live high-water (they will arrive again as live increments
+            // and re-establish the book naturally; book state may briefly
+            // appear thin until those increments catch up).
+            bool authoritativeReset = false;
             if (minHeal > 0 && snapshotRptSeq < minHeal)
             {
-                Interlocked.Increment(ref _staleSnapshotIgnored);
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug(
-                        "SymbolState: rejected lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High}",
-                        securityId, kind, snapshotRptSeq, minHeal, priorHighWater);
-                return new HealResult(Accepted: false, TransitionedToHealthy: false,
-                    SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
+                bool eligible = StaleEscapeTimeoutMs > 0
+                    && prev == SymbolState.Stale
+                    && entry.StaleSinceTicks[idx] != 0
+                    && (Environment.TickCount64 - entry.StaleSinceTicks[idx]) > StaleEscapeTimeoutMs;
+
+                if (!eligible)
+                {
+                    Interlocked.Increment(ref _staleSnapshotIgnored);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug(
+                            "SymbolState: rejected lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High}",
+                            securityId, kind, snapshotRptSeq, minHeal, priorHighWater);
+                    return new HealResult(Accepted: false, TransitionedToHealthy: false,
+                        SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
+                }
+
+                authoritativeReset = true;
+                Interlocked.Increment(ref _staleAuthoritativeReset);
+                long staleForMs = Environment.TickCount64 - entry.StaleSinceTicks[idx];
+                _logger.LogWarning(
+                    "SymbolState: stuck-Stale escape — accepting too-old snapshot as authoritative reset. secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High} staleForMs={StaleMs}",
+                    securityId, kind, snapshotRptSeq, minHeal, priorHighWater, staleForMs);
             }
 
             // Defensive: never regress a Healthy symbol whose live stream is already
@@ -453,9 +491,16 @@ public sealed class SymbolStateRegistry
             }
 
             // Drain window: anything strictly above snapshotRptSeq up to the
-            // observed high-water mark must be replayed by the caller.
+            // observed high-water mark must be replayed by the caller. When
+            // taking the authoritative-reset escape, the buffered tail is
+            // un-bridgeable (we lost data inside [snapshotRptSeq+1, highWater]
+            // — that is precisely why minHeal moved past snapshotRptSeq) so
+            // we signal an empty drain (DrainFrom > DrainTo) and the caller
+            // discards its per-symbol buffer.
             uint drainFrom = snapshotRptSeq + 1;
-            uint drainTo = priorHighWater > snapshotRptSeq ? priorHighWater : snapshotRptSeq;
+            uint drainTo = (!authoritativeReset && priorHighWater > snapshotRptSeq)
+                ? priorHighWater
+                : snapshotRptSeq;
             return new HealResult(Accepted: true, TransitionedToHealthy: transitioned,
                 SnapshotRptSeq: snapshotRptSeq, DrainFrom: drainFrom, DrainTo: drainTo);
         }
@@ -638,6 +683,14 @@ public sealed class SymbolStateRegistry
 
     /// <summary>Counter exposed to metrics: snapshot heals where snapshotRptSeq lagged the live high-water.</summary>
     public long LaggingSnapshotCount => Volatile.Read(ref _staleSnapshotIgnored);
+
+    /// <summary>
+    /// Counter exposed to metrics: snapshots accepted as authoritative reset
+    /// because the symbol was stuck Stale longer than <see cref="StaleEscapeTimeoutMs"/>.
+    /// Sustained growth indicates pathological loss the floor pin alone cannot
+    /// absorb; review hot cap sizing or upstream loss rate.
+    /// </summary>
+    public long StaleAuthoritativeResetCount => Volatile.Read(ref _staleAuthoritativeReset);
 
     /// <summary>
     /// Single-pass aggregate: total symbols with at least one Stale kind, plus per-kind counts.

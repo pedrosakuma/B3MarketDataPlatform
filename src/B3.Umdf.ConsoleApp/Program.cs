@@ -393,7 +393,10 @@ foreach (var gid in groupIds)
     IBookEventHandler bookHandler;
     IMarketDataEventHandler mdHandler = stats;
 
-    var groupRegistry = new SymbolStateRegistry(registryLogger);
+    var groupRegistry = new SymbolStateRegistry(registryLogger)
+    {
+        StaleEscapeTimeoutMs = settings.StaleEscapeTimeoutMs,
+    };
     var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger);
     registries[gid] = groupRegistry;
     staleBuffers[gid] = groupStaleBuffer;

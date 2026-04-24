@@ -527,4 +527,94 @@ public class SymbolStateRegistryTests
         Assert.False(r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 108).Accepted);
         Assert.True(r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 109).Accepted);
     }
+
+    // ---- StaleEscapeTimeoutMs (stuck-Stale escape valve) ----
+
+    [Fact]
+    public void StaleEscape_Disabled_TooOldSnapshotRejected()
+    {
+        var r = NewRegistry(); // StaleEscapeTimeoutMs = 0 by default in tests
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        r.Observe(1, SymbolGapKind.Mbo, 105); // gap → Stale, MinHeal=104
+
+        Thread.Sleep(50);
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50); // far too old
+
+        Assert.False(heal.Accepted);
+        Assert.Equal(0, r.StaleAuthoritativeResetCount);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void StaleEscape_Enabled_NotYetTimedOut_StillRejected()
+    {
+        var r = NewRegistry();
+        r.StaleEscapeTimeoutMs = 5_000; // 5 s — won't elapse in test
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        r.Observe(1, SymbolGapKind.Mbo, 105);
+
+        Thread.Sleep(20);
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
+
+        Assert.False(heal.Accepted);
+        Assert.Equal(0, r.StaleAuthoritativeResetCount);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void StaleEscape_Enabled_TimedOut_AcceptsAsAuthoritativeReset()
+    {
+        var r = NewRegistry();
+        r.StaleEscapeTimeoutMs = 30; // 30 ms timeout
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        r.Observe(1, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109, prior highWater=110
+
+        Thread.Sleep(80); // exceed timeout
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50); // too old
+
+        Assert.True(heal.Accepted);
+        Assert.True(heal.TransitionedToHealthy);
+        // Empty drain window → caller will discard buffer.
+        Assert.True(heal.DrainFrom > heal.DrainTo, $"expected empty drain, got [{heal.DrainFrom},{heal.DrainTo}]");
+        Assert.Equal(50u, heal.SnapshotRptSeq);
+        Assert.Equal(1, r.StaleAuthoritativeResetCount);
+        Assert.Equal(SymbolState.Healthy, r.GetState(1, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void StaleEscape_FreshSnapshot_TakesNormalAcceptPath_NotEscape()
+    {
+        var r = NewRegistry();
+        r.StaleEscapeTimeoutMs = 30;
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        r.Observe(1, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109
+
+        Thread.Sleep(80); // even though stale-elapsed, snapshot is fresh
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 109);
+
+        Assert.True(heal.Accepted);
+        Assert.Equal(0, r.StaleAuthoritativeResetCount); // not the escape path
+        // Normal accept: drain window non-empty (110 > 109).
+        Assert.Equal(110u, heal.DrainFrom);
+        Assert.Equal(110u, heal.DrainTo);
+    }
+
+    [Fact]
+    public void StaleEscape_DoesNotFire_OnUnknownBootstrap()
+    {
+        // Cold-start (Unknown) cannot use the escape — StaleSinceTicks is 0.
+        var r = NewRegistry();
+        r.StaleEscapeTimeoutMs = 1;
+        r.Observe(1, SymbolGapKind.Mbo, 100); // first obs → Unknown, MinHeal=99
+
+        Thread.Sleep(30);
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
+
+        Assert.False(heal.Accepted);
+        Assert.Equal(0, r.StaleAuthoritativeResetCount);
+    }
 }
