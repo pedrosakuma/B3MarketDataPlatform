@@ -447,6 +447,29 @@ A run is considered passing when:
 
 Failure of any of these criteria should block release.
 
+### 11.3 Production-readiness harnesses (`tools/`)
+
+Three additional harnesses validate behavior beyond unit/scenario tests:
+
+| Script | Purpose | Pass criteria |
+|---|---|---|
+| `tools/ws/ws-slow-stress.mjs` | Slow-client backpressure: spawns N WS clients (M throttled via TCP socket pause) and verifies only slow ones are dropped. | Slow clients disconnected; healthy fleet untouched. |
+| `tools/soak-test.sh` | Long-running stability: samples RSS, GC, and per-symbol counters every 30 s into CSV. | RSS slope < +10 % between halves of post-warmup window; no `evictUnsafe` growth without matching `authReset`. |
+| `tools/chaos-restart.sh` | Mid-recovery SIGKILL: brings up consumer with loss injection, kills container, restarts. | Cold-start succeeds, stale converges to 0, no `error:` in post-restart logs. |
+
+Recommended cadence: slow-client + chaos before every release; soak (≥ 4 h)
+weekly or before any change to broadcaster, recovery, or per-symbol state.
+
+Validated on 2026-04-24:
+
+- **Slow-client** (50 clients, 10 throttled @ 3 s pause / 10 ms drain, WIN
+  futures × 100 symbols, 60 s): 10/10 slow disconnected; 40/40 healthy
+  delivered 8.6 GB without disconnection. ✅
+- **Chaos restart** (5 % correlated AB loss, SIGKILL): cold-start ready
+  in < 1 s, stale converged to 0 immediately post-restart, 0 errors. ✅
+- **Soak (5 min validation)**: harness produces CSV; longer runs gated by
+  available execution time. ✅ harness; full 4 h run pending operator window.
+
 ## 12. Summary
 
 The consumer's resilience is the result of bounding **every** queue,
