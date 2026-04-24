@@ -99,6 +99,7 @@ public sealed class SymbolStateRegistry
     private readonly ConcurrentDictionary<ulong, SymbolEntry> _entries = new();
     private readonly ILogger _logger;
     private long _staleSnapshotIgnored;
+    private long _forcedHealSkippedGap;
 
     // O(1) cheap aggregates for the fanout backpressure gate. Maintained
     // atomically on every (symbol, kind) state transition so callers on the
@@ -279,13 +280,28 @@ public sealed class SymbolStateRegistry
         bool TransitionedToHealthy,
         uint SnapshotRptSeq,
         uint DrainFrom,
-        uint DrainTo);
+        uint DrainTo,
+        bool ForcedSkipGap = false,
+        uint NewBaselineRptSeq = 0);
+
+    /// <summary>
+    /// Maximum time a symbol may stay Stale before <see cref="HealFromSnapshot"/>
+    /// accepts an old snapshot as a forced escape. Hot symbols (mini-index
+    /// futures) generate messages faster than the always-on snapshot
+    /// rotation can carry their lastRptSeq, so strict <c>snap &gt;= MinHeal</c>
+    /// gating leaves them perpetually Stale. After this timeout we accept
+    /// any snapshot, drop the buffered window, and resume Healthy from the
+    /// observed high-water mark — accepting silent loss of operations in
+    /// <c>(snap, highWater]</c> as the lesser evil vs perpetual Stale.
+    /// </summary>
+    public TimeSpan ForcedHealAfter { get; init; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Snapshot path: forces (secId, kind) to <see cref="SymbolState.Healthy"/>
     /// at the given rptSeq. Caller must drain its per-symbol buffer using
     /// the returned <see cref="HealResult"/> when <see cref="HealResult.Accepted"/>
-    /// is true.
+    /// is true. When <see cref="HealResult.ForcedSkipGap"/> is true, caller
+    /// must instead CLEAR the buffer (silent loss).
     /// </summary>
     public HealResult HealFromSnapshot(ulong securityId, SymbolGapKind kind, uint snapshotRptSeq)
     {
@@ -308,13 +324,44 @@ public sealed class SymbolStateRegistry
             // incrementals until a fresher snapshot arrives.
             if (minHeal > 0 && snapshotRptSeq < minHeal)
             {
-                Interlocked.Increment(ref _staleSnapshotIgnored);
-                if (_logger.IsEnabled(LogLevel.Debug))
-                    _logger.LogDebug(
-                        "SymbolState: rejected lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High}",
-                        securityId, kind, snapshotRptSeq, minHeal, priorHighWater);
-                return new HealResult(Accepted: false, TransitionedToHealthy: false,
-                    SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
+                // Forced-heal escape: if the symbol has been Stale for too long,
+                // hot-symbol throughput is outpacing snapshot rotation. Accept the
+                // snapshot anyway, skip the unfilled gap [snap+1, highWater] as
+                // silent loss, baseline=highWater so subsequent live continues as
+                // Healthy. Caller must CLEAR the buffer (signalled via ForcedSkipGap).
+                long staleTicks = entry.StaleSinceTicks[idx];
+                long elapsedMs = staleTicks > 0 ? Environment.TickCount64 - staleTicks : 0;
+                bool forcedHeal = prev == SymbolState.Stale
+                    && staleTicks > 0
+                    && elapsedMs >= (long)ForcedHealAfter.TotalMilliseconds
+                    && priorHighWater > snapshotRptSeq;
+                if (!forcedHeal)
+                {
+                    Interlocked.Increment(ref _staleSnapshotIgnored);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug(
+                            "SymbolState: rejected lagging snapshot secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High}",
+                            securityId, kind, snapshotRptSeq, minHeal, priorHighWater);
+                    return new HealResult(Accepted: false, TransitionedToHealthy: false,
+                        SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0);
+                }
+
+                // Forced path: baseline = priorHighWater, MinHeal cleared, transition Healthy.
+                Interlocked.Increment(ref _forcedHealSkippedGap);
+                if (_logger.IsEnabled(LogLevel.Information))
+                    _logger.LogInformation(
+                        "SymbolState: FORCED heal secId={SecurityId} kind={Kind} snap={Snap} highWater={High} elapsedMs={Elapsed} (silent loss in ({Snap},{High}])",
+                        securityId, kind, snapshotRptSeq, priorHighWater, elapsedMs, snapshotRptSeq, priorHighWater);
+                entry.LastRptSeq[idx] = priorHighWater;
+                entry.States[idx] = SymbolState.Healthy;
+                entry.MinHealRptSeq[idx] = 0;
+                entry.StaleKindMask &= ~(1 << idx);
+                entry.StaleSinceTicks[idx] = 0;
+                if (prevMask != 0 && entry.StaleKindMask == 0)
+                    Interlocked.Decrement(ref _staleSymbolCount);
+                return new HealResult(Accepted: true, TransitionedToHealthy: true,
+                    SnapshotRptSeq: snapshotRptSeq, DrainFrom: 1, DrainTo: 0,
+                    ForcedSkipGap: true, NewBaselineRptSeq: priorHighWater);
             }
 
             // Defensive: never regress a Healthy symbol whose live stream is already
@@ -541,6 +588,8 @@ public sealed class SymbolStateRegistry
 
     /// <summary>Counter exposed to metrics: snapshot heals where snapshotRptSeq lagged the live high-water.</summary>
     public long LaggingSnapshotCount => Volatile.Read(ref _staleSnapshotIgnored);
+    /// <summary>Count of forced heals where snapshot &lt; MinHeal but we accepted anyway after the Stale timeout (silent gap loss).</summary>
+    public long ForcedHealSkippedGapCount => Volatile.Read(ref _forcedHealSkippedGap);
 
     /// <summary>
     /// Single-pass aggregate: total symbols with at least one Stale kind, plus per-kind counts.

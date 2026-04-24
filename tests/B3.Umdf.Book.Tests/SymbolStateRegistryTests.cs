@@ -100,6 +100,35 @@ public class SymbolStateRegistryTests
     }
 
     [Fact]
+    public void ForcedHeal_AfterStaleTimeout_AcceptsOldSnapshotAndSkipsGap()
+    {
+        var r = new SymbolStateRegistry(NullLogger.Instance) { ForcedHealAfter = TimeSpan.FromMilliseconds(50) };
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109, high-water=110
+        r.Observe(1, SymbolGapKind.Mbo, 200); // buffer keeps tracking high-water=200
+
+        // Snapshot at 50 (way below MinHeal=109) — would normally be rejected.
+        // Before timeout: rejected.
+        var early = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
+        Assert.False(early.Accepted);
+
+        // Wait past ForcedHealAfter and try again: forced accept.
+        Thread.Sleep(75);
+        var forced = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 50);
+        Assert.True(forced.Accepted);
+        Assert.True(forced.ForcedSkipGap);
+        Assert.True(forced.TransitionedToHealthy);
+        Assert.Equal((uint)200, forced.NewBaselineRptSeq); // baseline = priorHighWater
+        Assert.Equal(1, r.ForcedHealSkippedGapCount);
+        Assert.Equal(SymbolState.Healthy, r.GetState(1, SymbolGapKind.Mbo));
+
+        // Next contiguous live message (201) applies cleanly.
+        var live = r.Observe(1, SymbolGapKind.Mbo, 201);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, live.Action);
+        Assert.Equal((uint)0, live.GapSize);
+    }
+
+    [Fact]
     public void BumpMinHeal_Monotonic_RejectsStaleSnapshot()
     {
         var r = NewRegistry();
