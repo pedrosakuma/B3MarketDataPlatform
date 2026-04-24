@@ -397,7 +397,11 @@ foreach (var gid in groupIds)
     {
         StaleEscapeTimeoutMs = settings.StaleEscapeTimeoutMs,
     };
-    var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger);
+    // Multi-tier dynamic-grow cap ladder: base 8k → 64k (legacy hot, always
+    // allowed) → 256k → 1M (gated by global byte budget for upper tiers).
+    // Sized for ultra-hot futures (winv25-class) during long heal windows.
+    var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger,
+        capLevels: new[] { 8192, 65536, 262144, 1048576 });
     registries[gid] = groupRegistry;
     staleBuffers[gid] = groupStaleBuffer;
 

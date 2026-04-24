@@ -151,8 +151,15 @@ internal sealed class StatsPrinter
                 long evictUnsafe = bm.StaleBuffer.EvictedPerSymbolCapCount;
                 long evictSafe = bm.StaleBuffer.SafeEvictedBelowFloorCount;
                 long hotProm = bm.StaleBuffer.HotPromotionCount;
-                string floor = (evictUnsafe > 0 || evictSafe > 0 || hotProm > 0)
-                    ? $" floorPin[hotProm:{hotProm} evictSafe:{evictSafe:N0} evictUnsafe:{evictUnsafe:N0}]"
+                long promRefused = bm.StaleBuffer.PromotionsRefusedGlobalCapCount;
+                var promByLevel = bm.StaleBuffer.GetPromotionsByLevel();
+                long upperProm = 0;
+                for (int li = 2; li < promByLevel.Length; li++) upperProm += promByLevel[li];
+                string promExtra = (upperProm > 0 || promRefused > 0)
+                    ? $" upperProm:{upperProm}{(promRefused > 0 ? $" refused:{promRefused}" : "")}"
+                    : "";
+                string floor = (evictUnsafe > 0 || evictSafe > 0 || hotProm > 0 || upperProm > 0)
+                    ? $" floorPin[hotProm:{hotProm}{promExtra} evictSafe:{evictSafe:N0} evictUnsafe:{evictUnsafe:N0}]"
                     : "";
                 perSymbolParts.Add(
                     $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}");

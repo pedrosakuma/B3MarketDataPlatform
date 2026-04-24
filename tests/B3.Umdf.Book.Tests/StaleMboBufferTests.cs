@@ -291,4 +291,113 @@ public class StaleMboBufferTests
         Assert.Equal((uint)100, evicted); // bumped — snapshot will be rejected
         Assert.Equal(1, buf.EvictedPerSymbolCapCount);
     }
+
+    // ── Multi-tier dynamic-grow ladder ───────────────────────────────────────
+
+    [Fact]
+    public void MultiTier_PromotesThroughEachLevel()
+    {
+        var buf = new StaleMboBuffer(NullLogger.Instance, capLevels: new[] { 2, 4, 8 });
+        // Fill base tier (2). Next enqueue triggers promotion to level 1 (cap 4).
+        for (int i = 0; i < 3; i++)
+            buf.Enqueue(1, 50, (uint)(100 + i), 0, new byte[] { (byte)i });
+        Assert.Equal(1, buf.HotPromotionCount);             // legacy counter (0→1)
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(3, buf.DepthOf(1));
+
+        // Fill to level-1 cap (4). Next enqueue promotes to level 2 (cap 8).
+        for (int i = 3; i < 5; i++)
+            buf.Enqueue(1, 50, (uint)(100 + i), 0, new byte[] { (byte)i });
+        var byLevel = buf.GetPromotionsByLevel();
+        Assert.Equal(0, byLevel[0]);
+        Assert.Equal(1, byLevel[1]);
+        Assert.Equal(1, byLevel[2]);
+        Assert.Equal(1, buf.HotPromotionCount);             // level 0→1 only
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(5, buf.DepthOf(1));
+    }
+
+    [Fact]
+    public void MultiTier_AtTopTierEvictsOldest()
+    {
+        var buf = new StaleMboBuffer(NullLogger.Instance, capLevels: new[] { 1, 2, 3 });
+        // Fill all tiers and beyond.
+        for (int i = 0; i < 4; i++)
+            buf.Enqueue(1, 50, (uint)(100 + i), 0, new byte[] { (byte)i });
+        Assert.Equal(3, buf.DepthOf(1));                    // top tier cap=3
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);      // one unsafe eviction
+
+        var promByLevel = buf.GetPromotionsByLevel();
+        Assert.Equal(1, promByLevel[1]);
+        Assert.Equal(1, promByLevel[2]);
+    }
+
+    [Fact]
+    public void MultiTier_UpperTierGatedWhenGlobalBudgetTight()
+    {
+        // ladder=[1, 2, 4], globalCap=20 → upper-tier gate at 14 bytes (70%).
+        // Strategy: symbol 1 fills 15 bytes (above gate). Symbol 2 then promotes
+        // 0→1 (always allowed) but 1→2 must be refused.
+        var buf = new StaleMboBuffer(NullLogger.Instance,
+            capLevels: new[] { 1, 2, 4 },
+            globalByteCap: 20);
+
+        buf.Enqueue(1, 50, 100, 0, new byte[15]);            // bytes=15, > gate=14
+        buf.Enqueue(2, 50, 200, 0, new byte[] { 1 });        // sym2 depth=1, level 0
+        buf.Enqueue(2, 50, 201, 0, new byte[] { 2 });        // overflow → promote 0→1 (always allowed)
+        Assert.Equal(2, buf.DepthOf(2));
+        Assert.Equal(1, buf.HotPromotionCount);
+
+        // Next overflow: nextLevel=2 (upper tier). bytes=17 > gate=14 → REFUSED → drop oldest.
+        buf.Enqueue(2, 50, 202, 0, new byte[] { 3 });
+        Assert.Equal(1, buf.PromotionsRefusedGlobalCapCount);
+        Assert.Equal(2, buf.DepthOf(2));                    // stayed at level-1 cap=2
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);
+        var promByLevel = buf.GetPromotionsByLevel();
+        Assert.Equal(0, promByLevel[2]);                    // never reached level 2
+    }
+
+    [Fact]
+    public void MultiTier_Level1AlwaysAllowedEvenWhenGlobalTight()
+    {
+        // Global budget mostly full, but level 1 promotion (legacy hot tier)
+        // must STILL be allowed — preserves pre-multi-tier guarantee.
+        var buf = new StaleMboBuffer(NullLogger.Instance,
+            capLevels: new[] { 1, 4 },
+            globalByteCap: 4);
+
+        // Symbol A fills global budget to 75% via single allocs.
+        buf.Enqueue(1, 50, 100, 0, new byte[] { 1 });
+        // Symbol B's first overflow → promotion to level 1 should succeed.
+        buf.Enqueue(2, 50, 200, 0, new byte[] { 2 });
+        buf.Enqueue(2, 50, 201, 0, new byte[] { 3 }); // at base cap, overflow
+
+        Assert.Equal(1, buf.HotPromotionCount);             // level 1 promoted
+        Assert.Equal(0, buf.PromotionsRefusedGlobalCapCount);
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount);      // no eviction
+    }
+
+    [Fact]
+    public void MultiTier_RejectsInvalidCapLevels()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            new StaleMboBuffer(NullLogger.Instance, capLevels: Array.Empty<int>()));
+        Assert.Throws<ArgumentException>(() =>
+            new StaleMboBuffer(NullLogger.Instance, capLevels: new[] { 0, 1 }));
+        Assert.Throws<ArgumentException>(() =>
+            new StaleMboBuffer(NullLogger.Instance, capLevels: new[] { 4, 4 })); // not strictly increasing
+        Assert.Throws<ArgumentException>(() =>
+            new StaleMboBuffer(NullLogger.Instance, capLevels: new[] { 4, 2 })); // decreasing
+    }
+
+    [Fact]
+    public void LegacyConstructor_BehavesAs2TierLadder()
+    {
+        // Old ctor: must produce exactly [perSymbolCap, hotPerSymbolCap].
+        var buf = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        Assert.Equal(2, buf.CapLevelCount);
+        var levels = buf.GetCapLevels();
+        Assert.Equal(2, levels[0]);
+        Assert.Equal(4, levels[1]);
+    }
 }

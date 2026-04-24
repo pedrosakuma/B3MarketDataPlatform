@@ -47,9 +47,12 @@ public sealed class StaleMboBuffer
 {
     private readonly Dictionary<ulong, PerSymbolQueue> _queues = new();
     private readonly ILogger _logger;
-    private readonly int _perSymbolCap;
-    private readonly int _hotPerSymbolCap;
+    private readonly int[] _capLevels;
     private readonly long _globalByteCap;
+    // Promotion to levels >= 2 (beyond legacy hot tier) is gated when the
+    // global byte budget is above this fraction. Level 1 (legacy hot) is
+    // always allowed so we never regress versus the prior 2-tier behavior.
+    private const double UpperTierGlobalBudgetGate = 0.70;
 
     private long _totalBytes;
     private long _enqueued;
@@ -58,14 +61,50 @@ public sealed class StaleMboBuffer
 
     private long _evictedPerSymbolCap;
     private long _safeEvictedBelowFloor;
+    // Backward-compat: counts ONLY level 0 → 1 promotions (the legacy "hot
+    // promotion" event). Higher-tier promotions are tracked in
+    // _promotionsByLevel so existing dashboards/alerts comparing
+    // HotPromotionCount over time stay meaningful.
     private long _hotPromotions;
+    private readonly long[] _promotionsByLevel;
+    private long _promotionsRefusedGlobalCap;
 
+    /// <summary>
+    /// Backwards-compatible 2-tier constructor. Maps to a cap ladder of
+    /// exactly <c>[perSymbolCap, hotPerSymbolCap]</c> — preserves test
+    /// semantics. For the multi-tier dynamic-grow behavior, use the
+    /// <see cref="StaleMboBuffer(ILogger, int[], long)"/> overload.
+    /// </summary>
     public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024, int hotPerSymbolCap = 65536)
+        : this(logger, new[] { perSymbolCap, Math.Max(perSymbolCap, hotPerSymbolCap) }, globalByteCap)
     {
+    }
+
+    /// <summary>
+    /// Multi-tier dynamic-grow constructor. <paramref name="capLevels"/> must
+    /// be non-empty, contain only positive values, and be strictly increasing.
+    /// Each symbol starts at level 0; on overflow it promotes one level (one-way
+    /// ratchet). Promotion to level 1 is always allowed (legacy hot-tier
+    /// behavior); promotion to higher levels is gated when the global byte
+    /// budget is above 70% to keep the global cap from triggering drop-newest.
+    /// </summary>
+    public StaleMboBuffer(ILogger logger, int[] capLevels, long globalByteCap = 256L * 1024 * 1024)
+    {
+        if (capLevels is null || capLevels.Length == 0)
+            throw new ArgumentException("capLevels must be non-empty", nameof(capLevels));
+        for (int i = 0; i < capLevels.Length; i++)
+        {
+            if (capLevels[i] <= 0)
+                throw new ArgumentException($"capLevels[{i}] must be positive (got {capLevels[i]})", nameof(capLevels));
+            if (i > 0 && capLevels[i] <= capLevels[i - 1])
+                throw new ArgumentException(
+                    $"capLevels must be strictly increasing (capLevels[{i}]={capLevels[i]} <= capLevels[{i - 1}]={capLevels[i - 1]})",
+                    nameof(capLevels));
+        }
         _logger = logger;
-        _perSymbolCap = perSymbolCap;
-        _hotPerSymbolCap = Math.Max(perSymbolCap, hotPerSymbolCap);
+        _capLevels = (int[])capLevels.Clone();
         _globalByteCap = globalByteCap;
+        _promotionsByLevel = new long[_capLevels.Length];
     }
 
     public long TotalBytes => Volatile.Read(ref _totalBytes);
@@ -89,8 +128,29 @@ public sealed class StaleMboBuffer
     /// High values vs <see cref="EvictedPerSymbolCapCount"/> indicate the floor pin is
     /// successfully absorbing snapshot-delivery latency.</summary>
     public long SafeEvictedBelowFloorCount => Volatile.Read(ref _safeEvictedBelowFloor);
-    /// <summary>Count of symbols that were promoted from the normal cap to the hot cap on first overflow.</summary>
+    /// <summary>
+    /// Backwards-compatible counter — counts ONLY level 0 → 1 promotions
+    /// (legacy "hot promotion" event). For the full multi-tier breakdown
+    /// see <see cref="GetPromotionsByLevel"/>.
+    /// </summary>
     public long HotPromotionCount => Volatile.Read(ref _hotPromotions);
+    /// <summary>Number of cap tiers configured (length of the capLevels ladder).</summary>
+    public int CapLevelCount => _capLevels.Length;
+    /// <summary>Per-tier promotion counts. Index N = number of times a symbol promoted
+    /// from level N-1 to level N. Index 0 is always 0 (no promotion creates level 0).</summary>
+    public long[] GetPromotionsByLevel()
+    {
+        var snap = new long[_promotionsByLevel.Length];
+        for (int i = 0; i < snap.Length; i++) snap[i] = Volatile.Read(ref _promotionsByLevel[i]);
+        return snap;
+    }
+    /// <summary>Count of promotion requests denied because the global byte budget
+    /// was above the upper-tier admission gate (only applies to levels >= 2).
+    /// High values indicate the global cap is the limiting factor — consider raising
+    /// <c>globalByteCap</c> or reducing per-tier sizes.</summary>
+    public long PromotionsRefusedGlobalCapCount => Volatile.Read(ref _promotionsRefusedGlobalCap);
+    /// <summary>Snapshot of the configured cap ladder (defensive copy).</summary>
+    public int[] GetCapLevels() => (int[])_capLevels.Clone();
 
     /// <summary>
     /// One stored message. <see cref="Body"/> is rented from
@@ -111,13 +171,14 @@ public sealed class StaleMboBuffer
     private sealed class PerSymbolQueue
     {
         internal readonly Queue<DeferredMboMsg> Items = new();
-        // Per-symbol cap. Starts at the normal tier; promoted to the hot tier
-        // on first overflow. One-way ratchet — never demoted.
-        internal int Cap;
+        // Promotion level (index into _capLevels). Starts at 0 (base tier);
+        // ratchets upward on overflow. One-way — never demoted.
+        internal byte Level;
+        internal int Cap; // cached _capLevels[Level] for hot-path read
         // Protected-floor pin: while a snapshot is in flight for this symbol,
         // the BookManager publishes the snapshot's rptSeq+1 as the floor.
         // Messages with rptSeq < ProtectedFloor are NOT needed for the eventual
-        // drain (snapshot already covers them). At hot-cap eviction time:
+        // drain (snapshot already covers them). At cap eviction time:
         //   - If oldest.RptSeq < ProtectedFloor → safe drop, MinHeal NOT bumped.
         //   - Else (or ProtectedFloor == 0) → unsafe drop, MinHeal bumped (current behavior).
         // This protects the post-snapshot drain window from being lost while the
@@ -158,36 +219,42 @@ public sealed class StaleMboBuffer
 
         if (!_queues.TryGetValue(securityId, out var queue))
         {
-            queue = new PerSymbolQueue { Cap = _perSymbolCap };
+            queue = new PerSymbolQueue { Level = 0, Cap = _capLevels[0] };
             _queues[securityId] = queue;
         }
         long evictedBytes = 0;
         uint evictedRptSeq = 0;
         bool evicted = false;
         bool safeEviction = false;
-        bool promoted = false;
+        int promotedToLevel = -1;
         if (queue.Items.Count >= queue.Cap)
         {
-            if (queue.Cap < _hotPerSymbolCap)
+            int nextLevel = queue.Level + 1;
+            if (nextLevel < _capLevels.Length && CanPromoteTo(nextLevel))
             {
-                // First overflow: promote to hot cap, no eviction.
-                queue.Cap = _hotPerSymbolCap;
-                promoted = true;
+                queue.Level = (byte)nextLevel;
+                queue.Cap = _capLevels[nextLevel];
+                promotedToLevel = nextLevel;
             }
-            else if (queue.Items.TryDequeue(out var old))
+            else
             {
-                evictedBytes = old.BodyLength;
-                evictedRptSeq = old.RptSeq;
-                evicted = true;
-                // Floor pin: if the evicted message is below the snapshot floor,
-                // the in-flight snapshot already covers it — safe to drop without
-                // pushing MinHeal forward. This is what allows a high-rate symbol
-                // to absorb msgs during the snapshot's Begin→End delivery window
-                // without poisoning its own heal.
-                safeEviction = queue.ProtectedFloor != 0 && old.RptSeq < queue.ProtectedFloor;
-                old.Release();
-                if (safeEviction) _safeEvictedBelowFloor++;
-                else _evictedPerSymbolCap++;
+                // Either at top tier or upper-tier admission denied. Evict oldest.
+                if (nextLevel < _capLevels.Length) _promotionsRefusedGlobalCap++;
+                if (queue.Items.TryDequeue(out var old))
+                {
+                    evictedBytes = old.BodyLength;
+                    evictedRptSeq = old.RptSeq;
+                    evicted = true;
+                    // Floor pin: if the evicted message is below the snapshot floor,
+                    // the in-flight snapshot already covers it — safe to drop without
+                    // pushing MinHeal forward. This is what allows a high-rate symbol
+                    // to absorb msgs during the snapshot's Begin→End delivery window
+                    // without poisoning its own heal.
+                    safeEviction = queue.ProtectedFloor != 0 && old.RptSeq < queue.ProtectedFloor;
+                    old.Release();
+                    if (safeEviction) _safeEvictedBelowFloor++;
+                    else _evictedPerSymbolCap++;
+                }
             }
         }
         var rented = ArrayPool<byte>.Shared.Rent(body.Length);
@@ -195,16 +262,34 @@ public sealed class StaleMboBuffer
         queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length));
         Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) + body.Length - evictedBytes);
         _enqueued++;
-        if (promoted)
+        if (promotedToLevel > 0)
         {
-            _hotPromotions++;
+            _promotionsByLevel[promotedToLevel]++;
+            // Backward-compat: only level 0 → 1 increments the legacy hot counter.
+            if (promotedToLevel == 1) _hotPromotions++;
             if (_logger.IsEnabled(LogLevel.Information))
                 _logger.LogInformation(
-                    "StaleMboBuffer: symbol {SecurityId} promoted to hot cap ({HotCap}); normal cap {NormalCap} exceeded",
-                    securityId, _hotPerSymbolCap, _perSymbolCap);
+                    "StaleMboBuffer: symbol {SecurityId} promoted to level {Level} (cap {NewCap}); previous cap {OldCap} exceeded",
+                    securityId, promotedToLevel, _capLevels[promotedToLevel], _capLevels[promotedToLevel - 1]);
         }
         if (evicted && !safeEviction) onEvictedOldest?.Invoke(evictedRptSeq);
         return true;
+    }
+
+    /// <summary>
+    /// Promotion admission control:
+    /// <list type="bullet">
+    ///   <item>Level 1 (legacy hot tier): always allowed — preserves the
+    ///   pre-multi-tier guarantee that any overflow gets headroom.</item>
+    ///   <item>Level 2+: gated when global bytes &gt; 70% of cap, to keep
+    ///   the global drop-newest from triggering for everyone.</item>
+    /// </list>
+    /// </summary>
+    private bool CanPromoteTo(int level)
+    {
+        if (level <= 1) return true;
+        long currentBytes = Volatile.Read(ref _totalBytes);
+        return currentBytes < (long)(_globalByteCap * UpperTierGlobalBudgetGate);
     }
 
     /// <summary>
@@ -223,7 +308,7 @@ public sealed class StaleMboBuffer
         if (floor == 0) return;
         if (!_queues.TryGetValue(securityId, out var queue))
         {
-            queue = new PerSymbolQueue { Cap = _perSymbolCap };
+            queue = new PerSymbolQueue { Level = 0, Cap = _capLevels[0] };
             _queues[securityId] = queue;
         }
         if (floor > queue.ProtectedFloor) queue.ProtectedFloor = floor;

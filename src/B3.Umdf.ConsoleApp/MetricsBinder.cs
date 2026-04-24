@@ -536,6 +536,36 @@ static class MetricsBinder
             },
             unit: "{symbols}", description: "Symbols promoted from normal cap to hot cap on first overflow (one-way ratchet)");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_upper_tier_promotions",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    var byLevel = buf.GetPromotionsByLevel();
+                    for (int li = 2; li < byLevel.Length; li++)
+                        m.Add(new(byLevel[li], Tag("group", $"G{groupIds[i]}"), Tag("level", li.ToString())));
+                }
+                return m;
+            },
+            unit: "{symbols}", description: "Symbols promoted to upper-tier caps (level 2+) — typically ultra-hot symbols during long heal windows");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_promotions_refused",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.PromotionsRefusedGlobalCapCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{events}", description: "Upper-tier promotion requests denied because global byte budget was above threshold (~70%)");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.channel_gaps_absorbed",
             () => FeedHandlers().Select(h =>
                 new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
