@@ -652,11 +652,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         public uint OrdersExpected;    // TotNumBids + TotNumOffers from Header_30
         public uint OrdersReceived;    // accumulated across Orders_71 chunks
         public bool HasRptSeq;         // whether LastRptSeq is usable
+        public bool Skipped;           // Header_30 saw the symbol Healthy + ahead of snap; chunks must be dropped silently
     }
     private long _snapshotsHealed;
     private long _snapshotsMissingRptSeq;
     private long _snapshotChunksOrphaned;
     private long _snapshotsRejectedTooOld;
+    private long _snapshotsSkippedHealthyAhead;
 
     /// <summary>Number of snapshot cycles where the registry was successfully healed.</summary>
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
@@ -668,6 +670,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// (would leave a hole between the snapshot baseline and our first observed/last good rptSeq).
     /// Symbol stays Stale awaiting a fresher snapshot.</summary>
     public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
+    /// <summary>Snapshots ignored at Header_30 because the symbol is already Healthy with a more
+    /// recent book.LastRptSeq than the snapshot baseline. Without this guard the always-on snapshot
+    /// stream would clobber a healthy book with stale data, leaving holes after subsequent
+    /// incrementals are applied.</summary>
+    public long SnapshotsSkippedHealthyAhead => Volatile.Read(ref _snapshotsSkippedHealthyAhead);
 
     private void HandleSnapshotHeader(ReadOnlySpan<byte> body)
     {
@@ -677,22 +684,59 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ulong secId = (ulong)msg.SecurityID;
         uint expected = msg.TotNumBids + msg.TotNumOffers;
         bool hasRpt = msg.LastRptSeq is { } v && v > 0;
+        uint lastRpt = hasRpt ? msg.LastRptSeq!.Value : 0u;
+
+        BeginSnapshotHeader(secId, lastRpt, hasRpt, expected);
+    }
+
+    // Exposed internally to share the always-on snapshot guard between the wire-decode
+    // path and tests that don't want to forge raw SBE bytes.
+    internal void BeginSnapshotHeader(ulong secId, uint lastRptSeq, bool hasRptSeq, uint ordersExpected)
+    {
+        var book = GetOrCreateBook(secId);
+
+        // GUARD: do not clobber a healthy book that's already ahead of this snapshot.
+        // The B3 always-on snapshot stream rotates through every symbol periodically.
+        // Without this check, a snapshot at LastRptSeq=S arriving for a symbol whose
+        // book is at rptSeq=L (L > S) would: (1) Clear the book, (2) repopulate at
+        // state-as-of-S, (3) accept the heal (registry Math.Max keeps baseline=L),
+        // (4) apply live rptSeq=L+1 onward — leaving the [S+1..L] window unapplied
+        // to the snapshot-rebuilt book. Result: silent corruption (crossed BBOs,
+        // ghost orders). Only Stale/Unknown symbols benefit from snapshots.
+        if (hasRptSeq && _stateRegistry is not null)
+        {
+            var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
+            if (state == SymbolState.Healthy && book.LastRptSeq >= lastRptSeq)
+            {
+                // Mark the in-flight snapshot as Skipped so subsequent Orders_71 chunks
+                // are dropped silently without incrementing the orphan counter.
+                _pendingSnapshots[secId] = new PendingSnapshot
+                {
+                    LastRptSeq = lastRptSeq,
+                    OrdersExpected = ordersExpected,
+                    OrdersReceived = 0,
+                    HasRptSeq = true,
+                    Skipped = true,
+                };
+                Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
+                return;
+            }
+        }
 
         // Begin a fresh snapshot for this instrument: clear the book and reset counters.
         // If a previous snapshot for this same instrument was still in progress (incomplete
         // chunks), it gets superseded — chunks from the prior snapshot are abandoned.
-        var book = GetOrCreateBook(secId);
         book.Clear();
         _pendingSnapshots[secId] = new PendingSnapshot
         {
-            LastRptSeq = hasRpt ? msg.LastRptSeq!.Value : 0u,
-            OrdersExpected = expected,
+            LastRptSeq = lastRptSeq,
+            OrdersExpected = ordersExpected,
             OrdersReceived = 0,
-            HasRptSeq = hasRpt,
+            HasRptSeq = hasRptSeq,
         };
 
         // Empty book snapshot (no Orders_71 chunks will follow): heal immediately.
-        if (expected == 0)
+        if (ordersExpected == 0)
             CompleteSnapshot(secId, book);
     }
 
@@ -791,9 +835,27 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // An Orders_71 chunk must be preceded by a Header_30 for the same instrument.
         // If not (lost packet, out-of-order), drop the chunk — applying it would corrupt
         // the book (we would not know whether to clear first or how to know completion).
-        if (!_pendingSnapshots.ContainsKey(securityId))
+        if (!_pendingSnapshots.TryGetValue(securityId, out var pendingPeek))
         {
             Interlocked.Increment(ref _snapshotChunksOrphaned);
+            return;
+        }
+
+        // Skipped snapshot (Header_30 saw the symbol Healthy + ahead): silently drop chunks
+        // and tick OrdersReceived so CompleteSnapshot fires once all expected entries arrive
+        // (no orphan-counter increment, no book mutation).
+        if (pendingPeek.Skipped)
+        {
+            uint skippedAdded = 0;
+            reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData _) =>
+            {
+                skippedAdded++;
+            });
+            ref var skipPending = ref System.Runtime.InteropServices.CollectionsMarshal
+                .GetValueRefOrNullRef(_pendingSnapshots, securityId);
+            skipPending.OrdersReceived += skippedAdded;
+            if (skipPending.OrdersReceived >= skipPending.OrdersExpected)
+                _pendingSnapshots.Remove(securityId);
             return;
         }
 

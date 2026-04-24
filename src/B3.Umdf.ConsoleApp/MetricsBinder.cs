@@ -384,6 +384,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotsRejectedTooOld),
             unit: "{snapshots}", description: "Snapshots rejected because LastRptSeq is older than the symbol's MinHealRptSeq (would leave a hole)");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_skipped_healthy_ahead",
+            () => PerGroupBook(bm => bm.SnapshotsSkippedHealthyAhead),
+            unit: "{snapshots}", description: "Snapshots ignored because symbol is already Healthy with a more recent book.LastRptSeq than the snapshot baseline (always-on snapshot stream noise)");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_buffered",
             () => PerGroupBook(bm => bm.BufferedMboMessages),
             unit: "{messages}", description: "MBO messages enqueued into per-symbol stale buffer awaiting heal");

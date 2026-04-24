@@ -104,6 +104,60 @@ public class PerSymbolEndToEndTests
     }
 
     [Fact]
+    public void Scenario_AlwaysOnSnapshot_HealthyAhead_IsSkipped_BookNotRegressed()
+    {
+        var (bm, reg, _) = CreatePerSymbol();
+        const ulong sec = 350;
+
+        // Bring symbol to Healthy at rptSeq=100, then advance live book to rptSeq=200
+        // by simulating apply via the registry (book.LastRptSeq is set by the wire path
+        // but the registry baseline is what guards the heal decision; we set both).
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        // Drive the registry forward and mirror book.LastRptSeq advancement
+        for (uint r = 101; r <= 200; r++)
+            reg.Observe(sec, SymbolGapKind.Mbo, r);
+        var book = bm.GetOrCreateBook(sec);
+        book.LastRptSeq = 200;
+
+        long skippedBefore = bm.SnapshotsSkippedHealthyAhead;
+        long healedBefore = bm.SnapshotsHealed;
+
+        // Always-on snapshot stream rotates back with LastRptSeq=150 (older than book).
+        // Must be skipped — book and registry baseline must not regress.
+        bm.BeginSnapshotHeader(sec, lastRptSeq: 150, hasRptSeq: true, ordersExpected: 0);
+
+        Assert.Equal(skippedBefore + 1, bm.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(healedBefore, bm.SnapshotsHealed); // no fake heal counted
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        Assert.Equal(200u, book.LastRptSeq); // book NOT regressed
+    }
+
+    [Fact]
+    public void Scenario_AlwaysOnSnapshot_StaleSymbol_NotSkipped()
+    {
+        var (bm, reg, buf) = CreatePerSymbol();
+        const ulong sec = 360;
+
+        // Healthy at 100, then gap → Stale.
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        reg.Observe(sec, SymbolGapKind.Mbo, 110);  // Healthy→Stale, MinHealRptSeq=109
+        Assert.Equal(SymbolState.Stale, reg.GetState(sec, SymbolGapKind.Mbo));
+
+        long skippedBefore = bm.SnapshotsSkippedHealthyAhead;
+
+        // Snapshot at 109 (= MinHealRptSeq): should NOT be skipped (symbol is Stale),
+        // and should be accepted by the heal path.
+        bm.BeginSnapshotHeader(sec, lastRptSeq: 109, hasRptSeq: true, ordersExpected: 0);
+
+        Assert.Equal(skippedBefore, bm.SnapshotsSkippedHealthyAhead); // not skipped
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
     public void Scenario_LaggingSnapshot_DoesNotRegressHealthyState()
     {
         var (bm, reg, _) = CreatePerSymbol();
