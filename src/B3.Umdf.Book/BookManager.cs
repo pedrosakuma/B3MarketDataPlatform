@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-using System.Collections.Frozen;
 using System.Runtime.InteropServices;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -19,8 +17,7 @@ namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 {
-    private readonly ConcurrentDictionary<ulong, OrderBook> _books = new(Environment.ProcessorCount, 4096);
-    private volatile FrozenDictionary<ulong, OrderBook>? _frozenBooks;
+    private readonly BookStore _bookStore = new();
     private readonly IBookEventHandler? _eventHandler;
     private readonly ILogger<BookManager> _logger;
     private long _parseErrors;
@@ -41,7 +38,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// Thread-safe dictionary of all order books.
     /// Safe to read (Count, iterate) from any thread while the feed thread writes.
     /// </summary>
-    public IReadOnlyDictionary<ulong, OrderBook> Books => _books;
+    public IReadOnlyDictionary<ulong, OrderBook> Books => _bookStore.Books;
 
     /// <summary>Number of SBE parse errors encountered (malformed packets).</summary>
     public long ParseErrors => Volatile.Read(ref _parseErrors);
@@ -312,20 +309,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     public void FreezeBooks()
     {
-        _frozenBooks = _books.ToFrozenDictionary();
+        _bookStore.Freeze();
     }
 
-    public OrderBook GetOrCreateBook(ulong securityId)
-    {
-        // Fast path: frozen dictionary lookup (optimized hash)
-        if (_frozenBooks is { } frozen)
-        {
-            if (frozen.TryGetValue(securityId, out var book))
-                return book;
-        }
-
-        return _books.GetOrAdd(securityId, static id => new OrderBook(id));
-    }
+    public OrderBook GetOrCreateBook(ulong securityId) => _bookStore.GetOrCreate(securityId);
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
@@ -1187,15 +1174,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// falls back to mutable dictionary during setup.
     /// </summary>
     private bool TryLookupBook(ulong securityId, out OrderBook book)
-    {
-        if (_frozenBooks is { } frozen && frozen.TryGetValue(securityId, out book!))
-            return true;
-        return _books.TryGetValue(securityId, out book!);
-    }
+        => _bookStore.TryGet(securityId, out book);
 
     private void ClearAllBooks()
     {
-        foreach (var (secId, book) in _books)
+        foreach (var (secId, book) in _bookStore.Books)
         {
             book.Clear();
             _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
