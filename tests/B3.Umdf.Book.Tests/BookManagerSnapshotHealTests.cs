@@ -166,4 +166,94 @@ public class BookManagerSnapshotHealTests
         Assert.Equal(7u, bm.Books[400].LastRptSeq);
         Assert.Equal(0, bm.SnapshotChunksOrphaned);
     }
+
+    [Fact]
+    public void Staging_LiveBookIntactWhileSnapshotInFlight()
+    {
+        // New invariant: snapshots are staged in PendingSnapshot.StagedBids/Asks
+        // until CompleteSnapshot is called. Live book contents must remain
+        // untouched until the heal swap fires.
+        var (bm, reg, _) = CreatePerSymbol();
+        for (uint r = 1; r <= 5; r++)
+            reg.Observe(securityId: 500, SymbolGapKind.Mbo, r);
+        var live = bm.GetOrCreateBook(500);
+        live.Bids.Add(new OrderBookEntry { OrderId = 1, Price = 100, Quantity = 10, SecurityId = 500, Side = BookSideType.Bid });
+        live.Asks.Add(new OrderBookEntry { OrderId = 2, Price = 110, Quantity = 5, SecurityId = 500, Side = BookSideType.Ask });
+
+        bm.BeginChunkedSnapshotForTest(500, lastRptSeq: 5, ordersExpected: 4);
+        bm.StageSnapshotEntryForTest(500, BookSideType.Bid, orderId: 11, price: 99, quantity: 1);
+        bm.StageSnapshotEntryForTest(500, BookSideType.Bid, orderId: 12, price: 98, quantity: 1);
+        bm.StageSnapshotEntryForTest(500, BookSideType.Ask, orderId: 13, price: 111, quantity: 1);
+
+        // 3 of 4 staged — book still untouched.
+        Assert.Equal(1, live.Bids.OrderCount);
+        Assert.Equal(1, live.Asks.OrderCount);
+        Assert.True(live.Bids.TryGetOrder(1, out _));
+
+        // 4th entry triggers CompleteSnapshot → swap.
+        bm.StageSnapshotEntryForTest(500, BookSideType.Ask, orderId: 14, price: 112, quantity: 1);
+
+        Assert.Equal(2, live.Bids.OrderCount);
+        Assert.Equal(2, live.Asks.OrderCount);
+        Assert.True(live.Bids.TryGetOrder(11, out _));
+        Assert.True(live.Bids.TryGetOrder(12, out _));
+        Assert.True(live.Asks.TryGetOrder(13, out _));
+        Assert.True(live.Asks.TryGetOrder(14, out _));
+        // Pre-snapshot live orders are gone (swap = clear+repopulate).
+        Assert.False(live.Bids.TryGetOrder(1, out _));
+        Assert.False(live.Asks.TryGetOrder(2, out _));
+    }
+
+    [Fact]
+    public void Staging_RejectedSnapshot_DoesNotMutateLiveBookOrEmitClear()
+    {
+        // Rejection invariant: a snapshot whose LastRptSeq is older than
+        // MinHealRptSeq must leave the live book bytes untouched and emit
+        // NO OnBookCleared event. Pre-staging design clobbered the book on
+        // Header_30 then re-cleared on rejection (WINV25 phantom-asks).
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var clears = 0;
+        var handler = new ClearCountingHandler(() => clears++);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf, eventHandler: handler);
+
+        // Get the symbol Healthy at high-water = 100, then induce a gap → Stale.
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 600, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(600, SymbolGapKind.Mbo, 100);
+        // Force gap: jump from 100 to 200 → Stale.
+        reg.Observe(securityId: 600, SymbolGapKind.Mbo, 200);
+        Assert.Equal(SymbolState.Stale, reg.GetState(600, SymbolGapKind.Mbo));
+
+        // Seed live book with content (simulating it was populated before going Stale).
+        var live = bm.GetOrCreateBook(600);
+        live.Bids.Add(new OrderBookEntry { OrderId = 1, Price = 100, Quantity = 10, SecurityId = 600, Side = BookSideType.Bid });
+        live.Asks.Add(new OrderBookEntry { OrderId = 2, Price = 110, Quantity = 5, SecurityId = 600, Side = BookSideType.Ask });
+        live.LastRptSeq = 100;
+
+        // Stale snapshot arrives at lastRptSeq=50 — too old (< MinHeal=199).
+        bm.BeginChunkedSnapshotForTest(600, lastRptSeq: 50, ordersExpected: 1);
+        bm.StageSnapshotEntryForTest(600, BookSideType.Bid, orderId: 999, price: 50, quantity: 1);
+
+        // Rejection: live book bytes unchanged, no clear emitted.
+        Assert.Equal(1, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(0, bm.SnapshotsHealed);
+        Assert.Equal(0, clears);
+        Assert.Equal(1, live.Bids.OrderCount);
+        Assert.Equal(1, live.Asks.OrderCount);
+        Assert.True(live.Bids.TryGetOrder(1, out _));
+        Assert.True(live.Asks.TryGetOrder(2, out _));
+        Assert.Equal(100u, live.LastRptSeq);
+    }
+
+    private sealed class ClearCountingHandler : IBookEventHandler
+    {
+        private readonly Action _onCleared;
+        public ClearCountingHandler(Action onCleared) => _onCleared = onCleared;
+        public void OnOrderAdded(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side) { }
+        public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long tradeTimeNs) { }
+        public void OnBookCleared(ulong securityId, BookClearSide side) => _onCleared();
+    }
 }

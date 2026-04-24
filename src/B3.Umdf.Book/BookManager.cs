@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
+using System.Runtime.InteropServices;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
@@ -688,13 +689,22 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// only when all expected entries have been received.
     /// </summary>
     private readonly Dictionary<ulong, PendingSnapshot> _pendingSnapshots = new();
-    private struct PendingSnapshot
+    private sealed class PendingSnapshot
     {
         public uint LastRptSeq;        // 0 if no usable rptSeq baseline
         public uint OrdersExpected;    // TotNumBids + TotNumOffers from Header_30
         public uint OrdersReceived;    // accumulated across Orders_71 chunks
         public bool HasRptSeq;         // whether LastRptSeq is usable
         public bool Skipped;           // Header_30 saw the symbol Healthy + ahead of snap; chunks must be dropped silently
+        // Staging buffers — Orders_71 chunks accumulate here while the snapshot is in
+        // flight. The live `book` is only mutated at CompleteSnapshot time, and only
+        // when the heal is Accepted. This guarantees:
+        //   1. A rejected/incomplete snapshot leaves the live book intact (no spurious
+        //      OnBookCleared, no half-populated state visible to subscribers).
+        //   2. OnBookCleared is only emitted by wire-driven sources (MassDelete/EmptyBook)
+        //      and by exactly one swap per accepted snapshot.
+        public readonly List<OrderBookEntry> StagedBids = new();
+        public readonly List<OrderBookEntry> StagedAsks = new();
     }
     private long _snapshotsHealed;
     private long _snapshotsMissingRptSeq;
@@ -801,10 +811,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             }
         }
 
-        // Begin a fresh snapshot for this instrument: clear the book and reset counters.
+        // Begin a fresh snapshot for this instrument: stage in a parallel buffer.
+        // The live `book` is NOT mutated here — it stays at its prior state until
+        // CompleteSnapshot decides Accept (swap) or Reject (discard staging).
         // If a previous snapshot for this same instrument was still in progress (incomplete
         // chunks), it gets superseded — chunks from the prior snapshot are abandoned.
-        book.Clear();
         _pendingSnapshots[secId] = new PendingSnapshot
         {
             LastRptSeq = lastRptSeq,
@@ -819,15 +830,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     }
 
     /// <summary>
-    /// Test helper: simulate a Header_30 + N Orders_71 chunked snapshot. The book is
-    /// cleared, expected orders is set, and heal fires only once
-    /// <paramref name="ordersExpected"/> entries have been recorded via
-    /// <see cref="RecordSnapshotChunkForTest"/>.
+    /// Test helper: simulate a Header_30 + N Orders_71 chunked snapshot. Staging
+    /// begins; heal fires only once <paramref name="ordersExpected"/> entries have
+    /// been recorded via <see cref="RecordSnapshotChunkForTest"/>.
     /// </summary>
     internal void BeginChunkedSnapshotForTest(ulong securityId, uint lastRptSeq, uint ordersExpected)
     {
         var book = GetOrCreateBook(securityId);
-        book.Clear();
         _pendingSnapshots[securityId] = new PendingSnapshot
         {
             LastRptSeq = lastRptSeq,
@@ -846,17 +855,46 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     internal void RecordSnapshotChunkForTest(ulong securityId, uint ordersInChunk)
     {
-        if (!_pendingSnapshots.ContainsKey(securityId))
+        if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
         {
             Interlocked.Increment(ref _snapshotChunksOrphaned);
             return;
         }
         var book = GetOrCreateBook(securityId);
-        ref var pending = ref System.Runtime.InteropServices.CollectionsMarshal
-            .GetValueRefOrNullRef(_pendingSnapshots, securityId);
         pending.OrdersReceived += ordersInChunk;
         if (pending.OrdersReceived >= pending.OrdersExpected)
             CompleteSnapshot(securityId, book);
+    }
+
+    /// <summary>
+    /// Test helper: stage a single bid/ask entry into the in-flight snapshot for
+    /// <paramref name="securityId"/>, and tick OrdersReceived. Lets tests assert
+    /// that the live book is NOT mutated until heal completes (Accept) or that
+    /// staged entries are discarded on Reject.
+    /// </summary>
+    internal void StageSnapshotEntryForTest(ulong securityId, BookSideType side, ulong orderId, long price, long quantity)
+    {
+        if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
+            throw new InvalidOperationException($"No pending snapshot for {securityId}");
+        var entry = new OrderBookEntry
+        {
+            OrderId = orderId,
+            Price = price,
+            Quantity = quantity,
+            EnteringFirm = 0,
+            SecurityId = securityId,
+            Side = side,
+        };
+        if (side == BookSideType.Bid)
+            pending.StagedBids.Add(entry);
+        else
+            pending.StagedAsks.Add(entry);
+        pending.OrdersReceived++;
+        if (pending.OrdersReceived >= pending.OrdersExpected)
+        {
+            var book = GetOrCreateBook(securityId);
+            CompleteSnapshot(securityId, book);
+        }
     }
 
     /// <summary>
@@ -918,7 +956,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // An Orders_71 chunk must be preceded by a Header_30 for the same instrument.
         // If not (lost packet, out-of-order), drop the chunk — applying it would corrupt
         // the book (we would not know whether to clear first or how to know completion).
-        if (!_pendingSnapshots.TryGetValue(securityId, out var pendingPeek))
+        if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
         {
             Interlocked.Increment(ref _snapshotChunksOrphaned);
             return;
@@ -927,30 +965,30 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // Skipped snapshot (Header_30 saw the symbol Healthy + ahead): silently drop chunks
         // and tick OrdersReceived so CompleteSnapshot fires once all expected entries arrive
         // (no orphan-counter increment, no book mutation).
-        if (pendingPeek.Skipped)
+        if (pending.Skipped)
         {
             uint skippedAdded = 0;
             reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData _) =>
             {
                 skippedAdded++;
             });
-            ref var skipPending = ref System.Runtime.InteropServices.CollectionsMarshal
-                .GetValueRefOrNullRef(_pendingSnapshots, securityId);
-            skipPending.OrdersReceived += skippedAdded;
-            if (skipPending.OrdersReceived >= skipPending.OrdersExpected)
+            pending.OrdersReceived += skippedAdded;
+            if (pending.OrdersReceived >= pending.OrdersExpected)
                 _pendingSnapshots.Remove(securityId);
             return;
         }
 
-        var book = GetOrCreateBook(securityId);
-
         uint added = 0;
+        // Stage entries in PendingSnapshot lists — the live book is NOT touched.
+        // CompleteSnapshot will swap atomically only if the heal is Accepted.
+        var stagedBids = pending.StagedBids;
+        var stagedAsks = pending.StagedAsks;
         reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
         {
             added++;
             long? rawPrice = entry.MDEntryPx.Mantissa;
             if (rawPrice is null)
-                return; // Market orders have no price — counted toward expected but not added to book
+                return; // Market orders have no price — counted toward expected but not staged
 
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
             long price = rawPrice.Value;
@@ -968,16 +1006,19 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 Side = side
             };
 
-            book.GetSide(side).Add(in bookEntry);
+            if (side == BookSideType.Bid)
+                stagedBids.Add(bookEntry);
+            else
+                stagedAsks.Add(bookEntry);
         });
 
-        ref var pending = ref System.Runtime.InteropServices.CollectionsMarshal
-            .GetValueRefOrNullRef(_pendingSnapshots, securityId);
-        // pending cannot be null-ref here: ContainsKey check above + single-threaded access.
         pending.OrdersReceived += added;
 
         if (pending.OrdersReceived >= pending.OrdersExpected)
+        {
+            var book = GetOrCreateBook(securityId);
             CompleteSnapshot(securityId, book);
+        }
     }
 
     private void CompleteSnapshot(ulong securityId, OrderBook book)
@@ -1012,6 +1053,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             var illiquidHeal = _stateRegistry!.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 0);
             if (illiquidHeal.Accepted)
             {
+                // Empty-book illiquid snapshot: the staging is empty (TotNumBids+TotNumOffers=0
+                // for illiquid case), so nothing to swap. Live book stays at its prior state
+                // (which for a fresh symbol is empty).
+                ApplySnapshotStaging(book, pending);
                 book.LastRptSeq = 0;
                 if (illiquidHeal.TransitionedToHealthy)
                 {
@@ -1022,6 +1067,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             }
             else
             {
+                // Reject: discard staging, leave live book intact, emit no events.
                 Interlocked.Increment(ref _snapshotsMissingRptSeq);
             }
             return;
@@ -1032,24 +1078,19 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         if (!heal.Accepted)
         {
-            // Snapshot too old to bridge our gap. The book bytes already applied
-            // (Header_30 cleared + Orders_71 chunks repopulated) reflect a valid
-            // state at snapshotRptSeq, but applying it as the symbol's working
-            // book would discard already-buffered live messages we cannot
-            // reconcile. Roll the book back: clear it so the symbol stays Stale
-            // and the next-fresh-enough snapshot will rebuild it cleanly. Keep
-            // the buffered live messages so they can drain on that next heal.
-            book.Clear();
-            book.LastRptSeq = 0;
-            // Notify subscribers — without this, frontend caches the pre-rejection
-            // snapshot bytes (received via live OnOrderAdded events) indefinitely
-            // while the backend book is empty, producing the WINV25 phantom-asks UX
-            // (frontend shows stale levels, backend has nothing to reconcile).
-            _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
+            // Snapshot too old to bridge our gap. With staging-based snapshots the
+            // live book is UNTOUCHED — we simply drop the staged entries and emit
+            // no clear/notify. Symbol stays Stale; next-fresh-enough snapshot will
+            // rebuild cleanly. Buffered live messages remain so they can drain on
+            // that next heal.
             Interlocked.Increment(ref _snapshotsRejectedTooOld);
             return;
         }
 
+        // Heal accepted — atomically swap staged content into the live book.
+        // This is the ONLY place where snapshot consumption mutates the live book,
+        // and it emits exactly one OnBookCleared(Both) covering both sides.
+        ApplySnapshotStaging(book, pending);
         book.LastRptSeq = snapshotRptSeq;
         if (heal.TransitionedToHealthy)
         {
@@ -1089,6 +1130,24 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             // baseline (already covered). Drop them.
             _staleBuffer!.Clear(securityId);
         }
+    }
+
+    /// <summary>
+    /// Atomic swap: clears the live book, repopulates from the staged snapshot
+    /// entries, and emits exactly one <see cref="IBookEventHandler.OnBookCleared"/>
+    /// event covering both sides. Called only on heal.Accepted so the live book is
+    /// never left in a half-populated state by a rejected/incomplete snapshot.
+    /// </summary>
+    private void ApplySnapshotStaging(OrderBook book, PendingSnapshot pending)
+    {
+        book.Clear();
+        var bidSide = book.Bids;
+        foreach (ref var entry in CollectionsMarshal.AsSpan(pending.StagedBids))
+            bidSide.Add(in entry);
+        var askSide = book.Asks;
+        foreach (ref var entry in CollectionsMarshal.AsSpan(pending.StagedAsks))
+            askSide.Add(in entry);
+        _eventHandler?.OnBookCleared(book.SecurityId, BookClearSide.Both);
     }
 
     /// <summary>
