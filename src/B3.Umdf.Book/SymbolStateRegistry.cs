@@ -98,6 +98,7 @@ public sealed class SymbolStateRegistry
 
     private readonly ConcurrentDictionary<ulong, SymbolEntry> _entries = new();
     private readonly ILogger _logger;
+    private Action<ulong, bool>? _onMboStaleStatusChanged;
     private long _staleSnapshotIgnored;
 
     // O(1) cheap aggregates for the fanout backpressure gate. Maintained
@@ -111,6 +112,20 @@ public sealed class SymbolStateRegistry
     public SymbolStateRegistry(ILogger logger)
     {
         _logger = logger;
+    }
+
+    /// <summary>
+    /// Optional callback fired on Mbo state transitions Healthy↔Stale. Called
+    /// inside the per-symbol lock — the callback must be cheap and non-blocking.
+    /// Used by BookManager to emit
+    /// <see cref="IBookEventHandler.OnSymbolStaleStatusChanged"/> regardless of
+    /// which kind triggered the transition (e.g. a stat exposing a global gap
+    /// must surface the Mbo stale status to the frontend just as an MBO gap would).
+    /// Set once during wiring; safe to leave null in tests that don't need the signal.
+    /// </summary>
+    public void SetMboStaleStatusCallback(Action<ulong, bool>? callback)
+    {
+        _onMboStaleStatusChanged = callback;
     }
 
     /// <summary>Per-symbol state holder. Mutations require holding <see cref="Sync"/>.</summary>
@@ -137,6 +152,17 @@ public sealed class SymbolStateRegistry
         // O(1) IsAnyStale lookups and aggregate counting without scanning
         // all 14 slots.
         internal int StaleKindMask;
+
+        // Maximum rptSeq observed across ANY kind for this symbol. Per B3 UMDF spec
+        // (and confirmed by PCAP analysis: 175k cross-template advances, 0 violations
+        // in 200k packets), rptSeq is ONE counter per SecurityID shared across all
+        // message families (MBO, Trade, all stats). This field is the wire-truth
+        // baseline used for global-gap detection — when received > Observed+1 we know
+        // SOMEONE was lost (we don't know which kind), so the conservative response is
+        // to stale the Mbo bucket because the loss MAY have been a book-mutating
+        // message. This eliminates false-positive Stales caused by per-kind tracking
+        // (where a stat advancing the global counter made the next MBO look like a gap).
+        internal uint ObservedRptSeq;
     }
 
     /// <summary>
@@ -187,8 +213,74 @@ public sealed class SymbolStateRegistry
         {
             var prev = entry.States[idx];
             uint lastSeen = entry.LastRptSeq[idx];
+            uint observed = entry.ObservedRptSeq;
             int prevMask = entry.StaleKindMask;
 
+            // ───────────────────────────────────────────────────────────────────
+            // GLOBAL GAP DETECTION (kind-agnostic).
+            // rptSeq is shared per-instrument across all templates (PCAP-confirmed:
+            // 175k cross-template advances, 0 violations in 200k packets). When any
+            // message arrives with received > observed+1, SOME message was lost
+            // between the last seen and now — but we don't know which kind. Since
+            // the loss MAY have been a book-mutating MBO, conservatively force the
+            // Mbo bucket Stale (if currently Healthy) regardless of which kind
+            // exposed the gap. Snapshot heal is the only path back.
+            //
+            // This eliminates the false-positive Stales caused by per-kind tracking:
+            // previously, an interleaved stat advancing the wire counter would make
+            // the very next MBO look like a per-kind gap (lastSeen[Mbo] vs received)
+            // and stale the symbol unnecessarily. With ObservedRptSeq, an MBO that
+            // jumps in its own stream but is contiguous globally (e.g. lastSeen[Mbo]=10,
+            // observed=11 via stat, received=12) is correctly recognized as healthy.
+            // ───────────────────────────────────────────────────────────────────
+            bool globalGap = observed > 0 && receivedRptSeq > observed + 1;
+            uint globalGapSize = globalGap ? receivedRptSeq - observed - 1 : 0;
+            bool mboForcedStale = false;
+
+            if (globalGap)
+            {
+                const int mboIdx = (int)SymbolGapKind.Mbo;
+                if (entry.States[mboIdx] == SymbolState.Healthy)
+                {
+                    // Tighten MinHeal[Mbo] to (received - 1) on the Healthy→Stale
+                    // transition. Subsequent gaps observed while already Stale do
+                    // NOT bump MinHeal — the StaleMboBuffer eviction callback
+                    // (BumpMinHeal) is responsible for advancing it when buffered
+                    // entries are dropped, which preserves the existing contract:
+                    // a snapshot at the original MinHeal can still bridge into the
+                    // (possibly hole-laden) buffer for replay.
+                    uint mboMin = receivedRptSeq - 1;
+                    if (mboMin > entry.MinHealRptSeq[mboIdx])
+                        entry.MinHealRptSeq[mboIdx] = mboMin;
+                    entry.States[mboIdx] = SymbolState.Stale;
+                    entry.StaleSinceTicks[mboIdx] = Environment.TickCount64;
+                    entry.StaleKindMask |= 1 << mboIdx;
+                    if (prevMask == 0) Interlocked.Increment(ref _staleSymbolCount);
+                    mboForcedStale = true;
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                        _logger.LogDebug(
+                            "SymbolState: GLOBAL gap → Mbo Healthy→Stale secId={SecurityId} viaKind={TriggerKind} observed={Observed} received={Received} gap={Gap}",
+                            securityId, kind, observed, receivedRptSeq, globalGapSize);
+                    if (kind == SymbolGapKind.Mbo)
+                    {
+                        prev = SymbolState.Stale;
+                    }
+                    prevMask = entry.StaleKindMask;
+                    // Surface to fanout/metrics regardless of triggering kind — stat-exposed
+                    // losses must flip the symbol's stale flag just as MBO-exposed ones do.
+                    _onMboStaleStatusChanged?.Invoke(securityId, true);
+                }
+            }
+
+            // Update observed monotonically.
+            if (receivedRptSeq > observed) entry.ObservedRptSeq = receivedRptSeq;
+
+            // ───────────────────────────────────────────────────────────────────
+            // PER-KIND DISPATCH.
+            // Per-kind gap detection is intentionally REMOVED — global-gap above is
+            // the single source of truth. The per-kind Healthy branch only handles
+            // duplicate suppression and forward apply.
+            // ───────────────────────────────────────────────────────────────────
             switch (prev)
             {
                 case SymbolState.Unknown:
@@ -212,50 +304,33 @@ public sealed class SymbolStateRegistry
                 case SymbolState.Healthy:
                     if (receivedRptSeq <= lastSeen)
                         return new ObserveResult(SymbolState.Healthy, ObserveAction.Drop, false, false, 0);
-                    uint expected = lastSeen + 1;
-                    if (receivedRptSeq == expected)
-                    {
-                        entry.LastRptSeq[idx] = receivedRptSeq;
-                        return ObserveResult.ApplyHealthy;
-                    }
-                    // Gap detected.
-                    uint gapSize = receivedRptSeq - expected;
-                    // Pin the minimum acceptable heal baseline to (receivedRptSeq - 1).
-                    // Rationale: when the snapshot eventually arrives at rptSeq=S, the
-                    // caller drains the per-symbol buffer for [S+1, highWater]. The
-                    // buffer's earliest entry is `receivedRptSeq` (this message — first
-                    // observed after the gap). For the drain to leave NO HOLE, we need
-                    // S+1 <= receivedRptSeq, i.e. S >= receivedRptSeq - 1. Snapshots
-                    // older than that would silently leave gap [S+1, receivedRptSeq-1]
-                    // unfilled, corrupting book state.
-                    entry.MinHealRptSeq[idx] = receivedRptSeq - 1;
+                    // Per-kind apply path. Global-gap above already handled the
+                    // "MBO must stale" decision; if we're still Healthy here it
+                    // means there is no global gap (or the kind has live-resync
+                    // tolerance per its policy). Apply the forward update.
+                    //
+                    // Note: with rptSeq shared per-instrument across templates, the
+                    // condition `received > lastSeen[kind] + 1` in stat streams is
+                    // routine (other kinds advanced the counter in between) and is
+                    // NOT a per-kind loss. We surface GapSize to the caller only when
+                    // a global gap was detected (= true wire loss).
                     entry.LastRptSeq[idx] = receivedRptSeq;
-                    if (livePolicy == LiveResyncPolicy.NextMessage)
-                    {
-                        // Self-contained kind: accept the gap; this message is the new baseline.
-                        if (_logger.IsEnabled(LogLevel.Debug))
-                            _logger.LogDebug(
-                                "SymbolState: secId={SecurityId} kind={Kind} live-resync (expected={Expected} received={Received} gap={Gap})",
-                                securityId, kind, expected, receivedRptSeq, gapSize);
-                        return new ObserveResult(SymbolState.Healthy, ObserveAction.Apply, false, false, gapSize);
-                    }
-                    // SnapshotOnly: transition to Stale.
-                    entry.States[idx] = SymbolState.Stale;
-                    entry.StaleSinceTicks[idx] = Environment.TickCount64;
-                    entry.StaleKindMask |= 1 << idx;
-                    if (prevMask == 0) Interlocked.Increment(ref _staleSymbolCount);
-                    if (_logger.IsEnabled(LogLevel.Debug))
-                        _logger.LogDebug(
-                            "SymbolState: secId={SecurityId} kind={Kind} Healthy→Stale (expected={Expected} received={Received} gap={Gap})",
-                            securityId, kind, expected, receivedRptSeq, gapSize);
-                    return new ObserveResult(SymbolState.Stale, ObserveAction.Buffer, true, false, gapSize);
+                    return new ObserveResult(SymbolState.Healthy, ObserveAction.Apply,
+                        TransitionedToStale: false, TransitionedToHealthy: false,
+                        GapSize: globalGap ? globalGapSize : 0);
 
                 case SymbolState.Stale:
                     // Stale only heals via HealFromSnapshot (SnapshotOnly kinds reach Stale).
                     // Track the high-water mark so the post-heal drain knows the upper bound.
                     if (receivedRptSeq > lastSeen)
                         entry.LastRptSeq[idx] = receivedRptSeq;
-                    return new ObserveResult(SymbolState.Stale, ObserveAction.Buffer, false, false, 0);
+                    // Surface the global-gap forced transition to the caller (for metrics)
+                    // when this very call promoted Mbo to Stale — including when the
+                    // triggering kind was Mbo itself.
+                    return new ObserveResult(SymbolState.Stale, ObserveAction.Buffer,
+                        TransitionedToStale: mboForcedStale && kind == SymbolGapKind.Mbo,
+                        TransitionedToHealthy: false,
+                        GapSize: mboForcedStale && kind == SymbolGapKind.Mbo ? globalGapSize : 0);
 
                 default:
                     return new ObserveResult(prev, ObserveAction.Drop, false, false, 0);
@@ -357,6 +432,12 @@ public sealed class SymbolStateRegistry
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0; // baseline restored — no constraint until next stale event
 
+            // Bump observed to at least snapshotRptSeq. Snapshots are an authoritative
+            // "instrument is at rptSeq=N" signal from the wire (lower bound — live may
+            // be ahead). Without this bump, a heal followed by a live message at
+            // lastSeen+ε would bypass global-gap detection because observed lagged.
+            if (snapshotRptSeq > entry.ObservedRptSeq) entry.ObservedRptSeq = snapshotRptSeq;
+
             bool transitioned = prev != SymbolState.Healthy;
             if (transitioned)
             {
@@ -364,6 +445,11 @@ public sealed class SymbolStateRegistry
                 entry.StaleSinceTicks[idx] = 0;
                 if (prevMask != 0 && entry.StaleKindMask == 0)
                     Interlocked.Decrement(ref _staleSymbolCount);
+                // Surface Stale→Healthy for the Mbo bucket only when the symbol becomes
+                // fully Healthy (StaleKindMask == 0) AND prev was actually Stale (not
+                // Unknown). Unknown→Healthy is bootstrap, not a stale-recovery event.
+                if (kind == SymbolGapKind.Mbo && prev == SymbolState.Stale && entry.StaleKindMask == 0)
+                    _onMboStaleStatusChanged?.Invoke(securityId, false);
             }
 
             // Drain window: anything strictly above snapshotRptSeq up to the
@@ -400,6 +486,10 @@ public sealed class SymbolStateRegistry
                     entry.MinHealRptSeq[i] = 0;
                 }
                 entry.StaleKindMask = 0;
+                // Wire counter restarts on a catastrophic reset (SequenceReset_1 /
+                // ChannelReset_11) — clear the observed-rptSeq watermark so the next
+                // message at lower rptSeq doesn't trigger a spurious global gap.
+                entry.ObservedRptSeq = 0;
                 if (prevMask != 0)
                     Interlocked.Decrement(ref _staleSymbolCount);
             }
@@ -471,6 +561,10 @@ public sealed class SymbolStateRegistry
             entry.StaleKindMask &= ~(1 << idx);
             if (prevMask != 0 && entry.StaleKindMask == 0)
                 Interlocked.Decrement(ref _staleSymbolCount);
+            // EmptyBook resets the wire-level rptSeq counter for this instrument
+            // (per spec). Clear ObservedRptSeq so the next incremental at rpt=1
+            // doesn't trigger a spurious global gap against the pre-reset watermark.
+            entry.ObservedRptSeq = 0;
         }
     }
 

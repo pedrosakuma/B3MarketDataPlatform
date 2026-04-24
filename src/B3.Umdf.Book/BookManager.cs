@@ -76,6 +76,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             "SymbolStateRegistry is required.");
         _staleBuffer = staleBuffer ?? throw new ArgumentNullException(nameof(staleBuffer),
             "StaleMboBuffer is required.");
+        // Wire the registry's Mbo state-change callback so OnSymbolStaleStatusChanged
+        // surfaces regardless of which kind exposed the global gap (MBO or stat).
+        // Last-writer-wins on the registry: if multiple BookManagers shared a registry
+        // (they don't in the current architecture — one registry per group) only the
+        // last would be notified.
+        if (_eventHandler is { } eh)
+            _stateRegistry.SetMboStaleStatusCallback((securityId, isStale) =>
+                eh.OnSymbolStaleStatusChanged(securityId, isStale));
     }
 
     private readonly SymbolStateRegistry _stateRegistry;
@@ -148,7 +156,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 _logger.LogDebug(
                     "PerSymbol Healthy→Stale secId={SecurityId} templateId={TemplateId} rptSeq={RptSeq} gap={Gap}",
                     securityId, templateId, rptSeq, gap);
-            _eventHandler?.OnSymbolStaleStatusChanged(securityId, isStale: true);
+            // Note: OnSymbolStaleStatusChanged is fired from the SymbolStateRegistry
+            // callback (wired in BookManager's constructor), so it surfaces regardless
+            // of which kind triggered the global gap (MBO or stat).
         }
         switch (result.Action)
         {
@@ -1061,8 +1071,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 if (illiquidHeal.TransitionedToHealthy)
                 {
                     Interlocked.Increment(ref _snapshotsHealed);
-                    if (_eventHandler is not null && !_stateRegistry.IsAnyStale(securityId))
-                        _eventHandler.OnSymbolStaleStatusChanged(securityId, isStale: false);
+                    // Stale→Healthy event surfaces via the SymbolStateRegistry callback
+                    // wired in the BookManager constructor.
                 }
             }
             else
@@ -1095,11 +1105,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (heal.TransitionedToHealthy)
         {
             Interlocked.Increment(ref _snapshotsHealed);
-            // Emit a SymbolStaleStatus flip when the symbol is fully recovered
-            // (no other kinds remain Stale). When other kinds are still Stale
-            // the symbol-level status is unchanged so no event is emitted.
-            if (_eventHandler is not null && !_stateRegistry.IsAnyStale(securityId))
-                _eventHandler.OnSymbolStaleStatusChanged(securityId, isStale: false);
+            // Stale→Healthy event surfaces via the SymbolStateRegistry callback
+            // wired in the BookManager constructor (only fires when StaleKindMask
+            // becomes 0, matching the prior IsAnyStale gate semantics).
         }
 
         if (heal.DrainTo >= heal.DrainFrom)

@@ -428,4 +428,103 @@ public class SymbolStateRegistryTests
         Assert.Equal(0, r.StaleSymbolCount);
         Assert.Equal(1, r.KnownSymbolCount);
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Unified ObservedRptSeq global-gap dispatch (rptSeq is one counter per
+    // SecurityID, shared across all message templates per B3 spec).
+    // ───────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Mbo_StaysHealthy_WhenStatsInterleaveWithoutLoss()
+    {
+        // Stats advancing the wire counter between MBO messages MUST NOT cause
+        // the Mbo bucket to transition Stale (false-positive). PCAP-confirmed:
+        // rptSeq is shared across templates per SecurityID.
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 10);
+        var m1 = r.Observe(1, SymbolGapKind.Mbo, 11);
+        var s1 = r.Observe(1, SymbolGapKind.SecurityStatus, 12);
+        var s2 = r.Observe(1, SymbolGapKind.PriceBand, 13);
+        var m2 = r.Observe(1, SymbolGapKind.Mbo, 14);
+
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, m1.Action);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, s1.Action);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, s2.Action);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, m2.Action);
+        Assert.Equal(SymbolState.Healthy, r.GetState(1, SymbolGapKind.Mbo));
+        Assert.False(r.IsAnyStale(1));
+    }
+
+    [Fact]
+    public void Mbo_StaledByStat_WhenStatRevealsLoss()
+    {
+        // A stat message arriving with a rptSeq jump exposes a global gap that
+        // could be MBO loss → Mbo bucket must be forced Stale and MinHeal pinned.
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 10);
+        r.Observe(1, SymbolGapKind.Mbo, 11);                        // observed=11
+        var sGap = r.Observe(1, SymbolGapKind.SecurityStatus, 15);  // global gap → Mbo Stale
+
+        // The stat itself applies (live-resync is allowed for stats).
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, sGap.Action);
+        // Mbo is Stale even though no MBO message triggered it.
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+        Assert.True(r.IsAnyStale(1));
+
+        // Lagging snapshot below MinHeal (received-1 = 14) must be rejected.
+        var laggy = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 13);
+        Assert.False(laggy.Accepted);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+
+        // Snapshot at exactly MinHeal=14 bridges and heals.
+        var ok = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 14);
+        Assert.True(ok.Accepted);
+        Assert.True(ok.TransitionedToHealthy);
+    }
+
+    [Fact]
+    public void StatTriggeredMboStale_FiresCallback()
+    {
+        // The OnSymbolStaleStatusChanged signal must surface even when the gap
+        // was exposed by a stat (not an MBO). Without the registry callback,
+        // BookManager would never emit the stale event for stat-revealed gaps.
+        var events = new List<(ulong sid, bool stale)>();
+        var r = new SymbolStateRegistry(NullLogger.Instance);
+        r.SetMboStaleStatusCallback((sid, isStale) => events.Add((sid, isStale)));
+
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 10);
+        r.Observe(1, SymbolGapKind.Mbo, 11);
+        // No event yet — Mbo is Healthy and the heal didn't transition state.
+        Assert.Empty(events);
+
+        // Stat reveals MBO loss → callback fires (sid=1, isStale=true).
+        r.Observe(1, SymbolGapKind.SecurityStatus, 25);
+        Assert.Single(events);
+        Assert.Equal((1ul, true), events[0]);
+
+        // HealFromSnapshot with sufficient coverage → callback fires
+        // (sid=1, isStale=false) when StaleKindMask becomes 0.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 30);
+        Assert.True(heal.TransitionedToHealthy);
+        Assert.Equal(2, events.Count);
+        Assert.Equal((1ul, false), events[1]);
+    }
+
+    [Fact]
+    public void Mbo_GlobalGapFromMbo_StalesAndPinsMinHeal()
+    {
+        // Pure MBO loss case: also goes through the global-gap path.
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 101);
+        var gap = r.Observe(1, SymbolGapKind.Mbo, 110); // gap of 8
+
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Buffer, gap.Action);
+        Assert.True(gap.TransitionedToStale);
+        Assert.Equal(SymbolState.Stale, r.GetState(1, SymbolGapKind.Mbo));
+
+        // Snapshot at 108 (< MinHeal=109) rejected, at 109 accepted.
+        Assert.False(r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 108).Accepted);
+        Assert.True(r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 109).Accepted);
+    }
 }
