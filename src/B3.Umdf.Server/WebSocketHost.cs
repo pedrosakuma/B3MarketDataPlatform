@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using B3.Umdf.Book;
 using B3.Umdf.Feed;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -21,7 +22,7 @@ public sealed class WebSocketHost : IAsyncDisposable
     private WebApplication? _app;
     private volatile bool _isShuttingDown;
     private CancellationTokenRegistration _shutdownRegistration;
-    private int _maxConnections;
+    private readonly int _maxConnections;
     private readonly int _clientChannelCapacity;
     private readonly double _slowClientThreshold;
     private readonly int _slowClientMaxTicks;
@@ -79,8 +80,22 @@ public sealed class WebSocketHost : IAsyncDisposable
             KeepAliveInterval = TimeSpan.FromSeconds(30),
         });
 
-        // CORS for cross-origin frontend access
-        _app.Use(async (context, next) =>
+        UseCorsHeaders(_app);
+        MapHealthEndpoints(_app);
+        MapSymbolEndpoints(_app);
+        MapInstrumentEndpoint(_app);
+        MapWebSocketEndpoint(_app, ct);
+
+        await _app.StartAsync(ct);
+        _logger.LogInformation("WebSocket server listening on port {Port}", port);
+    }
+
+    private static void UseCorsHeaders(WebApplication app)
+    {
+        // CORS for cross-origin frontend access. Permissive by design — this
+        // service is intentionally read-only / public-by-default for the
+        // dashboard. Tighten via reverse proxy if exposed externally.
+        app.Use(async (context, next) =>
         {
             context.Response.Headers["Access-Control-Allow-Origin"] = "*";
             context.Response.Headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
@@ -92,9 +107,11 @@ public sealed class WebSocketHost : IAsyncDisposable
             }
             await next();
         });
+    }
 
-        // Health endpoints
-        _app.MapGet("/health", () =>
+    private void MapHealthEndpoints(WebApplication app)
+    {
+        app.MapGet("/health", () =>
         {
             var result = new HealthResponse
             {
@@ -115,12 +132,15 @@ public sealed class WebSocketHost : IAsyncDisposable
             return Results.Json(result, AppJsonContext.Default.HealthResponse);
         });
 
-        _app.MapGet("/ready", () =>
+        app.MapGet("/ready", () =>
             _subscriptionManager.IsReady ? Results.Ok("ready") : Results.StatusCode(503));
 
-        _app.MapGet("/live", () => Results.Ok("alive"));
+        app.MapGet("/live", () => Results.Ok("alive"));
+    }
 
-        _app.MapGet("/symbols", (string? q, int? limit) =>
+    private void MapSymbolEndpoints(WebApplication app)
+    {
+        app.MapGet("/symbols", (string? q, int? limit) =>
         {
             var registry = _subscriptionManager.SymbolRegistry;
             if (registry is null)
@@ -133,8 +153,11 @@ public sealed class WebSocketHost : IAsyncDisposable
             return Results.Json(new SymbolsResponse { Count = registry.Count, Matched = list.Length, Symbols = list },
                 AppJsonContext.Default.SymbolsResponse);
         });
+    }
 
-        _app.MapGet("/instrument/{symbol}", (string symbol) =>
+    private void MapInstrumentEndpoint(WebApplication app)
+    {
+        app.MapGet("/instrument/{symbol}", (string symbol) =>
         {
             var registry = _subscriptionManager.SymbolRegistry;
             if (registry is null)
@@ -147,77 +170,89 @@ public sealed class WebSocketHost : IAsyncDisposable
             if (info is null)
                 return Results.NotFound();
 
-            var resp = new InstrumentInfoResponse
-            {
-                SecurityId = securityId,
-                Symbol = info.Symbol,
-                Asset = info.Asset,
-                IsinNumber = info.IsinNumber,
-                Currency = info.Currency,
-                CfiCode = info.CfiCode,
-                SecurityGroup = info.SecurityGroup,
-                SecurityDescription = info.SecurityDescription,
-                SecurityType = info.SecurityType,
-                SecuritySubType = info.SecuritySubType,
-                Product = info.Product,
-                MinPriceIncrement = info.MinPriceIncrement,
-                PriceDivisor = info.PriceDivisor,
-                ContractMultiplier = info.ContractMultiplier,
-                StrikePrice = info.StrikePrice,
-                MaturityDate = info.MaturityDate,
-                PutOrCall = info.PutOrCall,
-                ExerciseStyle = info.ExerciseStyle,
-                MarketSegmentID = info.MarketSegmentID,
-                TickSizeDenominator = info.TickSizeDenominator,
-                TradingStatus = info.TradingStatus,
-                TradingEvent = info.TradingEvent,
-                OpeningPrice = info.OpeningPrice,
-                ClosingPrice = info.ClosingPrice,
-                HighPrice = info.HighPrice,
-                LowPrice = info.LowPrice,
-                LastTradePrice = info.LastTradePrice,
-                LastTradeSize = info.LastTradeSize,
-                SettlementPrice = info.SettlementPrice,
-                TheoreticalOpeningPrice = info.TheoreticalOpeningPrice,
-                TheoreticalOpeningSize = info.TheoreticalOpeningSize,
-                AuctionImbalanceSize = info.AuctionImbalanceSize,
-                PriceBandLow = info.PriceBandLow,
-                PriceBandHigh = info.PriceBandHigh,
-                PriceLimitType = info.PriceLimitType,
-                TradingReferencePrice = info.TradingReferencePrice,
-                AvgDailyTradedQty = info.AvgDailyTradedQty,
-                MaxTradeVol = info.MaxTradeVol,
-                TradeVolume = info.TradeVolume,
-                VwapPrice = info.VwapPrice,
-                NetChangeFromPrevDay = info.NetChangeFromPrevDay,
-                NumberOfTrades = info.NumberOfTrades,
-                OpenInterest = info.OpenInterest,
-                LastUpdateTimestamp = info.LastUpdateTimestamp,
-                Underlyings = info.Underlyings?.Select(u => new UnderlyingResponse
-                {
-                    SecurityId = u.SecurityId,
-                    Symbol = u.Symbol,
-                }).ToList(),
-                Legs = info.Legs?.Select(l => new LegResponse
-                {
-                    SecurityId = l.SecurityId,
-                    Symbol = l.Symbol,
-                    RatioQty = l.RatioQty,
-                    SecurityType = l.SecurityType,
-                    Side = l.Side,
-                }).ToList(),
-                InstrAttribs = info.InstrAttribs?.Select(a => new InstrAttribResponse
-                {
-                    Type = a.Type,
-                    Value = a.Value,
-                }).ToList(),
-            };
+            var resp = BuildInstrumentInfoResponse(securityId, info);
             return Results.Json(resp, AppJsonContext.Default.InstrumentInfoResponse);
         });
+    }
 
-        // WebSocket endpoint
+    /// <summary>
+    /// Pure mapping helper: copy every field from the internal <see cref="InstrumentInfo"/>
+    /// snapshot into the public DTO. Mechanical and large by necessity (~50 fields covering
+    /// reference data + statistics + collections); kept separate so the endpoint registration
+    /// stays scannable.
+    /// </summary>
+    private static InstrumentInfoResponse BuildInstrumentInfoResponse(ulong securityId, InstrumentInfo info)
+    {
+        return new InstrumentInfoResponse
+        {
+            SecurityId = securityId,
+            Symbol = info.Symbol,
+            Asset = info.Asset,
+            IsinNumber = info.IsinNumber,
+            Currency = info.Currency,
+            CfiCode = info.CfiCode,
+            SecurityGroup = info.SecurityGroup,
+            SecurityDescription = info.SecurityDescription,
+            SecurityType = info.SecurityType,
+            SecuritySubType = info.SecuritySubType,
+            Product = info.Product,
+            MinPriceIncrement = info.MinPriceIncrement,
+            PriceDivisor = info.PriceDivisor,
+            ContractMultiplier = info.ContractMultiplier,
+            StrikePrice = info.StrikePrice,
+            MaturityDate = info.MaturityDate,
+            PutOrCall = info.PutOrCall,
+            ExerciseStyle = info.ExerciseStyle,
+            MarketSegmentID = info.MarketSegmentID,
+            TickSizeDenominator = info.TickSizeDenominator,
+            TradingStatus = info.TradingStatus,
+            TradingEvent = info.TradingEvent,
+            OpeningPrice = info.OpeningPrice,
+            ClosingPrice = info.ClosingPrice,
+            HighPrice = info.HighPrice,
+            LowPrice = info.LowPrice,
+            LastTradePrice = info.LastTradePrice,
+            LastTradeSize = info.LastTradeSize,
+            SettlementPrice = info.SettlementPrice,
+            TheoreticalOpeningPrice = info.TheoreticalOpeningPrice,
+            TheoreticalOpeningSize = info.TheoreticalOpeningSize,
+            AuctionImbalanceSize = info.AuctionImbalanceSize,
+            PriceBandLow = info.PriceBandLow,
+            PriceBandHigh = info.PriceBandHigh,
+            PriceLimitType = info.PriceLimitType,
+            TradingReferencePrice = info.TradingReferencePrice,
+            AvgDailyTradedQty = info.AvgDailyTradedQty,
+            MaxTradeVol = info.MaxTradeVol,
+            TradeVolume = info.TradeVolume,
+            VwapPrice = info.VwapPrice,
+            NetChangeFromPrevDay = info.NetChangeFromPrevDay,
+            NumberOfTrades = info.NumberOfTrades,
+            OpenInterest = info.OpenInterest,
+            LastUpdateTimestamp = info.LastUpdateTimestamp,
+            Underlyings = info.Underlyings?.Select(u => new UnderlyingResponse
+            {
+                SecurityId = u.SecurityId,
+                Symbol = u.Symbol,
+            }).ToList(),
+            Legs = info.Legs?.Select(l => new LegResponse
+            {
+                SecurityId = l.SecurityId,
+                Symbol = l.Symbol,
+                RatioQty = l.RatioQty,
+                SecurityType = l.SecurityType,
+                Side = l.Side,
+            }).ToList(),
+            InstrAttribs = info.InstrAttribs?.Select(a => new InstrAttribResponse
+            {
+                Type = a.Type,
+                Value = a.Value,
+            }).ToList(),
+        };
+    }
 
-        _app.Map("/ws", async context =>
+    private void MapWebSocketEndpoint(WebApplication app, CancellationToken ct)
+    {
+        app.Map("/ws", async context =>
         {
             // Once shutdown has been signaled, refuse new connections immediately so the
             // drain phase does not have to wait on freshly-accepted clients (and so we
@@ -236,7 +271,11 @@ public sealed class WebSocketHost : IAsyncDisposable
                 return;
             }
 
-            // Connection limit
+            // Soft connection limit: this check is intentionally racy (TOCTOU vs
+            // RegisterClient below) — under heavy concurrent connect bursts we may
+            // briefly exceed _maxConnections by a handful, which is acceptable.
+            // Tightening would require a CAS-counter in SubscriptionManager and is
+            // not worth the contention for a soft cap.
             if (_maxConnections > 0 && _subscriptionManager.ClientCount >= _maxConnections)
             {
                 _logger.LogWarning("Connection rejected: limit {Max} reached", _maxConnections);
@@ -297,9 +336,6 @@ public sealed class WebSocketHost : IAsyncDisposable
                 session.Dispose();
             }
         });
-
-        await _app.StartAsync(ct);
-        _logger.LogInformation("WebSocket server listening on port {Port}", port);
     }
 
     public async Task StopAsync()
