@@ -6,13 +6,13 @@ using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V6.Order_MBO_50Data;
-using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V6.DeleteOrder_MBO_51Data;
-using MassDeleteOrders_MBO_52Data = B3.Umdf.Mbo.Sbe.V16.V6.MassDeleteOrders_MBO_52Data;
+using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V15.Order_MBO_50Data;
+using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V15.DeleteOrder_MBO_51Data;
+using MassDeleteOrders_MBO_52Data = B3.Umdf.Mbo.Sbe.V16.V15.MassDeleteOrders_MBO_52Data;
 using Trade_53Data = B3.Umdf.Mbo.Sbe.V16.V15.Trade_53Data;
 using ForwardTrade_54Data = B3.Umdf.Mbo.Sbe.V16.V15.ForwardTrade_54Data;
-using ExecutionSummary_55Data = B3.Umdf.Mbo.Sbe.V16.V6.ExecutionSummary_55Data;
-using TradeBust_57Data = B3.Umdf.Mbo.Sbe.V16.V6.TradeBust_57Data;
+using ExecutionSummary_55Data = B3.Umdf.Mbo.Sbe.V16.V15.ExecutionSummary_55Data;
+using TradeBust_57Data = B3.Umdf.Mbo.Sbe.V16.V15.TradeBust_57Data;
 
 namespace B3.Umdf.Book;
 
@@ -81,6 +81,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private readonly StaleMboBuffer _staleBuffer;
     private long _bufferedMboMessages;
     private long _replayedMboMessages;
+    private long _mboStaleTransitions;
+    private long _mboStaleGapSizeSum;
+    private long _mboStaleGapSizeMax;
 
     /// <summary>Symbol state registry (PerSymbol recovery is the only supported mode).</summary>
     public SymbolStateRegistry StateRegistry => _stateRegistry;
@@ -90,6 +93,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     public long BufferedMboMessages => Volatile.Read(ref _bufferedMboMessages);
     public long ReplayedMboMessages => Volatile.Read(ref _replayedMboMessages);
+    /// <summary>Number of Healthy→Stale Mbo transitions observed by RouteMbo.</summary>
+    public long MboStaleTransitions => Volatile.Read(ref _mboStaleTransitions);
+    /// <summary>Cumulative gap size (rptSeq distance) of Healthy→Stale transitions.</summary>
+    public long MboStaleGapSizeSum => Volatile.Read(ref _mboStaleGapSizeSum);
+    /// <summary>Largest gap size seen on any Healthy→Stale transition.</summary>
+    public long MboStaleGapSizeMax => Volatile.Read(ref _mboStaleGapSizeMax);
 
     /// <summary>
     /// Per-symbol rptSeq gap shadow tracker (telemetry only). The registry
@@ -123,7 +132,23 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
         var result = _stateRegistry.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
         if (result.TransitionedToStale)
+        {
+            Interlocked.Increment(ref _mboStaleTransitions);
+            long gap = (long)result.GapSize;
+            Interlocked.Add(ref _mboStaleGapSizeSum, gap);
+            // Lock-free max update.
+            long currentMax;
+            do
+            {
+                currentMax = Volatile.Read(ref _mboStaleGapSizeMax);
+                if (gap <= currentMax) break;
+            } while (Interlocked.CompareExchange(ref _mboStaleGapSizeMax, gap, currentMax) != currentMax);
+            if (_logger.IsEnabled(LogLevel.Information))
+                _logger.LogInformation(
+                    "PerSymbol Healthy→Stale secId={SecurityId} templateId={TemplateId} rptSeq={RptSeq} gap={Gap}",
+                    securityId, templateId, rptSeq, gap);
             _eventHandler?.OnSymbolStaleStatusChanged(securityId, isStale: true);
+        }
         switch (result.Action)
         {
             case SymbolStateRegistry.ObserveAction.Apply:

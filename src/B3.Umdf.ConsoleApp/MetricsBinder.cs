@@ -396,6 +396,18 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.ReplayedMboMessages),
             unit: "{messages}", description: "MBO messages replayed from stale buffer after snapshot heal");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_stale_transitions",
+            () => PerGroupBook(bm => bm.MboStaleTransitions),
+            unit: "{transitions}", description: "Healthy→Stale transitions observed by RouteMbo");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_stale_gap_size_sum",
+            () => PerGroupBook(bm => bm.MboStaleGapSizeSum),
+            unit: "{rptseq}", description: "Cumulative gap size of Healthy→Stale transitions (rptSeq distance)");
+
+        Meter.CreateObservableGauge("b3.umdf.persymbol.mbo_stale_gap_size_max",
+            () => PerGroupBook(bm => bm.MboStaleGapSizeMax),
+            unit: "{rptseq}", description: "Largest gap size on any Healthy→Stale transition");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.epoch_resets",
             () => PerGroupBook(bm => bm.EpochResets),
             unit: "{events}", description: "ChannelReset/SequenceReset events that bumped the per-symbol epoch");
