@@ -270,7 +270,7 @@ Layered defense (full design: [RESILIENCE.md](RESILIENCE.md#slow-consumer-protec
 1. **Bounded per-client outbound ring** (`UMDF_CLIENT_CHANNEL_CAPACITY`, default 4096) — feed thread never blocks on a slow client.
 2. **Hard pending-bytes cap** (`UMDF_CLIENT_MAX_PENDING_BYTES`, default 4 MiB) — exceeded → WebSocket close `PolicyViolation "slow consumer"`.
 3. **Outlier sweep** (1 Hz) — disconnects clients above `max(median × multiplier, minBytes)`, gated on aggregate pressure crossing `UMDF_CLIENT_OUTLIER_PRESSURE_PCT`.
-4. **Fanout suppression during Recovery / CatchUp** — on transition back to `RealTime`, all Book subscribers in the group receive a fresh snapshot.
+4. **Fanout suppression at cold-start + mass-stale gate** — fanout is suppressed during `WaitInstrumentDefinition` and re-engages when ≥ 50 % of symbols are Stale (e.g. `ChannelReset_11`, mass loss). On release, all Book subscribers in the group receive a fresh snapshot. Per-instrument heal absorbs ordinary gaps without touching fanout.
 5. **Snapshot rate-limit** (`UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH`, default 32/packet) — bounds dispatch-thread allocation under connect storms.
 
 Disconnected clients should reconnect and re-subscribe; they will

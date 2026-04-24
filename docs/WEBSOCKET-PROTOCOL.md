@@ -215,11 +215,15 @@ sequenceDiagram
     Note left of C: client re-subscribes its full set
 ```
 
-While any group is in `Recovery` / `CatchUp`, **fanout to subscribers of
-that group is suppressed**. On the rising edge to `RealTime`, every Book
-subscriber in the group receives a fresh `BookSnapshot`, breaking the
-cascading-recovery loop. See
-[RESILIENCE.md](RESILIENCE.md#fanout-suppression-during-recovery)
+While a group is bootstrapping (`FeedState = WaitInstrumentDefinition`)
+or while a market-wide event has flipped a large fraction of symbols
+to `Stale` (mass-stale fanout gate, default ≥ 50 % of known symbols),
+**fanout to subscribers of that group is suppressed**. On the rising
+edge back to a publishing state, every Book subscriber in the group
+receives a fresh `BookSnapshot`. There is no channel-level Recovery
+state on individual gaps — those are healed per-symbol without
+suppressing fanout. See
+[RESILIENCE.md §4](RESILIENCE.md#4-cascading-recovery--eliminated-by-per-instrument-heal)
 for the full design.
 
 ## Slow-consumer disconnect

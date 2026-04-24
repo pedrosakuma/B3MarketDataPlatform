@@ -26,10 +26,18 @@ straight from the B3 SBE XML schema.
 - **Per-instrument heal (differentiator)** — exploits B3's unified
   per-`SecurityID` `rptSeq` (validated against PCAP: 175 116 cross-template
   advances, zero violations) so a single-symbol gap stales **only that
-  symbol**, not the whole channel. The channel keeps streaming for
-  every other instrument while one heals via snapshot. Eliminates the
-  30 – 100 s blanket Recovery cycles that group-wide recovery imposes
-  on liquid feeds. See [RESILIENCE.md §2](./docs/RESILIENCE.md#2-per-instrument-recovery-unified-rptseq).
+  symbol**, not the whole channel. Per-instrument heal is universal
+  (cold-start, normal gap, wide burst — all the same path); the
+  channel-level state machine reduces to `WaitInstrumentDefinition →
+  Streaming` with no Recovery state to fall back to. Eliminates the
+  30 – 100 s blanket `Lost → Recovery → CatchUp` cycles imposed by
+  conventional consumers on liquid feeds. See
+  [RESILIENCE.md §2](./docs/RESILIENCE.md#2-per-instrument-recovery-unified-rptseq).
+- **Cascading-recovery loop structurally impossible** — the historical
+  slow-client → drop → Recovery → more drops feedback loop is gone:
+  there is no Recovery state to enter (see RESILIENCE.md §4). Cold-start
+  fanout suppression and a mass-stale fanout gate remain as residual
+  defenses for analogous failure modes.
 - **WebSocket subscription server** — compact binary protocol with `Book`
   and `Info` channels, unary `Get`, candle history (10 h of 1 s candles),
   and 2 s rankings broadcast.

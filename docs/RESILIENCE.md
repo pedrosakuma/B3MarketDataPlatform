@@ -13,10 +13,10 @@ invariant.
 
 | Failure | Where | Defense |
 | ------- | ----- | ------- |
-| Single UDP packet loss | Network → recv socket | Sequence-gap detection + recovery via incremental UDP recovery feed |
+| Single UDP packet loss | Network → recv socket | A/B reorder dedup; if both lost, per-symbol snapshot heal |
 | Burst loss / out-of-order | Network | A/B reorder buffer (configurable depth) |
-| Channel `Lost` state | Feed state machine | Snapshot recovery (TCP) once recovery becomes available, with retry/backoff |
-| **Cascading recovery** | Slow clients pressuring the dispatch thread → packets dropped → more recovery → loop | **Fanout suppression while in Recovery/CatchUp** + auto-resnapshot on RealTime |
+| Wide channel-level gap | Network burst > A/B reorder window | Gap absorbed: per-symbol routing flips affected instruments to Stale; each heals from the always-on snapshot rotation. **No channel-level Recovery escalation.** |
+| **Cascading recovery** | Slow clients pressuring the dispatch thread → packets dropped → would feed a Recovery loop in legacy consumers | **Eliminated structurally:** per-instrument heal removed the channel-level Recovery state. Residual: cold-start fanout suppression + mass-stale fanout gate (§ 4) |
 | Slow WS client (genuinely stuck) | TCP back-pressure → unbounded server-side queue | **Hard pending-bytes cap** with disconnect |
 | Many clients all slow at once (systemic) | All clients near cap simultaneously | **Outlier sweep** under aggregate-pressure gate |
 | Snapshot connect storm | 100 k+ subscribes at once → snapshot allocation flood | `MaxSnapshotRequestsPerBatch` cap on the dispatch thread |
@@ -32,9 +32,11 @@ invariant.
 > consumer instead exploits B3's per-`SecurityID` `rptSeq` invariant to
 > stale **only the affected symbol(s)** and heal each one independently
 > from the always-on snapshot rotation, leaving every other instrument
-> in the same channel streaming uninterrupted. Channel-level recovery
-> still exists as a catastrophic-case fallback (see § 2.6) but no longer
-> dominates the resilience budget on real loss patterns.
+> in the same channel streaming uninterrupted. **Per-instrument heal is
+> universal** — there is no channel-level Recovery state to fall back
+> to: bootstrap (Unknown→Healthy), normal gaps, and wide bursts all
+> follow the same path. The `FeedHandler` state machine reduces to
+> `WaitInstrumentDefinition → Streaming` (cold-start only); see § 2.6.
 
 The B3 UMDF spec — confirmed by PCAP analysis (200 k packets, 175 116
 cross-template `rptSeq` advances with gap = 0, 0 violations) — defines
@@ -125,8 +127,10 @@ Notes on the diagram:
 - The illiquid path (`Unknown → Healthy`) covers B3 spec §7.4 instruments
   that have never received an incremental: snapshot header omits
   `LastRptSeq`, anchored at `rptSeq = 0`.
-- A wide channel-level gap escalates outside this diagram via
-  `FeedHandler` (`Lost → Recovery → CatchUp → RealTime`), described in §2.6.
+- A wide channel-level gap is also absorbed via per-symbol routing —
+  there is no `FeedHandler` Recovery state to escalate to. The reduced
+  channel-level state machine (`WaitInstrumentDefinition → Streaming`)
+  is described in §2.6.
 
 #### 2.4.2 Detailed walkthrough (text form)
 
@@ -192,14 +196,32 @@ to clients exactly as an MBO-revealed one would. The callback only fires
 on real `Stale ↔ Healthy` transitions (Unknown → Healthy bootstrap is not
 counted).
 
-### 2.6 Channel-level fallback
+### 2.6 Channel-level state machine — reduced to bootstrap
 
-A wide channel-level gap (more than the 256-packet A/B reorder window) still
-escalates the channel's `FeedHandler` to `Lost → Recovery → CatchUp →
-RealTime` and triggers the resnapshot-all-subscribers path described in
-§ 4. Per-instrument and per-channel recovery are complementary: per-instrument
-absorbs the common case (a few symbols affected); per-channel handles the
-catastrophic case (the entire group fell behind).
+The historical UMDF state machine `WaitInstrumentDefinition → Lost →
+Recovery → CatchUp → RealTime` has been **collapsed** to just
+`WaitInstrumentDefinition → Streaming`. Per-symbol heal handles every
+post-bootstrap event:
+
+- **Cold-start.** Every `(secId, kind)` starts `Unknown`. Once the
+  channel finishes Instrument Definition consumption it transitions to
+  `Streaming`; from that moment incrementals and snapshots both flow,
+  and the always-on snapshot rotation walks each symbol `Unknown →
+  Healthy` over the next ~100 s. Client fanout is suppressed during
+  `WaitInstrumentDefinition` to avoid emitting partial books.
+- **Normal gap.** Detected by `ChannelHandler.HandlePacket`; the gap is
+  absorbed via `AcceptGapAndAdvance`. Per-symbol routing flips affected
+  instruments to `Stale` (`globalGap` rule, § 2.2). The channel never
+  leaves `Streaming`; counted as `b3.umdf.feed.channel_gaps_absorbed`.
+- **Wide gap (burst > 256-packet A/B reorder window).** Same path as
+  normal gap. There is no escalation. A market-wide event (e.g.
+  `ChannelReset_11`, mass loss) flips a large fraction of symbols to
+  Stale; the `PerSymbolFanoutGate` (§ 4) suppresses subscriber fanout
+  while the heal completes, then resumes when the stale ratio drops.
+- **`SequenceReset` / `ChannelReset_11`.** The registry epoch resets:
+  every `(secId, kind) → Unknown`, buffered MBO bodies are dropped,
+  and the next snapshot rotation rebuilds all symbols. Equivalent to a
+  controlled re-bootstrap inside a single `Streaming` session.
 
 Recovery progress is observable via metrics:
 
@@ -226,10 +248,11 @@ channel transparently — no recovery required.
 The reorder window size is configurable; the default is sized to absorb
 ~50 ms of single-channel jitter.
 
-## 4. Cascading recovery — and why it deserves its own defense
+## 4. Cascading recovery — eliminated by per-instrument heal
 
-The most subtle failure we observed in stress testing was a
-**self-reinforcing recovery loop**:
+Earlier versions of the consumer (with channel-level Recovery) were
+vulnerable to a **self-reinforcing recovery loop** observed in stress
+testing:
 
 ```mermaid
 flowchart TD
@@ -238,42 +261,51 @@ flowchart TD
     C --> D[MpscPacketRing fills]
     D --> E[recv thread drops UDP packets]
     E --> F[sequence gap]
-    F --> G[Recovery]
+    F --> G["Recovery (no longer reachable)"]
     G --> H["recovery enqueues into _incrementalQueue<br/>(processed on the dispatch thread!)"]
     H --> C
     G --> I[POH churn from snapshot allocations<br/>on every state transition]
     I --> J[OOM ~2.3 GiB]
 ```
 
-The arrow from **H back to C** is the self-reinforcing edge: recovery
-work piles onto the same thread that's already saturated, so dispatch
-never catches up.
+The arrow from **H back to C** was the self-reinforcing edge: recovery
+work piled onto the same thread that was already saturated, so dispatch
+never caught up.
 
-The trigger is fanout pressure but the **amplifier** is doing client
-fanout *while* the group is recovering. Recovery is by definition a CPU
-spike on the dispatch thread; layering subscriber fanout on top of it
-guarantees the queue never drains.
+**Status after the per-instrument refactor.** Node **G** is no longer
+reachable: `FeedHandler` cannot transition to a Recovery state because
+no such state exists (§ 2.6). A gap absorbed via `AcceptGapAndAdvance`
+costs O(1) on the dispatch thread (no snapshot stream consumption, no
+state transition); per-symbol heal happens later, paced by the always-on
+snapshot rotation. The structural feedback edge `H → C` is gone.
 
-### Defense: fanout suppression during Recovery / CatchUp
+### Residual defenses
 
-`GroupConflationHandler.SetFanoutSuppressed(true)` is called when the
-group's `FeedHandler` transitions to `Recovery` or `CatchUp`. While
-suppressed:
+The analogous failure modes (cold-start storm, mass-stale event) are
+still defended explicitly:
+
+- **Cold-start fanout suppression.** `GroupConflationHandler.SetFanoutSuppressed(true)`
+  is wired to `FeedState != Streaming`, so during `WaitInstrumentDefinition`
+  no per-client fanout occurs. On `Streaming` entry,
+  `SubscriptionManager.RequestResyncForAllSubscribersInGroup` schedules
+  a fresh MBP snapshot for every Book subscriber in the group, paced by
+  `MaxSnapshotRequestsPerBatch`.
+- **Mass-stale fanout gate.** `PerSymbolFanoutGate` re-engages
+  suppression when `StaleSymbolCount/KnownSymbolCount` crosses the
+  configured high-watermark (default 50 %), e.g. on `ChannelReset_11`
+  or correlated mass loss. Releases hysterically below the
+  low-watermark (default 10 %).
+
+While suppressed (either source):
 
 - `OnBatchComplete` still drains the unsubscribe queue (cleanup must continue).
 - Conflation buffers are **discarded** (cleared, counted as flushed for
   metrics integrity) — clients would have received stale data anyway.
 - `ProcessOwnSubscribeRequests` and `PublishCurrentBatch` are skipped.
 
-When the group transitions back to `RealTime`,
-`SubscriptionManager.RequestResyncForAllSubscribersInGroup` schedules a
-fresh MBP snapshot for every Book subscriber in the group, paced by
-`MaxSnapshotRequestsPerBatch`. From the client's perspective the recovery
-is invisible: they see a brief pause, then a clean snapshot, then
-incremental updates resume.
-
-This single change broke the recovery loop in stress tests at 500 c × 240 s
-where the consumer was previously OOM'ing reliably at t ≈ 90 s.
+The original loop broke at 500 c × 240 s where the consumer had been
+OOM'ing reliably at t ≈ 90 s. Subsequent removal of channel-level
+Recovery made the bug class structurally impossible.
 
 ## 5. Slow-consumer protection — layered defense
 
