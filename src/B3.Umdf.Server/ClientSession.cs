@@ -197,100 +197,32 @@ public sealed class ClientSession : IDisposable
             {
                 if (Socket.State != WebSocketState.Open) break;
 
-                // 1. Drain up to MaxDrainPerCycle pre-serialized messages
-                messages.Clear();
-                pooledToReturn.Clear();
-                int drained = 0;
-                int logicalDrained = 0;
-                long payloadBytesDrained = 0;
-                bool sawInfoWake = false;
-                while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
+                // Phase 1: drain outbound ring into temporary buffers.
+                var drained = DrainOutboundQueue(messages, pooledToReturn);
+                if (drained.Count == 0)
                 {
-                    drained++;
-                    switch (outbound.Kind)
-                    {
-                        case OutboundKind.Payload:
-                            messages.Add(outbound.Payload);
-                            logicalDrained += outbound.LogicalCount;
-                            payloadBytesDrained += outbound.Payload.Length;
-                            if (outbound.PooledArray is { } pooled)
-                                pooledToReturn.Add(pooled);
-                            break;
-                        case OutboundKind.InfoWake:
-                            sawInfoWake = true;
-                            break;
-                        case OutboundKind.AddInfoSub:
-                            // First time we see this securityId: seed version 0 so the next
-                            // info-snapshot scan emits the current value. Re-adds are no-ops.
-                            _infoVersions.TryAdd(outbound.SecurityId, 0);
-                            break;
-                        case OutboundKind.RemoveInfoSub:
-                            _infoVersions.Remove(outbound.SecurityId);
-                            break;
-                    }
+                    if (await ParkUntilProducerAsync(ct).ConfigureAwait(false))
+                        continue;
+                    break;
                 }
-
-                if (_maxPendingBytes > 0 && payloadBytesDrained > 0)
-                    Interlocked.Add(ref _pendingBytes, -payloadBytesDrained);
-
-                if (drained == 0)
-                {
-                    // Park until a producer enqueues. The ring's WaitForItemsAsync
-                    // re-checks after publishing the waiting flag, so producers that
-                    // raced our last failed TryDequeue are observed without sleeping.
-                    await _outbound.WaitForItemsAsync(ct).ConfigureAwait(false);
-                    // Optional coalescing window: sleep briefly to let more producers
-                    // accumulate items so we drain a bigger batch into a single
-                    // WebSocket frame (reduces Kestrel pipe-lock churn).
-                    if (_coalesceWindowMs > 0)
-                    {
-                        try { await Task.Delay(_coalesceWindowMs, ct).ConfigureAwait(false); }
-                        catch (OperationCanceledException) { break; }
-                    }
-                    continue;
-                }
-
-                if (sawInfoWake)
+                if (_maxPendingBytes > 0 && drained.PayloadBytes > 0)
+                    Interlocked.Add(ref _pendingBytes, -drained.PayloadBytes);
+                if (drained.SawInfoWake)
                     Interlocked.Exchange(ref _infoWakePending, 0);
 
-                // 2. Coalesce into buffer
-                int offset = 0;
-                foreach (var raw in messages)
-                {
-                    EnsureCapacity(ref coalesceBuf, offset, raw.Length);
-                    raw.Span.CopyTo(coalesceBuf.AsSpan(offset));
-                    offset += raw.Length;
-                }
+                // Phase 2: coalesce drained payloads into the contiguous send buffer.
+                int offset = CoalesceMessages(messages, ref coalesceBuf);
 
-                // 3. Dirty-flag info: read latest from MarketDataManagers for changed securities
-                int infoMessages = 0;
-                if (_marketDataManagers is { } managers)
-                {
-                    foreach (var (secId, lastVer) in _infoVersions)
-                    {
-                        InstrumentInfo? info = null;
-                        foreach (var mdm in managers)
-                        {
-                            if (mdm.InstrumentData.TryGetValue(secId, out info))
-                                break;
-                        }
-                        if (info is null) continue;
-                        long ver = info.Version;
-                        if (ver <= lastVer) continue;
+                // Phase 3: append info snapshots for any subscribed securities whose
+                // version advanced since we last emitted them (dirty-flag pull model).
+                int infoMessages = AppendInfoSnapshots(ref coalesceBuf, ref offset);
 
-                        EnsureCapacity(ref coalesceBuf, offset, WireProtocol.InfoSnapshotMaxSize);
-                        int len = WireProtocol.WriteInfoSnapshot(coalesceBuf.AsSpan(offset), secId, info);
-                        offset += len;
-                        _infoVersions[secId] = ver;
-                        infoMessages++;
-                    }
-                }
-
+                // Phase 4: send + accounting.
                 if (offset > 0)
                 {
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, ct);
-                    int totalMessages = logicalDrained + infoMessages;
+                    int totalMessages = drained.LogicalCount + infoMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
                     MetricsRegistry.WsMessagesSent.Add(totalMessages);
@@ -302,21 +234,9 @@ public sealed class ClientSession : IDisposable
                 for (int i = 0; i < pooledToReturn.Count; i++)
                     ArrayPool<byte>.Shared.Return(pooledToReturn[i]);
 
-                // 4. Slow-client self-detection
-                int remaining = QueueDepth;
-                if (remaining > ChannelCapacity * _slowClientThreshold)
-                {
-                    if (++slowTicks >= _slowClientMaxTicks)
-                    {
-                        DisconnectSlowConsumer(
-                            $"queue backlog persisted for {slowTicks} cycles (depth={remaining}/{ChannelCapacity})");
-                        break;
-                    }
-                }
-                else
-                {
-                    slowTicks = 0;
-                }
+                // Phase 5: slow-client self-detection.
+                if (CheckSlowClient(ref slowTicks))
+                    break;
             }
         }
         catch (OperationCanceledException) { }
@@ -330,6 +250,138 @@ public sealed class ClientSession : IDisposable
             // their pooled buffers so the ArrayPool doesn't accumulate orphans.
             DrainAndReturnPooled();
         }
+    }
+
+    private readonly record struct DrainResult(
+        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake);
+
+    /// <summary>
+    /// Drain up to <see cref="MaxDrainPerCycle"/> entries from the outbound ring,
+    /// dispatching each by <see cref="OutboundKind"/>. Payload entries land in
+    /// <paramref name="messages"/> (and pooled-array references in <paramref name="pooledToReturn"/>);
+    /// info-version deltas mutate <c>_infoVersions</c> in-place; an InfoWake records
+    /// that the producer's pending flag should be cleared.
+    /// </summary>
+    private DrainResult DrainOutboundQueue(
+        List<ReadOnlyMemory<byte>> messages, List<byte[]> pooledToReturn)
+    {
+        messages.Clear();
+        pooledToReturn.Clear();
+        int drained = 0;
+        int logicalDrained = 0;
+        long payloadBytesDrained = 0;
+        bool sawInfoWake = false;
+        while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
+        {
+            drained++;
+            switch (outbound.Kind)
+            {
+                case OutboundKind.Payload:
+                    messages.Add(outbound.Payload);
+                    logicalDrained += outbound.LogicalCount;
+                    payloadBytesDrained += outbound.Payload.Length;
+                    if (outbound.PooledArray is { } pooled)
+                        pooledToReturn.Add(pooled);
+                    break;
+                case OutboundKind.InfoWake:
+                    sawInfoWake = true;
+                    break;
+                case OutboundKind.AddInfoSub:
+                    // First time we see this securityId: seed version 0 so the next
+                    // info-snapshot scan emits the current value. Re-adds are no-ops.
+                    _infoVersions.TryAdd(outbound.SecurityId, 0);
+                    break;
+                case OutboundKind.RemoveInfoSub:
+                    _infoVersions.Remove(outbound.SecurityId);
+                    break;
+            }
+        }
+        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake);
+    }
+
+    /// <summary>
+    /// Park until a producer enqueues. The ring's WaitForItemsAsync re-checks after
+    /// publishing the waiting flag, so producers that raced our last failed TryDequeue
+    /// are observed without sleeping. After the wake, optionally sleep
+    /// <see cref="_coalesceWindowMs"/> to let more producers accumulate items.
+    /// Returns false if the coalesce delay was canceled (loop should break).
+    /// </summary>
+    private async Task<bool> ParkUntilProducerAsync(CancellationToken ct)
+    {
+        await _outbound.WaitForItemsAsync(ct).ConfigureAwait(false);
+        if (_coalesceWindowMs > 0)
+        {
+            try { await Task.Delay(_coalesceWindowMs, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return false; }
+        }
+        return true;
+    }
+
+    private static int CoalesceMessages(List<ReadOnlyMemory<byte>> messages, ref byte[] coalesceBuf)
+    {
+        int offset = 0;
+        foreach (var raw in messages)
+        {
+            EnsureCapacity(ref coalesceBuf, offset, raw.Length);
+            raw.Span.CopyTo(coalesceBuf.AsSpan(offset));
+            offset += raw.Length;
+        }
+        return offset;
+    }
+
+    /// <summary>
+    /// Pull-side dirty-flag delivery: scan all securities currently subscribed to
+    /// Info updates and emit a fresh InfoSnapshot for those whose version advanced
+    /// since the last cycle. Updates the per-security baseline in <c>_infoVersions</c>.
+    /// Returns the number of snapshot frames appended.
+    /// </summary>
+    private int AppendInfoSnapshots(ref byte[] coalesceBuf, ref int offset)
+    {
+        if (_marketDataManagers is not { } managers) return 0;
+        int infoMessages = 0;
+        foreach (var (secId, lastVer) in _infoVersions)
+        {
+            InstrumentInfo? info = null;
+            foreach (var mdm in managers)
+            {
+                if (mdm.InstrumentData.TryGetValue(secId, out info))
+                    break;
+            }
+            if (info is null) continue;
+            long ver = info.Version;
+            if (ver <= lastVer) continue;
+
+            EnsureCapacity(ref coalesceBuf, offset, WireProtocol.InfoSnapshotMaxSize);
+            int len = WireProtocol.WriteInfoSnapshot(coalesceBuf.AsSpan(offset), secId, info);
+            offset += len;
+            _infoVersions[secId] = ver;
+            infoMessages++;
+        }
+        return infoMessages;
+    }
+
+    /// <summary>
+    /// Returns true when the queue depth has stayed above the slow-client threshold
+    /// for <see cref="_slowClientMaxTicks"/> consecutive cycles, in which case the
+    /// session is disconnected and the caller should break the write loop.
+    /// </summary>
+    private bool CheckSlowClient(ref int slowTicks)
+    {
+        int remaining = QueueDepth;
+        if (remaining > ChannelCapacity * _slowClientThreshold)
+        {
+            if (++slowTicks >= _slowClientMaxTicks)
+            {
+                DisconnectSlowConsumer(
+                    $"queue backlog persisted for {slowTicks} cycles (depth={remaining}/{ChannelCapacity})");
+                return true;
+            }
+        }
+        else
+        {
+            slowTicks = 0;
+        }
+        return false;
     }
 
     private bool TryEnqueueCore(in OutboundMessage outbound, string itemKind)

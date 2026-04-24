@@ -304,15 +304,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             return;
         }
 
-        // 2. Process this group's routed subscribe/get requests (single-threaded, safe book access)
+        // 3. Process this group's routed subscribe/get requests (single-threaded, safe book access)
         ProcessOwnSubscribeRequests();
 
-        // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
+        // 4. Flush conflation buffers into _currentBatch (dispatch-side work only —
         //    no subscriber fan-out, no ArrayPool rentals for client buffers).
         if (_orderBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
             FlushBuffers();
 
-        // 4. Publish the batch to the broadcaster thread. On full ring, drop + schedule
+        // 5. Publish the batch to the broadcaster thread. On full ring, drop + schedule
         //    a resnapshot for each affected security so subscribers recover state.
         PublishCurrentBatch();
     }
