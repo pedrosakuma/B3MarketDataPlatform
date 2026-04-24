@@ -12,6 +12,9 @@
     <Project Path="src/B3.Umdf.Transport/B3.Umdf.Transport.csproj" />
     <Project Path="src/B3.Umdf.Server/B3.Umdf.Server.csproj" />
   </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/PcapRptSeqAnalyzer/PcapRptSeqAnalyzer.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
     <Project Path="tests/B3.Umdf.ConsoleApp.Tests/B3.Umdf.ConsoleApp.Tests.csproj" />
