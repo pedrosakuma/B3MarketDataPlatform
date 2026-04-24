@@ -730,18 +730,36 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     {
         var book = GetOrCreateBook(secId);
 
-        // GUARD: do not clobber a healthy book that's already ahead of this snapshot.
-        // The B3 always-on snapshot stream rotates through every symbol periodically.
-        // Without this check, a snapshot at LastRptSeq=S arriving for a symbol whose
-        // book is at rptSeq=L (L > S) would: (1) Clear the book, (2) repopulate at
-        // state-as-of-S, (3) accept the heal (registry Math.Max keeps baseline=L),
-        // (4) apply live rptSeq=L+1 onward — leaving the [S+1..L] window unapplied
-        // to the snapshot-rebuilt book. Result: silent corruption (crossed BBOs,
-        // ghost orders). Only Stale/Unknown symbols benefit from snapshots.
+        // GUARD: never apply a snapshot to an already-Healthy symbol. The B3
+        // always-on snapshot stream rotates through every instrument
+        // periodically and does not target our consumer's specific state — its
+        // payload reflects state-as-of some snapshot moment T, which may be
+        // either behind or ahead of where we are.
+        //
+        // - snap <= priorHighWater: snapshot is stale relative to live; applying
+        //   would Clear + repopulate at an older state, then registry baseline
+        //   stays at priorHighWater (defensive guard) so subsequent live msgs
+        //   skip [snap+1..priorHighWater] silently — book ends with [snap+1..pH]
+        //   operations missing.
+        // - snap > priorHighWater (Healthy idle): snapshot saw msgs [pH+1..snap]
+        //   that we either (a) haven't received yet (in-flight live) or (b)
+        //   missed silently (genuine UDP loss). Clear + repopulate would
+        //   clobber any live operations already applied AND mask the genuine
+        //   loss — we'd flip baseline to snap, then late-arriving live msgs in
+        //   [pH+1..snap] hit the Drop branch (received <= lastSeen).
+        //
+        // Healthy symbols already have correct, up-to-date state by definition.
+        // If a real gap exists, the next live message > priorHighWater+1 will
+        // detect it (Healthy→Stale via Observe) and the NEXT snapshot rotation
+        // heals it cleanly. Skipping unconditionally for Healthy is safe.
+        //
+        // (The pre-per-symbol channel-recovery model never had this problem
+        // because snapshots were only consumed during channel-wide Recovery
+        // state; Healthy symbols were never touched.)
         if (hasRptSeq && _stateRegistry is not null)
         {
             var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
-            if (state == SymbolState.Healthy && book.LastRptSeq >= lastRptSeq)
+            if (state == SymbolState.Healthy)
             {
                 // Mark the in-flight snapshot as Skipped so subsequent Orders_71 chunks
                 // are dropped silently without incrementing the orphan counter.

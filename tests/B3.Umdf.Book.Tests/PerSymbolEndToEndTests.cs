@@ -252,6 +252,37 @@ public class PerSymbolEndToEndTests
     }
 
     [Fact]
+    public void Scenario_AlwaysOnSnapshot_HealthySnapAhead_IsSkipped_BookNotClobbered()
+    {
+        // REGRESSION: previously Skipped guard only fired when book.LastRptSeq >= snap.
+        // For Healthy symbol with snap > book.LastRptSeq (snapshot taken at later moment T
+        // than our current live point), the snapshot was NOT skipped — book was Cleared
+        // and repopulated at state-as-of-T, clobbering live operations [pH+1..snap]
+        // already applied AND making any in-flight live msgs in that range hit the Drop
+        // branch (received <= lastSeen=snap). Healthy must be unconditionally skipped.
+        var (bm, reg, _) = CreatePerSymbol();
+        const ulong sec = 355;
+
+        reg.Observe(sec, SymbolGapKind.Mbo, 100);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        for (uint r = 101; r <= 150; r++)
+            reg.Observe(sec, SymbolGapKind.Mbo, r);
+        var book = bm.GetOrCreateBook(sec);
+        book.LastRptSeq = 150;
+
+        long skippedBefore = bm.SnapshotsSkippedHealthyAhead;
+
+        // Always-on snapshot rotates with LastRptSeq=200 — AHEAD of our live (150).
+        // Must still be skipped because we are Healthy.
+        bm.BeginSnapshotHeader(sec, lastRptSeq: 200, hasRptSeq: true, ordersExpected: 0);
+
+        Assert.Equal(skippedBefore + 1, bm.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        Assert.Equal(150u, book.LastRptSeq); // book NOT advanced/clobbered
+    }
+
+    [Fact]
     public void Scenario_AlwaysOnSnapshot_StaleSymbol_NotSkipped()
     {
         var (bm, reg, buf) = CreatePerSymbol();
