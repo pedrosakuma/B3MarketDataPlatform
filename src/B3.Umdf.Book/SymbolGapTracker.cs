@@ -28,12 +28,12 @@ public enum SymbolGapKind
 }
 
 /// <summary>
-/// Phase 0 (shadow) gap tracker. Compares the received per-symbol
-/// <c>rptSeq</c> against a stored "last seen" value per (symbol, kind) and
-/// records gap counters/sizes/affected-symbol sets. Behavior is read-only:
-/// the consumer's existing state machine (channel-level Recovery) is not
-/// affected — this only emits metrics/logs to quantify how per-symbol
-/// recovery would behave in production.
+/// Per-symbol gap tracker. Compares the received per-symbol <c>rptSeq</c>
+/// against a stored "last seen" value per (secId, kind) and records
+/// gap counters / sizes / affected-symbol sets. Pure observability:
+/// emits metrics and exposes affected-symbol sets consumed by
+/// <see cref="SymbolStateRegistry"/> (which owns the actual state machine
+/// and stale transitions).
 /// </summary>
 public sealed class SymbolGapTracker
 {

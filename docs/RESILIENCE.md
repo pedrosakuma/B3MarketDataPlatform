@@ -238,6 +238,82 @@ b3.umdf.persymbol.stale_buffer_evicted_unsafe       # ALERT if growing — patho
 b3.umdf.recovery.snapshot.attempts
 ```
 
+### 2.7 Graceful degradation — what stays live during heal
+
+Per-symbol heal is **scoped**: the channel never stops, other symbols never
+freeze, and within an affected symbol most data keeps flowing. Only the
+specific data category that lost its `rptSeq` is suspended until its
+snapshot rebuilds it.
+
+#### 2.7.1 Channel-wide invariants (always true during heal)
+
+- The channel stays in `Streaming`. Incrementals keep being parsed,
+  routed, and dispatched.
+- Every **other symbol** in the same group continues to receive book
+  updates, trades, stats, and snapshots normally.
+- The aggregated `RecoveryProgress` banner (`⚠ Recovering N/M symbols`)
+  reflects the count of symbols with at least one Stale kind plus a
+  per-kind breakdown.
+
+#### 2.7.2 Per-symbol scope of staleness
+
+The 14 `SymbolGapKind` values are tracked **independently** per
+`(securityId, kind)`. A gap on one kind does not stale the others:
+
+| Kind | What it carries (SBE templates) | Affected client surface |
+|---|---|---|
+| `Mbo` | `Order_50`, `DeleteOrder_51`, `MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecutionSummary_55`, `TradeBust_57` | Order book + Trades tape + Chart (candles derive from trades) |
+| `SecurityStatus` | `tpl 3` | Auction/halt banner, trading-phase indicators |
+| `OpeningPrice` / `ClosingPrice` / `LastTradePrice` / `HighPrice` / `LowPrice` / `SettlementPrice` / `TheoreticalOpeningPrice` / `OpenInterest` / `AuctionImbalance` / `PriceBand` / `QuantityBand` / `ExecutionStatistics` | individual stat templates | Subscriptions-table columns (Info side) |
+
+Trades and the order book share the `Mbo` bucket because the wire mixes
+them under the same `rptSeq` stream — losing one byte of incremental
+traffic invalidates both consistently. Stat fields are independent
+streams: e.g. an `OpeningPrice` gap leaves the book and trades fully
+live; only that single field freezes until live-resync or snapshot.
+
+#### 2.7.3 Per-symbol behavior while a kind is Stale
+
+For each affected `(secId, kind)`:
+
+- **`Mbo` Stale:** new incrementals (`Order_50`/`DeleteOrder_51`/
+  `MassDelete_52`/`Trade_53`/…) for that symbol are buffered in
+  `StaleMboBuffer` (capped, see § 8). The book is **not mutated** and
+  no fanout is emitted for this symbol. Trades are also suppressed (same
+  bucket). Once the snapshot arrives, the buffered tail is replayed
+  from the snapshot's `lastIncrementalRptSeq + 1` and the book resumes.
+- **Stat-kind Stale (e.g. `OpeningPrice`):** the field stops updating
+  for that symbol but everything else keeps flowing — book, trades,
+  other stats, status. `LiveResyncPolicy.NextMessage` lets a stat heal
+  on the **next valid message** of that kind without waiting for a
+  snapshot, so most stat gaps clear in milliseconds.
+- **`SecurityStatus` Stale:** the auction/halt indicator is held at the
+  last known value. Book and trades keep updating (they are not gated
+  on status). Heals on next valid `SecurityStatus` message or via
+  snapshot.
+
+The symbol is reported to clients as `isStale=true` while **any** kind
+is Stale; it returns to `isStale=false` only when the full
+`StaleKindMask` clears. (The current wire protocol exposes a single
+`isStale` bool per symbol — see § 2.5; per-kind breakdown is available
+in the aggregated `RecoveryProgress` payload.)
+
+#### 2.7.4 Resulting UX during heal
+
+A subscriber to a healing symbol sees:
+
+| Surface | During heal of `Mbo` | During heal of a stat kind | During heal of `SecurityStatus` |
+|---|---|---|---|
+| Order book | frozen (no updates) | live | live |
+| Trades / Chart | frozen | live | live |
+| Affected stat (e.g. opening price) | frozen | frozen (that field) | live |
+| Other stats | live | live (others) | live |
+| Auction banner | live | live | frozen at last value |
+| Subscriptions-table row | row marked stale | row marked stale | row marked stale |
+
+The row-level dim is intentional: any kind being Stale flags the symbol
+as "not fully consistent", even when most data keeps flowing.
+
 ## 3. A/B reorder buffer
 
 B3 publishes incremental data on **two equivalent multicast groups (A and
