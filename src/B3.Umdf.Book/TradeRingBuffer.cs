@@ -1,43 +1,91 @@
 namespace B3.Umdf.Book;
 
+/// <summary>
+/// One slot in <see cref="TradeRingBuffer"/>. <see cref="Busted"/> is set when a
+/// later TradeBust_57 cancels this trade — see B3 BinaryUMDF v2.2.0 spec §10.
+/// </summary>
+internal struct TradeSlot
+{
+    public long Price;
+    public long Qty;
+    public long TradeId;
+    public byte Busted;
+}
+
 /// <summary>Fixed-capacity ring buffer of recent trades for a single security.</summary>
 internal sealed class TradeRingBuffer
 {
-    private readonly (long Price, long Qty, long TradeId)[] _buf;
+    private readonly TradeSlot[] _buf;
     private volatile int _head; // next write position
     private volatile int _count;
+    // Mutation version stamp. Bumped on every Add() AND MarkBust() so concurrent
+    // readers (AsSpan) can detect any in-place change to the slot array — not
+    // just head/count advances. Without this, MarkBust() can flip a Busted byte
+    // mid-snapshot and never be retried by the reader.
+    private volatile int _version;
 
-    public TradeRingBuffer(int capacity) => _buf = new (long, long, long)[capacity];
+    public TradeRingBuffer(int capacity) => _buf = new TradeSlot[capacity];
 
     public void Add(long price, long qty, long tradeId)
     {
-        _buf[_head] = (price, qty, tradeId);
+        _buf[_head] = new TradeSlot { Price = price, Qty = qty, TradeId = tradeId, Busted = 0 };
         _head = (_head + 1) % _buf.Length;
         if (_count < _buf.Length) _count++;
+        _version++;
+    }
+
+    /// <summary>
+    /// Mark the most recent occurrence of <paramref name="tradeId"/> as busted.
+    /// Returns true if found within the retained window; false if the trade was
+    /// already evicted (ring is bounded — <see cref="Busted"/> annotation is
+    /// best-effort over the recent-history window only). Search is back-to-front
+    /// (busts typically reference very recent trades, often the previous one).
+    /// </summary>
+    public bool MarkBust(long tradeId)
+    {
+        int count = _count;
+        int head = _head;
+        int len = _buf.Length;
+        for (int i = 1; i <= count; i++)
+        {
+            int pos = (head - i + len) % len;
+            if (_buf[pos].TradeId == tradeId)
+            {
+                if (_buf[pos].Busted == 0)
+                {
+                    _buf[pos].Busted = 1;
+                    _version++;
+                }
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>
     /// Snapshot oldest → newest. Safe for concurrent reads.
-    /// Copies the tuple slots under a retry loop because struct assignments
-    /// of 24 bytes are not atomic — without this, a concurrent Add() could
-    /// produce torn reads (mixed fields from two different trades).
+    /// Re-copies the slot array if any mutation (Add or MarkBust) is detected
+    /// during the copy via the <see cref="_version"/> stamp — without this, a
+    /// concurrent writer could produce torn reads or a stale Busted byte.
     /// </summary>
-    public (long Price, long Qty, long TradeId)[] AsSpan()
+    public TradeSlot[] AsSpan()
     {
         const int MaxRetries = 8;
         for (int attempt = 0; attempt < MaxRetries; attempt++)
         {
+            int versionBefore = _version;
             int countBefore = _count;
             int headBefore = _head;
             int start = countBefore < _buf.Length ? 0 : headBefore;
 
-            var snapshot = new (long, long, long)[countBefore];
+            var snapshot = new TradeSlot[countBefore];
             for (int i = 0; i < countBefore; i++)
                 snapshot[i] = _buf[(start + i) % _buf.Length];
 
-            // Validate: if neither head nor count moved during the copy,
-            // no Add() ran concurrently and the snapshot is consistent.
-            if (_count == countBefore && _head == headBefore)
+            // Validate: if version, head, and count are all unchanged, no
+            // writer (Add or MarkBust) ran concurrently and the snapshot is
+            // consistent.
+            if (_version == versionBefore && _count == countBefore && _head == headBefore)
                 return snapshot;
         }
 
@@ -45,7 +93,7 @@ internal sealed class TradeRingBuffer
         int c = _count;
         int h = _head;
         int s = c < _buf.Length ? 0 : h;
-        var fallback = new (long, long, long)[c];
+        var fallback = new TradeSlot[c];
         for (int i = 0; i < c; i++)
             fallback[i] = _buf[(s + i) % _buf.Length];
         return fallback;

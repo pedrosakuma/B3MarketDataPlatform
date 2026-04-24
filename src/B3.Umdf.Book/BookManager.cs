@@ -25,9 +25,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _orderUpdates;
     private long _orderDeletes;
     private long _deleteNotFound;
-    private long _nullPriceNewSkips;
     private long _nullPriceChangeDeletes;
     private long _tradesFilteredNonReportable;
+    private long _marketOrderAdds;
+    private long _marketOrderUpdates;
+    private long _marketOrderDeletes;
+    private long _marketOrderTransitionsToPriced;
+    private long _marketOrderTransitionsToMarket;
 
     /// <summary>
     /// Packet-level SendingTime (nanoseconds since epoch) for the message currently being processed.
@@ -47,8 +51,30 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long OrderUpdates => Volatile.Read(ref _orderUpdates);
     public long OrderDeletes => Volatile.Read(ref _orderDeletes);
     public long DeleteNotFound => Volatile.Read(ref _deleteNotFound);
-    public long NullPriceNewSkips => Volatile.Read(ref _nullPriceNewSkips);
+    /// <summary>
+    /// Legacy counter — previously incremented when a NEW null-price order
+    /// arrived and was silently dropped. Now always returns 0 because such
+    /// orders are tracked in the per-side market tier per spec §12.1
+    /// (see <see cref="MarketOrderAdds"/>). Retained for backward
+    /// compatibility with existing dashboards and metrics.
+    /// </summary>
+    public long NullPriceNewSkips => 0L;
     public long NullPriceChangeDeletes => Volatile.Read(ref _nullPriceChangeDeletes);
+
+    /// <summary>Market orders (MOA/MOC) inserted into the per-side market tier
+    /// (B3 spec §12.1). Replaces the legacy silent skip — orders are now
+    /// tracked even when they have no price.</summary>
+    public long MarketOrderAdds => Volatile.Read(ref _marketOrderAdds);
+    public long MarketOrderUpdates => Volatile.Read(ref _marketOrderUpdates);
+    public long MarketOrderDeletes => Volatile.Read(ref _marketOrderDeletes);
+    /// <summary>An order changed from null-price (market) to a real price
+    /// (typically when the auction phase resolves). Migrated from the market
+    /// tier into the priced <see cref="BookSide"/>.</summary>
+    public long MarketOrderTransitionsToPriced => Volatile.Read(ref _marketOrderTransitionsToPriced);
+    /// <summary>An existing priced order was modified to remove its price (rare
+    /// — typically a venue-side phase rollback). Migrated out of the priced
+    /// <see cref="BookSide"/> into the per-side market tier.</summary>
+    public long MarketOrderTransitionsToMarket => Volatile.Read(ref _marketOrderTransitionsToMarket);
 
     /// <summary>
     /// Trades suppressed from <see cref="IBookEventHandler.OnTrade"/> /
@@ -59,6 +85,36 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// price) is gated.
     /// </summary>
     public long TradesFilteredNonReportable => Volatile.Read(ref _tradesFilteredNonReportable);
+
+    private long _endOfEventCount;
+    private long _recoveryMsgCount;
+    /// <summary>Total number of messages observed with the EndOfEvent bit set
+    /// in MatchEventIndicator (B3 spec §10). Marks the last message of an
+    /// atomic exchange-side matching event.</summary>
+    public long EndOfEventCount => Volatile.Read(ref _endOfEventCount);
+    /// <summary>Total number of messages observed with the RecoveryMsg bit set
+    /// in MatchEventIndicator (B3 spec §10). Indicates the message is part of
+    /// an exchange-side replay (distinct from this consumer's snapshot
+    /// recovery).</summary>
+    public long RecoveryMsgCount => Volatile.Read(ref _recoveryMsgCount);
+
+    /// <summary>
+    /// Updates MatchEventIndicator counters and fires
+    /// <see cref="IBookEventHandler.OnEndOfEvent"/> when the EndOfEvent bit is
+    /// set. Called once per processed wire message that carries a
+    /// MatchEventIndicator field.
+    /// </summary>
+    private void TrackMatchEvent(ulong securityId, MatchEventIndicator mei)
+    {
+        if ((mei & MatchEventIndicator.RecoveryMsg) != 0)
+            Interlocked.Increment(ref _recoveryMsgCount);
+        if ((mei & MatchEventIndicator.EndOfEvent) != 0)
+        {
+            Interlocked.Increment(ref _endOfEventCount);
+            try { _eventHandler?.OnEndOfEvent(securityId); }
+            catch (Exception ex) { _logger.LogWarning(ex, "OnEndOfEvent threw for securityId={SecurityId}", securityId); }
+        }
+    }
 
     /// <summary>
     /// B3 spec §18: trades flagged as out-of-sequence or as leg trades of a
@@ -473,53 +529,54 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         long quantity = (long)msg.MDEntrySize;
         uint enteringFirm = msg.EnteringFirm is { } ef ? (uint)ef : 0;
 
+        // Spec §12.1 — null-price orders (MOA / MOC) belong to the per-side
+        // market tier, not the priced BookSide. Routed early to keep the
+        // priced-side branch focused on real prices.
+        if (rawPrice is null)
+        {
+            HandleMarketOrder(book, bookSide, side, orderId, quantity, enteringFirm, msg.RptSeq);
+            TrackMatchEvent(securityId, msg.MatchEventIndicator);
+            return;
+        }
+
+        long price = rawPrice.Value;
+
+        // The new message has a real price. If a market order with this id
+        // exists, this is a phase-resolution transition (MOA → priced). Migrate
+        // it out of the market tier before falling through to the priced path.
+        if (book.TryRemoveMarketOrderAnySide(orderId, out _))
+            _marketOrderTransitionsToPriced++;
+
         if (bookSide.TryGetOrder(orderId, out var existing))
         {
-            if (rawPrice is null)
+            _orderUpdates++;
+            long oldPrice = existing.Price;
+
+            ref var slot = ref bookSide.GetOrderRef(orderId);
+            slot.Price = price;
+            slot.Quantity = quantity;
+            slot.EnteringFirm = enteringFirm;
+
+            if (oldPrice != price)
             {
-                _nullPriceChangeDeletes++;
-                bookSide.Remove(orderId);
-                if (msg.RptSeq is { } rs) TrackMboRptSeq(book, (uint)rs);
-                _eventHandler?.OnOrderDeleted(book, orderId, side);
+                bookSide.MoveOrder(orderId, oldPrice);
             }
             else
             {
-                _orderUpdates++;
-                long price = rawPrice.Value;
-                long oldPrice = existing.Price;
-
-                ref var slot = ref bookSide.GetOrderRef(orderId);
-                slot.Price = price;
-                slot.Quantity = quantity;
-                slot.EnteringFirm = enteringFirm;
-
-                if (oldPrice != price)
-                {
-                    bookSide.MoveOrder(orderId, oldPrice);
-                }
-                else
-                {
-                    // Same price — also update the per-level list copy so iteration sees the new
-                    // quantity/firm. MoveOrder takes care of this when price changes.
-                    bookSide.SyncPriceLevelCopy(orderId);
-                }
-
-                if (msg.RptSeq is { } rptSeq)
-                    TrackMboRptSeq(book, (uint)rptSeq);
-
-                _eventHandler?.OnOrderUpdated(book, in slot);
-                CheckCrossing(book, "UPDATE", orderId, price, side);
+                // Same price — also update the per-level list copy so iteration sees the new
+                // quantity/firm. MoveOrder takes care of this when price changes.
+                bookSide.SyncPriceLevelCopy(orderId);
             }
+
+            if (msg.RptSeq is { } rptSeq)
+                TrackMboRptSeq(book, (uint)rptSeq);
+
+            _eventHandler?.OnOrderUpdated(book, in slot);
+            CheckCrossing(book, "UPDATE", orderId, price, side);
+            TrackMatchEvent(securityId, msg.MatchEventIndicator);
         }
         else
         {
-            if (rawPrice is null)
-            {
-                _nullPriceNewSkips++;
-                return;
-            }
-
-            long price = rawPrice.Value;
             var entry = new OrderBookEntry
             {
                 OrderId = orderId,
@@ -538,7 +595,43 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
             _eventHandler?.OnOrderAdded(book, in entry);
             CheckCrossing(book, "ADD", orderId, price, side);
+            TrackMatchEvent(securityId, msg.MatchEventIndicator);
         }
+    }
+
+    /// <summary>
+    /// Handles an Order_MBO with no MDEntryPx — a MOA/MOC market order per
+    /// spec §12.1. Routes ADD/CHANGE through the per-side market tier; if the
+    /// order previously lived in the priced BookSide (rare priced→null
+    /// downgrade), migrates it across.
+    /// </summary>
+    private void HandleMarketOrder(OrderBook book, BookSide pricedSide, BookSideType side,
+        ulong orderId, long quantity, uint enteringFirm, uint? rptSeq)
+    {
+        // Uncommon path: an order that was priced is being downgraded to
+        // market. Drop it from the priced side first, fire the delete event so
+        // priced-side subscribers see consistent state, then upsert into the
+        // market tier.
+        if (pricedSide.TryGetOrder(orderId, out _))
+        {
+            pricedSide.Remove(orderId);
+            _nullPriceChangeDeletes++;
+            _marketOrderTransitionsToMarket++;
+            _eventHandler?.OnOrderDeleted(book, orderId, side);
+        }
+
+        bool isNew = book.UpsertMarketOrder(orderId, side, quantity, enteringFirm);
+        if (isNew) _marketOrderAdds++;
+        else _marketOrderUpdates++;
+
+        if (rptSeq is { } rs) TrackMboRptSeq(book, (uint)rs);
+
+        // Market-order events are intentionally NOT fanned out to client
+        // subscribers via OnOrderAdded/Updated — the wire protocol's price
+        // field has no representation for "market price" today. Backend
+        // tracking remains accurate (counters, BookSnapshot, BBO consumers
+        // that opt in via OrderBook.HasMarketOrders); a future protocol
+        // extension can enable per-order fanout without changing the parser.
     }
 
     private void HandleDeleteOrder(ReadOnlySpan<byte> body)
@@ -561,14 +654,26 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         var removed = book.GetSide(side).Remove(orderId);
         if (removed)
+        {
             _orderDeletes++;
+        }
+        else if (book.RemoveMarketOrder(orderId, side))
+        {
+            // Market-order delete (MOA/MOC). Tracked separately; not fanned
+            // out (mirrors the add-side decision in HandleMarketOrder).
+            _marketOrderDeletes++;
+        }
         else
+        {
             _deleteNotFound++;
+        }
 
         if (msg.RptSeq is { } rptSeq)
             TrackMboRptSeq(book, (uint)rptSeq);
 
-        _eventHandler?.OnOrderDeleted(book, orderId, side);
+        if (removed)
+            _eventHandler?.OnOrderDeleted(book, orderId, side);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
     private void HandleMassDelete(ReadOnlySpan<byte> body)
@@ -608,6 +713,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             TrackMboRptSeq(book, (uint)rptSeq);
 
         _eventHandler?.OnBookCleared(securityId, clearSide);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
     private void HandleTrade(ReadOnlySpan<byte> body, int blockLength)
@@ -638,10 +744,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (!IsReportableTrade(msg.TradeCondition, msg.TrdSubType))
         {
             Interlocked.Increment(ref _tradesFilteredNonReportable);
+            TrackMatchEvent(securityId, msg.MatchEventIndicator);
             return;
         }
 
         _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
     private void HandleEmptyBook(ReadOnlySpan<byte> body)
@@ -696,10 +804,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (!IsReportableTrade(msg.TradeCondition, msg.TrdSubType))
         {
             Interlocked.Increment(ref _tradesFilteredNonReportable);
+            TrackMatchEvent(securityId, msg.MatchEventIndicator);
             return;
         }
 
         _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
     private void HandleExecutionSummary(ReadOnlySpan<byte> body)
@@ -749,6 +859,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
 
         _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
     // ── Snapshot lifecycle (delegated to SnapshotApplier) ────────────────────

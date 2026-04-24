@@ -23,6 +23,11 @@ public enum MessageType : ushort
     OrderDeleted = 0x0032,
     Trade = 0x0033,
     BookCleared = 0x0034,
+    /// <summary>Server → Client: cancellation of a previously-broadcast trade
+    /// (TradeBust_57 from B3 spec §10). Carries securityId + tradeId so the
+    /// frontend can mark the corresponding entry in the trade history as
+    /// cancelled. Sent exactly once per bust observed on the wire.</summary>
+    TradeBust = 0x0035,
     RankingsUpdate = 0x0040,
 
     /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
@@ -197,6 +202,17 @@ public static class WireProtocol
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], qty); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId);
+        return totalLen;
+    }
+
+    /// <summary>Write TradeBust: securityId + tradeId.</summary>
+    public static int WriteTradeBust(Span<byte> dest, ulong securityId, long tradeId)
+    {
+        const ushort totalLen = FramingHeaderSize + 8 + 8; // 20
+        WriteFramingHeader(dest, totalLen, MessageType.TradeBust);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId);
         return totalLen;
     }

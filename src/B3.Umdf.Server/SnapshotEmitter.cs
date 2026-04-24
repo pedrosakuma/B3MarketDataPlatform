@@ -88,10 +88,14 @@ internal static class SnapshotEmitter
     /// </summary>
     public static void SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
     {
-        foreach (var (price, qty, tradeId) in ring.AsSpan())
+        foreach (var slot in ring.AsSpan())
         {
+            // Spec §10: TradeBust_57 cancels a previously-broadcast trade. New
+            // subscribers must not see busted trades in their initial history;
+            // live subscribers receive the bust via MessageType.TradeBust.
+            if (slot.Busted != 0) continue;
             var buf = new byte[36];
-            int len = WireProtocol.WriteTrade(buf, securityId, price, qty, tradeId);
+            int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId);
             session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
         }
     }

@@ -167,4 +167,91 @@ public class SpecComplianceTests
         // LEG_TRADE sub-type → filtered (multi-leg synthetic, not a venue trade).
         Assert.False(BookManager.IsReportableTrade((TradeCondition)0, TrdSubType.LEG_TRADE));
     }
+
+    // ── §10 — TradeBust_57 marks ring entries; snapshot skips them ───────────
+
+    [Fact]
+    public void TradeRingBuffer_MarkBust_FlagsMatchingTradeOnly()
+    {
+        var ring = new TradeRingBuffer(5);
+        ring.Add(price: 100_0000, qty: 10, tradeId: 1001);
+        ring.Add(price: 101_0000, qty: 20, tradeId: 1002);
+        ring.Add(price: 102_0000, qty: 30, tradeId: 1003);
+
+        Assert.True(ring.MarkBust(1002));
+
+        var snap = ring.AsSpan();
+        Assert.Equal(3, snap.Length);
+        Assert.Equal(0, snap[0].Busted);
+        Assert.Equal(1, snap[1].Busted);
+        Assert.Equal(0, snap[2].Busted);
+        Assert.Equal(1002L, snap[1].TradeId);
+    }
+
+    [Fact]
+    public void TradeRingBuffer_MarkBust_UnknownTradeReturnsFalse()
+    {
+        var ring = new TradeRingBuffer(3);
+        ring.Add(100, 1, tradeId: 1);
+        Assert.False(ring.MarkBust(99999));
+    }
+
+    [Fact]
+    public void TradeRingBuffer_MarkBust_IsIdempotent()
+    {
+        var ring = new TradeRingBuffer(3);
+        ring.Add(100, 1, tradeId: 7);
+        Assert.True(ring.MarkBust(7));
+        Assert.True(ring.MarkBust(7)); // second call still finds it; remains busted
+        Assert.Equal(1, ring.AsSpan()[0].Busted);
+    }
+
+    [Fact]
+    public void TradeRingBuffer_MarkBust_BustedTradeEvictedAfterRingFills()
+    {
+        // Ring of 2 — once a 3rd trade arrives, oldest evicted and bust no longer found.
+        var ring = new TradeRingBuffer(2);
+        ring.Add(100, 1, tradeId: 1);
+        ring.Add(101, 1, tradeId: 2);
+        ring.Add(102, 1, tradeId: 3); // evicts tradeId=1
+        Assert.False(ring.MarkBust(1));
+        Assert.True(ring.MarkBust(2));
+    }
+
+    // ── §12.1 — MOA/MOC null-price orders go to per-side market tier ─────────
+
+    [Fact]
+    public void OrderBook_UpsertMarketOrder_AddsThenUpdates()
+    {
+        var book = new OrderBook(securityId: 42);
+        Assert.True(book.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 100, enteringFirm: 8));
+        Assert.False(book.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 250, enteringFirm: 8));
+        Assert.Equal(1, book.MarketOrderCount(BookSideType.Bid));
+        Assert.True(book.HasMarketOrders(BookSideType.Bid));
+        Assert.False(book.HasMarketOrders(BookSideType.Ask));
+        Assert.True(book.TryGetMarketOrder(1, BookSideType.Bid, out var got));
+        Assert.Equal(250, got.Quantity);
+    }
+
+    [Fact]
+    public void OrderBook_TryRemoveMarketOrderAnySide_ResolvesSide()
+    {
+        var book = new OrderBook(99);
+        book.UpsertMarketOrder(orderId: 5, BookSideType.Ask, quantity: 50, enteringFirm: 1);
+        Assert.True(book.TryRemoveMarketOrderAnySide(5, out var side));
+        Assert.Equal(BookSideType.Ask, side);
+        Assert.Equal(0, book.MarketOrderCount(BookSideType.Ask));
+        Assert.False(book.TryRemoveMarketOrderAnySide(5, out _));
+    }
+
+    [Fact]
+    public void OrderBook_Clear_AlsoClearsMarketTier()
+    {
+        var book = new OrderBook(7);
+        book.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 10, enteringFirm: 1);
+        book.UpsertMarketOrder(orderId: 2, BookSideType.Ask, quantity: 20, enteringFirm: 1);
+        book.Clear();
+        Assert.Equal(0, book.MarketOrderCount(BookSideType.Bid));
+        Assert.Equal(0, book.MarketOrderCount(BookSideType.Ask));
+    }
 }

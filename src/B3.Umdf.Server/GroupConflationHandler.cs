@@ -226,7 +226,24 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         BufferTrade(securityId, price, quantity, tradeId);
     }
 
-    public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
+    public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
+    {
+        // Mark the trade in the per-security ring so future subscribers don't
+        // see the busted trade in their initial history snapshot. Best-effort:
+        // ring is bounded (50 entries) — busts of older trades return false
+        // and are silently ignored. Candle volumes are intentionally NOT
+        // adjusted (would require per-trade history we don't retain; a
+        // volume-only adjustment would still leave OHLC distorted, giving
+        // false confidence in recomputed candles). Spec §10 / TradeBust_57.
+        if (RecentTrades.TryGetValue(securityId, out var ring))
+            ring.MarkBust(tradeId);
+
+        if (!_parent.IsSubscribed(securityId)) return;
+        Span<byte> tmp = stackalloc byte[20];
+        int len = WireProtocol.WriteTradeBust(tmp, securityId, tradeId);
+        AppendEventToBatch(securityId, tmp[..len], logicalCount: 1);
+        _eventsReceived++;
+    }
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
 
     public void OnSymbolStaleStatusChanged(ulong securityId, bool isStale)

@@ -29,6 +29,16 @@ public interface IBookEventHandler
     void OnSymbolStaleStatusChanged(ulong securityId, bool isStale) { }
 
     /// <summary>
+    /// Atomic event boundary signal (B3 spec §10 — MatchEventIndicator
+    /// EndOfEvent bit). Fired after the last message of an exchange-side
+    /// matching event has been applied to the book. Default implementation
+    /// is a no-op; consumers MAY use this to flush per-event coalescing
+    /// buffers. Currently informational — buffer flushing is still
+    /// driven by <see cref="OnBatchComplete"/> at packet boundaries.
+    /// </summary>
+    void OnEndOfEvent(ulong securityId) { }
+
+    /// <summary>
     /// Called after all messages in a packet batch have been processed.
     /// Used as flush signal for upstream conflation buffers.
     /// </summary>

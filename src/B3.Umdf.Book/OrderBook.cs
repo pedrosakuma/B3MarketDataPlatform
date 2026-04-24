@@ -53,10 +53,70 @@ public sealed class OrderBook
 
     public BookSide GetSide(BookSideType side) => side == BookSideType.Bid ? Bids : Asks;
 
+    // ── Market orders (B3 spec §12.1 — MOA/MOC priority tier) ────────────────
+    //
+    // Orders without price (MOA = Market On Auction, MOC = Market On Close) have
+    // priority over all priced orders during reserved/pre-opening/final-closing-call
+    // phases. They are tracked in a separate per-side bucket rather than in the
+    // priced BookSide so that:
+    //   - BBO / CheckCrossing computations on Bids/Asks remain unpolluted.
+    //   - PriceLevels iteration and snapshot serialization see only real prices.
+    //   - Callers that reason about market orders opt in explicitly.
+    // Top-of-book BBO consumers should treat HasMarketOrders(side) == true as an
+    // implicit "market" tier ranked above any priced level.
+    private readonly Dictionary<ulong, MarketOrder> _marketBids = new();
+    private readonly Dictionary<ulong, MarketOrder> _marketAsks = new();
+
+    public IReadOnlyDictionary<ulong, MarketOrder> MarketBids => _marketBids;
+    public IReadOnlyDictionary<ulong, MarketOrder> MarketAsks => _marketAsks;
+    public int MarketOrderCount(BookSideType side) =>
+        (side == BookSideType.Bid ? _marketBids : _marketAsks).Count;
+    public bool HasMarketOrders(BookSideType side) => MarketOrderCount(side) > 0;
+
+    /// <summary>
+    /// Adds (or overwrites) a market order. Returns true if a new entry was
+    /// inserted, false if an existing order was replaced.
+    /// </summary>
+    public bool UpsertMarketOrder(ulong orderId, BookSideType side, long quantity, uint enteringFirm)
+    {
+        var bucket = side == BookSideType.Bid ? _marketBids : _marketAsks;
+        bool isNew = !bucket.ContainsKey(orderId);
+        bucket[orderId] = new MarketOrder
+        {
+            OrderId = orderId,
+            Side = side,
+            Quantity = quantity,
+            EnteringFirm = enteringFirm,
+            SecurityId = SecurityId,
+        };
+        return isNew;
+    }
+
+    public bool TryGetMarketOrder(ulong orderId, BookSideType side, out MarketOrder order)
+        => (side == BookSideType.Bid ? _marketBids : _marketAsks).TryGetValue(orderId, out order);
+
+    public bool RemoveMarketOrder(ulong orderId, BookSideType side)
+        => (side == BookSideType.Bid ? _marketBids : _marketAsks).Remove(orderId);
+
+    /// <summary>
+    /// Tries to remove a market order from either side. Useful when the caller
+    /// only knows the orderId (e.g. a transition from null-price → priced).
+    /// Returns true and outputs the side if found.
+    /// </summary>
+    public bool TryRemoveMarketOrderAnySide(ulong orderId, out BookSideType side)
+    {
+        if (_marketBids.Remove(orderId)) { side = BookSideType.Bid; return true; }
+        if (_marketAsks.Remove(orderId)) { side = BookSideType.Ask; return true; }
+        side = default;
+        return false;
+    }
+
     public void Clear()
     {
         Bids.Clear();
         Asks.Clear();
+        _marketBids.Clear();
+        _marketAsks.Clear();
         LastRptSeq = 0;
         IsCrossed = false;
         CrossedInAuction = false;
