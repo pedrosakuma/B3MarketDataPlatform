@@ -108,20 +108,21 @@ straight from the B3 SBE XML schema.
 | `B3.Umdf.Sbe` | SBE schema + source generator (generates all B3 message types) |
 | `B3.Umdf.Transport` | UMDF packet header, multicast transport, `IPacketSource` / `IPacketSink` |
 | `B3.Umdf.Feed` | Feed handler, gap detection, A/B dedup, message dispatch |
-| `B3.Umdf.Book` | MBO book: `OrderBook`, `BookSide`, `BookManager`, `MarketDataManager`, `SymbolRegistry` |
+| `B3.Umdf.Book` | MBO book + per-symbol heal: `OrderBook`, `BookSide`, `BookManager`, `BookStore`, `SnapshotApplier`, `SymbolStateRegistry`, `StaleMboBuffer`, `MarketDataManager`, `SymbolRegistry`, `CandleAggregator` |
 | `B3.Umdf.PcapReplay` | PCAP reader, UDP extractor, timestamp-merged replayer |
-| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `ClientSession`, `WebSocketHost`, `AppSettings` |
+| `B3.Umdf.Server` | WebSocket subscription server: `WireProtocol`, `SubscriptionManager`, `SnapshotEmitter`, `OutlierSweeper`, `RankingsPublisher`, `RecoveryProgressPublisher`, `GroupConflationHandler`, `ClientSession`, `WebSocketHost`, `AppSettings` |
 | `B3.Umdf.ConsoleApp` | CLI application — PCAP replay + optional WebSocket server + `AppMetrics` |
 
 ## Tests
 
 | Project | Tests | Description |
 |---------|-------|-------------|
-| `B3.Umdf.Book.Tests` | 19 | Order book operations, book side, concurrency stress |
-| `B3.Umdf.Feed.Tests` | 22 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
-| `B3.Umdf.PcapReplay.Tests` | 13 | PCAP reader, UDP/VLAN/SLL extraction, timestamp-merge ordering |
+| `B3.Umdf.Book.Tests` | 108 | Order book operations, book side, snapshot apply, symbol-state registry, stale buffer, candle aggregator, concurrency stress |
+| `B3.Umdf.Feed.Tests` | 20 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
+| `B3.Umdf.PcapReplay.Tests` | 18 | PCAP reader, UDP/VLAN/SLL extraction, timestamp-merge ordering |
 | `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
-| `B3.Umdf.Server.Tests` | 41 | Subscription manager, client session, settings, backpressure, outlier sweep |
+| `B3.Umdf.Server.Tests` | 57 | Subscription manager, snapshot emitter, outlier sweep, conflation, client session, settings, backpressure |
+| `B3.Umdf.ConsoleApp.Tests` | 29 | CLI option parsing, env-var precedence, multicast config validation |
 
 ```bash
 dotnet build

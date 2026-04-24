@@ -51,6 +51,14 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | **Recovery** | | | |
 | `UMDF_PERSYMBOL_FANOUT_SUPPRESS_HIGH_PCT` | — | `0.50` | Per-symbol fanout backpressure: fraction of known symbols that must be Stale to suppress client fanout. Set negative to disable. |
 | `UMDF_PERSYMBOL_FANOUT_SUPPRESS_LOW_PCT` | — | `0.10` | Hysteresis low-watermark for fanout suppression release. |
+| `UMDF_STALE_ESCAPE_TIMEOUT_MS` | — | `60000` | Stuck-Stale escape valve. When a per-symbol Stale interval exceeds this and the next snapshot would be rejected as too-old, the snapshot is accepted as authoritative reset. `0` disables (legacy strict-reject). Surfaces `b3.umdf.persymbol.snapshots_authoritative_reset`. |
+| **Replay loss injection** (resilience testing) | | | |
+| `UMDF_LOSS_TARGETS` | `--loss-targets` | *(off)* | Comma-separated channel classes to drop on. Tokens: `A`, `B`, `AB`, `Snap`, `InstrDef`, `All`, `None`. Empty disables. |
+| `UMDF_LOSS_RATE` | `--loss-rate` | `0` | Drop probability per eligible packet (`0..1`). |
+| `UMDF_LOSS_MODE` | `--loss-mode` | `random` | `random` or `burst`. |
+| `UMDF_LOSS_BURST` | `--loss-burst` | `1` | Consecutive packets dropped per burst trigger (burst mode only). |
+| `UMDF_LOSS_CORRELATED` | `--loss-correlated` | `false` | When true, A and B drop the SAME `SeqNum` (worst case for A/B arbitration). |
+| `UMDF_LOSS_SEED` | `--loss-seed` | `0` | RNG seed for reproducible loss patterns. `0` = nondeterministic. |
 
 Docker-specific helpers consumed by `docker-entrypoint.sh`:
 
