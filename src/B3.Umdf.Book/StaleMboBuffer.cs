@@ -54,9 +54,6 @@ public sealed class StaleMboBuffer
     private long _totalBytes;
     private long _enqueued;
     private long _drained;
-#pragma warning disable CS0649 // retained for ABI/metric compatibility; drop-oldest policy now evicts via _evictedPerSymbolCap
-    private long _droppedPerSymbolCap;
-#pragma warning restore CS0649
     private long _droppedGlobalCap;
 
     private long _evictedPerSymbolCap;
@@ -74,7 +71,13 @@ public sealed class StaleMboBuffer
     public long TotalBytes => Volatile.Read(ref _totalBytes);
     public long EnqueuedCount => Volatile.Read(ref _enqueued);
     public long DrainedCount => Volatile.Read(ref _drained);
-    public long DroppedPerSymbolCapCount => Volatile.Read(ref _droppedPerSymbolCap);
+    /// <summary>
+    /// Always 0 since the two-tier promotion + drop-oldest policy replaced the
+    /// drop-newest-on-cap policy. Retained for metric/dashboard ABI continuity;
+    /// new evictions are reported via <see cref="EvictedPerSymbolCapCount"/> and
+    /// <see cref="SafeEvictedBelowFloorCount"/>.
+    /// </summary>
+    public long DroppedPerSymbolCapCount => 0;
     public long DroppedGlobalCapCount => Volatile.Read(ref _droppedGlobalCap);
     /// <summary>Count of oldest messages evicted that bumped the symbol's MinHeal baseline
     /// (drop-oldest at hot cap, evicted msg's rptSeq was >= the protected floor — i.e., a

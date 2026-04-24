@@ -472,4 +472,39 @@ public class PerSymbolEndToEndTests
         var dup = reg.Observe(1u, SymbolGapKind.SecurityStatus, 20);
         Assert.Equal(SymbolStateRegistry.ObserveAction.Drop, dup.Action);
     }
+
+    [Fact]
+    public void Scenario_StaleEscape_BookManagerClearsBufferOnEmptyDrain()
+    {
+        // Contract: when the stuck-Stale escape valve fires (DrainFrom > DrainTo),
+        // the BookManager MUST clear the per-symbol stale buffer so the
+        // un-bridgeable buffered tail does not leak into the next snapshot cycle.
+        // Verifies the empty-drain branch in BookManager.HandleSnapshotEnd.
+        var (bm, reg, buf) = CreatePerSymbol();
+        const ulong sec = 555;
+        reg.StaleEscapeTimeoutMs = 30; // 30 ms timeout so the test exercises the escape
+
+        // Bring symbol Healthy at rptSeq=100, then induce a gap → Stale, MinHeal=109.
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 100);
+        bm.HealAfterSnapshotForTest(sec);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        reg.Observe(sec, SymbolGapKind.Mbo, 101);
+        reg.Observe(sec, SymbolGapKind.Mbo, 110); // gap → Stale, MinHeal=109
+        Assert.Equal(SymbolState.Stale, reg.GetState(sec, SymbolGapKind.Mbo));
+
+        // Buffer some live messages while Stale (simulating the un-bridgeable tail).
+        buf.Enqueue(sec, BUFFERED_TEMPLATE_ID, rptSeq: 110, sendingTimeNs: 0, DummyBody);
+        buf.Enqueue(sec, BUFFERED_TEMPLATE_ID, rptSeq: 111, sendingTimeNs: 0, DummyBody);
+        Assert.Equal(2, buf.DepthOf(sec));
+
+        // Wait past the escape timeout, then deliver a too-old snapshot (50 < 109).
+        Thread.Sleep(80);
+        bm.RecordSnapshotHeader(sec, lastRptSeq: 50);
+        bm.HealAfterSnapshotForTest(sec);
+
+        // Escape fired → registry healed via authoritative reset, buffer cleared.
+        Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
+        Assert.Equal(1, reg.StaleAuthoritativeResetCount);
+        Assert.Equal(0, buf.DepthOf(sec));
+    }
 }
