@@ -150,8 +150,14 @@ internal sealed class StatsPrinter
             {
                 string gate = (_groupHandlers is not null && i < _groupHandlers.Count && _groupHandlers[i].IsFanoutSuppressed)
                     ? " gate:on" : "";
+                long evictUnsafe = bm.StaleBuffer?.EvictedPerSymbolCapCount ?? 0;
+                long evictSafe = bm.StaleBuffer?.SafeEvictedBelowFloorCount ?? 0;
+                long hotProm = bm.StaleBuffer?.HotPromotionCount ?? 0;
+                string floor = (evictUnsafe > 0 || evictSafe > 0 || hotProm > 0)
+                    ? $" floorPin[hotProm:{hotProm} evictSafe:{evictSafe:N0} evictUnsafe:{evictUnsafe:N0}]"
+                    : "";
                 perSymbolParts.Add(
-                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}");
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}");
             }
         }
         if (_multiFeed is not null)
@@ -245,8 +251,20 @@ internal sealed class StatsPrinter
 
         if (anyPerSymbol)
         {
+            long totalEvictUnsafe = 0, totalEvictSafe = 0, totalHotProm = 0, totalDropPSCap = 0, totalDropGCap = 0;
+            for (int i = 0; i < _bookManagers.Count; i++)
+            {
+                var sb = _bookManagers[i].StaleBuffer;
+                if (sb is null) continue;
+                totalEvictUnsafe += sb.EvictedPerSymbolCapCount;
+                totalEvictSafe += sb.SafeEvictedBelowFloorCount;
+                totalHotProm += sb.HotPromotionCount;
+                totalDropPSCap += sb.DroppedPerSymbolCapCount;
+                totalDropGCap += sb.DroppedGlobalCapCount;
+            }
             Console.WriteLine($"  PerSymbol:    stale={totalStaleSymbols}/{totalSymbolsTracked}  healed={totalHealed:N0}  buffered={totalBuffered:N0}  replayed={totalReplayed:N0}");
             Console.WriteLine($"                dropDup={totalDropDup:N0}  liveResync={totalLiveResync:N0}  channelGapsAbsorbed={totalAbsorbed:N0}");
+            Console.WriteLine($"                floorPin: hotProm={totalHotProm:N0} evictSafe={totalEvictSafe:N0} evictUnsafe={totalEvictUnsafe:N0}  drop[psCap={totalDropPSCap:N0} gCap={totalDropGCap:N0}]");
         }
     }
 

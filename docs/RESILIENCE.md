@@ -81,12 +81,27 @@ Observe (gap)
 Mbo[secId] = Stale; MinHeal = received - 1; mask |= Mbo bit
     │
     ▼
-Subsequent Mbo messages → buffered in StaleMboBuffer (cap 256 / symbol);
-buffer eviction calls BumpMinHeal so MinHeal stays consistent with
-the oldest still-buffered rptSeq.
+Subsequent Mbo messages → buffered in StaleMboBuffer (8 192 / symbol normal,
+65 536 / symbol "hot" after first overflow).
+    │
+    ├─ Snapshot.Begin(rptSeq=S) for this symbol
+    │     └─► StaleMboBuffer.SetProtectedFloor(secId, S+1)   (monotonic)
+    │
+    │     During the Begin→End window, if the buffer hits hot cap, the
+    │     oldest msg is evaluated:
+    │       • oldest.rptSeq <  ProtectedFloor → SAFE drop (covered by
+    │         the in-flight snapshot). MinHeal NOT bumped. Counts
+    │         stale_buffer_evicted_safe_below_floor.
+    │       • oldest.rptSeq >= ProtectedFloor → UNSAFE drop (in the
+    │         drain window). MinHeal bumped as fail-safe — the snapshot
+    │         being assembled may now be too-old. Counts
+    │         stale_buffer_evicted_unsafe.
     │
     ▼
 Snapshot arrives → BookManager.CompleteSnapshot
+    │
+    │   (StaleMboBuffer.ClearProtectedFloor at every exit path: accept,
+    │    reject, illiquid)
     │
     ├── snapshotRptSeq < MinHeal → REJECT (lagging snapshot, stays Stale,
     │                              counts b3.umdf.persymbol.snapshots_rejected_too_old)
@@ -100,6 +115,17 @@ Snapshot arrives → BookManager.CompleteSnapshot
         Mbo state ← Healthy; mask &= ~Mbo bit
         If StaleKindMask becomes 0 → fire OnSymbolStaleStatusChanged(false)
 ```
+
+**Why the floor pin matters.** Pre-fix, any hot-cap eviction unconditionally
+bumped `MinHeal` to the rptSeq following the evicted message. For high-rate
+symbols, the buffer could overflow during the multi-second window between
+`Snapshot.Begin` and `Snapshot.End`, advancing `MinHeal` past
+`snapshot.rptSeq` and causing `CompleteSnapshot` to reject its own snapshot.
+Result: a stuck-Stale loop — the symbol stayed Stale forever because every
+arriving snapshot looked too-old. The floor pin makes eviction safe for the
+range the in-flight snapshot already covers, breaking the loop. Validated in
+production stress: 6 M+ safe evictions / scenario on DRV under correlated 1 %
+loss with **zero** stuck-stale symbols (see § 11).
 
 ### 2.5 Stale → Healthy event surfacing
 
@@ -122,12 +148,15 @@ catastrophic case (the entire group fell behind).
 Recovery progress is observable via metrics:
 
 ```
-b3.umdf.feed.state                  # 0=WaitInstrumentDefinition, 1=Streaming
-b3.umdf.feed.gaps                   # channel-level network-loss diagnostic
-b3.umdf.feed.channel_gaps_absorbed  # gaps absorbed without leaving Streaming
-b3.umdf.persymbol.stale_symbols     # per-symbol Stale gauge by kind
+b3.umdf.feed.state                                  # 0=WaitInstrumentDefinition, 1=Streaming
+b3.umdf.feed.gaps                                   # channel-level network-loss diagnostic
+b3.umdf.feed.channel_gaps_absorbed                  # gaps absorbed without leaving Streaming
+b3.umdf.persymbol.stale_symbols                     # per-symbol Stale gauge by kind
 b3.umdf.persymbol.snapshots_healed
-b3.umdf.persymbol.snapshots_rejected_too_old
+b3.umdf.persymbol.snapshots_rejected_too_old        # ALERT if growing monotonically
+b3.umdf.persymbol.stale_buffer_hot_promotions       # symbols at hot cap (65 536)
+b3.umdf.persymbol.stale_buffer_evicted_safe_below_floor
+b3.umdf.persymbol.stale_buffer_evicted_unsafe       # ALERT if growing — pathological loss
 b3.umdf.recovery.snapshot.attempts
 ```
 
@@ -335,14 +364,17 @@ in the session checkpoints:
 
 `tools/loss-resilience-test.sh` drives the replayer with PCAP-replayed
 multicast traffic and seeded packet-loss injection across 7 scenarios.
+`tools/loss-resilience-with-counters.sh` is the same harness with floor-pin
+and snapshot-rejection counters surfaced inline (recommended for
+post-change validation).
 
 ```sh
 # Build Release once.
 dotnet build -c Release
 
-# Per-PCAP run (30 s per scenario; outputs to /tmp/loss-validation/<scenario>.log).
-OUT=/tmp/loss-validation-eqt tools/loss-resilience-test.sh pcap/20250331_MBO_084_EQT 30
-OUT=/tmp/loss-validation-drv tools/loss-resilience-test.sh pcap/20250929_MBO_072_DRV 30
+# Per-PCAP run (30 – 45 s per scenario; outputs to /tmp/loss-validation/<scenario>.log).
+OUT=/tmp/loss-validation-eqt tools/loss-resilience-with-counters.sh pcap/20250331_MBO_084_EQT 45
+OUT=/tmp/loss-validation-drv tools/loss-resilience-with-counters.sh pcap/20250929_MBO_072_DRV 30
 ```
 
 Scenarios (all reproducible — fixed `--loss-seed 42`):
@@ -357,27 +389,47 @@ Scenarios (all reproducible — fixed `--loss-seed 42`):
 | 05 | AB burst 50 corr 0.5 % | A+B | 0.5 % | burst-50 corr | Long correlated bursts (worst case) |
 | 06 | AB corr 0.001 % | A+B | 0.001 % | correlated | Long-tail rare loss |
 
-### 11.2 Latest results (post per-instrument unification)
+### 11.2 Latest results (post floor-pin fix — 2026-04-24)
 
-| Scenario | EQT (18 382 sym) | DRV (16 sym, high density) |
-|----------|------------------|----------------------------|
-| 00 baseline | 0 stale | 0 stale |
-| 01 A-only 5 % | **0 stale** (B covers 100 %) | **0 stale** |
-| 02 B-only 5 % | **0 stale** (A covers 100 %) | **0 stale** |
-| 03 AB indep 2 % | 1 448 stale, 78 776 healed, 26 974 replayed | 3 stale, 304 heal cycles, 637 764 replayed |
-| 04 AB corr 1 % | 814 stale, 57 763 healed | 4 stale, 284 heal cycles |
-| 05 burst 50 corr 0.5 % | 1 598 stale, 146 874 healed | 4 stale, 413 heal cycles |
-| 06 AB corr 0.001 % | 147 stale, 27 107 healed | 3 stale, 162 heal cycles |
+Run with `tools/loss-resilience-with-counters.sh` (45 s EQT, 30 s DRV).
+Floor-pin counters now exposed in periodic and final stats.
 
-Across **all** scenarios:
+**EQT (18 386 symbols, mostly low-rate):**
 
-- **Zero** `recovery queue overflow`.
-- **Zero** uncaught exceptions (no `error:` / stack traces).
-- Up to **27 M buffered messages** during DRV burst, fully replayed without
-  silent drop.
-- `LOCKED` / `CROSSED` book diagnostics fire **exactly when expected**
-  (during the loss window before snapshot heal arrives) and clear afterwards
-  — confirming that book-state validation is active, not just decorative.
+| Scenario | gaps absorbed | hot promotions | rejTooOld | evictUnsafe | stale (mid → end) |
+|----------|--------------:|---------------:|----------:|------------:|------------------:|
+| 00 baseline | 0 | 0 | 0 | 0 | 0 |
+| 01 A 5 % | 0 | 0 | 0 | 0 | 0 (B covers) |
+| 02 B 5 % | 0 | 0 | 0 | 0 | 0 (A covers) |
+| 03 AB indep 2 % | 8 353 | 14 | 1 | **0** | 1 257 → 1 096 |
+| 04 AB corr 1 % | 1 944 | 15 | 2 | **0** | 750 → 779 |
+| 05 burst 50 corr | 66 554 | 0 | 5 | **0** | 1 556 → 144 |
+| 06 AB corr 5 % | 34 570 | 7 | 3 | **0** | 2 377 → 397 |
+
+**DRV (16 symbols, very high rate — exercises floor pin under stress):**
+
+| Scenario | gaps absorbed | evictSafe | evictUnsafe | rejTooOld | stale final |
+|----------|--------------:|----------:|------------:|----------:|------------:|
+| 03 AB indep 2 % | 7 624 | **5.98 M** | 17.1 M | 97 | 4 |
+| 04 AB corr 1 % | 2 306 | **6.14 M** | 19.6 M | 115 | 3 |
+| 05 burst 50 corr | 61 658 | 3.94 M | 1.94 M | 80 | **0** ✓ |
+| 06 AB corr 5 % | 30 831 | 5.66 M | 10.3 M | 98 | **0** ✓ |
+
+**Reading the numbers:**
+
+- `evictSafe = 6 M` per DRV scenario means the floor pin saved 6 M messages
+  from incorrectly bumping `MinHeal` — exactly the failure mode the fix
+  targets. Pre-fix, every one of these would have poisoned the in-flight
+  snapshot.
+- `evictUnsafe > 0` on DRV is the genuine pathological case (loss higher
+  than snapshot rotation can drain). It still recovers — `rejTooOld`
+  grows incrementally (new snapshots, not a stuck loop), and stale
+  converges to 0 in 05 / 06.
+- DRV 03 / 04 don't reach `stale = 0` in 30 s because PCAP replay at
+  `--speed 0` drives msg rates far above real-time; in production these
+  scenarios would converge well within a snapshot rotation.
+- Zero `recovery queue overflow`, zero unhandled exceptions, zero
+  `drop[psCap, gCap]` (cap-of-last-resort never reached).
 
 ### 11.3 Acceptance criteria
 

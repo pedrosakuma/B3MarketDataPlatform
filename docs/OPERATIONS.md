@@ -223,6 +223,17 @@ automatically.
 | `b3.umdf.book.null_price_skips` | Counter | `group` | New orders skipped due to null price |
 | `b3.umdf.book.null_price_deletes` | Counter | `group` | Updates with null price converted to deletes |
 | `b3.umdf.book.active` | Gauge | `group` | Active order books |
+| `b3.umdf.persymbol.snapshots_healed` | Counter | `group` | Per-symbol snapshots accepted and applied |
+| `b3.umdf.persymbol.snapshots_rejected_too_old` | Counter | `group` | Snapshots rejected (snapshot.rptSeq < MinHeal). Sustained growth = recovery loop |
+| `b3.umdf.persymbol.snapshots_skipped_healthy_ahead` | Counter | `group` | Snapshots skipped because symbol is already ahead |
+| `b3.umdf.persymbol.snapshots_missing_rptseq` | Counter | `group` | Snapshots missing rptSeq metadata |
+| `b3.umdf.persymbol.channel_gaps_absorbed` | Counter | `group` | Channel-level gaps absorbed via per-symbol heal (no Recovery escalation) |
+| `b3.umdf.persymbol.stale_buffer_bytes` | Gauge | `group` | Bytes currently held in StaleMboBuffer |
+| `b3.umdf.persymbol.stale_buffer_dropped_persymbol_cap` | Counter | `group` | MBO msgs dropped on per-symbol cap (newest dropped) |
+| `b3.umdf.persymbol.stale_buffer_dropped_global_cap` | Counter | `group` | MBO msgs dropped on global byte cap |
+| `b3.umdf.persymbol.stale_buffer_hot_promotions` | Counter | `group` | Symbols promoted from normal cap (8 192) to hot cap (65 536) |
+| `b3.umdf.persymbol.stale_buffer_evicted_safe_below_floor` | Counter | `group` | Oldest msg evicted at hot cap with `rptSeq < ProtectedFloor` (safe — covered by in-flight snapshot) |
+| `b3.umdf.persymbol.stale_buffer_evicted_unsafe` | Counter | `group` | Oldest msg evicted at hot cap with `rptSeq >= ProtectedFloor` (unsafe — bumps MinHeal, may force resnapshot). **Sustained growth indicates pathological loss; consider raising hot cap.** |
 
 ### Market data
 
