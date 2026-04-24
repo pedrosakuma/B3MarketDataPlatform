@@ -159,16 +159,7 @@ public sealed class SubscriptionManager : IDisposable
     {
         var req = SubscriptionRequest.Subscribe(clientId, symbol, flags);
         if (!RouteToGroup(req))
-        {
-            // Could not route — send error directly (safe: TryEnqueue is multi-writer)
-            if (_clients.TryGetValue(clientId, out var session))
-            {
-                if (!_ready)
-                    SendError(session, SubscribeErrorCode.NotReady, symbol);
-                else
-                    SendError(session, SubscribeErrorCode.UnknownSymbol, symbol);
-            }
-        }
+            SendRouteFailureError(clientId, symbol);
     }
 
     /// <summary>Called from WebSocket read thread to request a one-shot snapshot.</summary>
@@ -176,15 +167,21 @@ public sealed class SubscriptionManager : IDisposable
     {
         var req = SubscriptionRequest.Get(clientId, symbol, flags);
         if (!RouteToGroup(req))
-        {
-            if (_clients.TryGetValue(clientId, out var session))
-            {
-                if (!_ready)
-                    SendError(session, SubscribeErrorCode.NotReady, symbol);
-                else
-                    SendError(session, SubscribeErrorCode.UnknownSymbol, symbol);
-            }
-        }
+            SendRouteFailureError(clientId, symbol);
+    }
+
+    /// <summary>
+    /// Common failure response for Subscribe/Get when routing returns false.
+    /// Distinguishes NotReady (still loading instrument definitions) from
+    /// UnknownSymbol (no group owns it) so the client can react accordingly.
+    /// Safe to call from the WebSocket read thread because <see cref="ClientSession.TryEnqueue"/>
+    /// is multi-writer.
+    /// </summary>
+    private void SendRouteFailureError(string clientId, string symbol)
+    {
+        if (!_clients.TryGetValue(clientId, out var session)) return;
+        var code = _ready ? SubscribeErrorCode.UnknownSymbol : SubscribeErrorCode.NotReady;
+        SendError(session, code, symbol);
     }
 
     /// <summary>Called from WebSocket read thread to unsubscribe.</summary>
@@ -713,15 +710,9 @@ public sealed class SubscriptionManager : IDisposable
         gainerList.Sort((a, b) => b.Value.CompareTo(a.Value));
         loserList.Sort((a, b) => a.Value.CompareTo(b.Value));
 
-        var volume = volumeList.Count > RankingsTopN
-            ? volumeList.GetRange(0, RankingsTopN).ToArray()
-            : volumeList.ToArray();
-        var gainers = gainerList.Count > RankingsTopN
-            ? gainerList.GetRange(0, RankingsTopN).ToArray()
-            : gainerList.ToArray();
-        var losers = loserList.Count > RankingsTopN
-            ? loserList.GetRange(0, RankingsTopN).ToArray()
-            : loserList.ToArray();
+        var volume = TopN(volumeList, RankingsTopN);
+        var gainers = TopN(gainerList, RankingsTopN);
+        var losers = TopN(loserList, RankingsTopN);
 
         var buf = new byte[WireProtocol.RankingsUpdateMaxSize];
         int len = WireProtocol.WriteRankingsUpdate(buf, volume, gainers, losers);
@@ -730,6 +721,10 @@ public sealed class SubscriptionManager : IDisposable
         foreach (var (_, client) in _clients)
             client.TryEnqueue(payload);
     }
+
+    /// <summary>Take the first <paramref name="n"/> elements (caller has pre-sorted).</summary>
+    private static RankingEntry[] TopN(List<RankingEntry> sorted, int n)
+        => sorted.Count > n ? sorted.GetRange(0, n).ToArray() : sorted.ToArray();
 
     /// <summary>Called when feed enters RealTime state. Enables subscriptions and starts background rankings.</summary>
     public void SetReady()
