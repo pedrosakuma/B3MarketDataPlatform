@@ -834,6 +834,20 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             HasRptSeq = hasRptSeq,
         };
 
+        // Floor pin: while this snapshot is in flight (Begin → Orders_71 chunks → End),
+        // tell the per-symbol stale buffer that messages with rptSeq ≤ lastRptSeq are
+        // already covered by the snapshot — so eviction of those at hot cap is "safe"
+        // and must NOT advance MinHeal. Without this pin, a high-rate symbol can:
+        //   (a) overflow the hot cap during the snapshot's own delivery window,
+        //   (b) bump MinHeal past the snapshot's lastRptSeq,
+        //   (c) and have the same snapshot rejected at CompleteSnapshot for being
+        //       "too old" — leaving the symbol stuck Stale until a much later
+        //       rotation (potentially never, if the race repeats).
+        // The floor only applies when we have a usable rptSeq; the illiquid path
+        // (hasRptSeq=false, baseline=0) sets no floor — there is nothing to protect.
+        if (hasRptSeq)
+            _staleBuffer!.SetProtectedFloor(secId, lastRptSeq + 1);
+
         // Empty book snapshot (no Orders_71 chunks will follow): heal immediately.
         if (ordersExpected == 0)
             CompleteSnapshot(secId, book);
@@ -854,6 +868,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             OrdersReceived = 0,
             HasRptSeq = lastRptSeq > 0,
         };
+        // Mirror BeginSnapshotHeader's floor pin so tests exercise the same path
+        // as production. ClearProtectedFloor fires automatically in CompleteSnapshot.
+        if (lastRptSeq > 0)
+            _staleBuffer!.SetProtectedFloor(securityId, lastRptSeq + 1);
         if (ordersExpected == 0 && lastRptSeq > 0)
             CompleteSnapshot(securityId, book);
     }
@@ -1041,6 +1059,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             Interlocked.Increment(ref _snapshotsMissingRptSeq);
             return;
         }
+
+        // Snapshot lifecycle is ending (heal accepted, rejected, illiquid, or skipped) —
+        // release the per-symbol stale-buffer floor pin set at BeginSnapshotHeader.
+        // From here on, eviction reverts to bumping MinHeal (current behavior) until
+        // the next snapshot's Begin re-pins.
+        _staleBuffer!.ClearProtectedFloor(securityId);
 
         if (!pending.HasRptSeq)
         {

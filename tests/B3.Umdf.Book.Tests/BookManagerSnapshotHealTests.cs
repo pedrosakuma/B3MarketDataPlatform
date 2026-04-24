@@ -443,6 +443,103 @@ public class BookManagerSnapshotHealTests
         Assert.Equal(210u, live.LastRptSeq);
     }
 
+    [Fact]
+    public void FloorPin_BufferOverflowsDuringSnapshotDelivery_HealStillSucceeds()
+    {
+        // REGRESSÃO: símbolo high-rate ficava preso em Stale por 47min após canal
+        // gap. Causa: durante a janela Begin→End do snapshot, o buffer transbordava
+        // e cada eviction chamava BumpMinHeal, levando o snapshot (cuja rptSeq
+        // estava abaixo do novo MinHeal) a ser rejeitado em CompleteSnapshot.
+        //
+        // Fix: BeginSnapshotHeader pina um "floor protegido" no buffer (lastRptSeq+1).
+        // Eviction de msgs com rptSeq < floor é seguro (snapshot cobre) e NÃO
+        // avança MinHeal. Snapshot heals corretamente.
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
+
+        // Bootstrap: Healthy at 10, gap to 11 → Stale, MinHeal=10.
+        for (uint r = 5; r <= 10; r++)
+            reg.Observe(securityId: 2000, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(2000, SymbolGapKind.Mbo, 10);
+        // Force gap to put symbol Stale; observed jumps far ahead.
+        reg.Observe(securityId: 2000, SymbolGapKind.Mbo, 100);
+        Assert.Equal(SymbolState.Stale, reg.GetState(2000, SymbolGapKind.Mbo));
+
+        // Pre-snapshot: a couple of msgs accumulate in the buffer (r=100,101).
+        foreach (uint r in new uint[] { 100, 101 })
+            buf.Enqueue(2000, 50, r, 0, new byte[] { (byte)r },
+                onEvictedOldest: ev => reg.BumpMinHeal(2000, SymbolGapKind.Mbo, ev));
+
+        // Snapshot Begin arrives with lastRptSeq=105 (snapshot includes everything ≤105).
+        // Floor is set to 106 → msgs <106 are safe to evict.
+        bm.BeginChunkedSnapshotForTest(2000, lastRptSeq: 105, ordersExpected: 1);
+        Assert.Equal(106u, buf.ProtectedFloorOf(2000));
+
+        // During Begin→End delivery window, MORE msgs arrive: r=102..107.
+        // Buffer is at hot cap (4). r=102 enters, evicts r=100 (< 106 → safe).
+        // r=103,104,105 enter, evicting 101,102,103 (all < 106 → safe).
+        // r=106,107 enter, evicting 104,105 (still < 106 → safe; 105<106).
+        // Final buffer: [104,105,106,107] → wait, we evicted 104 and 105 too.
+        // Let me recount: after r=102..107 arrive (6 msgs) and buffer cap=4,
+        // we end with the last 4 that arrived: [104,105,106,107]. Evicted=100..103
+        // → ALL < 106 → all safe. SafeEvictedBelowFloor should be 4.
+        foreach (uint r in new uint[] { 102, 103, 104, 105, 106, 107 })
+            buf.Enqueue(2000, 50, r, 0, new byte[] { (byte)r },
+                onEvictedOldest: ev => reg.BumpMinHeal(2000, SymbolGapKind.Mbo, ev));
+
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount); // no UNSAFE eviction
+        Assert.True(buf.SafeEvictedBelowFloorCount >= 4); // 100..103 all safe-evicted
+
+        // Snapshot End: stage 1 entry → CompleteSnapshot fires → heal accepted
+        // (because MinHeal was NOT bumped during the snapshot delivery window).
+        bm.StageSnapshotEntryForTest(2000, BookSideType.Bid, orderId: 1, price: 50, quantity: 1);
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(0, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(2000, SymbolGapKind.Mbo));
+        // Floor is cleared on CompleteSnapshot.
+        Assert.Equal(0u, buf.ProtectedFloorOf(2000));
+    }
+
+    [Fact]
+    public void FloorPin_OverflowAboveFloor_StillBumpsMinHeal_SnapshotRejected()
+    {
+        // Pathological case: even with the floor pin, if the buffer overflows
+        // with msgs ALL above the floor (snapshot covers nothing in our buffer),
+        // eviction MUST bump MinHeal — otherwise we'd silently leave a hole and
+        // accept a snapshot whose drain target is missing from the buffer. The
+        // failsafe path (snapshot rejected at CompleteSnapshot) MUST trigger.
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf);
+
+        // Stale at observed=200, MinHeal=199.
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(2100, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(2100, SymbolGapKind.Mbo, 100);
+        reg.Observe(2100, SymbolGapKind.Mbo, 200);
+
+        // Snapshot Begin at lastRptSeq=300 (floor=301), but buffer holds nothing yet.
+        bm.BeginChunkedSnapshotForTest(2100, lastRptSeq: 300, ordersExpected: 1);
+
+        // Now flood with msgs all > 301 (above floor). Hot cap=4. Send 6 msgs;
+        // 2 evictions happen — both above floor → must bump MinHeal.
+        foreach (uint r in new uint[] { 400, 401, 402, 403, 404, 405 })
+            buf.Enqueue(2100, 50, r, 0, new byte[] { (byte)(r & 0xFF) },
+                onEvictedOldest: ev => reg.BumpMinHeal(2100, SymbolGapKind.Mbo, ev));
+
+        Assert.True(buf.EvictedPerSymbolCapCount >= 2); // unsafe evictions
+        Assert.Equal(0, buf.SafeEvictedBelowFloorCount);
+
+        // CompleteSnapshot: snapshot.rptSeq=300 < MinHeal (now ≥400) → rejected.
+        bm.StageSnapshotEntryForTest(2100, BookSideType.Bid, orderId: 1, price: 50, quantity: 1);
+
+        Assert.Equal(0, bm.SnapshotsHealed);
+        Assert.Equal(1, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Stale, reg.GetState(2100, SymbolGapKind.Mbo));
+    }
+
     private sealed class ClearCountingHandler : IBookEventHandler
     {
         private readonly Action _onCleared;

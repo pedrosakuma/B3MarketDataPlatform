@@ -180,4 +180,115 @@ public class StaleMboBufferTests
         var buf = NewBuffer();
         Assert.Equal(0, buf.DepthOf(999));
     }
+
+    // ─── Floor pin ──────────────────────────────────────────────────────
+
+    [Fact]
+    public void FloorPin_EvictionBelowFloor_DoesNotInvokeCallback()
+    {
+        // Floor set: snapshot in-flight covers msgs with rptSeq ≤ 10. Hot-cap eviction
+        // of msgs at rptSeq 11 (below floor=12) must be SAFE — no MinHeal bump.
+        var buf = NewBuffer(perSymbolCap: 1, hotPerSymbolCap: 2);
+        buf.Enqueue(1, 50, 11, 0, new byte[] { 11 });
+        buf.Enqueue(1, 50, 12, 0, new byte[] { 12 }); // promote to hot cap
+        buf.SetProtectedFloor(1, floor: 13); // snapshot covers ≤12
+        uint? evicted = null;
+        // Enqueue rptSeq=14 → at cap, evict oldest (11). 11 < 13 → safe.
+        buf.Enqueue(1, 50, 14, 0, new byte[] { 14 }, e => evicted = e);
+        Assert.Null(evicted);
+        Assert.Equal(0, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(1, buf.SafeEvictedBelowFloorCount);
+    }
+
+    [Fact]
+    public void FloorPin_EvictionAtOrAboveFloor_BumpsCallbackAsBefore()
+    {
+        // Floor set, but the evicted msg is above the floor → must signal eviction
+        // (snapshot does NOT cover it, so caller must bump MinHeal, leading to
+        // the snapshot being rejected at CompleteSnapshot — fail-safe path).
+        var buf = NewBuffer(perSymbolCap: 1, hotPerSymbolCap: 2);
+        buf.Enqueue(1, 50, 20, 0, new byte[] { 20 });
+        buf.Enqueue(1, 50, 21, 0, new byte[] { 21 }); // promote
+        buf.SetProtectedFloor(1, floor: 15); // snapshot covers ≤14, our buffer is all > 14
+        uint? evicted = null;
+        buf.Enqueue(1, 50, 22, 0, new byte[] { 22 }, e => evicted = e);
+        Assert.Equal((uint)20, evicted);
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(0, buf.SafeEvictedBelowFloorCount);
+    }
+
+    [Fact]
+    public void FloorPin_NoFloor_BehavesAsLegacy()
+    {
+        // Without a floor, every hot-cap eviction signals (legacy behavior).
+        var buf = NewBuffer(perSymbolCap: 1, hotPerSymbolCap: 2);
+        buf.Enqueue(1, 50, 5, 0, new byte[] { 5 });
+        buf.Enqueue(1, 50, 6, 0, new byte[] { 6 }); // promote
+        uint? evicted = null;
+        buf.Enqueue(1, 50, 7, 0, new byte[] { 7 }, e => evicted = e);
+        Assert.Equal((uint)5, evicted);
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);
+        Assert.Equal(0, buf.SafeEvictedBelowFloorCount);
+    }
+
+    [Fact]
+    public void FloorPin_SetIsMonotonic_LowerValueIgnored()
+    {
+        var buf = NewBuffer();
+        buf.Enqueue(1, 50, 10, 0, new byte[] { 1 }); // lazy-create queue
+        buf.SetProtectedFloor(1, 100);
+        buf.SetProtectedFloor(1, 50); // ignored (lower)
+        Assert.Equal(100u, buf.ProtectedFloorOf(1));
+        buf.SetProtectedFloor(1, 200); // raises
+        Assert.Equal(200u, buf.ProtectedFloorOf(1));
+    }
+
+    [Fact]
+    public void FloorPin_SetCreatesQueue_IfMissing()
+    {
+        // Snapshot Begin can race ahead of the first buffered msg for a symbol.
+        // Setting floor must lazily create the queue without crashing.
+        var buf = NewBuffer();
+        buf.SetProtectedFloor(99, 42);
+        Assert.Equal(42u, buf.ProtectedFloorOf(99));
+        Assert.Equal(0, buf.DepthOf(99));
+    }
+
+    [Fact]
+    public void FloorPin_Clear_RemovesFloor()
+    {
+        var buf = NewBuffer();
+        buf.SetProtectedFloor(1, 10);
+        buf.ClearProtectedFloor(1);
+        Assert.Equal(0u, buf.ProtectedFloorOf(1));
+    }
+
+    [Fact]
+    public void FloorPin_BufferClear_AlsoClearsFloor()
+    {
+        // Clear() (epoch reset path / CompleteSnapshot drop-all) must reset the floor;
+        // a stale floor lingering across snapshot lifecycles would skew accounting.
+        var buf = NewBuffer();
+        buf.Enqueue(1, 50, 10, 0, new byte[] { 1 });
+        buf.SetProtectedFloor(1, 99);
+        buf.Clear(1);
+        Assert.Equal(0u, buf.ProtectedFloorOf(1));
+    }
+
+    [Fact]
+    public void FloorPin_AllProtectedAndOverflowing_FallsBackToBumping()
+    {
+        // Pathological case: buffer is at hot cap and EVERY message is above the
+        // floor (snapshot covers nothing in our buffer). Eviction MUST still
+        // happen (otherwise we'd exceed the cap) and MUST bump MinHeal —
+        // otherwise we'd silently leave a hole and the snapshot wouldn't reject.
+        var buf = NewBuffer(perSymbolCap: 1, hotPerSymbolCap: 2);
+        buf.Enqueue(1, 50, 100, 0, new byte[] { 1 });
+        buf.Enqueue(1, 50, 101, 0, new byte[] { 2 }); // promote to hot cap
+        buf.SetProtectedFloor(1, 50); // covers nothing in our buffer
+        uint? evicted = null;
+        buf.Enqueue(1, 50, 102, 0, new byte[] { 3 }, e => evicted = e);
+        Assert.Equal((uint)100, evicted); // bumped — snapshot will be rejected
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);
+    }
 }

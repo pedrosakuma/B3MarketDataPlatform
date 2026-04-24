@@ -60,6 +60,7 @@ public sealed class StaleMboBuffer
     private long _droppedGlobalCap;
 
     private long _evictedPerSymbolCap;
+    private long _safeEvictedBelowFloor;
     private long _hotPromotions;
 
     public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024, int hotPerSymbolCap = 65536)
@@ -75,8 +76,16 @@ public sealed class StaleMboBuffer
     public long DrainedCount => Volatile.Read(ref _drained);
     public long DroppedPerSymbolCapCount => Volatile.Read(ref _droppedPerSymbolCap);
     public long DroppedGlobalCapCount => Volatile.Read(ref _droppedGlobalCap);
-    /// <summary>Count of oldest messages evicted (drop-oldest policy after a symbol is already at hot cap).</summary>
+    /// <summary>Count of oldest messages evicted that bumped the symbol's MinHeal baseline
+    /// (drop-oldest at hot cap, evicted msg's rptSeq was >= the protected floor — i.e., a
+    /// message we still needed for drain). Each one of these effectively makes the next
+    /// snapshot heal harder for that symbol.</summary>
     public long EvictedPerSymbolCapCount => Volatile.Read(ref _evictedPerSymbolCap);
+    /// <summary>Count of oldest messages evicted that fell BELOW the protected floor (i.e.,
+    /// snapshot in flight already covers them — safe to drop without bumping MinHeal).
+    /// High values vs <see cref="EvictedPerSymbolCapCount"/> indicate the floor pin is
+    /// successfully absorbing snapshot-delivery latency.</summary>
+    public long SafeEvictedBelowFloorCount => Volatile.Read(ref _safeEvictedBelowFloor);
     /// <summary>Count of symbols that were promoted from the normal cap to the hot cap on first overflow.</summary>
     public long HotPromotionCount => Volatile.Read(ref _hotPromotions);
 
@@ -102,6 +111,15 @@ public sealed class StaleMboBuffer
         // Per-symbol cap. Starts at the normal tier; promoted to the hot tier
         // on first overflow. One-way ratchet — never demoted.
         internal int Cap;
+        // Protected-floor pin: while a snapshot is in flight for this symbol,
+        // the BookManager publishes the snapshot's rptSeq+1 as the floor.
+        // Messages with rptSeq < ProtectedFloor are NOT needed for the eventual
+        // drain (snapshot already covers them). At hot-cap eviction time:
+        //   - If oldest.RptSeq < ProtectedFloor → safe drop, MinHeal NOT bumped.
+        //   - Else (or ProtectedFloor == 0) → unsafe drop, MinHeal bumped (current behavior).
+        // This protects the post-snapshot drain window from being lost while the
+        // snapshot is still being delivered chunk-by-chunk.
+        internal uint ProtectedFloor;
     }
 
     /// <summary>
@@ -114,11 +132,15 @@ public sealed class StaleMboBuffer
     ///   <item>Hot tier: when the buffer is already at the hot cap, the OLDEST
     ///   buffered message is evicted to make room — the buffer always retains
     ///   the most-recent <c>hotPerSymbolCap</c> messages so the next snapshot
-    ///   heal reflects the freshest possible state. The caller receives the
-    ///   evicted message's rptSeq via <paramref name="onEvictedOldest"/> so it
-    ///   can advance its <see cref="SymbolStateRegistry.BumpMinHeal"/> baseline
-    ///   accordingly (rejecting future snapshots that would leave a hole between
-    ///   the snapshot and the new buffer earliest).</item>
+    ///   heal reflects the freshest possible state. If the evicted message's
+    ///   rptSeq is BELOW the symbol's protected floor (set by the caller when
+    ///   a snapshot is in flight), the eviction is "safe" — the snapshot
+    ///   already covers that message — and <paramref name="onEvictedOldest"/>
+    ///   is NOT invoked. Otherwise (no floor set, or evicted msg ≥ floor),
+    ///   the callback fires so the caller can advance its
+    ///   <see cref="SymbolStateRegistry.BumpMinHeal"/> baseline (rejecting
+    ///   future snapshots that would leave a hole between the snapshot and
+    ///   the new buffer earliest).</item>
     /// </list>
     /// </summary>
     public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null)
@@ -139,6 +161,7 @@ public sealed class StaleMboBuffer
         long evictedBytes = 0;
         uint evictedRptSeq = 0;
         bool evicted = false;
+        bool safeEviction = false;
         bool promoted = false;
         if (queue.Items.Count >= queue.Cap)
         {
@@ -153,8 +176,15 @@ public sealed class StaleMboBuffer
                 evictedBytes = old.BodyLength;
                 evictedRptSeq = old.RptSeq;
                 evicted = true;
+                // Floor pin: if the evicted message is below the snapshot floor,
+                // the in-flight snapshot already covers it — safe to drop without
+                // pushing MinHeal forward. This is what allows a high-rate symbol
+                // to absorb msgs during the snapshot's Begin→End delivery window
+                // without poisoning its own heal.
+                safeEviction = queue.ProtectedFloor != 0 && old.RptSeq < queue.ProtectedFloor;
                 old.Release();
-                _evictedPerSymbolCap++;
+                if (safeEviction) _safeEvictedBelowFloor++;
+                else _evictedPerSymbolCap++;
             }
         }
         var rented = ArrayPool<byte>.Shared.Rent(body.Length);
@@ -170,9 +200,46 @@ public sealed class StaleMboBuffer
                     "StaleMboBuffer: symbol {SecurityId} promoted to hot cap ({HotCap}); normal cap {NormalCap} exceeded",
                     securityId, _hotPerSymbolCap, _perSymbolCap);
         }
-        if (evicted) onEvictedOldest?.Invoke(evictedRptSeq);
+        if (evicted && !safeEviction) onEvictedOldest?.Invoke(evictedRptSeq);
         return true;
     }
+
+    /// <summary>
+    /// Mark the symbol as having an in-flight snapshot whose baseline rptSeq is
+    /// <paramref name="floor"/> − 1. While the floor is set, hot-cap eviction
+    /// of messages with <c>rptSeq &lt; floor</c> is "safe" (snapshot covers
+    /// them) and does NOT advance <see cref="SymbolStateRegistry.BumpMinHeal"/>.
+    /// Eviction of messages with <c>rptSeq &gt;= floor</c> still advances
+    /// MinHeal as a last-resort safety guard. The floor is monotonic per snapshot
+    /// — calling again with a smaller value is a no-op (a newer snapshot only
+    /// raises the floor; a stale set would weaken the protection). Caller MUST
+    /// invoke <see cref="ClearProtectedFloor"/> on snapshot completion or rejection.
+    /// </summary>
+    public void SetProtectedFloor(ulong securityId, uint floor)
+    {
+        if (floor == 0) return;
+        if (!_queues.TryGetValue(securityId, out var queue))
+        {
+            queue = new PerSymbolQueue { Cap = _perSymbolCap };
+            _queues[securityId] = queue;
+        }
+        if (floor > queue.ProtectedFloor) queue.ProtectedFloor = floor;
+    }
+
+    /// <summary>
+    /// Remove the protected-floor pin for a symbol (snapshot completed,
+    /// rejected, or superseded). Subsequent evictions revert to bumping
+    /// MinHeal as before. No-op if no floor was set.
+    /// </summary>
+    public void ClearProtectedFloor(ulong securityId)
+    {
+        if (_queues.TryGetValue(securityId, out var queue))
+            queue.ProtectedFloor = 0;
+    }
+
+    /// <summary>Current protected floor for a symbol (0 if none). Test/diagnostic helper.</summary>
+    public uint ProtectedFloorOf(ulong securityId) =>
+        _queues.TryGetValue(securityId, out var q) ? q.ProtectedFloor : 0u;
 
     /// <summary>
     /// Drain messages with <c>RptSeq ∈ [drainFrom, drainTo]</c> in queue
@@ -240,6 +307,10 @@ public sealed class StaleMboBuffer
             item.Release();
             count++;
         }
+        // Clear floor too — it is only meaningful while pendingSnapshot is alive,
+        // and Clear is called by the symbol-level reset paths (epoch reset, drain
+        // window-empty CompleteSnapshot success).
+        queue.ProtectedFloor = 0;
         Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) - releasedBytes);
         return count;
     }

@@ -480,6 +480,48 @@ static class MetricsBinder
             },
             unit: "{messages}", description: "Stale-buffer enqueues rejected because the global byte cap was reached");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_evicted_unsafe",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.EvictedPerSymbolCapCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{messages}", description: "Hot-cap evictions that bumped MinHeal (no snapshot in flight, or evicted msg ≥ snapshot floor — each one makes the next heal harder)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_evicted_safe_below_floor",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.SafeEvictedBelowFloorCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{messages}", description: "Hot-cap evictions absorbed safely below the protected snapshot floor (snapshot already covers — heal still viable)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.stale_buffer_hot_promotions",
+            () =>
+            {
+                var m = new List<Measurement<long>>();
+                for (int i = 0; i < bookManagers.Count; i++)
+                {
+                    var buf = bookManagers[i].StaleBuffer;
+                    if (buf is null) continue;
+                    m.Add(new(buf.HotPromotionCount, Tag("group", $"G{groupIds[i]}")));
+                }
+                return m;
+            },
+            unit: "{symbols}", description: "Symbols promoted from normal cap to hot cap on first overflow (one-way ratchet)");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.channel_gaps_absorbed",
             () => FeedHandlers().Select(h =>
                 new Measurement<long>(h.Handler.PerSymbolGapsAbsorbed, Tag("group", h.Label))),
