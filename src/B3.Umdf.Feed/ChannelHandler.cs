@@ -21,9 +21,8 @@ namespace B3.Umdf.Feed;
 /// <see cref="MaxReorderDistance"/> packets do we declare a real gap and let
 /// the FeedHandler fall into snapshot recovery.
 ///
-/// The buffer holds retained <see cref="UmdfPacket"/> instances; callers
-/// must dispose this handler (or call <see cref="Reset"/> /
-/// <see cref="CompleteRecovery"/>) to release pinned buffers.
+/// The buffer holds retained <see cref="UmdfPacket"/> instances; the handler
+/// drains and releases them on <see cref="Dispose"/>.
 /// </summary>
 public sealed class ChannelHandler : IDisposable
 {
@@ -40,7 +39,6 @@ public sealed class ChannelHandler : IDisposable
     private readonly Dictionary<uint, UmdfPacket> _reorderBuffer = new(MaxReorderDistance);
 
     private uint _expectedSeqNum = 1;
-    private bool _inRecovery;
 
     private long _packetsProcessed;
     private long _duplicatesSkipped;
@@ -49,7 +47,6 @@ public sealed class ChannelHandler : IDisposable
     private volatile uint _lastGapExpected;
     private volatile uint _lastGapReceived;
 
-    public bool InRecovery => _inRecovery;
     public uint ExpectedSequenceNumber => _expectedSeqNum;
     public long PacketsProcessed => Volatile.Read(ref _packetsProcessed);
     public long DuplicatesSkipped => Volatile.Read(ref _duplicatesSkipped);
@@ -113,7 +110,6 @@ public sealed class ChannelHandler : IDisposable
         if (distance > MaxReorderDistance)
         {
             _gapsDetected++;
-            _inRecovery = true;
             _lastGapExpected = _expectedSeqNum;
             _lastGapReceived = seq;
             return GapResult.Gap;
@@ -132,28 +128,10 @@ public sealed class ChannelHandler : IDisposable
     }
 
     /// <summary>
-    /// Returns and clears the reorder buffer. Ownership of the retained packets
-    /// transfers to the caller, which must release each one. Used by
-    /// FeedHandler when entering Recovery so the future packets can be
-    /// re-applied during catch-up.
-    /// </summary>
-    public List<UmdfPacket> DrainReorderBuffer()
-    {
-        if (_reorderBuffer.Count == 0)
-            return new List<UmdfPacket>(0);
-
-        var list = new List<UmdfPacket>(_reorderBuffer.Count);
-        foreach (var kvp in _reorderBuffer)
-            list.Add(kvp.Value);
-        _reorderBuffer.Clear();
-        return list;
-    }
-
-    /// <summary>
     /// PerSymbol mode helper: when a real gap is declared (distance > MaxReorderDistance),
     /// dispatch the gapped packet, advance the expected SeqNum past it, and dispatch any
-    /// reorder-buffered packets ahead in SeqNum order. Returns without entering
-    /// channel-level Recovery — per-symbol routing handles healing on a per-instrument basis.
+    /// reorder-buffered packets ahead in SeqNum order. Per-symbol routing handles healing
+    /// on a per-instrument basis — there is no channel-level Recovery to enter.
     /// </summary>
     public void AcceptGapAndAdvance(in UmdfPacket packet)
     {
@@ -166,7 +144,6 @@ public sealed class ChannelHandler : IDisposable
         MessageDispatcher.Dispatch(in packet, span, _eventHandler);
         _eventHandler.OnPacketProcessed();
         _expectedSeqNum = seq + 1;
-        _inRecovery = false;
 
         if (_reorderBuffer.Count > 0)
         {
@@ -196,20 +173,6 @@ public sealed class ChannelHandler : IDisposable
                 }
             }
         }
-    }
-
-    public void Reset()
-    {
-        DiscardReorderBuffer();
-        _expectedSeqNum = 1;
-        _inRecovery = false;
-    }
-
-    public void CompleteRecovery(uint nextSeqNum)
-    {
-        DiscardReorderBuffer();
-        _expectedSeqNum = nextSeqNum;
-        _inRecovery = false;
     }
 
     public void Dispose()
