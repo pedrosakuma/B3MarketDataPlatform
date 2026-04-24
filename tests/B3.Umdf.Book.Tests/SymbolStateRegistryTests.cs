@@ -100,6 +100,28 @@ public class SymbolStateRegistryTests
     }
 
     [Fact]
+    public void BumpMinHeal_Monotonic_RejectsStaleSnapshot()
+    {
+        var r = NewRegistry();
+        r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
+        r.Observe(1, SymbolGapKind.Mbo, 105);  // gap → Stale, MinHealRptSeq=104, high-water=105
+
+        // Buffer evicted the oldest entry (rptSeq=105) to make room. Caller bumps MinHeal.
+        Assert.True(r.BumpMinHeal(1, SymbolGapKind.Mbo, 110));
+        // Idempotent: lower value is a no-op.
+        Assert.False(r.BumpMinHeal(1, SymbolGapKind.Mbo, 109));
+
+        // Snapshot at 105 used to be valid (>= old MinHeal=104) but now is below
+        // the bumped baseline (110) → rejected to prevent silent hole.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 105);
+        Assert.False(heal.Accepted);
+
+        // Snapshot at 110 is at the bumped baseline → accepted.
+        var heal2 = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 110);
+        Assert.True(heal2.Accepted);
+    }
+
+    [Fact]
     public void Mbo_LaggingSnapshot_BelowMinHeal_Rejected()
     {
         var r = NewRegistry();

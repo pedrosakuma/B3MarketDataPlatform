@@ -75,14 +75,21 @@ public class StaleMboBufferTests
     }
 
     [Fact]
-    public void PerSymbolCap_DropsNewest()
+    public void PerSymbolCap_EvictsOldest_RetainsNewest()
     {
         var buf = NewBuffer(perSymbolCap: 2);
+        uint? evicted = null;
         Assert.True(buf.Enqueue(1, 50, 10, 0, new byte[] { 1 }));
         Assert.True(buf.Enqueue(1, 50, 11, 0, new byte[] { 2 }));
-        Assert.False(buf.Enqueue(1, 50, 12, 0, new byte[] { 3 }));
-        Assert.Equal(1, buf.DroppedPerSymbolCapCount);
+        // Cap reached: oldest (rptSeq=10) evicted, newest enqueued.
+        Assert.True(buf.Enqueue(1, 50, 12, 0, new byte[] { 3 }, e => evicted = e));
+        Assert.Equal((uint)10, evicted);
+        Assert.Equal(1, buf.EvictedPerSymbolCapCount);
         Assert.Equal(2, buf.DepthOf(1));
+        // Drain confirms only [11, 12] retained.
+        var seen = new List<uint>();
+        buf.Drain(1, 11, 12, m => seen.Add(m.RptSeq));
+        Assert.Equal(new uint[] { 11, 12 }, seen);
     }
 
     [Fact]

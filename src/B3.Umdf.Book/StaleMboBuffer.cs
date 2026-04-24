@@ -41,8 +41,12 @@ public sealed class StaleMboBuffer
     private long _totalBytes;
     private long _enqueued;
     private long _drained;
+#pragma warning disable CS0649 // retained for ABI/metric compatibility; drop-oldest policy now evicts via _evictedPerSymbolCap
     private long _droppedPerSymbolCap;
+#pragma warning restore CS0649
     private long _droppedGlobalCap;
+
+    private long _evictedPerSymbolCap;
 
     public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024)
     {
@@ -56,6 +60,8 @@ public sealed class StaleMboBuffer
     public long DrainedCount => Volatile.Read(ref _drained);
     public long DroppedPerSymbolCapCount => Volatile.Read(ref _droppedPerSymbolCap);
     public long DroppedGlobalCapCount => Volatile.Read(ref _droppedGlobalCap);
+    /// <summary>Count of oldest messages evicted (drop-oldest policy under per-symbol cap pressure).</summary>
+    public long EvictedPerSymbolCapCount => Volatile.Read(ref _evictedPerSymbolCap);
 
     /// <summary>
     /// One stored message. <see cref="Body"/> is rented from
@@ -81,9 +87,17 @@ public sealed class StaleMboBuffer
 
     /// <summary>
     /// Buffer a message body. Copies <paramref name="body"/> into a pooled
-    /// array. Returns true on success, false if a cap tripped (message dropped).
+    /// array. Returns true on success, false if the global cap tripped
+    /// (message dropped). When the per-symbol cap is reached, the OLDEST
+    /// buffered message is evicted to make room — the buffer always
+    /// retains the most-recent <c>perSymbolCap</c> messages so the next
+    /// snapshot heal reflects the freshest possible state. The caller
+    /// receives the evicted message's rptSeq via <paramref name="onEvictedOldest"/>
+    /// so it can advance its <see cref="SymbolStateRegistry.BumpMinHeal"/>
+    /// baseline accordingly (rejecting future snapshots that would leave
+    /// a hole between the snapshot and the new buffer earliest).
     /// </summary>
-    public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body)
+    public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null)
     {
         // Global byte cap: check before allocating.
         long postEnqueueBytes = Interlocked.Read(ref _totalBytes) + body.Length;
@@ -94,19 +108,29 @@ public sealed class StaleMboBuffer
         }
 
         var queue = _queues.GetOrAdd(securityId, static _ => new PerSymbolQueue());
+        long evictedBytes = 0;
+        uint evictedRptSeq = 0;
+        bool evicted = false;
         lock (queue.Sync)
         {
             if (queue.Items.Count >= _perSymbolCap)
             {
-                Interlocked.Increment(ref _droppedPerSymbolCap);
-                return false;
+                if (queue.Items.TryDequeue(out var old))
+                {
+                    evictedBytes = old.BodyLength;
+                    evictedRptSeq = old.RptSeq;
+                    evicted = true;
+                    old.Release();
+                    Interlocked.Increment(ref _evictedPerSymbolCap);
+                }
             }
             var rented = ArrayPool<byte>.Shared.Rent(body.Length);
             body.CopyTo(rented);
             queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length));
         }
-        Interlocked.Add(ref _totalBytes, body.Length);
+        Interlocked.Add(ref _totalBytes, body.Length - evictedBytes);
         Interlocked.Increment(ref _enqueued);
+        if (evicted) onEvictedOldest?.Invoke(evictedRptSeq);
         return true;
     }
 

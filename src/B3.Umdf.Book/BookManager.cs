@@ -154,7 +154,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             case SymbolStateRegistry.ObserveAction.Apply:
                 return true;
             case SymbolStateRegistry.ObserveAction.Buffer:
-                if (_staleBuffer.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body))
+                if (_staleBuffer.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body,
+                        evictedRptSeq =>
+                        {
+                            // Buffer evicted its oldest entry to make room for this newer message.
+                            // Advance MinHeal to evictedRptSeq so future snapshots must be at-least
+                            // that fresh — otherwise we'd silently leave a hole in [snap+1..evicted].
+                            _stateRegistry!.BumpMinHeal(securityId, SymbolGapKind.Mbo, evictedRptSeq);
+                        }))
                     Interlocked.Increment(ref _bufferedMboMessages);
                 return false;
             case SymbolStateRegistry.ObserveAction.Drop:
@@ -1034,6 +1041,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             // the buffered live messages so they can drain on that next heal.
             book.Clear();
             book.LastRptSeq = 0;
+            // Notify subscribers — without this, frontend caches the pre-rejection
+            // snapshot bytes (received via live OnOrderAdded events) indefinitely
+            // while the backend book is empty, producing the WINV25 phantom-asks UX
+            // (frontend shows stale levels, backend has nothing to reconcile).
+            _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
             Interlocked.Increment(ref _snapshotsRejectedTooOld);
             return;
         }

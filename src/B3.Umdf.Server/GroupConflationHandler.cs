@@ -234,6 +234,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (!_parent.IsSubscribed(securityId)) return;
         _staleStatusBuffer[securityId] = isStale;
+
+        // On heal (Stale→Healthy), trigger a fresh book snapshot to all
+        // subscribers. The backend book was rebuilt from the always-on snapshot
+        // chunks WITHOUT firing per-order events to subscribers, so the
+        // frontend's view diverges from the backend state. Re-snapshotting
+        // synchronizes them. (For the Stale entry direction we just buffer the
+        // status flag — no resnap needed since live updates will keep flowing
+        // once heal completes.)
+        if (!isStale) _parent.RequestResyncForBookSubscribers(securityId);
     }
 
     /// <summary>

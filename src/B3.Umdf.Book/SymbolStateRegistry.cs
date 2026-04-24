@@ -472,6 +472,29 @@ public sealed class SymbolStateRegistry
     }
 
     /// <summary>
+    /// Advance the minimum-acceptable-heal baseline for a symbol because the
+    /// Stale buffer evicted older messages (per-symbol cap exceeded).
+    /// After this call, snapshots with <c>lastRptSeq &lt; newMin</c> are
+    /// rejected — they would leave a hole between the snapshot and the
+    /// buffer's earliest retained message. Idempotent and monotonic
+    /// (never lowers MinHeal). Returns true if MinHeal advanced.
+    /// </summary>
+    public bool BumpMinHeal(ulong securityId, SymbolGapKind kind, uint newMin)
+    {
+        if (!_entries.TryGetValue(securityId, out var entry)) return false;
+        int idx = (int)kind;
+        lock (entry.Sync)
+        {
+            if (newMin > entry.MinHealRptSeq[idx])
+            {
+                entry.MinHealRptSeq[idx] = newMin;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Pre-populate an entry on SecurityDefinition so the cold-start path
     /// avoids racing GetOrAdd on the feed thread. Idempotent.
     /// </summary>
