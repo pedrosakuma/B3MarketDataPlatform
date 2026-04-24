@@ -18,7 +18,7 @@ namespace B3.Umdf.Book;
 /// SendingTime. Copies are unavoidable because the source span is owned by
 /// the receive batch and recycled immediately after dispatch.</para>
 ///
-/// <para><b>Caps.</b> Per-symbol queue depth is capped (default 1024) so
+/// <para><b>Caps.</b> Per-symbol queue depth is capped (default 8192) so
 /// one pathological symbol cannot exhaust memory. Global byte cap (default
 /// 256 MiB) protects against many symbols filling buffers simultaneously.
 /// When either cap trips, the newest message is dropped and the overflow
@@ -44,7 +44,7 @@ public sealed class StaleMboBuffer
     private long _droppedPerSymbolCap;
     private long _droppedGlobalCap;
 
-    public StaleMboBuffer(ILogger logger, int perSymbolCap = 1024, long globalByteCap = 256L * 1024 * 1024)
+    public StaleMboBuffer(ILogger logger, int perSymbolCap = 8192, long globalByteCap = 256L * 1024 * 1024)
     {
         _logger = logger;
         _perSymbolCap = perSymbolCap;
