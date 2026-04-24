@@ -74,6 +74,51 @@ occurred. Unification eliminated this entire class of spurious recovery.
 
 ### 2.4 Heal flow
 
+#### 2.4.1 Per-symbol state machine
+
+The full lifecycle of a `(secId, Mbo)` bucket. States live in
+`SymbolStateRegistry`; transitions are driven by `Observe` (incremental
+dispatch) and by `SnapshotApplier` (Begin/Complete events).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unknown: registry init / epoch reset
+
+    Unknown --> Healthy: first incremental applied
+    Unknown --> Healthy: illiquid snapshot complete<br/>(no LastRptSeq, snap=0)
+
+    Healthy --> Stale: globalGap detected<br/>MinHeal := received - 1<br/>mask |= Mbo bit
+    Healthy --> Healthy: snapshot.Begin while Healthy<br/>SKIPPED — chunks dropped silently<br/>+snapshots_skipped_healthy_ahead
+
+    Stale --> Stale: incremental buffered<br/>StaleMboBuffer (8 192 normal / 65 536 hot)
+    Stale --> Stale: snapshot.Begin<br/>SetProtectedFloor(snap+1)
+    Stale --> Stale: hot-cap eviction (safe)<br/>oldest.rptSeq < ProtectedFloor<br/>MinHeal NOT bumped<br/>+stale_buffer_evicted_safe_below_floor
+    Stale --> Stale: hot-cap eviction (unsafe)<br/>oldest.rptSeq ≥ ProtectedFloor<br/>MinHeal bumped (fail-safe)<br/>+stale_buffer_evicted_unsafe
+    Stale --> Stale: snapshot.Complete REJECT<br/>snap < MinHeal<br/>staging discarded; live book intact<br/>+snapshots_rejected_too_old
+
+    Stale --> Healthy: snapshot.Complete ACCEPT<br/>snap ≥ MinHeal<br/>ApplySnapshotStaging (atomic swap)<br/>replay buffer [snap+1, high-water]<br/>+snapshots_healed<br/>fires OnSymbolStaleStatusChanged(false)<br/>if StaleKindMask = 0
+
+    Healthy --> Unknown: ChannelReset_11 / SequenceReset<br/>+epoch_resets
+    Stale --> Unknown: ChannelReset_11 / SequenceReset<br/>buffer dropped, +epoch_resets
+```
+
+Notes on the diagram:
+
+- The four `Stale → Stale` self-loops are the safety machinery that prevents
+  the historical "stuck-Stale" failure mode: snapshot.Begin pins the floor,
+  evictions below the floor are silent, evictions above bump `MinHeal`
+  (publishing the loss to the next snapshot cycle).
+- `Healthy → Healthy (SKIPPED)` exists because the B3 always-on snapshot
+  rotation periodically targets symbols that are already up-to-date —
+  applying would either clobber in-flight live messages or open a hole.
+- The illiquid path (`Unknown → Healthy`) covers B3 spec §7.4 instruments
+  that have never received an incremental: snapshot header omits
+  `LastRptSeq`, anchored at `rptSeq = 0`.
+- A wide channel-level gap escalates outside this diagram via
+  `FeedHandler` (`Lost → Recovery → CatchUp → RealTime`), described in §2.6.
+
+#### 2.4.2 Detailed walkthrough (text form)
+
 ```
 Observe (gap)
     │
