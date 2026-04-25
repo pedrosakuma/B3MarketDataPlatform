@@ -239,7 +239,7 @@ public sealed class SubscriptionManager : IDisposable
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
         foreach (var (clientId, flags) in clients)
         {
-            if (!flags.HasFlag(DataFlags.Book)) continue;
+            if ((flags & DataFlags.Book) == 0) continue;
             if (_clients.TryGetValue(clientId, out var session))
                 session.TryEnqueue(payload);
         }
@@ -265,7 +265,7 @@ public sealed class SubscriptionManager : IDisposable
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
         foreach (var (_, f) in clients)
-            if (f.HasFlag(DataFlags.Book)) return true;
+            if ((f & DataFlags.Book) != 0) return true;
         return false;
     }
 
@@ -287,7 +287,7 @@ public sealed class SubscriptionManager : IDisposable
         if (group is null) return false;
         foreach (var (clientId, flags) in clients)
         {
-            if (!flags.HasFlag(DataFlags.Book)) continue;
+            if ((flags & DataFlags.Book) == 0) continue;
             group.EnqueueRequest(clientId, symbol, DataFlags.Book, isGet: true);
             any = true;
         }

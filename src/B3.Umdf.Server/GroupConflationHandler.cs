@@ -420,50 +420,47 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
 
-        if (_orderBuffer.TryGetValue(orderId, out var existing))
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orderBuffer, orderId, out bool existed);
+        if (existed)
         {
             if (kind == PendingOrderKind.Deleted)
             {
-                if (existing.Kind == PendingOrderKind.Added)
-                    _orderBuffer.Remove(orderId);
+                if (slot.Kind == PendingOrderKind.Added)
+                    _orderBuffer.Remove(orderId); // Add+Delete → drop entirely
                 else
-                    _orderBuffer[orderId] = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
+                    slot = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
             }
             else
             {
-                var mergedKind = existing.Kind == PendingOrderKind.Added ? PendingOrderKind.Added : kind;
-                _orderBuffer[orderId] = new BufferedOrder(mergedKind, securityId, side, price, qty);
+                var mergedKind = slot.Kind == PendingOrderKind.Added ? PendingOrderKind.Added : kind;
+                slot = new BufferedOrder(mergedKind, securityId, side, price, qty);
             }
         }
         else
         {
-            _orderBuffer[orderId] = new BufferedOrder(kind, securityId, side, price, qty);
+            slot = new BufferedOrder(kind, securityId, side, price, qty);
         }
     }
 
     private void BufferOrderDelete(ulong securityId, ulong orderId, byte side)
     {
         _eventsReceived++;
-        if (_orderBuffer.TryGetValue(orderId, out var existing))
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_orderBuffer, orderId, out bool existed);
+        if (existed && slot.Kind == PendingOrderKind.Added)
         {
-            if (existing.Kind == PendingOrderKind.Added)
-                _orderBuffer.Remove(orderId);
-            else
-                _orderBuffer[orderId] = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
+            _orderBuffer.Remove(orderId); // Add+Delete → drop entirely
+            return;
         }
-        else
-        {
-            _orderBuffer[orderId] = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
-        }
+        slot = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
     }
 
     private void BufferTrade(ulong securityId, long price, long quantity, long tradeId)
     {
-        var key = (securityId, price);
-        if (_tradeBuffer.TryGetValue(key, out var existing))
-            _tradeBuffer[key] = (existing.Qty + quantity, tradeId);
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_tradeBuffer, (securityId, price), out bool existed);
+        if (existed)
+            slot = (slot.Qty + quantity, tradeId);
         else
-            _tradeBuffer[key] = (quantity, tradeId);
+            slot = (quantity, tradeId);
     }
 
     private void PurgeBufferedOrders(ulong securityId, byte clearSide)
@@ -496,7 +493,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         foreach (var (secId, side) in _clearBuffer)
         {
-            if (!_parent.IsSubscribed(secId)) continue;
             int len = WireProtocol.WriteBookCleared(tmp, secId, side);
             AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
@@ -514,7 +510,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             Span<byte> staleTmp = stackalloc byte[16];
             foreach (var (secId, isStale) in _staleStatusBuffer)
             {
-                if (!_parent.IsSubscribed(secId)) continue;
                 int len = WireProtocol.WriteSymbolStaleStatus(staleTmp, secId, isStale);
                 AppendEventToBatch(secId, staleTmp[..len], logicalCount: 1);
                 flushed++;
@@ -542,8 +537,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         Span<byte> tmp = stackalloc byte[64];
         foreach (var (orderId, order) in _orderBuffer)
         {
-            if (!_parent.IsSubscribed(order.SecurityId)) { flushed++; continue; }
-
             int len;
             if (order.Kind == PendingOrderKind.Deleted)
             {
@@ -618,11 +611,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         int flushed = 0;
         Span<byte> tmp = stackalloc byte[64];
 
-        // Collect securities that need candle broadcasts (deduplicated)
+        // Collect securities that need candle broadcasts (deduplicated). All entries
+        // already came in via subscribed callers so no additional filter is needed.
         HashSet<ulong>? candleSecIds = null;
         foreach (var ((secId, _), _) in _tradeBuffer)
         {
-            if (!_parent.IsSubscribed(secId)) continue;
             candleSecIds ??= new();
             candleSecIds.Add(secId);
         }
@@ -630,7 +623,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // Flush trades
         foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
-            if (!_parent.IsSubscribed(secId)) { flushed++; continue; }
             int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
             AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
@@ -796,7 +788,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         foreach (var (clientId, flags) in subs)
         {
-            if (!flags.HasFlag(DataFlags.Book)) continue;
+            if ((flags & DataFlags.Book) == 0) continue;
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
 
