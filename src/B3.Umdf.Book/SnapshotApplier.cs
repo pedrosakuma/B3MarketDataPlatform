@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using B3.Umdf.Mbo.Sbe.V16;
 using Microsoft.Extensions.Logging;
+using SnapshotFullRefresh_Header_30Data = B3.Umdf.Mbo.Sbe.V16.V15.SnapshotFullRefresh_Header_30Data;
 
 namespace B3.Umdf.Book;
 
