@@ -60,6 +60,38 @@ that UDP loss is imminent.**
 Disable via `UMDF_SCHEDULER_JITTER_PROBE=0` (overhead is ~200 wakeups/s, but
 some operators may prefer pristine flame graphs).
 
+### Validation (measured)
+
+Setup: consumer in container with DRV PCAP replay at `--speed=10`, 25 s of
+collection per scenario, `dotnet-counters collect` capturing the
+`B3.Umdf.Consumer` meter.
+
+**Probe overhead** (matched conditions, no contention):
+
+| Run | CPU% | Memory |
+| --- | ---- | ------ |
+| Probe **off** (`UMDF_SCHEDULER_JITTER_PROBE=0`) | 116.65 % | 39.1 MiB |
+| Probe **on** | 115.58 % | 36.4 MiB |
+
+Difference is within run-to-run noise (< 1 %). The probe costs nothing
+worth measuring.
+
+**Detection signal** (consumer with `--cpus=2`, with and without a co-located
+`stress-ng --cpu 4` container fighting for CPU):
+
+| Quantile | Load only | Load + noisy neighbour | Δ |
+| -------- | --------: | ---------------------: | --: |
+| p50      |   521 µs  |   504 µs               | ~0  |
+| **p95**  |   930 µs  | **2 244 µs**           | **+141 %** |
+| **p99**  | 3 088 µs  | **5 000 µs**           | **+62 %**  |
+| **max**  | 12.9 ms   | **20.7 ms**            | **+60 %**  |
+
+The probe ticks at ~175-180 Hz observed (vs 200 Hz nominal — sampling drop
+is expected with `dotnet-counters collect`). The signature is clean: p50
+stays put because most wakeups complete normally, but the upper tail
+explodes — exactly the regime where UDP receive starts losing fights for
+the core. This is the leading indicator the probe was built to surface.
+
 ## Mitigation: orchestrator hardening
 
 ### Docker / Compose
