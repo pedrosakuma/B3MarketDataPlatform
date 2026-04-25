@@ -541,6 +541,18 @@ MetricsBinder.Register(stats, bookManagers, marketDataManagers, groupIds,
     multiFeed, singleFeed, multicastMerger: null, subscriptionManager, groupHandlers, symbolRegistry,
     multicastSources: liveMulticastSources);
 
+// Scheduler jitter probe — detects CPU contention from noisy neighbours,
+// GC pauses, IRQ storms, cgroup CFS throttling. Detection only.
+// Disable via UMDF_SCHEDULER_JITTER_PROBE=0.
+SchedulerJitterProbe? jitterProbe = null;
+var jitterProbeEnv = Environment.GetEnvironmentVariable("UMDF_SCHEDULER_JITTER_PROBE");
+if (!string.Equals(jitterProbeEnv, "0", StringComparison.Ordinal) &&
+    !string.Equals(jitterProbeEnv, "false", StringComparison.OrdinalIgnoreCase))
+{
+    jitterProbe = new SchedulerJitterProbe();
+    jitterProbe.Start();
+}
+
 using var statsTimer = new Timer(_ => statsPrinter.PrintPeriodic(), null, TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(5));
 
 Console.WriteLine($"Starting {(liveMulticastSources is not null ? "live feed" : "replay")}...");
@@ -647,6 +659,8 @@ singleFeed?.Dispose();
 // Stop broadcaster threads after feed sources are disposed so no more batches can be
 // published. StopBroadcaster signals the ring and joins the thread.
 foreach (var gh in groupHandlers) gh.StopBroadcaster();
+
+jitterProbe?.Dispose();
 
 if (liveMulticastSources is not null)
 {

@@ -61,6 +61,8 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | `UMDF_LOSS_BURST` | `--loss-burst` | `1` | Consecutive packets dropped per burst trigger (burst mode only). |
 | `UMDF_LOSS_CORRELATED` | `--loss-correlated` | `false` | When true, A and B drop the SAME `SeqNum` (worst case for A/B arbitration). |
 | `UMDF_LOSS_SEED` | `--loss-seed` | `0` | RNG seed for reproducible loss patterns. `0` = nondeterministic. |
+| **Diagnostics** | | | |
+| `UMDF_SCHEDULER_JITTER_PROBE` | — | `1` | Enables the scheduler jitter probe (200 Hz wakeup, exposes `b3.umdf.scheduler.jitter_us` histogram + `jitter_max_us` gauge). Set `0`/`false` to disable. See [NOISY-NEIGHBOUR.md](./NOISY-NEIGHBOUR.md). |
 
 Docker-specific helpers consumed by `docker-entrypoint.sh`:
 

@@ -1,0 +1,13 @@
+{
+  "channelGroups": [
+    {
+      "name": "DRV",
+      "channels": [
+        { "channelId": 72, "type": "IncrementalA",         "multicastGroup": "239.10.0.72", "port": 30072 },
+        { "channelId": 72, "type": "IncrementalB",         "multicastGroup": "239.10.0.73", "port": 30073 },
+        { "channelId": 72, "type": "InstrumentDefinition", "multicastGroup": "239.10.0.74", "port": 30074 },
+        { "channelId": 72, "type": "SnapshotRecovery",     "multicastGroup": "239.10.0.75", "port": 30075 }
+      ]
+    }
+  ]
+}
