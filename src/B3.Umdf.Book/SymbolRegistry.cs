@@ -78,6 +78,18 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
         if (!string.IsNullOrEmpty(symbol))
         {
+            // Hot-path optimization: B3's InstrumentDefinition feed re-broadcasts every
+            // SecurityDefinition_12 periodically (~every few seconds for ~18k symbols).
+            // The vast majority of those re-broadcasts carry values we already mapped.
+            // Skip the ConcurrentDictionary indexer writes (which take a bucket lock
+            // even on no-op upserts) when the existing mapping already matches.
+            if (TryResolve(symbol, out var existingId) && existingId == securityId &&
+                TryGetSymbol(securityId, out var existingSymbol) &&
+                string.Equals(existingSymbol, symbol, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
             _bySymbol[symbol] = securityId;
             _byId[securityId] = symbol;
         }

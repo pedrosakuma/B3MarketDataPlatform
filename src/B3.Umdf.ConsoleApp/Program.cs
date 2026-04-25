@@ -55,15 +55,26 @@ var shutdownStopwatch = new System.Diagnostics.Stopwatch();
 
 void TriggerShutdown(string source)
 {
-    if (cts.IsCancellationRequested)
+    // CTS may already be disposed by the `using` in Main when the runtime
+    // fires AppDomain.ProcessExit during late-stage shutdown. Guard the Cancel
+    // call so a benign post-disposal signal doesn't surface as an unhandled
+    // ObjectDisposedException on the finalizer/exit path.
+    try
     {
-        shutdownLogger.LogWarning("Shutdown re-requested via {Source} (already in progress, elapsed={Elapsed}ms)",
-            source, shutdownStopwatch.ElapsedMilliseconds);
-        return;
+        if (cts.IsCancellationRequested)
+        {
+            shutdownLogger.LogWarning("Shutdown re-requested via {Source} (already in progress, elapsed={Elapsed}ms)",
+                source, shutdownStopwatch.ElapsedMilliseconds);
+            return;
+        }
+        shutdownStopwatch.Start();
+        shutdownLogger.LogInformation("Shutdown requested via {Source}. Cancelling pipelines...", source);
+        cts.Cancel();
     }
-    shutdownStopwatch.Start();
-    shutdownLogger.LogInformation("Shutdown requested via {Source}. Cancelling pipelines...", source);
-    cts.Cancel();
+    catch (ObjectDisposedException)
+    {
+        // Process is already past the using-scope of `cts`; nothing left to cancel.
+    }
 }
 
 Console.CancelKeyPress += (_, e) =>
@@ -430,7 +441,7 @@ foreach (var gid in groupIds)
         stateRegistry: groupRegistry);
     marketDataManagers.Add(mm);
 
-    var composite = new CompositeFeedHandler(bookManagers[^1], mm, symbolRegistry);
+    var composite = new OptimizedFeedComposite(bookManagers[^1], mm, symbolRegistry);
     groupFeedHandlers[gid] = composite;
     groupMdHandlers[gid] = mm;
 }

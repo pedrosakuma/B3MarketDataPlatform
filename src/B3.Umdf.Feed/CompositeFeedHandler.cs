@@ -4,6 +4,10 @@ namespace B3.Umdf.Feed;
 
 /// <summary>
 /// Multiplexes feed events to multiple handlers.
+/// Generic fan-out via IFeedEventHandler[]; specialized hot-path composites
+/// (e.g. for the canonical book + market-data + symbol-registry triple) live in
+/// the consuming layer (B3.Umdf.Book.OptimizedFeedComposite) to avoid pulling
+/// concrete handler types into this lower layer.
 /// </summary>
 public sealed class CompositeFeedHandler : IFeedEventHandler
 {
