@@ -80,10 +80,8 @@ internal sealed class SnapshotApplier
     /// <summary>
     /// Wire-driven entry: parse a Header_30 then begin the snapshot lifecycle.
     /// </summary>
-    public void OnHeader(ReadOnlySpan<byte> body)
+    public void OnHeader(in SnapshotFullRefresh_Header_30DataReader reader)
     {
-        if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader)) return;
-
         ref readonly var msg = ref reader.Data;
         ulong secId = (ulong)msg.SecurityID;
         uint expected = msg.TotNumBids + msg.TotNumOffers;
@@ -177,11 +175,8 @@ internal sealed class SnapshotApplier
     /// <summary>
     /// Wire-driven entry: parse and apply an Orders_71 chunk for an in-flight snapshot.
     /// </summary>
-    public void OnOrdersChunk(ReadOnlySpan<byte> body)
+    public void OnOrdersChunk(in SnapshotFullRefresh_Orders_MBO_71DataReader reader)
     {
-        if (!SnapshotFullRefresh_Orders_MBO_71Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 

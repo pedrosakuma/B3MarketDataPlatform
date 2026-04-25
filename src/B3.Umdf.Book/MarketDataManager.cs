@@ -7,8 +7,6 @@ using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-using LastTradePrice_27Data = B3.Umdf.Mbo.Sbe.V16.V6.LastTradePrice_27Data;
-
 namespace B3.Umdf.Book;
 
 public sealed class MarketDataManager : IFeedEventHandler
@@ -117,67 +115,60 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
-        if (!MessageHeader.TryParse(sbePayload, out var header, out _))
-            return;
-
-        var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
-
         try
         {
-            switch (templateId)
-            {
-                case SecurityDefinition_12Data.MESSAGE_ID:
-                    HandleSecurityDefinition(body, header.BlockLength);
-                    break;
-                case SecurityStatus_3Data.MESSAGE_ID:
-                    HandleSecurityStatus(body);
-                    break;
-                case SecurityGroupPhase_10Data.MESSAGE_ID:
-                    HandleSecurityGroupPhase(body);
-                    break;
-                case OpeningPrice_15Data.MESSAGE_ID:
-                    HandleOpeningPrice(body);
-                    break;
-                case TheoreticalOpeningPrice_16Data.MESSAGE_ID:
-                    HandleTheoreticalOpeningPrice(body);
-                    break;
-                case ClosingPrice_17Data.MESSAGE_ID:
-                    HandleClosingPrice(body);
-                    break;
-                case AuctionImbalance_19Data.MESSAGE_ID:
-                    HandleAuctionImbalance(body);
-                    break;
-                case QuantityBand_21Data.MESSAGE_ID:
-                    HandleQuantityBand(body);
-                    break;
-                case PriceBand_22Data.MESSAGE_ID:
-                    HandlePriceBand(body);
-                    break;
-                case HighPrice_24Data.MESSAGE_ID:
-                    HandleHighPrice(body);
-                    break;
-                case LowPrice_25Data.MESSAGE_ID:
-                    HandleLowPrice(body);
-                    break;
-                case LastTradePrice_27Data.MESSAGE_ID:
-                    HandleLastTradePrice(body);
-                    break;
-                case SettlementPrice_28Data.MESSAGE_ID:
-                    HandleSettlementPrice(body);
-                    break;
-                case OpenInterest_29Data.MESSAGE_ID:
-                    HandleOpenInterest(body);
-                    break;
-                case ExecutionStatistics_56Data.MESSAGE_ID:
-                    HandleExecutionStatistics(body);
-                    break;
-            }
+            var handler = new MarketDataSbeHandler { Owner = this };
+            SbeDispatcher.Dispatch(sbePayload, ref handler);
         }
         catch (Exception ex)
         {
             Interlocked.Increment(ref _parseErrors);
             _logger.LogWarning(ex, "Error processing templateId={TemplateId}", templateId);
         }
+    }
+
+    /// <summary>
+    /// Zero-cost devirtualized dispatcher for the market-data feed. See
+    /// <c>BookManager.BookSbeHandler</c> for the same pattern. Methods left empty
+    /// are templates this manager doesn't process (orders/trades/snapshots).
+    /// </summary>
+    private struct MarketDataSbeHandler : ISbeMessageHandler
+    {
+        public MarketDataManager Owner;
+
+        public void OnSecurityDefinition_12(in SecurityDefinition_12DataReader reader, int blockLength, int version) => Owner.HandleSecurityDefinition(in reader);
+        public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) => Owner.HandleSecurityStatus(in reader);
+        public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) => Owner.HandleSecurityGroupPhase(in reader);
+        public void OnOpeningPrice_15(in OpeningPrice_15DataReader reader, int blockLength, int version) => Owner.HandleOpeningPrice(in reader);
+        public void OnTheoreticalOpeningPrice_16(in TheoreticalOpeningPrice_16DataReader reader, int blockLength, int version) => Owner.HandleTheoreticalOpeningPrice(in reader);
+        public void OnClosingPrice_17(in ClosingPrice_17DataReader reader, int blockLength, int version) => Owner.HandleClosingPrice(in reader);
+        public void OnAuctionImbalance_19(in AuctionImbalance_19DataReader reader, int blockLength, int version) => Owner.HandleAuctionImbalance(in reader);
+        public void OnQuantityBand_21(in QuantityBand_21DataReader reader, int blockLength, int version) => Owner.HandleQuantityBand(in reader);
+        public void OnPriceBand_22(in PriceBand_22DataReader reader, int blockLength, int version) => Owner.HandlePriceBand(in reader);
+        public void OnHighPrice_24(in HighPrice_24DataReader reader, int blockLength, int version) => Owner.HandleHighPrice(in reader);
+        public void OnLowPrice_25(in LowPrice_25DataReader reader, int blockLength, int version) => Owner.HandleLowPrice(in reader);
+        public void OnLastTradePrice_27(in LastTradePrice_27DataReader reader, int blockLength, int version) => Owner.HandleLastTradePrice(in reader);
+        public void OnSettlementPrice_28(in SettlementPrice_28DataReader reader, int blockLength, int version) => Owner.HandleSettlementPrice(in reader);
+        public void OnOpenInterest_29(in OpenInterest_29DataReader reader, int blockLength, int version) => Owner.HandleOpenInterest(in reader);
+        public void OnExecutionStatistics_56(in ExecutionStatistics_56DataReader reader, int blockLength, int version) => Owner.HandleExecutionStatistics(in reader);
+
+        // Intentional no-ops: not consumed by the market-data manager (orders/trades/snapshots/news/etc).
+        public void OnSequenceReset_1(in SequenceReset_1DataReader reader, int blockLength, int version) { }
+        public void OnSequence_2(in Sequence_2DataReader reader, int blockLength, int version) { }
+        public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) { }
+        public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) { }
+        public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { }
+        public void OnSnapshotFullRefresh_Header_30(in SnapshotFullRefresh_Header_30DataReader reader, int blockLength, int version) { }
+        public void OnOrder_MBO_50(in Order_MBO_50DataReader reader, int blockLength, int version) { }
+        public void OnDeleteOrder_MBO_51(in DeleteOrder_MBO_51DataReader reader, int blockLength, int version) { }
+        public void OnMassDeleteOrders_MBO_52(in MassDeleteOrders_MBO_52DataReader reader, int blockLength, int version) { }
+        public void OnTrade_53(in Trade_53DataReader reader, int blockLength, int version) { }
+        public void OnForwardTrade_54(in ForwardTrade_54DataReader reader, int blockLength, int version) { }
+        public void OnExecutionSummary_55(in ExecutionSummary_55DataReader reader, int blockLength, int version) { }
+        public void OnTradeBust_57(in TradeBust_57DataReader reader, int blockLength, int version) { }
+        public void OnSnapshotFullRefresh_Orders_MBO_71(in SnapshotFullRefresh_Orders_MBO_71DataReader reader, int blockLength, int version) { }
+        public void OnHeaderMessage_0(in HeaderMessage_0DataReader reader, int blockLength, int version) { }
+        public void OnUnknownMessage(int templateId, int blockLength, int version, ReadOnlySpan<byte> payload) { }
     }
 
     public void OnSequenceReset()
@@ -218,11 +209,8 @@ public sealed class MarketDataManager : IFeedEventHandler
     }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeData(); }
 
-    private void HandleSecurityDefinition(ReadOnlySpan<byte> body, int blockLength)
+    private void HandleSecurityDefinition(in SecurityDefinition_12DataReader reader)
     {
-        if (!SecurityDefinition_12Data.TryParse(body, blockLength, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -305,11 +293,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.BumpVersion();
     }
 
-    private void HandleSecurityStatus(ReadOnlySpan<byte> body)
+    private void HandleSecurityStatus(in SecurityStatus_3DataReader reader)
     {
-        if (!SecurityStatus_3Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -359,11 +344,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
     }
 
-    private void HandleSecurityGroupPhase(ReadOnlySpan<byte> body)
+    private void HandleSecurityGroupPhase(in SecurityGroupPhase_10DataReader reader)
     {
-        if (!SecurityGroupPhase_10Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ReadOnlySpan<byte> groupBytes = msg.SecurityGroup.AsSpan();
         int status = (int)msg.TradingSessionSubID;
@@ -460,11 +442,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         newList.Add(new KeyValuePair<ulong, InstrumentInfo>(securityId, info));
     }
 
-    private void HandleOpeningPrice(ReadOnlySpan<byte> body)
+    private void HandleOpeningPrice(in OpeningPrice_15DataReader reader)
     {
-        if (!OpeningPrice_15Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -484,11 +463,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleTheoreticalOpeningPrice(ReadOnlySpan<byte> body)
+    private void HandleTheoreticalOpeningPrice(in TheoreticalOpeningPrice_16DataReader reader)
     {
-        if (!TheoreticalOpeningPrice_16Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -508,11 +484,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleClosingPrice(ReadOnlySpan<byte> body)
+    private void HandleClosingPrice(in ClosingPrice_17DataReader reader)
     {
-        if (!ClosingPrice_17Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -531,11 +504,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleAuctionImbalance(ReadOnlySpan<byte> body)
+    private void HandleAuctionImbalance(in AuctionImbalance_19DataReader reader)
     {
-        if (!AuctionImbalance_19Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -554,11 +524,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleQuantityBand(ReadOnlySpan<byte> body)
+    private void HandleQuantityBand(in QuantityBand_21DataReader reader)
     {
-        if (!QuantityBand_21Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -578,11 +545,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandlePriceBand(ReadOnlySpan<byte> body)
+    private void HandlePriceBand(in PriceBand_22DataReader reader)
     {
-        if (!PriceBand_22Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -607,11 +571,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleHighPrice(ReadOnlySpan<byte> body)
+    private void HandleHighPrice(in HighPrice_24DataReader reader)
     {
-        if (!HighPrice_24Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -630,11 +591,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleLowPrice(ReadOnlySpan<byte> body)
+    private void HandleLowPrice(in LowPrice_25DataReader reader)
     {
-        if (!LowPrice_25Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -653,11 +611,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleLastTradePrice(ReadOnlySpan<byte> body)
+    private void HandleLastTradePrice(in LastTradePrice_27DataReader reader)
     {
-        if (!LastTradePrice_27Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -677,11 +632,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleSettlementPrice(ReadOnlySpan<byte> body)
+    private void HandleSettlementPrice(in SettlementPrice_28DataReader reader)
     {
-        if (!SettlementPrice_28Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -700,11 +652,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleOpenInterest(ReadOnlySpan<byte> body)
+    private void HandleOpenInterest(in OpenInterest_29DataReader reader)
     {
-        if (!OpenInterest_29Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
@@ -723,11 +672,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }
 
-    private void HandleExecutionStatistics(ReadOnlySpan<byte> body)
+    private void HandleExecutionStatistics(in ExecutionStatistics_56DataReader reader)
     {
-        if (!ExecutionStatistics_56Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);

@@ -5,14 +5,6 @@ using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
-using Order_MBO_50Data = B3.Umdf.Mbo.Sbe.V16.V15.Order_MBO_50Data;
-using DeleteOrder_MBO_51Data = B3.Umdf.Mbo.Sbe.V16.V15.DeleteOrder_MBO_51Data;
-using MassDeleteOrders_MBO_52Data = B3.Umdf.Mbo.Sbe.V16.V15.MassDeleteOrders_MBO_52Data;
-using Trade_53Data = B3.Umdf.Mbo.Sbe.V16.V15.Trade_53Data;
-using ForwardTrade_54Data = B3.Umdf.Mbo.Sbe.V16.V15.ForwardTrade_54Data;
-using ExecutionSummary_55Data = B3.Umdf.Mbo.Sbe.V16.V15.ExecutionSummary_55Data;
-using TradeBust_57Data = B3.Umdf.Mbo.Sbe.V16.V15.TradeBust_57Data;
-
 namespace B3.Umdf.Book;
 
 public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
@@ -223,7 +215,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// returns silently.
     /// </summary>
     /// <returns><c>true</c> if the caller should proceed with apply logic.</returns>
-    private bool RouteMbo(ulong securityId, ushort templateId, uint? rptSeqOpt, ReadOnlySpan<byte> body)
+    private bool RouteMbo(ulong securityId, ushort templateId, uint? rptSeqOpt, ReadOnlySpan<byte> body, int blockLength)
     {
         if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
         var result = _stateRegistry.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
@@ -259,7 +251,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                             // Advance MinHeal to evictedRptSeq so future snapshots must be at-least
                             // that fresh — otherwise we'd silently leave a hole in [snap+1..evicted].
                             _stateRegistry!.BumpMinHeal(securityId, SymbolGapKind.Mbo, evictedRptSeq);
-                        }))
+                        },
+                        blockLength: blockLength))
                     Interlocked.Increment(ref _bufferedMboMessages);
                 return false;
             case SymbolStateRegistry.ObserveAction.Drop:
@@ -282,13 +275,34 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             _currentSendingTimeNs = m.SendingTimeNs;
             switch (m.TemplateId)
             {
-                case Order_MBO_50Data.MESSAGE_ID: HandleOrder(m.Span); break;
-                case DeleteOrder_MBO_51Data.MESSAGE_ID: HandleDeleteOrder(m.Span); break;
-                case MassDeleteOrders_MBO_52Data.MESSAGE_ID: HandleMassDelete(m.Span); break;
-                case Trade_53Data.MESSAGE_ID: HandleTrade(m.Span, Trade_53Data.MESSAGE_SIZE); break;
-                case ForwardTrade_54Data.MESSAGE_ID: HandleForwardTrade(m.Span, ForwardTrade_54Data.MESSAGE_SIZE); break;
-                case ExecutionSummary_55Data.MESSAGE_ID: HandleExecutionSummary(m.Span); break;
-                case TradeBust_57Data.MESSAGE_ID: HandleTradeBust(m.Span); break;
+                case Order_MBO_50Data.MESSAGE_ID:
+                    if (Order_MBO_50Data.TryParse(m.Span, m.BlockLength, out var orderReader))
+                        HandleOrder(in orderReader);
+                    break;
+                case DeleteOrder_MBO_51Data.MESSAGE_ID:
+                    if (DeleteOrder_MBO_51Data.TryParse(m.Span, m.BlockLength, out var delReader))
+                        HandleDeleteOrder(in delReader);
+                    break;
+                case MassDeleteOrders_MBO_52Data.MESSAGE_ID:
+                    if (MassDeleteOrders_MBO_52Data.TryParse(m.Span, m.BlockLength, out var mdReader))
+                        HandleMassDelete(in mdReader);
+                    break;
+                case Trade_53Data.MESSAGE_ID:
+                    if (Trade_53Data.TryParse(m.Span, m.BlockLength, out var trReader))
+                        HandleTrade(in trReader);
+                    break;
+                case ForwardTrade_54Data.MESSAGE_ID:
+                    if (ForwardTrade_54Data.TryParse(m.Span, m.BlockLength, out var fwdReader))
+                        HandleForwardTrade(in fwdReader);
+                    break;
+                case ExecutionSummary_55Data.MESSAGE_ID:
+                    if (ExecutionSummary_55Data.TryParse(m.Span, m.BlockLength, out var exReader))
+                        HandleExecutionSummary(in exReader);
+                    break;
+                case TradeBust_57Data.MESSAGE_ID:
+                    if (TradeBust_57Data.TryParse(m.Span, m.BlockLength, out var tbReader))
+                        HandleTradeBust(in tbReader);
+                    break;
             }
             Interlocked.Increment(ref _replayedMboMessages);
         });
@@ -406,64 +420,70 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
-        if (!MessageHeader.TryParse(sbePayload, out var header, out _))
-            return;
-
         // Extract packet-level SendingTime for use in HandleTrade/HandleForwardTrade
         if (packet.TryGetHeader(out var pktHeader))
             _currentSendingTimeNs = pktHeader.SendingTime;
 
-        var body = sbePayload[MessageHeader.MESSAGE_SIZE..];
-
         try
         {
-            switch (templateId)
-            {
-                case SecurityDefinition_12Data.MESSAGE_ID:
-                    HandleSecurityDefinition(body, header.BlockLength);
-                    break;
-                case Order_MBO_50Data.MESSAGE_ID:
-                    HandleOrder(body);
-                    break;
-                case DeleteOrder_MBO_51Data.MESSAGE_ID:
-                    HandleDeleteOrder(body);
-                    break;
-                case MassDeleteOrders_MBO_52Data.MESSAGE_ID:
-                    HandleMassDelete(body);
-                    break;
-                case Trade_53Data.MESSAGE_ID:
-                    HandleTrade(body, header.BlockLength);
-                    break;
-                case EmptyBook_9Data.MESSAGE_ID:
-                    HandleEmptyBook(body);
-                    break;
-                case ChannelReset_11Data.MESSAGE_ID:
-                    HandleChannelReset();
-                    break;
-                case ForwardTrade_54Data.MESSAGE_ID:
-                    HandleForwardTrade(body, header.BlockLength);
-                    break;
-                case ExecutionSummary_55Data.MESSAGE_ID:
-                    HandleExecutionSummary(body);
-                    break;
-                case TradeBust_57Data.MESSAGE_ID:
-                    HandleTradeBust(body);
-                    break;
-                case SnapshotFullRefresh_Header_30Data.MESSAGE_ID:
-                    HandleSnapshotHeader(body);
-                    break;
-                case SnapshotFullRefresh_Orders_MBO_71Data.MESSAGE_ID:
-                    HandleSnapshotOrders(body);
-                    break;
-                default:
-                    break;
-            }
+            var handler = new BookSbeHandler { Owner = this };
+            SbeDispatcher.Dispatch(sbePayload, ref handler);
         }
         catch (Exception ex)
         {
             _parseErrors++;
             _logger.LogWarning(ex, "Error processing templateId={TemplateId}", templateId);
         }
+    }
+
+    /// <summary>
+    /// Zero-cost (devirtualized via generic struct constraint) <see cref="ISbeMessageHandler"/>
+    /// implementation that routes each known templateId to the corresponding
+    /// <see cref="BookManager"/> Handle* method. Methods left empty here are intentional
+    /// no-ops for templates this manager doesn't process (e.g. statistics, prices, news).
+    /// <para>
+    /// <b>Do not</b> wire <c>OnSequenceReset_1</c> here — sequence resets arrive via
+    /// <see cref="IFeedEventHandler.OnSequenceReset"/> from the channel layer, not as
+    /// inline SBE messages on the data feed.
+    /// </para>
+    /// </summary>
+    private struct BookSbeHandler : ISbeMessageHandler
+    {
+        public BookManager Owner;
+
+        public void OnSecurityDefinition_12(in SecurityDefinition_12DataReader reader, int blockLength, int version) => Owner.HandleSecurityDefinition(in reader);
+        public void OnOrder_MBO_50(in Order_MBO_50DataReader reader, int blockLength, int version) => Owner.HandleOrder(in reader);
+        public void OnDeleteOrder_MBO_51(in DeleteOrder_MBO_51DataReader reader, int blockLength, int version) => Owner.HandleDeleteOrder(in reader);
+        public void OnMassDeleteOrders_MBO_52(in MassDeleteOrders_MBO_52DataReader reader, int blockLength, int version) => Owner.HandleMassDelete(in reader);
+        public void OnTrade_53(in Trade_53DataReader reader, int blockLength, int version) => Owner.HandleTrade(in reader);
+        public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) => Owner.HandleEmptyBook(in reader);
+        public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) => Owner.HandleChannelReset();
+        public void OnForwardTrade_54(in ForwardTrade_54DataReader reader, int blockLength, int version) => Owner.HandleForwardTrade(in reader);
+        public void OnExecutionSummary_55(in ExecutionSummary_55DataReader reader, int blockLength, int version) => Owner.HandleExecutionSummary(in reader);
+        public void OnTradeBust_57(in TradeBust_57DataReader reader, int blockLength, int version) => Owner.HandleTradeBust(in reader);
+        public void OnSnapshotFullRefresh_Header_30(in SnapshotFullRefresh_Header_30DataReader reader, int blockLength, int version) => Owner.HandleSnapshotHeader(in reader);
+        public void OnSnapshotFullRefresh_Orders_MBO_71(in SnapshotFullRefresh_Orders_MBO_71DataReader reader, int blockLength, int version) => Owner.HandleSnapshotOrders(in reader);
+
+        // Intentional no-ops: not consumed by the order book.
+        public void OnSequenceReset_1(in SequenceReset_1DataReader reader, int blockLength, int version) { }
+        public void OnSequence_2(in Sequence_2DataReader reader, int blockLength, int version) { }
+        public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) { }
+        public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { }
+        public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) { }
+        public void OnOpeningPrice_15(in OpeningPrice_15DataReader reader, int blockLength, int version) { }
+        public void OnTheoreticalOpeningPrice_16(in TheoreticalOpeningPrice_16DataReader reader, int blockLength, int version) { }
+        public void OnClosingPrice_17(in ClosingPrice_17DataReader reader, int blockLength, int version) { }
+        public void OnAuctionImbalance_19(in AuctionImbalance_19DataReader reader, int blockLength, int version) { }
+        public void OnQuantityBand_21(in QuantityBand_21DataReader reader, int blockLength, int version) { }
+        public void OnPriceBand_22(in PriceBand_22DataReader reader, int blockLength, int version) { }
+        public void OnHighPrice_24(in HighPrice_24DataReader reader, int blockLength, int version) { }
+        public void OnLowPrice_25(in LowPrice_25DataReader reader, int blockLength, int version) { }
+        public void OnLastTradePrice_27(in LastTradePrice_27DataReader reader, int blockLength, int version) { }
+        public void OnSettlementPrice_28(in SettlementPrice_28DataReader reader, int blockLength, int version) { }
+        public void OnOpenInterest_29(in OpenInterest_29DataReader reader, int blockLength, int version) { }
+        public void OnExecutionStatistics_56(in ExecutionStatistics_56DataReader reader, int blockLength, int version) { }
+        public void OnHeaderMessage_0(in HeaderMessage_0DataReader reader, int blockLength, int version) { }
+        public void OnUnknownMessage(int templateId, int blockLength, int version, ReadOnlySpan<byte> payload) { }
     }
 
     public void OnSequenceReset() => HandleSequenceReset();
@@ -498,25 +518,19 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     // Feed thread is the sole writer for all book mutations — no locks needed.
     // Callbacks are inline (same thread) so no race condition exists.
 
-    private void HandleSecurityDefinition(ReadOnlySpan<byte> body, int blockLength)
+    private void HandleSecurityDefinition(in SecurityDefinition_12DataReader reader)
     {
-        if (!SecurityDefinition_12Data.TryParse(body, blockLength, out var reader))
-            return;
-
         ulong securityId = (ulong)reader.Data.SecurityID;
         GetOrCreateBook(securityId);
     }
 
-    private void HandleOrder(ReadOnlySpan<byte> body)
+    private void HandleOrder(in Order_MBO_50DataReader reader)
     {
-        if (!Order_MBO_50Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, Order_MBO_50Data.MESSAGE_ID,
-                msg.RptSeq is { } orderRs ? (uint)orderRs : null, body))
+                msg.RptSeq is { } orderRs ? (uint)orderRs : null, reader.Block, reader.BlockLength))
             return;
 
         var book = GetOrCreateBook(securityId);
@@ -634,16 +648,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // extension can enable per-order fanout without changing the parser.
     }
 
-    private void HandleDeleteOrder(ReadOnlySpan<byte> body)
+    private void HandleDeleteOrder(in DeleteOrder_MBO_51DataReader reader)
     {
-        if (!DeleteOrder_MBO_51Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, DeleteOrder_MBO_51Data.MESSAGE_ID,
-                msg.RptSeq is { } delRs ? (uint)delRs : null, body))
+                msg.RptSeq is { } delRs ? (uint)delRs : null, reader.Block, reader.BlockLength))
             return;
 
         if (!TryLookupBook(securityId, out var book))
@@ -676,16 +687,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
-    private void HandleMassDelete(ReadOnlySpan<byte> body)
+    private void HandleMassDelete(in MassDeleteOrders_MBO_52DataReader reader)
     {
-        if (!MassDeleteOrders_MBO_52Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, MassDeleteOrders_MBO_52Data.MESSAGE_ID,
-                msg.RptSeq is { } mdRs ? (uint)mdRs : null, body))
+                msg.RptSeq is { } mdRs ? (uint)mdRs : null, reader.Block, reader.BlockLength))
             return;
 
         if (!TryLookupBook(securityId, out var book))
@@ -716,16 +724,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
-    private void HandleTrade(ReadOnlySpan<byte> body, int blockLength)
+    private void HandleTrade(in Trade_53DataReader reader)
     {
-        if (!Trade_53Data.TryParse(body, blockLength, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, Trade_53Data.MESSAGE_ID,
-                msg.RptSeq is { } trRs ? (uint)trRs : null, body))
+                msg.RptSeq is { } trRs ? (uint)trRs : null, reader.Block, reader.BlockLength))
             return;
 
         long price = msg.MDEntryPx.Mantissa;
@@ -752,11 +757,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
-    private void HandleEmptyBook(ReadOnlySpan<byte> body)
+    private void HandleEmptyBook(in EmptyBook_9DataReader reader)
     {
-        if (!EmptyBook_9Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
@@ -777,16 +779,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         _stateRegistry?.ResetSymbolEpoch(securityId, SymbolGapKind.Mbo);
     }
 
-    private void HandleForwardTrade(ReadOnlySpan<byte> body, int blockLength)
+    private void HandleForwardTrade(in ForwardTrade_54DataReader reader)
     {
-        if (!ForwardTrade_54Data.TryParse(body, blockLength, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, ForwardTrade_54Data.MESSAGE_ID,
-                msg.RptSeq is { } fwdRs ? (uint)fwdRs : null, body))
+                msg.RptSeq is { } fwdRs ? (uint)fwdRs : null, reader.Block, reader.BlockLength))
             return;
 
         long price = msg.MDEntryPx.Mantissa;
@@ -812,16 +811,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
-    private void HandleExecutionSummary(ReadOnlySpan<byte> body)
+    private void HandleExecutionSummary(in ExecutionSummary_55DataReader reader)
     {
-        if (!ExecutionSummary_55Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, ExecutionSummary_55Data.MESSAGE_ID,
-                msg.RptSeq is { } exRs ? (uint)exRs : null, body))
+                msg.RptSeq is { } exRs ? (uint)exRs : null, reader.Block, reader.BlockLength))
             return;
 
         long lastPx = msg.LastPx.Mantissa;
@@ -836,16 +832,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         _eventHandler?.OnExecutionSummary(securityId, lastPx, fillQty);
     }
 
-    private void HandleTradeBust(ReadOnlySpan<byte> body)
+    private void HandleTradeBust(in TradeBust_57DataReader reader)
     {
-        if (!TradeBust_57Data.TryParse(body, out var reader))
-            return;
-
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, TradeBust_57Data.MESSAGE_ID,
-                msg.RptSeq is { } tbRs ? (uint)tbRs : null, body))
+                msg.RptSeq is { } tbRs ? (uint)tbRs : null, reader.Block, reader.BlockLength))
             return;
 
         long price = msg.MDEntryPx.Mantissa;
@@ -877,8 +870,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// <summary>Snapshots silently skipped because their LastSequenceVersion is older than the channel's current SequenceVersion (B3 spec §7.2).</summary>
     public long SnapshotsRejectedStaleVersion => _snapshotApplier.SnapshotsRejectedStaleVersion;
 
-    private void HandleSnapshotHeader(ReadOnlySpan<byte> body) => _snapshotApplier.OnHeader(body);
-    private void HandleSnapshotOrders(ReadOnlySpan<byte> body) => _snapshotApplier.OnOrdersChunk(body);
+    private void HandleSnapshotHeader(in SnapshotFullRefresh_Header_30DataReader reader) => _snapshotApplier.OnHeader(in reader);
+    private void HandleSnapshotOrders(in SnapshotFullRefresh_Orders_MBO_71DataReader reader) => _snapshotApplier.OnOrdersChunk(in reader);
 
     // Exposed internally for tests that don't want to forge raw SBE bytes.
     internal void BeginSnapshotHeader(ulong secId, uint lastRptSeq, bool hasRptSeq, uint ordersExpected)
@@ -898,7 +891,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         => _snapshotApplier.RecordSnapshotHeader(securityId, lastRptSeq);
     internal void HealAfterSnapshotForTest(ulong securityId)
         => _snapshotApplier.HealAfterSnapshotForTest(securityId);
-    internal void HandleEmptyBookForTest(ReadOnlySpan<byte> body) => HandleEmptyBook(body);
+    internal void HandleEmptyBookForTest(ReadOnlySpan<byte> body)
+    {
+        if (EmptyBook_9Data.TryParse(body, out var reader))
+            HandleEmptyBook(in reader);
+    }
 
     /// <summary>
     /// Fast book lookup — uses FrozenDictionary when available (hot path),

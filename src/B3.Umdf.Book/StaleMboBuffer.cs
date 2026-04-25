@@ -162,7 +162,8 @@ public sealed class StaleMboBuffer
         uint RptSeq,
         ulong SendingTimeNs,
         byte[] Body,
-        int BodyLength)
+        int BodyLength,
+        int BlockLength)
     {
         public ReadOnlySpan<byte> Span => Body.AsSpan(0, BodyLength);
         public void Release() => ArrayPool<byte>.Shared.Return(Body);
@@ -207,8 +208,12 @@ public sealed class StaleMboBuffer
     ///   the new buffer earliest).</item>
     /// </list>
     /// </summary>
-    public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null)
+    public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null, int blockLength = -1)
     {
+        // Default blockLength to body.Length when caller doesn't differentiate
+        // (test paths that don't carry a separate wire blockLength).
+        if (blockLength < 0) blockLength = body.Length;
+
         // Global byte cap: check before allocating.
         long postEnqueueBytes = Volatile.Read(ref _totalBytes) + body.Length;
         if (postEnqueueBytes > _globalByteCap)
@@ -259,7 +264,7 @@ public sealed class StaleMboBuffer
         }
         var rented = ArrayPool<byte>.Shared.Rent(body.Length);
         body.CopyTo(rented);
-        queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length));
+        queue.Items.Enqueue(new DeferredMboMsg(templateId, rptSeq, sendingTimeNs, rented, body.Length, blockLength));
         Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) + body.Length - evictedBytes);
         _enqueued++;
         if (promotedToLevel > 0)
