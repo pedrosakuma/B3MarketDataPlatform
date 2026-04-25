@@ -5,7 +5,7 @@ namespace B3.Umdf.Feed;
 
 public static class MessageDispatcher
 {
-    public const int SbeHeaderSize = 8; // SBE MessageHeader: blockLength(2) + templateId(2) + schemaId(2) + version(2)
+    public const int SbeHeaderSize = MessageHeader.MESSAGE_SIZE;
 
     public static void Dispatch(in UmdfPacket packet, IFeedEventHandler handler)
     {
@@ -36,7 +36,8 @@ public static class MessageDispatcher
 
             // SBE message starts right after the FramingHeader
             var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
-            ushort templateId = System.Runtime.InteropServices.MemoryMarshal.Read<ushort>(sbeSlice[2..]);
+            if (!MessageHeader.TryReadTemplateId(sbeSlice, out var templateId))
+                break;
 
             handler.OnPacket(in packet, sbeSlice, templateId);
 

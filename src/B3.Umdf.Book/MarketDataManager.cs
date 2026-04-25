@@ -216,14 +216,14 @@ public sealed class MarketDataManager : IFeedEventHandler
         var info = GetOrCreateInfo(securityId);
 
         string? oldGroup = info.SecurityGroup;
-        string newGroup = msg.SecurityGroup.ToString().Trim();
+        string newGroup = Encoding.Latin1.GetString(msg.SecurityGroup.AsTrimmedSpan());
         info.SecurityGroup = newGroup;
         UpdateGroupMembership(securityId, info, oldGroup, newGroup);
-        info.Symbol = msg.Symbol.ToString().Trim();
-        info.Asset = msg.Asset.ToString().Trim();
-        info.CfiCode = msg.CfiCode.ToString().Trim();
-        info.Currency = msg.Currency.ToString().Trim();
-        info.IsinNumber = msg.IsinNumber.ToString().Trim();
+        info.Symbol = Encoding.Latin1.GetString(msg.Symbol.AsTrimmedSpan());
+        info.Asset = Encoding.Latin1.GetString(msg.Asset.AsTrimmedSpan());
+        info.CfiCode = Encoding.Latin1.GetString(msg.CfiCode.AsTrimmedSpan());
+        info.Currency = Encoding.Latin1.GetString(msg.Currency.AsTrimmedSpan());
+        info.IsinNumber = Encoding.Latin1.GetString(msg.IsinNumber.AsTrimmedSpan());
 
         info.SecurityType = (int)msg.SecurityType;
         info.SecuritySubType = msg.SecuritySubType;
@@ -252,7 +252,7 @@ public sealed class MarketDataManager : IFeedEventHandler
                 underlyings.Add(new UnderlyingInfo
                 {
                     SecurityId = uid,
-                    Symbol = u.UnderlyingSymbol.ToString().Trim(),
+                    Symbol = Encoding.Latin1.GetString(u.UnderlyingSymbol.AsTrimmedSpan()),
                 });
             },
             (in SecurityDefinition_12Data.NoLegsData leg) =>
@@ -263,7 +263,7 @@ public sealed class MarketDataManager : IFeedEventHandler
                 legs.Add(new LegInfo
                 {
                     SecurityId = lid,
-                    Symbol = leg.LegSymbol.ToString().Trim(),
+                    Symbol = Encoding.Latin1.GetString(leg.LegSymbol.AsTrimmedSpan()),
                     RatioQty = leg.LegRatioQty.Mantissa,
                     SecurityType = (int)leg.LegSecurityType,
                     Side = (int)leg.LegSide,
@@ -354,7 +354,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         // ToString().Trim() allocation on the hot path. New groups (cache
         // miss) fall back to the legacy normalization to preserve identity
         // with whatever HandleSecurityDefinition stored.
-        string group = InternGroup(groupBytes) ?? msg.SecurityGroup.ToString().Trim();
+        string group = InternGroup(groupBytes) ?? Encoding.Latin1.GetString(msg.SecurityGroup.AsTrimmedSpan());
 
         _groupStatus[group] = status;
 

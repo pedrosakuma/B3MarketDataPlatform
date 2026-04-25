@@ -193,10 +193,8 @@ internal sealed class SnapshotApplier
         if (pending.Skipped)
         {
             uint skippedAdded = 0;
-            reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData _) =>
-            {
+            foreach (ref readonly var _ in reader.NoMDEntries)
                 skippedAdded++;
-            });
             pending.OrdersReceived += skippedAdded;
             if (pending.OrdersReceived >= pending.OrdersExpected)
                 _pendingSnapshots.Remove(securityId);
@@ -206,12 +204,12 @@ internal sealed class SnapshotApplier
         uint added = 0;
         var stagedBids = pending.StagedBids;
         var stagedAsks = pending.StagedAsks;
-        reader.ReadGroups((in SnapshotFullRefresh_Orders_MBO_71Data.NoMDEntriesData entry) =>
+        foreach (ref readonly var entry in reader.NoMDEntries)
         {
             added++;
             long? rawPrice = entry.MDEntryPx.Mantissa;
             if (rawPrice is null)
-                return; // Market orders have no price — counted toward expected but not staged
+                continue; // Market orders have no price — counted toward expected but not staged
 
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
             long price = rawPrice.Value;
@@ -233,7 +231,7 @@ internal sealed class SnapshotApplier
                 stagedBids.Add(bookEntry);
             else
                 stagedAsks.Add(bookEntry);
-        });
+        }
 
         pending.OrdersReceived += added;
 

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
+using System.Text;
 using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
@@ -74,7 +75,7 @@ public sealed class SymbolRegistry : IFeedEventHandler
 
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
-        string symbol = msg.Symbol.ToString().Trim();
+        string symbol = Encoding.Latin1.GetString(msg.Symbol.AsTrimmedSpan());
 
         if (!string.IsNullOrEmpty(symbol))
         {
