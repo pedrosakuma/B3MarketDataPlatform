@@ -44,19 +44,19 @@ internal static class SnapshotEmitter
     {
         ulong securityId = book.SecurityId;
         uint lastRptSeq = book.LastRptSeq;
-        var bidOrders = CopyOrderData(book.Bids);
-        var askOrders = CopyOrderData(book.Asks);
+        var bids = book.Bids;
+        var asks = book.Asks;
 
         int headerSize = WireProtocol.BookSnapshotSize(0, 0);
-        int totalOrders = bidOrders.Length + askOrders.Length;
+        int totalOrders = bids.OrderCount + asks.OrderCount;
         int needed = headerSize + totalOrders * 37;
         var buf = ArrayPool<byte>.Shared.Rent(needed);
 
         WireProtocol.WriteBookSnapshotHeader(buf, securityId, lastRptSeq, 0, 0);
         int offset = headerSize;
 
-        SerializeOrderArray(buf, ref offset, securityId, bidOrders);
-        SerializeOrderArray(buf, ref offset, securityId, askOrders);
+        WriteOrdersDirect(buf, ref offset, securityId, bids);
+        WriteOrdersDirect(buf, ref offset, securityId, asks);
 
         session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
     }
@@ -147,23 +147,18 @@ internal static class SnapshotEmitter
         session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
-    private static (ulong OrderId, byte Side, long Price, long Quantity)[] CopyOrderData(BookSide side)
+    /// <summary>
+    /// Writes every order on the given side directly into <paramref name="buf"/> without
+    /// allocating an intermediate tuple array. Iterates over the concrete-typed
+    /// <see cref="Dictionary{TKey,TValue}.ValueCollection"/> so the foreach uses a
+    /// struct enumerator instead of the boxed <see cref="IEnumerable{T}"/> path.
+    /// </summary>
+    private static void WriteOrdersDirect(byte[] buf, ref int offset, ulong securityId, BookSide side)
     {
-        var orders = side.Orders;
-        var result = new (ulong, byte, long, long)[orders.Count];
-        int i = 0;
-        foreach (var entry in orders.Values)
-            result[i++] = (entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
-        return result;
-    }
-
-    private static void SerializeOrderArray(byte[] buf, ref int offset, ulong securityId,
-        (ulong OrderId, byte Side, long Price, long Quantity)[] orders)
-    {
-        foreach (var (orderId, side, price, quantity) in orders)
+        foreach (var entry in side.SnapshotOrderValues)
         {
             int len = WireProtocol.WriteOrderEvent(buf.AsSpan(offset), MessageType.OrderAdded,
-                securityId, orderId, side, price, quantity);
+                securityId, entry.OrderId, (byte)entry.Side, entry.Price, entry.Quantity);
             offset += len;
         }
     }

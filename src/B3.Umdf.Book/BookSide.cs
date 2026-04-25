@@ -19,6 +19,13 @@ public sealed class BookSide
     public BookSideType Side => _side;
     public int OrderCount => _orders.Count;
     public IReadOnlyDictionary<ulong, OrderBookEntry> Orders => _orders;
+
+    /// <summary>
+    /// Concrete-typed accessor used on the snapshot path so foreach pattern matching
+    /// picks up the struct enumerator <see cref="Dictionary{TKey,TValue}.ValueCollection.Enumerator"/>
+    /// instead of boxing it through the <see cref="IEnumerable{T}"/> interface dispatch.
+    /// </summary>
+    public Dictionary<ulong, OrderBookEntry>.ValueCollection SnapshotOrderValues => _orders.Values;
     public int LevelCount => _levels.Count;
 
     /// <summary>
