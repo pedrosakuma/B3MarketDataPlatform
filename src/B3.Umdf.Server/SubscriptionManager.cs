@@ -248,8 +248,12 @@ public sealed class SubscriptionManager : IDisposable
     /// <summary>Lock-free accessor for the inner per-security subscriber dict (copy-on-write under
     /// _subLock). Used by hot-path coalesced broadcast in <see cref="GroupConflationHandler"/>
     /// to amortize the per-event Channel.TryWrite cost across an entire flush cycle.
+    ///
+    /// Returns the concrete <see cref="Dictionary{TKey, TValue}"/> (not the interface) so the
+    /// broadcaster's foreach uses the struct enumerator — avoids boxing one IEnumerator per
+    /// per-event call inside the fan-out loop.
     /// </summary>
-    internal IReadOnlyDictionary<string, DataFlags>? GetSubscribers(ulong securityId) =>
+    internal Dictionary<string, DataFlags>? GetSubscribers(ulong securityId) =>
         _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
 
     /// <summary>
