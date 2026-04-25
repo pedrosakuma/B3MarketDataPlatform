@@ -106,9 +106,9 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     private void TrackMatchEvent(ulong securityId, MatchEventIndicator mei)
     {
-        if ((mei & MatchEventIndicator.RecoveryMsg) != 0)
+        if (mei.IsRecoveryMsg())
             Interlocked.Increment(ref _recoveryMsgCount);
-        if ((mei & MatchEventIndicator.EndOfEvent) != 0)
+        if (mei.IsEndOfEvent())
         {
             Interlocked.Increment(ref _endOfEventCount);
             try { _eventHandler?.OnEndOfEvent(securityId); }
