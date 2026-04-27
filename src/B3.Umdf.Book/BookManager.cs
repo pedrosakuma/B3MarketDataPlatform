@@ -81,6 +81,16 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     private long _endOfEventCount;
     private long _recoveryMsgCount;
+    private long _emptyBookEventCount;
+    /// <summary>
+    /// Total <c>EmptyBook_9</c> messages applied since startup. EmptyBook is a
+    /// per-instrument provable empty-state event that resets the wire RptSeq
+    /// to 1 (B3 spec). Distinct from generic <see cref="OrderDeletes"/> /
+    /// MassDelete-driven clears: a sustained rate of EmptyBook events for a
+    /// given instrument typically indicates session phase changes (e.g., end
+    /// of trading session, instrument expiry) rather than incremental flow.
+    /// </summary>
+    public long EmptyBookEventCount => Volatile.Read(ref _emptyBookEventCount);
     /// <summary>Total number of messages observed with the EndOfEvent bit set
     /// in MatchEventIndicator (B3 spec §10). Marks the last message of an
     /// atomic exchange-side matching event.</summary>
@@ -768,6 +778,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     {
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        Interlocked.Increment(ref _emptyBookEventCount);
 
         if (TryLookupBook(securityId, out var book))
         {

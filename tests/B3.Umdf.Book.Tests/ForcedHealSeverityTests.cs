@@ -12,13 +12,24 @@ namespace B3.Umdf.Book.Tests;
 /// </summary>
 public class ForcedHealSeverityTests
 {
-    private static SymbolStateRegistry NewRegistry()
-        => new(NullLogger<SymbolStateRegistry>.Instance);
+    private sealed class FakeClock : IClock
+    {
+        // Start non-zero so StaleSinceTicks != 0 (the escape guard requires it).
+        private long _ticks = 1_000_000;
+        public long NowTicks => _ticks;
+        public void Advance(long ms) => _ticks += ms;
+    }
+
+    private static (SymbolStateRegistry Registry, FakeClock Clock) NewRegistry()
+    {
+        var clock = new FakeClock();
+        return (new SymbolStateRegistry(NullLogger<SymbolStateRegistry>.Instance, clock), clock);
+    }
 
     [Fact]
     public void NoForcedHeal_GaugesAreZero()
     {
-        var r = NewRegistry();
+        var (r, _) = NewRegistry();
         Assert.Equal(0u, r.LastAuthoritativeResetUnsafeDelta);
         Assert.Equal(0u, r.MaxAuthoritativeResetUnsafeDelta);
         Assert.Equal(0UL, r.SumAuthoritativeResetUnsafeDelta);
@@ -30,13 +41,13 @@ public class ForcedHealSeverityTests
     [Fact]
     public void ForcedHeal_PopulatesUnsafeAndDiscardedTailDeltas()
     {
-        var r = NewRegistry();
+        var (r, clock) = NewRegistry();
         r.StaleEscapeTimeoutMs = 30;
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
         r.Observe(1, SymbolGapKind.Mbo, 101);
         // Gap to 200 → MinHeal becomes 199, priorHighWater becomes 200.
         r.Observe(1, SymbolGapKind.Mbo, 200);
-        Thread.Sleep(80);
+        clock.Advance(80);
 
         // Snapshot at 50 forces escape: unsafe = MinHeal(199)-snap(50)=149,
         // discarded tail = highWater(200)-snap(50)=150.
@@ -55,21 +66,21 @@ public class ForcedHealSeverityTests
     [Fact]
     public void ForcedHeal_MaxRetainsLargestSpike_SumAccumulates()
     {
-        var r = NewRegistry();
+        var (r, clock) = NewRegistry();
         r.StaleEscapeTimeoutMs = 30;
 
         // Symbol A: large delta.
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
         r.Observe(1, SymbolGapKind.Mbo, 101);
         r.Observe(1, SymbolGapKind.Mbo, 1_001); // MinHeal=1000, high=1001
-        Thread.Sleep(80);
+        clock.Advance(80);
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 1); // unsafe=999, tail=1000
 
         // Symbol B: small delta.
         r.HealFromSnapshot(2, SymbolGapKind.Mbo, snapshotRptSeq: 100);
         r.Observe(2, SymbolGapKind.Mbo, 101);
         r.Observe(2, SymbolGapKind.Mbo, 110); // MinHeal=109, high=110
-        Thread.Sleep(80);
+        clock.Advance(80);
         r.HealFromSnapshot(2, SymbolGapKind.Mbo, snapshotRptSeq: 50); // unsafe=59, tail=60
 
         Assert.Equal(2, r.StaleAuthoritativeResetCount);
@@ -88,7 +99,7 @@ public class ForcedHealSeverityTests
     public void RejectedSnapshot_DoesNotMoveSeverityGauges()
     {
         // Lagging snapshot rejected before timeout → counters stay clean.
-        var r = NewRegistry();
+        var (r, _) = NewRegistry();
         r.StaleEscapeTimeoutMs = 5_000;
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 100);
         r.Observe(1, SymbolGapKind.Mbo, 101);
