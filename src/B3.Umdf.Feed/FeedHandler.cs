@@ -23,12 +23,23 @@ public sealed class FeedHandler : IDisposable
     // Instrument Definition tracking
     private uint _instrDefTotalExpected;
     private uint _instrDefReceived;
+    private long _instrDefDuplicateCount;
+    private long _instrDefMismatchedTotalCount;
+    // Set of unique SecurityIDs already counted toward _instrDefReceived.
+    // Bootstrap completion is gated on UNIQUE securities, not raw message
+    // count, so a duplicate SecDef cannot prematurely complete and leave the
+    // tail of the universe permanently unknown to downstream consumers.
+    private readonly HashSet<ulong> _instrDefSeenSymbols = new();
 
     public FeedState State => _state;
     public long PacketCount => _packetCount;
     public long InstrDefPacketCount => _instrDefPacketCount;
     public uint InstrDefReceived => _instrDefReceived;
     public uint InstrDefTotalExpected => _instrDefTotalExpected;
+    /// <summary>Repeated SecurityDefinition_12 messages observed during bootstrap (deduplicated by SecurityID).</summary>
+    public long InstrDefDuplicateCount => Volatile.Read(ref _instrDefDuplicateCount);
+    /// <summary>SecurityDefinition_12 messages whose <c>TotNoRelatedSym</c> contradicted the first observed value (the original total wins).</summary>
+    public long InstrDefMismatchedTotalCount => Volatile.Read(ref _instrDefMismatchedTotalCount);
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
     /// <summary>Fires after the state machine transitions. Args are (oldState, newState). Invoked synchronously on the worker thread.</summary>
@@ -219,6 +230,11 @@ public sealed class FeedHandler : IDisposable
                 // the channel. Each (Header_30, Orders_71) pair is self-contained
                 // and applies independently — no cycle gating required.
                 DispatchSnapshotMessages(in packet);
+                // Snapshot apply can mutate book state (clears, market-tier
+                // changes, stale→healthy transitions). Fire OnPacketProcessed
+                // so downstream conflation buffers (e.g. GroupConflationHandler)
+                // flush promptly instead of waiting for an unrelated incremental.
+                _eventHandler.OnPacketProcessed();
                 break;
         }
     }
@@ -248,10 +264,32 @@ public sealed class FeedHandler : IDisposable
             return;
 
         ref readonly var msg = ref reader.Data;
+
+        // Dedupe by SecurityID: B3 may resend SecDefs (snapshot retry, slow
+        // listeners) and counting raw messages would prematurely satisfy
+        // TotNoRelatedSym, leaving symbols at the tail permanently unknown.
+        ulong securityId = msg.SecurityID.Value;
+        if (!_instrDefSeenSymbols.Add(securityId))
+        {
+            Interlocked.Increment(ref _instrDefDuplicateCount);
+            return;
+        }
         _instrDefReceived++;
 
         if (_instrDefTotalExpected == 0)
+        {
             _instrDefTotalExpected = msg.TotNoRelatedSym;
+        }
+        else if (msg.TotNoRelatedSym != 0 && msg.TotNoRelatedSym != _instrDefTotalExpected)
+        {
+            // Contradictory total — log once per occurrence; the first
+            // observed value remains authoritative to keep completion
+            // deterministic.
+            Interlocked.Increment(ref _instrDefMismatchedTotalCount);
+            _logger.LogWarning(
+                "InstrumentDefinition reported mismatched TotNoRelatedSym: first={Expected} now={Observed} (SecurityID={SecurityId}); first value wins",
+                _instrDefTotalExpected, msg.TotNoRelatedSym, securityId);
+        }
 
         if (_instrDefReceived >= _instrDefTotalExpected && _instrDefTotalExpected > 0
             && _state == FeedState.WaitInstrumentDefinition)

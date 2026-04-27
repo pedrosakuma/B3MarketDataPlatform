@@ -371,17 +371,33 @@ public sealed class StaleMboBuffer
         }
 
         matches.Sort(static (a, b) => a.RptSeq.CompareTo(b.RptSeq));
-        foreach (var m in matches)
+        try
         {
-            apply(m);
-            releasedBytes += m.BodyLength;
-            m.Release();
-            applied++;
+            for (int i = 0; i < matches.Count; i++)
+            {
+                var m = matches[i];
+                apply(m);
+                releasedBytes += m.BodyLength;
+                m.Release();
+                applied++;
+            }
         }
-        // Restore future items for the next drain.
-        foreach (var f in future) queue.Items.Enqueue(f);
-        Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) - releasedBytes);
-        _drained += applied;
+        finally
+        {
+            // Release every match we did NOT successfully apply (apply threw,
+            // or we never reached it). Indexes [applied, matches.Count) still
+            // own pooled buffers.
+            for (int i = applied; i < matches.Count; i++)
+            {
+                releasedBytes += matches[i].BodyLength;
+                matches[i].Release();
+            }
+            // Always restore future items: they were never the target of
+            // this drain and must remain available for the next one.
+            foreach (var f in future) queue.Items.Enqueue(f);
+            Volatile.Write(ref _totalBytes, Volatile.Read(ref _totalBytes) - releasedBytes);
+            _drained += applied;
+        }
         return applied;
     }
 
