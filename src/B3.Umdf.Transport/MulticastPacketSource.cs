@@ -57,6 +57,11 @@ public sealed class MulticastPacketSource : IPacketSource
     public int ChannelGroup => _channelGroup;
     public bool IsJoined { get { lock (_membershipLock) return _isJoined; } }
 
+    // Test-only: exposes whether the recvmmsg batch state (POH buffer pool +
+    // pinned iovec/mmsghdr arrays) has been allocated. Pinned to verify
+    // Dispose drops the references for prompt GC.
+    internal bool BatchStateAllocatedForTests => _batchBufferPool is not null;
+
     public MulticastPacketSource(ChannelConfig config, ILogger<MulticastPacketSource>? logger = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(config.ReceiveBufferBytes, 1);
@@ -451,5 +456,22 @@ public sealed class MulticastPacketSource : IPacketSource
         _socket.Dispose();
         if (_batchIovecsHandle.IsAllocated) _batchIovecsHandle.Free();
         if (_batchMmsghdrsHandle.IsAllocated) _batchMmsghdrsHandle.Free();
+
+        // Drop strong references to the POH-allocated batch buffers and
+        // ancillary structs so the GC can reclaim them as soon as any
+        // outstanding PinnedPoolPacketLease completes, rather than waiting
+        // for this MulticastPacketSource itself to become unreferenced.
+        // POH arrays are pinned-while-alive (not immortal) — they're
+        // collectible once unreferenced, but only then.
+        // Outstanding leases independently reference the pool via their own
+        // _pool field, so Release continues to work after this clear; the
+        // returned buffer enters the pool's _free queue and is reclaimed
+        // when the pool itself becomes unreferenced.
+        if (_batchPendingBuffers is not null)
+            Array.Clear(_batchPendingBuffers);
+        _batchPendingBuffers = null;
+        _batchBufferPool = null;
+        _batchIovecs = null;
+        _batchMmsghdrs = null;
     }
 }
