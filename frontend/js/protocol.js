@@ -7,6 +7,7 @@ export const MSG = {
   BOOK_SNAPSHOT: 0x0020, INFO_SNAPSHOT: 0x0021,
   ORDER_ADDED: 0x0030, ORDER_UPDATED: 0x0031, ORDER_DELETED: 0x0032,
   TRADE: 0x0033, BOOK_CLEARED: 0x0034,
+  TRADE_BUST: 0x0035, MARKET_TIER_UPDATE: 0x0036,
   RANKINGS_UPDATE: 0x0040,
   SERVER_STATUS: 0x0050,
   CANDLE_SNAPSHOT: 0x0060,
@@ -154,6 +155,13 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const securityId = v.getBigUint64(o, true); o += 8;
       const side = o < msgLen ? v.getUint8(o) : 0;
       return { type: 'BookCleared', securityId, side };
+    }
+    case MSG.MARKET_TIER_UPDATE: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const side = v.getUint8(o); o += 1;
+      const qty = Number(v.getBigInt64(o, true)); o += 8;
+      const count = v.getUint32(o, true);
+      return { type: 'MarketTierUpdate', securityId, side, qty, count };
     }
     case MSG.RANKINGS_UPDATE: {
       const categories = [];

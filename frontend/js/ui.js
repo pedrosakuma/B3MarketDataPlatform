@@ -77,6 +77,25 @@ function getBookPool() {
       thead.appendChild(el);
     }
     table.appendChild(thead);
+    const marketTr = document.createElement('tr');
+    marketTr.style.display = 'none';
+    marketTr.className = 'market-tier-row';
+    const marketPrice = document.createElement('td');
+    marketPrice.className = label === 'Bids' ? 'bid-price' : 'ask-price';
+    marketPrice.style.fontWeight = '700';
+    marketPrice.title = 'MOA/MOC market tier';
+    const marketQty = document.createElement('td');
+    const marketCount = document.createElement('td');
+    const marketDepth = document.createElement('td');
+    marketDepth.className = 'depth-cell';
+    const marketBar = document.createElement('div');
+    marketBar.className = label === 'Bids' ? 'depth-bar bid-bar' : 'depth-bar ask-bar';
+    marketDepth.appendChild(marketBar);
+    marketTr.appendChild(marketPrice);
+    marketTr.appendChild(marketQty);
+    marketTr.appendChild(marketCount);
+    marketTr.appendChild(marketDepth);
+    table.appendChild(marketTr);
     const rows = [];
     for (let i = 0; i < MAX_BOOK_POOL; i++) {
       const tr = document.createElement('tr');
@@ -104,7 +123,7 @@ function getBookPool() {
     table.appendChild(emptyTr);
     side.appendChild(table);
     grid.appendChild(side);
-    return { rows, emptyTr };
+    return { rows, emptyTr, market: { tr: marketTr, tdPrice: marketPrice, tdQty: marketQty, tdCount: marketCount, bar: marketBar } };
   }
 
   const bidSide = createSide('Bids');
@@ -119,6 +138,7 @@ function getBookPool() {
   bookPool = {
     summary, spread, sBid, sAsk, sSpread, grid, emptyMsg,
     bids: bidSide.rows, asks: askSide.rows,
+    bidMarket: bidSide.market, askMarket: askSide.market,
     bidEmpty: bidSide.emptyTr, askEmpty: askSide.emptyTr,
   };
   return bookPool;
@@ -193,7 +213,7 @@ export function renderBook(bookData) {
   pool.summary.style.display = '';
   pool.grid.style.display = '';
 
-  const { bids, asks, maxQty, totalBids, totalAsks, totalOrders, orderCount } = bookData;
+  const { bids, asks, maxQty, totalBids, totalAsks, totalOrders, orderCount, marketBid, marketAsk } = bookData;
 
   pool.summary.textContent = totalBids + 'b/' + totalAsks + 'a | ' + totalOrders + ' orders | +' + orderCount + ' events';
 
@@ -206,6 +226,7 @@ export function renderBook(bookData) {
     pool.spread.style.display = 'none';
   }
 
+  renderMarketTier(pool.bidMarket, marketBid, maxQty);
   for (let i = 0; i < pool.bids.length; i++) {
     const row = pool.bids[i];
     if (i < bids.length) {
@@ -219,8 +240,9 @@ export function renderBook(bookData) {
       row.tr.style.display = 'none';
     }
   }
-  pool.bidEmpty.style.display = bids.length === 0 ? '' : 'none';
+  pool.bidEmpty.style.display = bids.length === 0 && (!marketBid || marketBid.count === 0) ? '' : 'none';
 
+  renderMarketTier(pool.askMarket, marketAsk, maxQty);
   for (let i = 0; i < pool.asks.length; i++) {
     const row = pool.asks[i];
     if (i < asks.length) {
@@ -234,7 +256,19 @@ export function renderBook(bookData) {
       row.tr.style.display = 'none';
     }
   }
-  pool.askEmpty.style.display = asks.length === 0 ? '' : 'none';
+  pool.askEmpty.style.display = asks.length === 0 && (!marketAsk || marketAsk.count === 0) ? '' : 'none';
+}
+
+function renderMarketTier(row, tier, maxQty) {
+  if (!tier || tier.count === 0) {
+    row.tr.style.display = 'none';
+    return;
+  }
+  row.tr.style.display = '';
+  row.tdPrice.textContent = 'MKT';
+  row.tdQty.textContent = formatQty(tier.qty);
+  row.tdCount.textContent = String(tier.count);
+  row.bar.style.width = (tier.qty / maxQty * 100).toFixed(1) + '%';
 }
 
 export function renderRankings(rankingsData, tab, connected) {

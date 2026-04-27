@@ -67,6 +67,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// — typically a venue-side phase rollback). Migrated out of the priced
     /// <see cref="BookSide"/> into the per-side market tier.</summary>
     public long MarketOrderTransitionsToMarket => Volatile.Read(ref _marketOrderTransitionsToMarket);
+    public long SnapshotMarketOrderAdds => _snapshotApplier.SnapshotMarketOrderAdds;
 
     /// <summary>
     /// Trades suppressed from <see cref="IBookEventHandler.OnTrade"/> /
@@ -558,8 +559,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // The new message has a real price. If a market order with this id
         // exists, this is a phase-resolution transition (MOA → priced). Migrate
         // it out of the market tier before falling through to the priced path.
-        if (book.TryRemoveMarketOrderAnySide(orderId, out _))
+        if (book.TryRemoveMarketOrderAnySide(orderId, out var removedMarketSide))
+        {
             _marketOrderTransitionsToPriced++;
+            EmitMarketTierChanged(book, removedMarketSide);
+        }
 
         if (bookSide.TryGetOrder(orderId, out var existing))
         {
@@ -640,12 +644,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
         if (rptSeq is { } rs) TrackMboRptSeq(book, (uint)rs);
 
-        // Market-order events are intentionally NOT fanned out to client
-        // subscribers via OnOrderAdded/Updated — the wire protocol's price
-        // field has no representation for "market price" today. Backend
-        // tracking remains accurate (counters, BookSnapshot, BBO consumers
-        // that opt in via OrderBook.HasMarketOrders); a future protocol
-        // extension can enable per-order fanout without changing the parser.
+        EmitMarketTierChanged(book, side);
     }
 
     private void HandleDeleteOrder(in DeleteOrder_MBO_51DataReader reader)
@@ -670,9 +669,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
         else if (book.RemoveMarketOrder(orderId, side))
         {
-            // Market-order delete (MOA/MOC). Tracked separately; not fanned
-            // out (mirrors the add-side decision in HandleMarketOrder).
+            // Market-order delete (MOA/MOC). The priced-order stream has no
+            // null-price representation, so clients receive the aggregate
+            // market-tier update instead of a per-order delete.
             _marketOrderDeletes++;
+            EmitMarketTierChanged(book, side);
         }
         else
         {
@@ -699,16 +700,23 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (!TryLookupBook(securityId, out var book))
             return;
 
+        ApplyMassDelete(book, msg.MDEntryType, msg.RptSeq is { } rptSeq ? (uint)rptSeq : null);
+        TrackMatchEvent(securityId, msg.MatchEventIndicator);
+    }
+
+    private void ApplyMassDelete(OrderBook book, MDEntryType entryType, uint? rptSeq)
+    {
         BookClearSide clearSide;
-        var entryType = msg.MDEntryType;
         if (entryType == MDEntryType.BID)
         {
             book.Bids.Clear();
+            book.ClearMarketOrders(BookSideType.Bid);
             clearSide = BookClearSide.Bid;
         }
         else if (entryType == MDEntryType.OFFER)
         {
             book.Asks.Clear();
+            book.ClearMarketOrders(BookSideType.Ask);
             clearSide = BookClearSide.Ask;
         }
         else
@@ -717,11 +725,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             clearSide = BookClearSide.Both;
         }
 
-        if (msg.RptSeq is { } rptSeq)
-            TrackMboRptSeq(book, (uint)rptSeq);
+        if (rptSeq is { } sequence)
+            TrackMboRptSeq(book, sequence);
 
-        _eventHandler?.OnBookCleared(securityId, clearSide);
-        TrackMatchEvent(securityId, msg.MatchEventIndicator);
+        _eventHandler?.OnBookCleared(book.SecurityId, clearSide);
     }
 
     private void HandleTrade(in Trade_53DataReader reader)
@@ -887,6 +894,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         => _snapshotApplier.OnHeaderForTest(securityId, lastRptSeq, ordersExpected, lastSequenceVersion);
     internal void StageSnapshotEntryForTest(ulong securityId, BookSideType side, ulong orderId, long price, long quantity)
         => _snapshotApplier.StageSnapshotEntryForTest(securityId, side, orderId, price, quantity);
+    internal void StageSnapshotMarketOrderForTest(ulong securityId, BookSideType side, ulong orderId, long quantity, uint enteringFirm = 0)
+        => _snapshotApplier.StageSnapshotMarketOrderForTest(securityId, side, orderId, quantity, enteringFirm);
     internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)
         => _snapshotApplier.RecordSnapshotHeader(securityId, lastRptSeq);
     internal void HealAfterSnapshotForTest(ulong securityId)
@@ -896,6 +905,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         if (EmptyBook_9Data.TryParse(body, out var reader))
             HandleEmptyBook(in reader);
     }
+    internal void HandleMassDeleteForTest(ulong securityId, MDEntryType entryType, uint? rptSeq = null)
+        => ApplyMassDelete(GetOrCreateBook(securityId), entryType, rptSeq);
 
     /// <summary>
     /// Fast book lookup — uses FrozenDictionary when available (hot path),
@@ -911,6 +922,15 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             book.Clear();
             _eventHandler?.OnBookCleared(secId, BookClearSide.Both);
         }
+    }
+
+    private void EmitMarketTierChanged(OrderBook book, BookSideType side)
+    {
+        _eventHandler?.OnMarketTierChanged(
+            book,
+            side,
+            book.MarketOrderQuantity(side),
+            book.MarketOrderCount(side));
     }
 
     private long _epochResets;

@@ -205,6 +205,42 @@ public class BookManagerSnapshotHealTests
     }
 
     [Fact]
+    public void Staging_AcceptedSnapshot_RebuildsMarketTierAndEmitsAggregate()
+    {
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var marketEvents = new List<(BookSideType Side, long Qty, int Count)>();
+        var clears = 0;
+        var handler = new SnapshotEventCaptureHandler(() => clears++,
+            (side, qty, count) => marketEvents.Add((side, qty, count)));
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf, eventHandler: handler);
+
+        for (uint r = 1; r <= 5; r++)
+            reg.Observe(securityId: 550, SymbolGapKind.Mbo, r);
+
+        var live = bm.GetOrCreateBook(550);
+        live.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 10, enteringFirm: 1);
+        live.UpsertMarketOrder(orderId: 2, BookSideType.Ask, quantity: 20, enteringFirm: 1);
+
+        bm.BeginChunkedSnapshotForTest(550, lastRptSeq: 5, ordersExpected: 3);
+        bm.StageSnapshotEntryForTest(550, BookSideType.Bid, orderId: 11, price: 99, quantity: 1);
+        bm.StageSnapshotMarketOrderForTest(550, BookSideType.Bid, orderId: 12, quantity: 30, enteringFirm: 2);
+        bm.StageSnapshotMarketOrderForTest(550, BookSideType.Ask, orderId: 13, quantity: 40, enteringFirm: 3);
+
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(1, clears);
+        Assert.Equal(1, live.Bids.OrderCount);
+        Assert.Equal(1, live.MarketOrderCount(BookSideType.Bid));
+        Assert.Equal(1, live.MarketOrderCount(BookSideType.Ask));
+        Assert.Equal(30, live.MarketOrderQuantity(BookSideType.Bid));
+        Assert.Equal(40, live.MarketOrderQuantity(BookSideType.Ask));
+        Assert.False(live.TryGetMarketOrder(1, BookSideType.Bid, out _));
+        Assert.False(live.TryGetMarketOrder(2, BookSideType.Ask, out _));
+        Assert.Contains((BookSideType.Bid, 30L, 1), marketEvents);
+        Assert.Contains((BookSideType.Ask, 40L, 1), marketEvents);
+    }
+
+    [Fact]
     public void Staging_RejectedSnapshot_DoesNotMutateLiveBookOrEmitClear()
     {
         // Rejection invariant: a snapshot whose LastRptSeq is older than
@@ -244,6 +280,36 @@ public class BookManagerSnapshotHealTests
         Assert.True(live.Bids.TryGetOrder(1, out _));
         Assert.True(live.Asks.TryGetOrder(2, out _));
         Assert.Equal(100u, live.LastRptSeq);
+    }
+
+    [Fact]
+    public void Staging_RejectedSnapshot_DoesNotMutateMarketTierOrEmitAggregate()
+    {
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var marketEvents = 0;
+        var handler = new SnapshotEventCaptureHandler(() => { }, (_, _, _) => marketEvents++);
+        var bm = new BookManager(stateRegistry: reg, staleBuffer: buf, eventHandler: handler);
+
+        for (uint r = 50; r <= 100; r++)
+            reg.Observe(securityId: 650, SymbolGapKind.Mbo, r);
+        reg.HealFromSnapshot(650, SymbolGapKind.Mbo, 100);
+        reg.Observe(securityId: 650, SymbolGapKind.Mbo, 200);
+
+        var live = bm.GetOrCreateBook(650);
+        live.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 10, enteringFirm: 1);
+        live.UpsertMarketOrder(orderId: 2, BookSideType.Ask, quantity: 20, enteringFirm: 1);
+
+        bm.BeginChunkedSnapshotForTest(650, lastRptSeq: 50, ordersExpected: 1);
+        bm.StageSnapshotMarketOrderForTest(650, BookSideType.Bid, orderId: 999, quantity: 99);
+
+        Assert.Equal(1, bm.SnapshotsRejectedTooOld);
+        Assert.Equal(0, marketEvents);
+        Assert.Equal(1, live.MarketOrderCount(BookSideType.Bid));
+        Assert.Equal(1, live.MarketOrderCount(BookSideType.Ask));
+        Assert.Equal(10, live.MarketOrderQuantity(BookSideType.Bid));
+        Assert.Equal(20, live.MarketOrderQuantity(BookSideType.Ask));
+        Assert.False(live.TryGetMarketOrder(999, BookSideType.Bid, out _));
     }
 
     // ===== Complex scenarios =====
@@ -547,6 +613,24 @@ public class BookManagerSnapshotHealTests
         public void OnOrderAdded(OrderBook book, in OrderBookEntry entry) { }
         public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry) { }
         public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side) { }
+        public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long tradeTimeNs) { }
+        public void OnBookCleared(ulong securityId, BookClearSide side) => _onCleared();
+    }
+
+    private sealed class SnapshotEventCaptureHandler : IBookEventHandler
+    {
+        private readonly Action _onCleared;
+        private readonly Action<BookSideType, long, int> _onMarketTierChanged;
+        public SnapshotEventCaptureHandler(Action onCleared, Action<BookSideType, long, int> onMarketTierChanged)
+        {
+            _onCleared = onCleared;
+            _onMarketTierChanged = onMarketTierChanged;
+        }
+        public void OnOrderAdded(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side) { }
+        public void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount)
+            => _onMarketTierChanged(side, totalQuantity, orderCount);
         public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long tradeTimeNs) { }
         public void OnBookCleared(ulong securityId, BookClearSide side) => _onCleared();
     }

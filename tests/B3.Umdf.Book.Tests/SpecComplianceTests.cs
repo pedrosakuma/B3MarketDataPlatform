@@ -254,4 +254,66 @@ public class SpecComplianceTests
         Assert.Equal(0, book.MarketOrderCount(BookSideType.Bid));
         Assert.Equal(0, book.MarketOrderCount(BookSideType.Ask));
     }
+
+    [Fact]
+    public void OrderBook_MarketOrderQuantity_SumsBySide()
+    {
+        var book = new OrderBook(8);
+        book.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 10, enteringFirm: 1);
+        book.UpsertMarketOrder(orderId: 2, BookSideType.Bid, quantity: 15, enteringFirm: 1);
+        book.UpsertMarketOrder(orderId: 3, BookSideType.Ask, quantity: 7, enteringFirm: 1);
+
+        Assert.Equal(25, book.MarketOrderQuantity(BookSideType.Bid));
+        Assert.Equal(7, book.MarketOrderQuantity(BookSideType.Ask));
+    }
+
+    [Fact]
+    public void OrderBook_ClearMarketOrders_ClearsOnlyRequestedSide()
+    {
+        var book = new OrderBook(9);
+        book.UpsertMarketOrder(orderId: 1, BookSideType.Bid, quantity: 10, enteringFirm: 1);
+        book.UpsertMarketOrder(orderId: 2, BookSideType.Ask, quantity: 20, enteringFirm: 1);
+
+        book.ClearMarketOrders(BookSideType.Bid);
+
+        Assert.Equal(0, book.MarketOrderCount(BookSideType.Bid));
+        Assert.Equal(1, book.MarketOrderCount(BookSideType.Ask));
+        Assert.Equal(20, book.MarketOrderQuantity(BookSideType.Ask));
+    }
+
+    [Fact]
+    public void BookManager_MassDeleteBid_ClearsPricedAndMarketBidOnly()
+    {
+        var clears = new List<BookClearSide>();
+        var bm = new BookManager(
+            eventHandler: new ClearSideCaptureHandler(clears.Add),
+            stateRegistry: new SymbolStateRegistry(NullLogger.Instance),
+            staleBuffer: new StaleMboBuffer(NullLogger.Instance));
+        var book = bm.GetOrCreateBook(10);
+        book.Bids.Add(new OrderBookEntry { OrderId = 1, Price = 100, Quantity = 10, SecurityId = 10, Side = BookSideType.Bid });
+        book.Asks.Add(new OrderBookEntry { OrderId = 2, Price = 110, Quantity = 20, SecurityId = 10, Side = BookSideType.Ask });
+        book.UpsertMarketOrder(orderId: 3, BookSideType.Bid, quantity: 30, enteringFirm: 1);
+        book.UpsertMarketOrder(orderId: 4, BookSideType.Ask, quantity: 40, enteringFirm: 1);
+
+        bm.HandleMassDeleteForTest(10, MDEntryType.BID, rptSeq: 11);
+
+        Assert.Equal(0, book.Bids.OrderCount);
+        Assert.Equal(1, book.Asks.OrderCount);
+        Assert.Equal(0, book.MarketOrderCount(BookSideType.Bid));
+        Assert.Equal(1, book.MarketOrderCount(BookSideType.Ask));
+        Assert.Equal(40, book.MarketOrderQuantity(BookSideType.Ask));
+        Assert.Equal(11u, book.LastRptSeq);
+        Assert.Equal(new[] { BookClearSide.Bid }, clears);
+    }
+
+    private sealed class ClearSideCaptureHandler : IBookEventHandler
+    {
+        private readonly Action<BookClearSide> _onCleared;
+        public ClearSideCaptureHandler(Action<BookClearSide> onCleared) => _onCleared = onCleared;
+        public void OnOrderAdded(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderUpdated(OrderBook book, in OrderBookEntry entry) { }
+        public void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side) { }
+        public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs) { }
+        public void OnBookCleared(ulong securityId, BookClearSide side) => _onCleared(side);
+    }
 }

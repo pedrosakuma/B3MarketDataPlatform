@@ -316,6 +316,30 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.NullPriceChangeDeletes),
             description: "Order updates with null price converted to deletes");
 
+        Meter.CreateObservableCounter("b3.umdf.book.market_order_adds",
+            () => PerGroupBook(bm => bm.MarketOrderAdds),
+            description: "MOA/MOC null-price orders inserted into the market tier");
+
+        Meter.CreateObservableCounter("b3.umdf.book.snapshot_market_order_adds",
+            () => PerGroupBook(bm => bm.SnapshotMarketOrderAdds),
+            description: "MOA/MOC null-price orders accepted from MBO snapshots");
+
+        Meter.CreateObservableCounter("b3.umdf.book.market_order_updates",
+            () => PerGroupBook(bm => bm.MarketOrderUpdates),
+            description: "MOA/MOC null-price orders updated in the market tier");
+
+        Meter.CreateObservableCounter("b3.umdf.book.market_order_deletes",
+            () => PerGroupBook(bm => bm.MarketOrderDeletes),
+            description: "MOA/MOC null-price orders removed from the market tier");
+
+        Meter.CreateObservableCounter("b3.umdf.book.market_order_transitions_to_priced",
+            () => PerGroupBook(bm => bm.MarketOrderTransitionsToPriced),
+            description: "MOA/MOC orders that later received a concrete price");
+
+        Meter.CreateObservableCounter("b3.umdf.book.market_order_transitions_to_market",
+            () => PerGroupBook(bm => bm.MarketOrderTransitionsToMarket),
+            description: "Priced orders that later moved into the MOA/MOC market tier");
+
         // ── Per-symbol recovery ──
         // These instruments report the per-symbol heal pipeline (Stale-symbol
         // counts, snapshot heal counters). They are always populated since

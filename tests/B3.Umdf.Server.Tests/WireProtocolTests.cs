@@ -126,6 +126,24 @@ public class WireProtocolTests
     }
 
     [Fact]
+    public void WriteMarketTierUpdate_RoundTrip()
+    {
+        var buf = new byte[64];
+        int len = WireProtocol.WriteMarketTierUpdate(buf, securityId: 501, side: 0, totalQty: 12345, orderCount: 7);
+
+        Assert.Equal(25, len);
+        var (msgLen, type) = ReadFraming(buf);
+        Assert.Equal(25, msgLen);
+        Assert.Equal(MessageType.MarketTierUpdate, type);
+
+        int off = 4;
+        Assert.Equal(501UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
+        Assert.Equal(0, buf[off++]);
+        Assert.Equal(12345L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
+        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off)));
+    }
+
+    [Fact]
     public void WriteInfoSnapshot_EmptyInfo_ContainsOnlyHeader()
     {
         var buf = new byte[WireProtocol.InfoSnapshotMaxSize];

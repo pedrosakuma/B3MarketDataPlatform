@@ -36,10 +36,11 @@ Get               0x0003        Unsubscribed        0x0012
                                 InfoSnapshot        0x0021
                                 OrderAdded          0x0030
                                 OrderUpdated        0x0031
-                                OrderDeleted        0x0032
-                                Trade               0x0033
-                                BookCleared         0x0034
-                                RankingsUpdate      0x0040
+                                 OrderDeleted        0x0032
+                                 Trade               0x0033
+                                 BookCleared         0x0034
+                                 MarketTierUpdate    0x0036
+                                 RankingsUpdate      0x0040
                                 ServerStatus        0x0050
                                 CandleSnapshot      0x0060
                                 CandleUpdate        0x0061
@@ -58,7 +59,7 @@ Get               0x0003        Unsubscribed        0x0012
 | Value | Name | Meaning |
 |-------|------|---------|
 | `0x00` | None | Treated as `All` |
-| `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `Trade`, `BookCleared`) |
+| `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `Trade`, `BookCleared`) |
 | `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
 | `0x03` | All  | Both channels |
 
@@ -110,6 +111,12 @@ do not consume incrementals" and re-subscribe on the rising edge.
 | **InfoSnapshot** | `0x0021` | `[secId u64][fieldMask u32][value i64 × popcount(mask)]` |
 
 Each price level is **18 bytes**: `[price i64][totalQty i64][orderCount u16]`.
+The current server uses `BookSnapshot` as a reset marker (`bidCount=0`,
+`askCount=0`) and then appends priced snapshot orders as `OrderAdded` frames in
+the same snapshot batch. If the book has MOA/MOC null-price orders, the server
+sends one `MarketTierUpdate` per non-empty side immediately after the priced
+snapshot; clients should reset any prior market tier when processing
+`BookSnapshot`.
 
 `InfoSnapshot.fieldMask` bit positions:
 
@@ -138,11 +145,20 @@ bit order). Max `InfoSnapshot` body: 192 bytes.
 | **OrderUpdated** | `0x0031` | *(same as OrderAdded)* |
 | **OrderDeleted** | `0x0032` | `[secId u64][orderId u64][side u8]` |
 | **Trade**        | `0x0033` | `[secId u64][price i64][qty i64][tradeId i64]` |
-| **BookCleared**  | `0x0034` | `[secId u64]` |
+| **BookCleared**  | `0x0034` | `[secId u64][clearSide u8]` |
+| **MarketTierUpdate** | `0x0036` | `[secId u64][side u8][totalQty i64][orderCount u32]` |
 
-`side` = `1` (Bid) or `2` (Ask). Prices use the SBE schema's exponents:
+For order events and `MarketTierUpdate`, `side` = `0` (Bid) or `1` (Ask).
+For `BookCleared`, `clearSide` = `0` (Both), `1` (Bid), or `2` (Ask).
+Prices use the SBE schema's exponents:
 `Price` / `PriceOptional` = `1e-4`, `Price8` = `1e-8`. Apply
 `mantissa × 10^-decimals` for display.
+
+`MarketTierUpdate` represents B3 null-price MOA/MOC orders as an aggregate
+market tier per side. It is intentionally separate from priced order events:
+do not insert it into price-level sorting, and do not use sentinel prices such
+as `0`, `±∞`, or `null` inside the priced ladder. Render it as a distinct
+`MKT`/`MOA-MOC` tier above the priced levels for that side.
 
 ### Aggregates
 

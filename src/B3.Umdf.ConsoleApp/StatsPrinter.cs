@@ -96,6 +96,7 @@ internal sealed class StatsPrinter
         Console.WriteLine();
         Console.WriteLine($"── [{_sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
         Console.WriteLine($"   Packets: {packets:N0} ({pktRate:N0}/s)  |  Events: {totalEvents:N0} ({evtRate:N0}/s)  |  Books: {_bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {_marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {_symbolRegistry.Count:N0}");
+        Console.WriteLine($"   MOA/MOC: snap={_bookManagers.Sum(bm => bm.SnapshotMarketOrderAdds):N0} add={_bookManagers.Sum(bm => bm.MarketOrderAdds):N0} upd={_bookManagers.Sum(bm => bm.MarketOrderUpdates):N0} del={_bookManagers.Sum(bm => bm.MarketOrderDeletes):N0} toPx={_bookManagers.Sum(bm => bm.MarketOrderTransitionsToPriced):N0}");
 
         if (_subscriptionManager is not null)
         {
@@ -229,6 +230,7 @@ internal sealed class StatsPrinter
         Console.WriteLine($"  Books:        {_bookManagers.Sum(bm => bm.Books.Count):N0}");
         Console.WriteLine($"  Instruments:  {_marketDataManagers.Sum(m => m.InstrumentData.Count):N0}");
         Console.WriteLine($"  Symbols:      {_symbolRegistry.Count:N0}");
+        Console.WriteLine($"  MOA/MOC:      snap={_bookManagers.Sum(bm => bm.SnapshotMarketOrderAdds):N0} add={_bookManagers.Sum(bm => bm.MarketOrderAdds):N0} upd={_bookManagers.Sum(bm => bm.MarketOrderUpdates):N0} del={_bookManagers.Sum(bm => bm.MarketOrderDeletes):N0} toPx={_bookManagers.Sum(bm => bm.MarketOrderTransitionsToPriced):N0}");
 
         // Per-symbol heal summary.
         long totalStaleSymbols = 0, totalSymbolsTracked = 0, totalHealed = 0, totalBuffered = 0, totalReplayed = 0, totalDropDup = 0, totalLiveResync = 0, totalAbsorbed = 0;

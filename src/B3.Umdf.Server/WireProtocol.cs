@@ -28,6 +28,10 @@ public enum MessageType : ushort
     /// frontend can mark the corresponding entry in the trade history as
     /// cancelled. Sent exactly once per bust observed on the wire.</summary>
     TradeBust = 0x0035,
+    /// <summary>Server → Client: aggregate null-price MOA/MOC market tier for one side.
+    /// Carries total quantity and order count; it is deliberately separate from
+    /// OrderAdded/Updated so no sentinel price is needed.</summary>
+    MarketTierUpdate = 0x0036,
     RankingsUpdate = 0x0040,
 
     /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
@@ -214,6 +218,19 @@ public static class WireProtocol
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId);
+        return totalLen;
+    }
+
+    /// <summary>Write MarketTierUpdate: securityId + side + aggregate qty + order count.</summary>
+    public static int WriteMarketTierUpdate(Span<byte> dest, ulong securityId, byte side, long totalQty, int orderCount)
+    {
+        const ushort totalLen = FramingHeaderSize + 8 + 1 + 8 + 4; // 25
+        WriteFramingHeader(dest, totalLen, MessageType.MarketTierUpdate);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        dest[offset++] = side;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount));
         return totalLen;
     }
 

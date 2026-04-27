@@ -71,6 +71,13 @@ public sealed class OrderBook
     public IReadOnlyDictionary<ulong, MarketOrder> MarketAsks => _marketAsks;
     public int MarketOrderCount(BookSideType side) =>
         (side == BookSideType.Bid ? _marketBids : _marketAsks).Count;
+    public long MarketOrderQuantity(BookSideType side)
+    {
+        long total = 0;
+        foreach (var order in (side == BookSideType.Bid ? _marketBids : _marketAsks).Values)
+            total += order.Quantity;
+        return total;
+    }
     public bool HasMarketOrders(BookSideType side) => MarketOrderCount(side) > 0;
 
     /// <summary>
@@ -97,6 +104,14 @@ public sealed class OrderBook
 
     public bool RemoveMarketOrder(ulong orderId, BookSideType side)
         => (side == BookSideType.Bid ? _marketBids : _marketAsks).Remove(orderId);
+
+    public void ClearMarketOrders(BookSideType side)
+    {
+        if (side == BookSideType.Bid)
+            _marketBids.Clear();
+        else
+            _marketAsks.Clear();
+    }
 
     /// <summary>
     /// Tries to remove a market order from either side. Useful when the caller

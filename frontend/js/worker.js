@@ -480,7 +480,9 @@ function bestOfSide(sub, side) {
 
 function computeBook() {
   const sub = selectedId ? subscriptions.get(selectedId) : null;
-  if (!sub || sub.orders.size === 0) return null;
+  if (!sub) return null;
+  const hasMarketTier = sub.marketBidCount > 0 || sub.marketAskCount > 0;
+  if (sub.orders.size === 0 && !hasMarketTier) return null;
 
   const bids = sub.topBids;
   const asks = sub.topAsks;
@@ -488,11 +490,15 @@ function computeBook() {
   let maxQty = 1;
   for (const b of bids) if (b.qty > maxQty) maxQty = b.qty;
   for (const a of asks) if (a.qty > maxQty) maxQty = a.qty;
+  if (sub.marketBidQty > maxQty) maxQty = sub.marketBidQty;
+  if (sub.marketAskQty > maxQty) maxQty = sub.marketAskQty;
 
   return {
     bids, asks, maxQty,
     totalBids: sub.bidLevels.size, totalAsks: sub.askLevels.size,
-    totalOrders: sub.orders.size, orderCount: sub.orderCount,
+    totalOrders: sub.orders.size + sub.marketBidCount + sub.marketAskCount, orderCount: sub.orderCount,
+    marketBid: { qty: sub.marketBidQty, count: sub.marketBidCount },
+    marketAsk: { qty: sub.marketAskQty, count: sub.marketAskCount },
   };
 }
 
@@ -600,6 +606,8 @@ function handleMessage(msg) {
           // so computeBook() avoids a full O(N) scan over all orders every render frame.
           bidLevels: new Map(), askLevels: new Map(),
           topBids: [], topAsks: [],
+          marketBidQty: 0, marketBidCount: 0,
+          marketAskQty: 0, marketAskCount: 0,
           info: {}, candles: [], currentCandle: null,
           orderCount: 0, tradeCount: 0, candleResolution: 1, snapshotReceived: false,
           recentTrades: [],   // [{time, price, qty, side, tradeId}] — newest last; capped MAX_RECENT_TRADES
@@ -660,6 +668,8 @@ function handleMessage(msg) {
         sub.askLevels.clear();
         sub.topBids = [];
         sub.topAsks = [];
+        sub.marketBidQty = 0; sub.marketBidCount = 0;
+        sub.marketAskQty = 0; sub.marketAskCount = 0;
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -746,14 +756,38 @@ function handleMessage(msg) {
           sub.askLevels.clear();
           sub.topBids = [];
           sub.topAsks = [];
+          sub.marketBidQty = 0; sub.marketBidCount = 0;
+          sub.marketAskQty = 0; sub.marketAskCount = 0;
         } else {
           const orderSide = msg.side - 1;
           for (const [oid, order] of sub.orders) {
             if (order.side === orderSide) sub.orders.delete(oid);
           }
           (orderSide === 0 ? sub.bidLevels : sub.askLevels).clear();
-          if (orderSide === 0) sub.topBids = [];
-          else sub.topAsks = [];
+          if (orderSide === 0) {
+            sub.topBids = [];
+            sub.marketBidQty = 0; sub.marketBidCount = 0;
+          } else {
+            sub.topAsks = [];
+            sub.marketAskQty = 0; sub.marketAskCount = 0;
+          }
+        }
+      }
+      if (sel === id) mark(D_BOOK);
+      break;
+    }
+    case 'MarketTierUpdate': {
+      stats.orders++;
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        sub.orderCount++;
+        if (msg.side === 0) {
+          sub.marketBidQty = msg.qty;
+          sub.marketBidCount = msg.count;
+        } else if (msg.side === 1) {
+          sub.marketAskQty = msg.qty;
+          sub.marketAskCount = msg.count;
         }
       }
       if (sel === id) mark(D_BOOK);

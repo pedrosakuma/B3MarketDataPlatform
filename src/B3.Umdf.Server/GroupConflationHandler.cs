@@ -20,6 +20,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     // Per-group conflation buffers (single-threaded, no locks)
     private readonly Dictionary<ulong, BufferedOrder> _orderBuffer = new();
+    private readonly Dictionary<(ulong SecurityId, byte Side), (long TotalQty, int OrderCount)> _marketTierBuffer = new();
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
     private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
     // Per-symbol stale-status flips. Coalesced per security:
@@ -173,6 +174,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         BufferOrderDelete(book.SecurityId, orderId, (byte)side);
     }
 
+    public void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount)
+    {
+        if (!_parent.IsSubscribed(book.SecurityId)) return;
+        _eventsReceived++;
+        _marketTierBuffer[(book.SecurityId, (byte)side)] = (totalQuantity, orderCount);
+    }
+
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
         // Always capture trades (regardless of subscription)
@@ -201,6 +209,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (!_parent.IsSubscribed(securityId)) return;
         PurgeBufferedOrders(securityId, (byte)side);
+        PurgeBufferedMarketTiers(securityId, side);
         _clearBuffer.Add((securityId, (byte)side));
     }
 
@@ -325,7 +334,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         // 4. Flush conflation buffers into _currentBatch (dispatch-side work only —
         //    no subscriber fan-out, no ArrayPool rentals for client buffers).
-        if (_orderBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
+        if (_orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
             FlushBuffers();
 
         // 5. Publish the batch to the broadcaster thread. On full ring, drop + schedule
@@ -366,8 +375,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         // Equivalent of FlushBuffers without producing wire bytes — keep the upstream
         // event counter accurate so UpstreamConflated reflects discarded work too.
-        int discarded = _orderBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count + _staleStatusBuffer.Count;
+        int discarded = _orderBuffer.Count + _marketTierBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count + _staleStatusBuffer.Count;
         _orderBuffer.Clear();
+        _marketTierBuffer.Clear();
         _clearBuffer.Clear();
         _tradeBuffer.Clear();
         _staleStatusBuffer.Clear();
@@ -478,6 +488,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 _orderBuffer.Remove(id);
     }
 
+    private void PurgeBufferedMarketTiers(ulong securityId, BookClearSide clearSide)
+    {
+        if (clearSide == BookClearSide.Both)
+        {
+            _marketTierBuffer.Remove((securityId, (byte)BookSideType.Bid));
+            _marketTierBuffer.Remove((securityId, (byte)BookSideType.Ask));
+            return;
+        }
+
+        var side = clearSide == BookClearSide.Bid ? BookSideType.Bid : BookSideType.Ask;
+        _marketTierBuffer.Remove((securityId, (byte)side));
+    }
+
     // ── Buffer flushing (dispatch thread) ──────────────────────────────────────
     //
     // These methods now only *append events to the current broadcast batch*. They do
@@ -501,6 +524,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         if (_orderBuffer.Count > 0)
             flushed += FlushOrderBuffer();
+
+        if (_marketTierBuffer.Count > 0)
+            flushed += FlushMarketTierBuffer();
 
         if (_tradeBuffer.Count > 0)
             flushed += FlushTradeBuffer();
@@ -603,6 +629,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (offset > segmentStart)
             AppendEventToBatch(currentSecId, _flushBuf.AsSpan(segmentStart, offset - segmentStart), segmentCount);
 
+        return flushed;
+    }
+
+    private int FlushMarketTierBuffer()
+    {
+        int flushed = 0;
+        Span<byte> tmp = stackalloc byte[32];
+        foreach (var ((secId, side), (totalQty, orderCount)) in _marketTierBuffer)
+        {
+            int len = WireProtocol.WriteMarketTierUpdate(tmp, secId, side, totalQty, orderCount);
+            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
+            flushed++;
+        }
+        _marketTierBuffer.Clear();
         return flushed;
     }
 

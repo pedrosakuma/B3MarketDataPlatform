@@ -27,6 +27,8 @@ internal sealed class SnapshotApplier
         public bool Skipped;           // Header_30 saw the symbol Healthy + ahead of snap; chunks must be dropped silently
         public readonly List<OrderBookEntry> StagedBids = new();
         public readonly List<OrderBookEntry> StagedAsks = new();
+        public readonly List<MarketOrder> StagedMarketBids = new();
+        public readonly List<MarketOrder> StagedMarketAsks = new();
     }
 
     private readonly BookStore _bookStore;
@@ -45,12 +47,14 @@ internal sealed class SnapshotApplier
     private long _snapshotsRejectedTooOld;
     private long _snapshotsSkippedHealthyAhead;
     private long _snapshotsRejectedStaleVersion;
+    private long _snapshotMarketOrderAdds;
 
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
     public long SnapshotChunksOrphaned => Volatile.Read(ref _snapshotChunksOrphaned);
     public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
     public long SnapshotsSkippedHealthyAhead => Volatile.Read(ref _snapshotsSkippedHealthyAhead);
+    public long SnapshotMarketOrderAdds => Volatile.Read(ref _snapshotMarketOrderAdds);
     /// <summary>
     /// Snapshots silently skipped because their <c>LastSequenceVersion</c>
     /// was older than the channel's current SequenceVersion (B3 spec §7.2).
@@ -208,19 +212,32 @@ internal sealed class SnapshotApplier
         {
             added++;
             long? rawPrice = entry.MDEntryPx.Mantissa;
-            if (rawPrice is null)
-                continue; // Market orders have no price — counted toward expected but not staged
-
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
-            long price = rawPrice.Value;
             long quantity = (long)entry.MDEntrySize;
             ulong orderId = (ulong)entry.SecondaryOrderID;
             uint enteringFirm = entry.EnteringFirm.Value ?? 0;
 
+            if (rawPrice is null)
+            {
+                var marketOrder = new MarketOrder
+                {
+                    OrderId = orderId,
+                    Side = side,
+                    Quantity = quantity,
+                    EnteringFirm = enteringFirm,
+                    SecurityId = securityId
+                };
+                if (side == BookSideType.Bid)
+                    pending.StagedMarketBids.Add(marketOrder);
+                else
+                    pending.StagedMarketAsks.Add(marketOrder);
+                continue;
+            }
+
             var bookEntry = new OrderBookEntry
             {
                 OrderId = orderId,
-                Price = price,
+                Price = rawPrice.Value,
                 Quantity = quantity,
                 EnteringFirm = enteringFirm,
                 SecurityId = securityId,
@@ -338,7 +355,23 @@ internal sealed class SnapshotApplier
         var askSide = book.Asks;
         foreach (ref var entry in CollectionsMarshal.AsSpan(pending.StagedAsks))
             askSide.Add(in entry);
+        foreach (ref var order in CollectionsMarshal.AsSpan(pending.StagedMarketBids))
+            book.UpsertMarketOrder(order.OrderId, BookSideType.Bid, order.Quantity, order.EnteringFirm);
+        foreach (ref var order in CollectionsMarshal.AsSpan(pending.StagedMarketAsks))
+            book.UpsertMarketOrder(order.OrderId, BookSideType.Ask, order.Quantity, order.EnteringFirm);
+        Interlocked.Add(ref _snapshotMarketOrderAdds, pending.StagedMarketBids.Count + pending.StagedMarketAsks.Count);
         _eventHandler?.OnBookCleared(book.SecurityId, BookClearSide.Both);
+        EmitMarketTierChanged(book, BookSideType.Bid);
+        EmitMarketTierChanged(book, BookSideType.Ask);
+    }
+
+    private void EmitMarketTierChanged(OrderBook book, BookSideType side)
+    {
+        _eventHandler?.OnMarketTierChanged(
+            book,
+            side,
+            book.MarketOrderQuantity(side),
+            book.MarketOrderCount(side));
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
@@ -417,6 +450,30 @@ internal sealed class SnapshotApplier
             pending.StagedBids.Add(entry);
         else
             pending.StagedAsks.Add(entry);
+        pending.OrdersReceived++;
+        if (pending.OrdersReceived >= pending.OrdersExpected)
+        {
+            var book = _bookStore.GetOrCreate(securityId);
+            CompleteSnapshot(securityId, book);
+        }
+    }
+
+    internal void StageSnapshotMarketOrderForTest(ulong securityId, BookSideType side, ulong orderId, long quantity, uint enteringFirm = 0)
+    {
+        if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
+            throw new InvalidOperationException($"No pending snapshot for {securityId}");
+        var order = new MarketOrder
+        {
+            OrderId = orderId,
+            Side = side,
+            Quantity = quantity,
+            EnteringFirm = enteringFirm,
+            SecurityId = securityId,
+        };
+        if (side == BookSideType.Bid)
+            pending.StagedMarketBids.Add(order);
+        else
+            pending.StagedMarketAsks.Add(order);
         pending.OrdersReceived++;
         if (pending.OrdersReceived >= pending.OrdersExpected)
         {

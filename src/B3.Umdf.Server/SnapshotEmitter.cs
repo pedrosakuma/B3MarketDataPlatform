@@ -59,6 +59,7 @@ internal static class SnapshotEmitter
         WriteOrdersDirect(buf, ref offset, securityId, asks);
 
         session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
+        SendMarketTierSnapshot(session, book);
     }
 
     /// <summary>
@@ -72,6 +73,21 @@ internal static class SnapshotEmitter
         var emptyBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
         WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
         session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
+    }
+
+    private static void SendMarketTierSnapshot(ClientSession session, OrderBook book)
+    {
+        Span<byte> buf = stackalloc byte[32];
+        SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Bid, book.MarketOrderQuantity(BookSideType.Bid), book.MarketOrderCount(BookSideType.Bid));
+        SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Ask, book.MarketOrderQuantity(BookSideType.Ask), book.MarketOrderCount(BookSideType.Ask));
+    }
+
+    private static void SendMarketTierSide(ClientSession session, Span<byte> buf, ulong securityId, BookSideType side, long totalQty, int orderCount)
+    {
+        if (orderCount == 0 && totalQty == 0)
+            return;
+        int len = WireProtocol.WriteMarketTierUpdate(buf, securityId, (byte)side, totalQty, orderCount);
+        session.TryEnqueue(new ReadOnlyMemory<byte>(buf[..len].ToArray()));
     }
 
     /// <summary>Send the current <see cref="InstrumentInfo"/> snapshot for a security.</summary>
