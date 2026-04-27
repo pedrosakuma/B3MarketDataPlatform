@@ -118,16 +118,31 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Source-driven constructor with a single shared event handler. The internal dispatcher loop
+    /// pulls packets from <paramref name="source"/> and routes them to one <see cref="FeedHandler"/>
+    /// per channel group. Use this overload for offline replay (PCAP files) where one source feeds
+    /// every group; for live multicast prefer the <em>live-push</em> overload below so each receive
+    /// thread can write directly without an extra hop through the ring on the dispatcher thread.
+    /// </summary>
+    /// <param name="feedChannelCapacity">
+    /// No-op. Retained only so existing callers (notably the console app and a handful of tests)
+    /// keep compiling without source edits. The per-group ring capacity is now controlled by
+    /// <paramref name="groupRingCapacity"/>; this parameter will be removed in a future major bump.
+    /// </param>
     public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
         : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, groupRingCapacity)
     {
-        _ = feedChannelCapacity; // accepted for API compatibility; no longer used
+        _ = feedChannelCapacity;
     }
 
     /// <summary>
-    /// Live-push constructor: no source / no internal dispatcher. Receive threads (e.g. one per
-    /// MulticastPacketSource) must call <see cref="PushPacket(in UmdfPacket)"/> directly.
+    /// Live-push constructor with a single shared event handler: no internal dispatcher loop.
+    /// Receive threads (e.g. one per <c>MulticastPacketSource</c>) must call
+    /// <see cref="PushPacket(in UmdfPacket)"/> directly; the call routes through the per-group
+    /// ring to the appropriate <see cref="FeedHandler"/> on the same calling thread (no async hop).
     /// </summary>
+    /// <param name="feedChannelCapacity">No-op; see source-driven overload.</param>
     public MultiFeedManager(IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
         : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source: null, groupRingCapacity)
     {
@@ -153,16 +168,20 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Creates a MultiFeedManager where each group has its own event handler.
-    /// Optionally accepts per-group market data handlers for passthrough during non-RealTime states.
+    /// Source-driven constructor with a per-group event handler map. Use when each channel group
+    /// must dispatch into a distinct downstream subscriber (e.g. separating MBO from MBP). The
+    /// <paramref name="marketDataHandlers"/> overlay receives passthrough events while a group is
+    /// not in <see cref="FeedState.Streaming"/>; pass <c>null</c> if not needed.
     /// </summary>
+    /// <param name="feedChannelCapacity">No-op; see single-handler overload.</param>
     public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
         : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, groupRingCapacity)
     {
         _ = feedChannelCapacity;
     }
 
-    /// <summary>Live-push constructor with per-group handlers (no internal dispatcher).</summary>
+    /// <summary>Live-push constructor with per-group handlers (no internal dispatcher); see live-push overload above for the push-mode contract.</summary>
+    /// <param name="feedChannelCapacity">No-op; see single-handler overload.</param>
     public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
         : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, groupRingCapacity)
     {

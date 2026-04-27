@@ -727,6 +727,25 @@ public sealed class SymbolStateRegistry
     /// buffer's earliest retained message. Idempotent and monotonic
     /// (never lowers MinHeal). Returns true if MinHeal advanced.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Concurrency invariant.</b> Callers must guarantee that
+    /// <see cref="HealFromSnapshot"/> for the same <paramref name="securityId"/>
+    /// cannot run concurrently with this call. Today the invariant is enforced
+    /// by per-channel-group FIFO dispatch in
+    /// <c>MultiFeedManager.PushPacket</c>: the
+    /// <c>StaleMboBuffer</c> eviction callback that drives
+    /// <see cref="BumpMinHeal"/> fires synchronously inside <c>RouteMbo</c> on
+    /// the dispatch thread, so it strictly precedes the next packet — including
+    /// any snapshot — handled by the same group. The internal
+    /// <c>entry.Sync</c> lock here only serializes the read-modify-write of
+    /// <c>MinHealRptSeq[idx]</c>; it does <i>not</i> close the
+    /// (read MinHeal → accept snapshot → bump MinHeal) window in
+    /// <see cref="HealFromSnapshot"/>.</para>
+    /// <para>If the dispatch contract ever changes (e.g. multi-thread routing
+    /// per group, or a separate eviction worker), wrap the snapshot-acceptance
+    /// sequence in <see cref="HealFromSnapshot"/> with this same lock to close
+    /// the TOCTOU window.</para>
+    /// </remarks>
     public bool BumpMinHeal(ulong securityId, SymbolGapKind kind, uint newMin)
     {
         if (!_entries.TryGetValue(securityId, out var entry)) return false;
