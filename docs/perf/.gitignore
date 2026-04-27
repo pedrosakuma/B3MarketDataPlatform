@@ -1,0 +1,2 @@
+# /docs/perf/.gitignore — large per-bucket CSVs are reproducible from PCAPs.
+*-buckets.csv
