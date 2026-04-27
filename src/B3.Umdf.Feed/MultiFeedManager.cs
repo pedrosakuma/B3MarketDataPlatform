@@ -36,6 +36,11 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     private readonly Dictionary<int, MpscPacketRing> _rings = new();
     private readonly Dictionary<int, Thread> _dispatchThreads = new();
     private readonly Dictionary<int, long> _dispatchExceptionCounts = new();
+    // Per-group last-logged drop count. Used to rate-limit drop warnings:
+    // log on the first drop, then once per power-of-two threshold (1, 2, 4, 8, ...).
+    // Power-of-two cadence preserves visibility on bursts without flooding logs
+    // when the dispatch thread permanently lags.
+    private readonly Dictionary<int, long> _lastLoggedDropMilestone = new();
     private readonly Dictionary<int, int> _groupIndex = new();
     private volatile bool[] _groupReady = [];
     private CancellationTokenSource? _cts;
@@ -94,6 +99,25 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Aggregate packets dropped across every per-group ring since startup.
+    /// Drops happen when the receive thread enqueues faster than the dispatch
+    /// thread drains — surfaces app-level backpressure overflow distinct from
+    /// kernel SO_RCVBUF overruns. Sustained growth indicates the dispatch
+    /// thread (or a downstream handler under it) cannot keep up; alarm on
+    /// rate, not magnitude.
+    /// </summary>
+    public long DroppedPacketsTotal
+    {
+        get
+        {
+            long total = 0;
+            foreach (var ring in _rings.Values)
+                total += ring.DroppedPackets;
+            return total;
+        }
+    }
+
     public MultiFeedManager(IPacketSource source, IReadOnlyList<int> groupIds, IFeedEventHandler eventHandler, ILogger<FeedHandler>? feedLogger = null, IFeedEventHandler? marketDataHandler = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
         : this(groupIds, eventHandler, feedLogger, marketDataHandler, logger, source, groupRingCapacity)
     {
@@ -122,6 +146,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
             _dispatchExceptionCounts[gid] = 0L;
+            _lastLoggedDropMilestone[gid] = 0L;
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -158,6 +183,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
             _dispatchExceptionCounts[gid] = 0L;
+            _lastLoggedDropMilestone[gid] = 0L;
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -363,7 +389,8 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// </summary>
     public void PushPacket(in UmdfPacket packet)
     {
-        if (!_rings.TryGetValue(packet.ChannelGroup, out var ring))
+        int groupId = packet.ChannelGroup;
+        if (!_rings.TryGetValue(groupId, out var ring))
         {
             packet.Release();
             return;
@@ -373,6 +400,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         {
             // Ring full: drop and release. Producer counter inside the ring tracks drops.
             packet.Release();
+            LogDropRateLimited(groupId, ring.DroppedPackets);
         }
     }
 
@@ -386,6 +414,26 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     {
         for (int i = 0; i < packets.Length; i++)
             PushPacket(in packets[i]);
+    }
+
+    private void LogDropRateLimited(int groupId, long currentDropCount)
+    {
+        // Power-of-two milestone cadence: log at 1, 2, 4, 8, 16, ... drops per group.
+        // Hot path is single-producer per group in practice (one receive thread per
+        // channel pushes for the group), so the non-atomic read/write here is safe;
+        // worst case is a duplicated log line, never a missed escalation.
+        if (!_lastLoggedDropMilestone.TryGetValue(groupId, out var last))
+            return;
+        if (currentDropCount <= last)
+            return;
+        // Round currentDropCount down to the nearest power of two ≥ 1.
+        long milestone = 1L << (63 - System.Numerics.BitOperations.LeadingZeroCount((ulong)currentDropCount));
+        if (milestone <= last)
+            return;
+        _lastLoggedDropMilestone[groupId] = milestone;
+        _logger.LogWarning(
+            "MultiFeedManager group {GroupId} dropped {DropCount} packets (ring capacity {Capacity}); dispatch thread cannot keep up with producers",
+            groupId, currentDropCount, _ringCapacity);
     }
 
     private void CheckReadyTransition(int groupId, FeedHandler handler)

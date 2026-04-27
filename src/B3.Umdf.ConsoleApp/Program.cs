@@ -692,6 +692,8 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
     public long ForwardTradeCount;
     public long TradeBustCount;
     public long ExecSummaryCount;
+    public long EpochResetCount;
+    public SnapshotClearReason LastEpochResetReason;
 
     public void OnOrderAdded(OrderBook book, in OrderBookEntry entry)
     {
@@ -739,5 +741,11 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty)
     {
         ExecSummaryCount++;
+    }
+
+    public void OnEpochReset(SnapshotClearReason reason)
+    {
+        EpochResetCount++;
+        LastEpochResetReason = reason;
     }
 }

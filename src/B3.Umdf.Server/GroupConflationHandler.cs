@@ -56,10 +56,22 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private long _broadcastBatchesDroppedFull;
     private long _broadcastResyncRequests;
     private long _lastPublishedBatchSequence;
+    private long _epochResetsObserved;
+    private SnapshotClearReason _lastEpochResetReason;
 
     public long BroadcastBatchesPublished => Volatile.Read(ref _broadcastBatchesPublished);
     public long BroadcastBatchesDroppedFull => Volatile.Read(ref _broadcastBatchesDroppedFull);
     public long BroadcastResyncRequests => Volatile.Read(ref _broadcastResyncRequests);
+    /// <summary>
+    /// Count of <see cref="IBookEventHandler.OnEpochReset"/> notifications
+    /// received from the BookManager (one per ChannelReset_11 / SequenceReset_1
+    /// / SequenceVersion change). Sustained growth indicates an unhealthy
+    /// upstream (frequent failovers / weekly rollover triggering more often
+    /// than expected).
+    /// </summary>
+    public long EpochResetsObserved => Volatile.Read(ref _epochResetsObserved);
+    /// <summary>Reason of the most recently observed epoch reset.</summary>
+    public SnapshotClearReason LastEpochResetReason => _lastEpochResetReason;
     public int BroadcastRingDepth => _broadcastRing.ApproximateDepth;
     public int BroadcastRingCapacity => _broadcastRing.Capacity;
     internal long LastPublishedBatchSequence => Volatile.Read(ref _lastPublishedBatchSequence);
@@ -272,6 +284,32 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // status flag — no resnap needed since live updates will keep flowing
         // once heal completes.)
         if (!isStale) _parent.RequestResyncForBookSubscribers(securityId);
+    }
+
+    /// <summary>
+    /// Catastrophic per-channel reset notification from <see cref="BookManager"/>.
+    /// At this point every subscribed book has already received a per-symbol
+    /// <see cref="OnBookCleared"/> (via <c>ClearAllBooks</c>) so the in-flight
+    /// conflation buffers contain the correct cleanup events for clients —
+    /// they will flush normally on the next <see cref="OnBatchComplete"/>.
+    /// <para>
+    /// Per-symbol session attributes (<c>_tradingStatus</c>, <c>_vwapBySecurity</c>)
+    /// and history (<c>RecentTrades</c>, <c>Candles</c>) are NOT invalidated:
+    /// they survive across SequenceVersion change (weekly rollover or failover)
+    /// because they reflect physical session state, not the volatile incremental
+    /// stream's seq space. ChannelReset_11 / SequenceReset_1 are also non-invalidating
+    /// for these.
+    /// </para>
+    /// <para>
+    /// Recovery flow continues per-symbol via <see cref="OnSymbolStaleStatusChanged"/>:
+    /// when each symbol heals (Stale→Healthy via snapshot), the existing path
+    /// fires <see cref="SubscriptionManager.RequestResyncForBookSubscribers"/>.
+    /// </para>
+    /// </summary>
+    public void OnEpochReset(SnapshotClearReason reason)
+    {
+        Interlocked.Increment(ref _epochResetsObserved);
+        _lastEpochResetReason = reason;
     }
 
     /// <summary>
