@@ -44,4 +44,19 @@ public interface IBookEventHandler
     /// Used as flush signal for upstream conflation buffers.
     /// </summary>
     void OnBatchComplete() { }
+
+    /// <summary>
+    /// Catastrophic per-channel reset: every (symbol, kind) is being moved
+    /// to <see cref="SymbolState.Unknown"/> and all books have been cleared
+    /// (per-book <see cref="OnBookCleared"/> notifications still fire for
+    /// each affected symbol). Fired after the cleanup completes.
+    /// Triggered by <see cref="SnapshotClearReason.SequenceVersionChanged"/>
+    /// (B3 spec §6.5.5.1 weekly rollover / failover),
+    /// <see cref="SnapshotClearReason.ChannelReset"/> (ChannelReset_11), or
+    /// <see cref="SnapshotClearReason.SequenceReset"/> (SequenceReset_1).
+    /// Default implementation is a no-op; consumers that maintain per-symbol
+    /// derived state outside the order book (stats, conflation queues,
+    /// caches) SHOULD use this to invalidate that state.
+    /// </summary>
+    void OnEpochReset(SnapshotClearReason reason) { }
 }

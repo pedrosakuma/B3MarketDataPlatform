@@ -71,17 +71,33 @@ public class BookManagerSnapshotHealTests
     [Fact]
     public void Header_RptSeqZero_HealthyAlready_NoRegression()
     {
-        // Defensive: if symbol is already Healthy at some baseline, an illiquid-style
-        // snapshot (LastRptSeq=null) MUST NOT regress it. Defensive Healthy-ahead
-        // guard in HealFromSnapshot rejects snap=0 <= priorHighWater.
+        // Defensive: when symbol is already Healthy at some baseline, an
+        // illiquid-style snapshot (LastRptSeq=null, OrdersExpected=0) MUST NOT
+        // regress it. Per the post-Bug#17 contract the empty payload is
+        // accepted as authoritative ("instrument is empty as of now"), but
+        // because the symbol was already Healthy no spurious heal counter
+        // increments and the live high-water baseline is preserved.
         var (bm, reg, _) = CreatePerSymbol();
-        reg.Observe(99, SymbolGapKind.Mbo, 100);
+        // Bootstrap the symbol to Healthy via a real snapshot at rpt=50, then
+        // advance the live high-water to 100 with an in-band observation.
+        bm.RecordSnapshotHeader(99, lastRptSeq: 50);
+        bm.HealAfterSnapshotForTest(99);
+        Assert.Equal(1, bm.SnapshotsHealed);
+        // Stay contiguous so Observe doesn't trip a gap → Stale.
+        reg.Observe(99, SymbolGapKind.Mbo, 51);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(99, SymbolGapKind.Mbo));
 
+        // Now feed an illiquid-empty snapshot — must be a no-op against the
+        // counters and must leave Healthy state intact.
         bm.RecordSnapshotHeader(99, lastRptSeq: null);
         bm.HealAfterSnapshotForTest(99);
 
-        Assert.Equal(0, bm.SnapshotsHealed);
-        Assert.Equal(1, bm.SnapshotsMissingRptSeq);
+        Assert.Equal(1, bm.SnapshotsHealed);
+        Assert.Equal(0, bm.SnapshotsMissingRptSeq);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(99, SymbolGapKind.Mbo));
+        // First live incremental at rpt=52 must still be accepted (Healthy.Apply).
+        var observe = reg.Observe(99, SymbolGapKind.Mbo, 52);
+        Assert.Equal(B3.Umdf.Book.SymbolStateRegistry.ObserveAction.Apply, observe.Action);
     }
 
     [Fact]

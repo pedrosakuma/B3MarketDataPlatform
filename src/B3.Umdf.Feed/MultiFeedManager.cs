@@ -35,6 +35,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     private readonly Dictionary<int, FeedHandler> _handlers = new();
     private readonly Dictionary<int, MpscPacketRing> _rings = new();
     private readonly Dictionary<int, Thread> _dispatchThreads = new();
+    private readonly Dictionary<int, long> _dispatchExceptionCounts = new();
     private readonly Dictionary<int, int> _groupIndex = new();
     private volatile bool[] _groupReady = [];
     private CancellationTokenSource? _cts;
@@ -63,6 +64,23 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             return ready.Length > 0;
         }
     }
+
+    /// <summary>
+    /// True iff the per-group dispatch thread is alive (started and not
+    /// exited). Becomes false after StopAsync joins the thread, or if the
+    /// thread crashes for an unrecoverable reason. Returns false for an
+    /// unknown group.
+    /// </summary>
+    public bool IsDispatchThreadAlive(int groupId)
+        => _dispatchThreads.TryGetValue(groupId, out var t) && t.IsAlive;
+
+    /// <summary>
+    /// Number of handler exceptions absorbed by the per-group dispatch loop
+    /// since startup (DispatchOne isolation). Sustained growth means a
+    /// handler bug is silently dropping packets — alarm on rate.
+    /// </summary>
+    public long DispatchHandlerExceptionCount(int groupId)
+        => _dispatchExceptionCounts.TryGetValue(groupId, out var c) ? Volatile.Read(ref c) : 0L;
 
     /// <summary>Total packets processed across all groups.</summary>
     public long TotalPacketCount
@@ -103,6 +121,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         {
             _handlers[gid] = new FeedHandler(eventHandler, feedLogger, marketDataHandler: marketDataHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
+            _dispatchExceptionCounts[gid] = 0L;
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -138,6 +157,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             marketDataHandlers?.TryGetValue(gid, out mdHandler);
             _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
+            _dispatchExceptionCounts[gid] = 0L;
             _groupIndex[gid] = idx++;
         }
         _groupReady = new bool[idx];
@@ -270,7 +290,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             {
                 if (ring.TryDequeue(out var packet))
                 {
-                    handler.FeedPacket(in packet);
+                    DispatchOne(groupId, handler, in packet);
                     CheckReadyTransition(groupId, handler);
                     continue;
                 }
@@ -281,7 +301,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
                 {
                     if (ring.TryDequeue(out packet))
                     {
-                        handler.FeedPacket(in packet);
+                        DispatchOne(groupId, handler, in packet);
                         CheckReadyTransition(groupId, handler);
                         gotItem = true;
                         break;
@@ -298,13 +318,42 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         }
         catch (Exception ex) when (!ct.IsCancellationRequested)
         {
-            _logger.LogError(ex, "Dispatch thread for group {GroupId} crashed", groupId);
+            // Unreachable in normal operation: DispatchOne isolates handler
+            // failures so the dispatch loop survives. Anything reaching here
+            // is a bug in the dispatcher itself (ring corruption, OOM).
+            _logger.LogCritical(ex, "Dispatch loop for group {GroupId} died unexpectedly; channel will silently drop packets until restart", groupId);
         }
         finally
         {
             // Drain any remaining packets so leases aren't leaked.
             while (ring.TryDequeue(out var packet))
                 packet.Release();
+        }
+    }
+
+    /// <summary>
+    /// Dispatch a single packet to the handler with per-packet exception
+    /// isolation. A misbehaving handler MUST NOT kill the dispatch thread —
+    /// the previous behavior caught at the loop level and silently exited,
+    /// after which the producer kept enqueueing until the ring filled and
+    /// dropped packets unobserved.
+    /// </summary>
+    private void DispatchOne(int groupId, FeedHandler handler, in UmdfPacket packet)
+    {
+        try
+        {
+            handler.FeedPacket(in packet);
+        }
+        catch (Exception ex)
+        {
+            // Increment first so even logging failures don't mask the metric.
+            // Key is guaranteed to exist (pre-populated in ctor), and the dict
+            // is not mutated after StartAsync, so the ref is stable.
+            ref var counter = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(
+                _dispatchExceptionCounts, groupId);
+            if (!System.Runtime.CompilerServices.Unsafe.IsNullRef(ref counter))
+                Interlocked.Increment(ref counter);
+            _logger.LogError(ex, "Handler exception in dispatch for group {GroupId}; packet skipped, dispatch loop continuing", groupId);
         }
     }
 

@@ -98,9 +98,16 @@ public sealed class SymbolStateRegistry
 
     private readonly ConcurrentDictionary<ulong, SymbolEntry> _entries = new();
     private readonly ILogger _logger;
+    private readonly IClock _clock;
     private Action<ulong, bool>? _onMboStaleStatusChanged;
     private long _staleSnapshotIgnored;
     private long _staleAuthoritativeReset;
+    private long _lastAuthResetUnsafeDelta;
+    private long _maxAuthResetUnsafeDelta;
+    private long _sumAuthResetUnsafeDelta;
+    private long _lastAuthResetDiscardedTailDelta;
+    private long _maxAuthResetDiscardedTailDelta;
+    private long _sumAuthResetDiscardedTailDelta;
 
     /// <summary>
     /// Stuck-Stale escape valve: when a symbol has been Stale longer than this
@@ -121,8 +128,12 @@ public sealed class SymbolStateRegistry
     private int _staleSymbolCount;
 
     public SymbolStateRegistry(ILogger logger)
+        : this(logger, SystemClock.Instance) { }
+
+    public SymbolStateRegistry(ILogger logger, IClock clock)
     {
         _logger = logger;
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
     }
 
     /// <summary>
@@ -285,7 +296,7 @@ public sealed class SymbolStateRegistry
 
         int prevMask = entry.StaleKindMask;
         entry.States[mboIdx] = SymbolState.Stale;
-        entry.StaleSinceTicks[mboIdx] = Environment.TickCount64;
+        entry.StaleSinceTicks[mboIdx] = _clock.NowTicks;
         entry.StaleKindMask |= 1 << mboIdx;
         if (prevMask == 0) Interlocked.Increment(ref _staleSymbolCount);
 
@@ -414,7 +425,7 @@ public sealed class SymbolStateRegistry
                 bool eligible = StaleEscapeTimeoutMs > 0
                     && prev == SymbolState.Stale
                     && entry.StaleSinceTicks[idx] != 0
-                    && (Environment.TickCount64 - entry.StaleSinceTicks[idx]) > StaleEscapeTimeoutMs;
+                    && (_clock.NowTicks - entry.StaleSinceTicks[idx]) > StaleEscapeTimeoutMs;
 
                 if (!eligible)
                 {
@@ -429,7 +440,24 @@ public sealed class SymbolStateRegistry
 
                 authoritativeReset = true;
                 Interlocked.Increment(ref _staleAuthoritativeReset);
-                long staleForMs = Environment.TickCount64 - entry.StaleSinceTicks[idx];
+
+                // Severity instrumentation. Two distinct deltas:
+                //   unsafeDelta        = MinHeal - snap   (proven-unbridgeable gap)
+                //   discardedTailDelta = highWater - snap (live tail abandoned)
+                // Both are exposed as last/max/sum so dashboards can alert on
+                // magnitude (a lone "last" gauge can hide spikes between scrapes).
+                long unsafeDelta = (long)minHeal - (long)snapshotRptSeq;
+                long discardedTailDelta = (long)priorHighWater - (long)snapshotRptSeq;
+                if (unsafeDelta < 0) unsafeDelta = 0;
+                if (discardedTailDelta < 0) discardedTailDelta = 0;
+                Volatile.Write(ref _lastAuthResetUnsafeDelta, unsafeDelta);
+                Volatile.Write(ref _lastAuthResetDiscardedTailDelta, discardedTailDelta);
+                Interlocked.Add(ref _sumAuthResetUnsafeDelta, unsafeDelta);
+                Interlocked.Add(ref _sumAuthResetDiscardedTailDelta, discardedTailDelta);
+                UpdateMaxIfGreater(ref _maxAuthResetUnsafeDelta, unsafeDelta);
+                UpdateMaxIfGreater(ref _maxAuthResetDiscardedTailDelta, discardedTailDelta);
+
+                long staleForMs = _clock.NowTicks - entry.StaleSinceTicks[idx];
                 _logger.LogWarning(
                     "SymbolState: stuck-Stale escape — accepting too-old snapshot as authoritative reset. secId={SecurityId} kind={Kind} snapshotRptSeq={Snap} minHeal={MinHeal} priorHighWater={High} staleForMs={StaleMs}",
                     securityId, kind, snapshotRptSeq, minHeal, priorHighWater, staleForMs);
@@ -523,6 +551,68 @@ public sealed class SymbolStateRegistry
     }
 
     /// <summary>
+    /// Authoritative empty-book heal for the illiquid case (B3 spec §7.4):
+    /// the wire publishes a snapshot with <c>LastRptSeq</c> absent AND
+    /// <c>TotNumBids+TotNumOffers == 0</c>, asserting the instrument is empty.
+    /// Always accepted regardless of <see cref="SymbolEntry.MinHealRptSeq"/> —
+    /// the empty payload is itself proof that any cross-kind global gap that
+    /// flipped this kind Stale did NOT leave persistent book state behind
+    /// (whatever orders may have been lost are gone from the venue too).
+    ///
+    /// <para>The post-heal baseline is the maximum of (per-kind LastRptSeq,
+    /// per-kind MinHealRptSeq, per-symbol ObservedRptSeq) so any late
+    /// pre-snapshot MBO packet with a smaller rptSeq is dropped via the normal
+    /// <see cref="SymbolState.Healthy"/> drop branch (received &lt;= lastSeen)
+    /// rather than resurrecting ghost orders into the empty book.</para>
+    ///
+    /// <para>Caller MUST clear its per-symbol buffer for <paramref name="securityId"/>
+    /// — the empty drain window <see cref="HealResult.DrainFrom"/> &gt;
+    /// <see cref="HealResult.DrainTo"/> communicates this.</para>
+    /// </summary>
+    public HealResult HealFromIlliquidEmptySnapshot(ulong securityId, SymbolGapKind kind)
+    {
+        var entry = GetOrAddEntry(securityId);
+        int idx = (int)kind;
+        bool fireMboHealedCallback = false;
+        HealResult result;
+        lock (entry.Sync)
+        {
+            var prev = entry.States[idx];
+            int prevMask = entry.StaleKindMask;
+
+            // Anchor baseline above any prior observation so late pre-snapshot
+            // MBO packets are dropped rather than applied to the empty book.
+            uint anchor = entry.LastRptSeq[idx];
+            if (entry.MinHealRptSeq[idx] > anchor) anchor = entry.MinHealRptSeq[idx];
+            if (entry.ObservedRptSeq > anchor) anchor = entry.ObservedRptSeq;
+
+            entry.LastRptSeq[idx] = anchor;
+            entry.States[idx] = SymbolState.Healthy;
+            entry.MinHealRptSeq[idx] = 0;
+            if (anchor > entry.ObservedRptSeq) entry.ObservedRptSeq = anchor;
+
+            bool transitioned = prev != SymbolState.Healthy;
+            if (transitioned)
+            {
+                entry.StaleKindMask &= ~(1 << idx);
+                entry.StaleSinceTicks[idx] = 0;
+                if (prevMask != 0 && entry.StaleKindMask == 0)
+                    Interlocked.Decrement(ref _staleSymbolCount);
+                if (kind == SymbolGapKind.Mbo && prev == SymbolState.Stale && entry.StaleKindMask == 0)
+                    fireMboHealedCallback = true;
+            }
+
+            // Empty drain window — caller drops any buffered tail.
+            result = new HealResult(Accepted: true, TransitionedToHealthy: transitioned,
+                SnapshotRptSeq: anchor, DrainFrom: 1, DrainTo: 0);
+        }
+
+        if (fireMboHealedCallback) _onMboStaleStatusChanged?.Invoke(securityId, false);
+
+        return result;
+    }
+
+    /// <summary>
     /// Catastrophic-reset path (SequenceReset_1, ChannelReset_11). Resets
     /// every (symbol, kind) to <see cref="SymbolState.Unknown"/> and clears
     /// the rptSeq baseline so a new epoch with lower-numbered rptSeq is
@@ -566,7 +656,7 @@ public sealed class SymbolStateRegistry
     /// </summary>
     public void MarkAllStale(string reason)
     {
-        long now = Environment.TickCount64;
+        long now = _clock.NowTicks;
         int affected = 0;
         foreach (var kv in _entries)
         {
@@ -714,6 +804,41 @@ public sealed class SymbolStateRegistry
     /// absorb; review hot cap sizing or upstream loss rate.
     /// </summary>
     public long StaleAuthoritativeResetCount => Volatile.Read(ref _staleAuthoritativeReset);
+
+    /// <summary>
+    /// Severity gauge for the most recent forced heal: <c>MinHealRptSeq - snapshotRptSeq</c>.
+    /// Quantifies the proven-unbridgeable gap that the escape valve silenced.
+    /// Use alongside <see cref="MaxAuthoritativeResetUnsafeDelta"/> /
+    /// <see cref="SumAuthoritativeResetUnsafeDelta"/> — a "last" gauge alone
+    /// can hide spikes between metric scrapes.
+    /// </summary>
+    public uint LastAuthoritativeResetUnsafeDelta => (uint)Volatile.Read(ref _lastAuthResetUnsafeDelta);
+    /// <summary>Largest historical <see cref="LastAuthoritativeResetUnsafeDelta"/>; never decreases.</summary>
+    public uint MaxAuthoritativeResetUnsafeDelta => (uint)Volatile.Read(ref _maxAuthResetUnsafeDelta);
+    /// <summary>Cumulative sum of unsafe deltas across every forced heal.</summary>
+    public ulong SumAuthoritativeResetUnsafeDelta => (ulong)Volatile.Read(ref _sumAuthResetUnsafeDelta);
+
+    /// <summary>
+    /// Severity gauge for the most recent forced heal: <c>priorHighWater - snapshotRptSeq</c>.
+    /// Quantifies the live tail abandoned by the empty-drain signal (caller
+    /// drops everything in <c>(snap, priorHighWater]</c>).
+    /// </summary>
+    public uint LastAuthoritativeResetDiscardedTailDelta => (uint)Volatile.Read(ref _lastAuthResetDiscardedTailDelta);
+    /// <summary>Largest historical <see cref="LastAuthoritativeResetDiscardedTailDelta"/>; never decreases.</summary>
+    public uint MaxAuthoritativeResetDiscardedTailDelta => (uint)Volatile.Read(ref _maxAuthResetDiscardedTailDelta);
+    /// <summary>Cumulative sum of discarded-tail deltas across every forced heal.</summary>
+    public ulong SumAuthoritativeResetDiscardedTailDelta => (ulong)Volatile.Read(ref _sumAuthResetDiscardedTailDelta);
+
+    private static void UpdateMaxIfGreater(ref long target, long candidate)
+    {
+        long observed = Volatile.Read(ref target);
+        while (candidate > observed)
+        {
+            long previous = Interlocked.CompareExchange(ref target, candidate, observed);
+            if (previous == observed) return;
+            observed = previous;
+        }
+    }
 
     /// <summary>
     /// Single-pass aggregate: total symbols with at least one Stale kind, plus per-kind counts.

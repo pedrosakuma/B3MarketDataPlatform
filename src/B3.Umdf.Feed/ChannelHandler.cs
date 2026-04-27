@@ -27,7 +27,7 @@ namespace B3.Umdf.Feed;
 public sealed class ChannelHandler : IDisposable
 {
     /// <summary>
-    /// Maximum SeqNum distance we will buffer before declaring a real gap.
+    /// Default reorder window (instance value can override via constructor).
     /// 256 packets ≈ 384 KB pinned per group worst case. At 30k pkt/s that
     /// is ≈ 8 ms of look-ahead. We saw bursts of exactly 129 packets in
     /// loopback at REPLAY=0 (one over the previous 128-window) tripping
@@ -36,7 +36,8 @@ public sealed class ChannelHandler : IDisposable
     public const int MaxReorderDistance = 256;
 
     private readonly IFeedEventHandler _eventHandler;
-    private readonly Dictionary<uint, UmdfPacket> _reorderBuffer = new(MaxReorderDistance);
+    private readonly int _maxReorderDistance;
+    private readonly Dictionary<uint, UmdfPacket> _reorderBuffer;
 
     private uint _expectedSeqNum = 1;
 
@@ -53,6 +54,7 @@ public sealed class ChannelHandler : IDisposable
     private long _gapsDetected;
     private long _reorderHits;
     private long _sequenceVersionResets;
+    private int _maxObservedReorderDepth;
     private volatile uint _lastGapExpected;
     private volatile uint _lastGapReceived;
 
@@ -74,12 +76,28 @@ public sealed class ChannelHandler : IDisposable
     public long ReorderHits => Volatile.Read(ref _reorderHits);
     /// <summary>Current depth of the reorder buffer.</summary>
     public int ReorderBufferDepth => _reorderBuffer.Count;
+    /// <summary>
+    /// High-watermark of <see cref="ReorderBufferDepth"/> ever observed since
+    /// process start. Useful to size <see cref="MaxReorderDistanceConfigured"/>
+    /// — if this approaches the configured limit, real gaps are being declared
+    /// just below the threshold and bumping the window may avoid recoveries.
+    /// </summary>
+    public int MaxObservedReorderBufferDepth => Volatile.Read(ref _maxObservedReorderDepth);
+    /// <summary>Effective per-instance reorder window (constructor-injected; defaults to <see cref="MaxReorderDistance"/>).</summary>
+    public int MaxReorderDistanceConfigured => _maxReorderDistance;
     public uint LastGapExpected => _lastGapExpected;
     public uint LastGapReceived => _lastGapReceived;
 
     public ChannelHandler(IFeedEventHandler eventHandler)
+        : this(eventHandler, MaxReorderDistance) { }
+
+    public ChannelHandler(IFeedEventHandler eventHandler, int maxReorderDistance)
     {
+        if (maxReorderDistance < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxReorderDistance), "Must be ≥ 1.");
         _eventHandler = eventHandler;
+        _maxReorderDistance = maxReorderDistance;
+        _reorderBuffer = new Dictionary<uint, UmdfPacket>(maxReorderDistance);
     }
 
     public GapResult HandlePacket(in UmdfPacket packet)
@@ -114,7 +132,7 @@ public sealed class ChannelHandler : IDisposable
         // start-from-1 scenarios (tests, replay) keep the existing behavior.
         if (_packetsProcessed == 0 && _reorderBuffer.Count == 0
             && seq > _expectedSeqNum
-            && seq - _expectedSeqNum > MaxReorderDistance)
+            && seq - _expectedSeqNum > _maxReorderDistance)
         {
             _expectedSeqNum = seq;
         }
@@ -139,7 +157,7 @@ public sealed class ChannelHandler : IDisposable
         // Future packet. If within the reorder window, stash and wait for the
         // hole to fill. Otherwise declare a real gap.
         uint distance = seq - _expectedSeqNum;
-        if (distance > MaxReorderDistance)
+        if (distance > _maxReorderDistance)
         {
             _gapsDetected++;
             _lastGapExpected = _expectedSeqNum;
@@ -156,6 +174,9 @@ public sealed class ChannelHandler : IDisposable
 
         packet.Retain();
         _reorderBuffer[seq] = packet;
+        int depth = _reorderBuffer.Count;
+        if (depth > Volatile.Read(ref _maxObservedReorderDepth))
+            Volatile.Write(ref _maxObservedReorderDepth, depth);
         return GapResult.InSequence;
     }
 

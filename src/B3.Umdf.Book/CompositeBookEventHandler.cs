@@ -68,4 +68,9 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
     {
         foreach (var h in _handlers) h.OnBatchComplete();
     }
+
+    public void OnEpochReset(SnapshotClearReason reason)
+    {
+        foreach (var h in _handlers) h.OnEpochReset(reason);
+    }
 }

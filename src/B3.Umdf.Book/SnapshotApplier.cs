@@ -48,6 +48,8 @@ internal sealed class SnapshotApplier
     private long _snapshotsSkippedHealthyAhead;
     private long _snapshotsRejectedStaleVersion;
     private long _snapshotMarketOrderAdds;
+    private long _snapshotsAbandoned;
+    private long _snapshotsAbortedByEpoch;
 
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
@@ -55,6 +57,27 @@ internal sealed class SnapshotApplier
     public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
     public long SnapshotsSkippedHealthyAhead => Volatile.Read(ref _snapshotsSkippedHealthyAhead);
     public long SnapshotMarketOrderAdds => Volatile.Read(ref _snapshotMarketOrderAdds);
+    /// <summary>
+    /// Pending snapshots that were overwritten by a new <c>Header_30</c> for the
+    /// same instrument before completion. Counts the "incomplete-then-replaced"
+    /// pattern that <see cref="SnapshotChunksOrphaned"/> cannot capture
+    /// (orphan tracks chunks-without-header; this tracks header-without-completion).
+    /// Sustained growth indicates persistent loss of snapshot tail chunks for
+    /// specific instruments.
+    /// </summary>
+    public long SnapshotsAbandoned => Volatile.Read(ref _snapshotsAbandoned);
+    /// <summary>
+    /// Pending snapshots dropped because of an epoch reset
+    /// (<see cref="SnapshotClearReason.SequenceVersionChanged"/> /
+    /// <see cref="SnapshotClearReason.ChannelReset"/> /
+    /// <see cref="SnapshotClearReason.SequenceReset"/>). Distinct from
+    /// <see cref="SnapshotsAbandoned"/> (replacement by another header for the
+    /// SAME instrument) — epoch resets discard ALL pending snapshots
+    /// indiscriminately because the wire seq space is invalidated.
+    /// Sustained growth often indicates frequent failovers or weekly rollover
+    /// happening more often than expected.
+    /// </summary>
+    public long SnapshotsAbortedByEpoch => Volatile.Read(ref _snapshotsAbortedByEpoch);
     /// <summary>
     /// Snapshots silently skipped because their <c>LastSequenceVersion</c>
     /// was older than the channel's current SequenceVersion (B3 spec §7.2).
@@ -98,16 +121,14 @@ internal sealed class SnapshotApplier
         // silently (Skipped path) so the orphan counter is not polluted.
         ushort currentVersion = _currentSequenceVersion();
         if (currentVersion != 0
-            && msg.LastSequenceVersion is { } snapVer
-            && snapVer != 0
-            && snapVer < currentVersion)
+            && !IsSnapshotVersionAcceptable(msg.LastSequenceVersion, currentVersion))
         {
-            _pendingSnapshots[secId] = new PendingSnapshot
+            ReplacePendingSnapshot(secId, new PendingSnapshot
             {
                 OrdersExpected = expected,
                 OrdersReceived = 0,
                 Skipped = true,
-            };
+            });
             Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
             return;
         }
@@ -136,14 +157,14 @@ internal sealed class SnapshotApplier
         var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
         if (state == SymbolState.Healthy)
         {
-            _pendingSnapshots[secId] = new PendingSnapshot
+            ReplacePendingSnapshot(secId, new PendingSnapshot
             {
                 LastRptSeq = lastRptSeq,
                 OrdersExpected = ordersExpected,
                 OrdersReceived = 0,
                 HasRptSeq = hasRptSeq,
                 Skipped = true,
-            };
+            });
             Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
             return;
         }
@@ -151,13 +172,13 @@ internal sealed class SnapshotApplier
         // Begin a fresh snapshot for this instrument: stage in a parallel buffer.
         // The live `book` is NOT mutated here — it stays at its prior state until
         // CompleteSnapshot decides Accept (swap) or Reject (discard staging).
-        _pendingSnapshots[secId] = new PendingSnapshot
+        ReplacePendingSnapshot(secId, new PendingSnapshot
         {
             LastRptSeq = lastRptSeq,
             OrdersExpected = ordersExpected,
             OrdersReceived = 0,
             HasRptSeq = hasRptSeq,
-        };
+        });
 
         // Floor pin: while this snapshot is in flight (Begin → Orders_71 chunks → End),
         // tell the per-symbol stale buffer that messages with rptSeq ≤ lastRptSeq are
@@ -260,10 +281,68 @@ internal sealed class SnapshotApplier
     }
 
     /// <summary>
-    /// Reset all in-flight snapshot state. Called on epoch reset
-    /// (ChannelReset_11 / SequenceReset).
+    /// Atomically replaces an in-flight pending snapshot, accounting any
+    /// abandoned predecessor and clearing its protected-floor pin so the
+    /// stale-buffer cap eviction reverts to the conservative MinHeal-bumping
+    /// behavior. Centralized so every call site (normal Begin, Healthy-skip,
+    /// stale-version skip, test helpers) gets the bookkeeping for free.
     /// </summary>
-    public void Clear() => _pendingSnapshots.Clear();
+    private void ReplacePendingSnapshot(ulong secId, PendingSnapshot next)
+    {
+        if (_pendingSnapshots.TryGetValue(secId, out var existing))
+        {
+            // Abandon = a real (non-skipped) header that never reached
+            // OrdersReceived >= OrdersExpected. Includes "header arrived, zero
+            // chunks delivered" — total loss is at least as important as partial.
+            if (!existing.Skipped && existing.OrdersReceived < existing.OrdersExpected)
+                Interlocked.Increment(ref _snapshotsAbandoned);
+            // Always release any protected floor that the predecessor pinned —
+            // skipped replacements never call CompleteSnapshot, so without this
+            // the floor would leak indefinitely.
+            _staleBuffer.ClearProtectedFloor(secId);
+        }
+        _pendingSnapshots[secId] = next;
+    }
+
+    /// <summary>
+    /// Spec §7.2 guard, tightened: when the channel has observed a
+    /// SequenceVersion (currentVersion != 0), only snapshots that explicitly
+    /// match that version are processed. Snapshots without
+    /// <c>LastSequenceVersion</c> populated (sentinel null/0) and snapshots from
+    /// a different version are absorbed silently. The previous "snapVer &lt;
+    /// currentVersion" check let in-flight V1 snapshots (which often arrive
+    /// without the field after a rollover) leak through and poison the V2
+    /// baseline with huge V1 rptSeq values, silently dropping subsequent live
+    /// messages until rpt caught up.
+    /// </summary>
+    private static bool IsSnapshotVersionAcceptable(ushort? lastSequenceVersion, ushort currentVersion)
+    {
+        return lastSequenceVersion is { } v && v != 0 && v == currentVersion;
+    }
+
+    /// <summary>
+    /// Reset all in-flight snapshot state. Called on epoch reset
+    /// (ChannelReset_11 / SequenceReset / SequenceVersion change). Counts
+    /// non-Skipped non-completed pendings as <see cref="SnapshotsAbortedByEpoch"/>
+    /// for operational visibility, and clears the per-symbol stale-buffer
+    /// protected floor that those pendings had pinned.
+    /// </summary>
+    public void Clear(SnapshotClearReason reason)
+    {
+        if (_pendingSnapshots.Count == 0) return;
+        long aborted = 0;
+        foreach (var (secId, pending) in _pendingSnapshots)
+        {
+            if (!pending.Skipped && pending.OrdersReceived < pending.OrdersExpected)
+                aborted++;
+        }
+        if (aborted > 0)
+            Interlocked.Add(ref _snapshotsAbortedByEpoch, aborted);
+        _pendingSnapshots.Clear();
+    }
+
+    /// <summary>Convenience overload — unspecified reset reason.</summary>
+    public void Clear() => Clear(SnapshotClearReason.Unspecified);
 
     private void CompleteSnapshot(ulong securityId, OrderBook book)
     {
@@ -286,22 +365,36 @@ internal sealed class SnapshotApplier
     /// <summary>
     /// Illiquid instrument case (B3 spec §7.4): LastRptSeq is omitted from the
     /// snapshot header when the instrument has not received any incremental
-    /// updates yet. Treat as "anchor at rptSeq=0" so the first incremental
-    /// (rptSeq=1) is contiguous.
+    /// updates yet. Two sub-cases:
+    /// <list type="bullet">
+    ///   <item><b>Empty illiquid (OrdersExpected == 0)</b>: authoritative
+    ///   "instrument is empty" signal. Heal Mbo regardless of any cross-kind
+    ///   global gap that may have flipped it Stale (otherwise the symbol stays
+    ///   Stale forever — the wire never produces a non-zero-rpt snapshot for
+    ///   an illiquid instrument). Baseline is anchored to the highest rptSeq
+    ///   we have ever seen for the symbol so late pre-snapshot MBO packets are
+    ///   dropped, not applied to the empty book.</item>
+    ///   <item><b>Non-empty illiquid (defensive)</b>: malformed per spec —
+    ///   absent rpt with concrete orders is contradictory. Reject (count as
+    ///   missing-rpt) to avoid healing without a safe baseline.</item>
+    /// </list>
     /// </summary>
     private void CompleteIlliquidSnapshot(ulong securityId, OrderBook book, PendingSnapshot pending)
     {
-        var heal = _stateRegistry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 0);
-        if (!heal.Accepted)
+        if (pending.OrdersExpected != 0)
         {
             Interlocked.Increment(ref _snapshotsMissingRptSeq);
             return;
         }
 
+        var heal = _stateRegistry.HealFromIlliquidEmptySnapshot(securityId, SymbolGapKind.Mbo);
         ApplySnapshotStaging(book, pending);
-        book.LastRptSeq = 0;
+        book.LastRptSeq = heal.SnapshotRptSeq;
         if (heal.TransitionedToHealthy)
             Interlocked.Increment(ref _snapshotsHealed);
+        // No drain window — illiquid asserts the book is empty as of the
+        // snapshot moment, so any Stale-buffered tail is meaningless.
+        _staleBuffer.Clear(securityId);
     }
 
     /// <summary>
@@ -385,16 +478,14 @@ internal sealed class SnapshotApplier
     {
         ushort currentVersion = _currentSequenceVersion();
         if (currentVersion != 0
-            && lastSequenceVersion is { } snapVer
-            && snapVer != 0
-            && snapVer < currentVersion)
+            && !IsSnapshotVersionAcceptable(lastSequenceVersion, currentVersion))
         {
-            _pendingSnapshots[secId] = new PendingSnapshot
+            ReplacePendingSnapshot(secId, new PendingSnapshot
             {
                 OrdersExpected = ordersExpected,
                 OrdersReceived = 0,
                 Skipped = true,
-            };
+            });
             Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
             return;
         }
@@ -407,13 +498,13 @@ internal sealed class SnapshotApplier
     internal void BeginChunkedSnapshotForTest(ulong securityId, uint lastRptSeq, uint ordersExpected)
     {
         var book = _bookStore.GetOrCreate(securityId);
-        _pendingSnapshots[securityId] = new PendingSnapshot
+        ReplacePendingSnapshot(securityId, new PendingSnapshot
         {
             LastRptSeq = lastRptSeq,
             OrdersExpected = ordersExpected,
             OrdersReceived = 0,
             HasRptSeq = lastRptSeq > 0,
-        };
+        });
         if (lastRptSeq > 0)
             _staleBuffer.SetProtectedFloor(securityId, lastRptSeq + 1);
         if (ordersExpected == 0 && lastRptSeq > 0)
@@ -485,26 +576,13 @@ internal sealed class SnapshotApplier
     internal void RecordSnapshotHeader(ulong securityId, uint? lastRptSeq)
     {
         bool hasRpt = lastRptSeq is { } v && v > 0;
-        if (hasRpt)
+        ReplacePendingSnapshot(securityId, new PendingSnapshot
         {
-            _pendingSnapshots[securityId] = new PendingSnapshot
-            {
-                LastRptSeq = lastRptSeq!.Value,
-                OrdersExpected = 0,
-                OrdersReceived = 0,
-                HasRptSeq = true,
-            };
-        }
-        else
-        {
-            _pendingSnapshots[securityId] = new PendingSnapshot
-            {
-                LastRptSeq = 0,
-                OrdersExpected = 0,
-                OrdersReceived = 0,
-                HasRptSeq = false,
-            };
-        }
+            LastRptSeq = hasRpt ? lastRptSeq!.Value : 0u,
+            OrdersExpected = 0,
+            OrdersReceived = 0,
+            HasRptSeq = hasRpt,
+        });
     }
 
     internal void HealAfterSnapshotForTest(ulong securityId)

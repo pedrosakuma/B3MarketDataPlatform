@@ -503,7 +503,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     {
         Volatile.Write(ref _currentSequenceVersion, newVersion);
         ClearAllBooks();
-        ResetPerSymbolEpoch($"SequenceVersionChanged → {newVersion}");
+        ResetPerSymbolEpoch($"SequenceVersionChanged → {newVersion}", SnapshotClearReason.SequenceVersionChanged);
     }
 
     private int _currentSequenceVersion;
@@ -876,6 +876,17 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
     /// <summary>Snapshots silently skipped because their LastSequenceVersion is older than the channel's current SequenceVersion (B3 spec §7.2).</summary>
     public long SnapshotsRejectedStaleVersion => _snapshotApplier.SnapshotsRejectedStaleVersion;
+    /// <summary>
+    /// Pending snapshots overwritten by a new <c>Header_30</c> for the same
+    /// instrument before completion (incomplete-then-replaced pattern). See
+    /// <see cref="SnapshotApplier.SnapshotsAbandoned"/>.
+    /// </summary>
+    public long SnapshotsAbandoned => _snapshotApplier.SnapshotsAbandoned;
+    /// <summary>
+    /// Pending snapshots dropped because of an epoch reset. See
+    /// <see cref="SnapshotApplier.SnapshotsAbortedByEpoch"/>.
+    /// </summary>
+    public long SnapshotsAbortedByEpoch => _snapshotApplier.SnapshotsAbortedByEpoch;
 
     private void HandleSnapshotHeader(in SnapshotFullRefresh_Header_30DataReader reader) => _snapshotApplier.OnHeader(in reader);
     private void HandleSnapshotOrders(in SnapshotFullRefresh_Orders_MBO_71DataReader reader) => _snapshotApplier.OnOrdersChunk(in reader);
@@ -944,13 +955,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private void HandleChannelReset()
     {
         ClearAllBooks();
-        ResetPerSymbolEpoch("ChannelReset_11");
+        ResetPerSymbolEpoch("ChannelReset_11", SnapshotClearReason.ChannelReset);
     }
 
     private void HandleSequenceReset()
     {
         ClearAllBooks();
-        ResetPerSymbolEpoch("SequenceReset");
+        ResetPerSymbolEpoch("SequenceReset", SnapshotClearReason.SequenceReset);
     }
 
     /// <summary>
@@ -958,12 +969,17 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// snapshot headers, and reset the registry epoch (every (symbol, kind)
     /// → Unknown).
     /// </summary>
-    private void ResetPerSymbolEpoch(string reason)
+    private void ResetPerSymbolEpoch(string reason, SnapshotClearReason clearReason = SnapshotClearReason.Unspecified)
     {
         int dropped = _staleBuffer.ClearAll();
-        _snapshotApplier.Clear();
+        _snapshotApplier.Clear(clearReason);
         _stateRegistry.ResetEpoch(reason);
         Interlocked.Add(ref _epochResetMessagesDropped, dropped);
         Interlocked.Increment(ref _epochResets);
+        try { _eventHandler?.OnEpochReset(clearReason); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "BookManager.ResetPerSymbolEpoch: OnEpochReset handler threw (reason={Reason})", reason);
+        }
     }
 }
