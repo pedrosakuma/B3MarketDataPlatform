@@ -160,6 +160,16 @@ public sealed class AppSettings
     /// <summary>PCAP prefix paths (repeatable). CLI: --pcap-prefix</summary>
     public List<string> PcapPrefixes { get; set; } = new();
 
+    /// <summary>
+    /// Base directory for PCAP files referenced by short prefixes. Combined with each
+    /// entry of <see cref="PcapPrefixes"/> only when the legacy <c>PCAP_PREFIX</c>
+    /// environment variable is in use; explicit paths in <see cref="PcapPrefixes"/>
+    /// (set via JSON, <c>--pcap-prefix</c>, or positional args) are not rewritten.
+    /// Default <c>/app/pcap</c> matches the Docker image layout. Env: <c>PCAP_DIR</c>
+    /// (legacy; kept for the shell-less Docker image).
+    /// </summary>
+    public string PcapDirectory { get; set; } = "/app/pcap";
+
     /// <summary>Multicast config JSON path. CLI: --multicast-config</summary>
     public string? MulticastConfig { get; set; }
 
@@ -322,6 +332,32 @@ public sealed class AppSettings
             PerSymbolFanoutSuppressLowPct = psLow;
         if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_STALE_ESCAPE_TIMEOUT_MS"), out var staleEscapeMs))
             StaleEscapeTimeoutMs = staleEscapeMs;
+
+        // ── Legacy environment variable fallbacks ──
+        // Pre-UMDF_* naming, retained for the shell-less Docker image (compose files
+        // ship PCAP_DIR / PCAP_PREFIX / WS_PORT / REPLAY_SPEED). Applied after the
+        // UMDF_* block so newer names always win when both are set, and only when
+        // the corresponding setting is still at its default (no JSON / UMDF_* value).
+        var pcapDir = Environment.GetEnvironmentVariable("PCAP_DIR");
+        if (!string.IsNullOrEmpty(pcapDir))
+            PcapDirectory = pcapDir;
+
+        var pcapPrefix = Environment.GetEnvironmentVariable("PCAP_PREFIX");
+        if (!string.IsNullOrEmpty(pcapPrefix) && PcapPrefixes.Count == 0)
+        {
+            foreach (var prefix in pcapPrefix.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                PcapPrefixes.Add(Path.Combine(PcapDirectory, prefix));
+        }
+
+        if (WsPort is null
+            && Environment.GetEnvironmentVariable("UMDF_WS_PORT") is null
+            && int.TryParse(Environment.GetEnvironmentVariable("WS_PORT"), out var legacyWsPort))
+            WsPort = legacyWsPort;
+
+        if (Environment.GetEnvironmentVariable("UMDF_SPEED") is null
+            && double.TryParse(Environment.GetEnvironmentVariable("REPLAY_SPEED"),
+                System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var legacySpeed))
+            Speed = legacySpeed;
     }
 
     private static bool TryParseBoolean(string? value, out bool result)

@@ -126,30 +126,11 @@ AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         e.IsTerminating);
 };
 
-// Fallback to environment variables (for shell-less Docker images)
-if (pcapPrefixes.Count == 0 && positionalArgs.Count == 0 && (multicastConfig is null || replayToMulticast))
-{
-    var envPcapDir = Environment.GetEnvironmentVariable("PCAP_DIR") ?? "/app/pcap";
-    var envPcapPrefix = Environment.GetEnvironmentVariable("PCAP_PREFIX") ?? "";
-    if (!string.IsNullOrEmpty(envPcapPrefix))
-    {
-        foreach (var prefix in envPcapPrefix.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            pcapPrefixes.Add(Path.Combine(envPcapDir, prefix));
-    }
-    if (wsPort is null
-        && Environment.GetEnvironmentVariable("UMDF_WS_PORT") is null
-        && int.TryParse(Environment.GetEnvironmentVariable("WS_PORT"), out var envPort))
-        wsPort = envPort;
-    if (Environment.GetEnvironmentVariable("UMDF_SPEED") is null
-        && speed == settings.Speed
-        && double.TryParse(Environment.GetEnvironmentVariable("REPLAY_SPEED"),
-            System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var envSpeed))
-        speed = envSpeed;
-}
-
 // Build packet source — either from multicast config, --pcap-prefix, or positional args.
 // In live multicast mode, packetSource is left null and receive threads push directly into the
 // MultiFeedManager via PushPacket(), eliminating the merger queue and the async dispatcher loop.
+// Legacy env vars (PCAP_DIR / PCAP_PREFIX / WS_PORT / REPLAY_SPEED) are folded into AppSettings
+// by ApplyEnvironment above; CLI / UMDF_* values continue to take precedence over them.
 IPacketSource? packetSource = null;
 var groupIds = new List<int>();
 List<MulticastPacketSource>? liveMulticastSources = null;
