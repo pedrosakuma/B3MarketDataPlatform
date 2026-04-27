@@ -79,7 +79,57 @@ public class MultiFeedManagerDropVisibilityTests
         }
     }
 
+    [Fact]
+    public void PushPacket_RingFull_AttributesDropsToOriginatingChannel()
+    {
+        var logger = new RecordingLogger();
+        var manager = new MultiFeedManager(
+            new[] { 0 },
+            new NoopHandler(),
+            feedLogger: null,
+            marketDataHandler: null,
+            logger: logger,
+            feedChannelCapacity: 0,
+            groupRingCapacity: 2);
+        try
+        {
+            // Ring capacity = 2; never drained. Fill it with two IncA packets,
+            // then overflow with a mix: 3 IncB, 2 Snap, 1 Instr → 6 drops total
+            // attributed by channel.
+            manager.PushPacket(MakePacket(seqNum: 1, channel: ChannelType.IncrementalA));
+            manager.PushPacket(MakePacket(seqNum: 2, channel: ChannelType.IncrementalA));
+            for (int i = 0; i < 3; i++)
+                manager.PushPacket(MakePacket(seqNum: (uint)(10 + i), channel: ChannelType.IncrementalB));
+            for (int i = 0; i < 2; i++)
+                manager.PushPacket(MakePacket(seqNum: (uint)(20 + i), channel: ChannelType.SnapshotRecovery));
+            manager.PushPacket(MakePacket(seqNum: 30, channel: ChannelType.InstrumentDefinition));
+
+            Assert.Equal(6L, manager.DroppedPacketsTotal);
+
+            var breakdown = manager.GetChannelDropBreakdown()
+                .Where(s => s.GroupId == 0)
+                .ToDictionary(s => s.Channel, s => s.DroppedPackets);
+
+            Assert.Equal(0L, breakdown[ChannelType.IncrementalA]); // succeeded — no drops
+            Assert.Equal(3L, breakdown[ChannelType.IncrementalB]);
+            Assert.Equal(2L, breakdown[ChannelType.SnapshotRecovery]);
+            Assert.Equal(1L, breakdown[ChannelType.InstrumentDefinition]);
+
+            // Sum invariant: per-channel breakdown must equal per-group total.
+            Assert.Equal(
+                manager.GetChannelStats().Single().DroppedPackets,
+                breakdown.Values.Sum());
+        }
+        finally
+        {
+            manager.Dispose();
+        }
+    }
+
     private static UmdfPacket MakePacket(uint seqNum, int channelGroup = 0)
+        => MakePacket(seqNum, ChannelType.IncrementalA, channelGroup);
+
+    private static UmdfPacket MakePacket(uint seqNum, ChannelType channel, int channelGroup = 0)
     {
         var buf = new byte[PacketHeader.MESSAGE_SIZE];
         BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 1);
@@ -87,7 +137,7 @@ public class MultiFeedManagerDropVisibilityTests
         return new UmdfPacket
         {
             Data = buf,
-            Channel = ChannelType.IncrementalA,
+            Channel = channel,
             ChannelGroup = channelGroup,
             ReceivedTimestampTicks = 1L,
         };

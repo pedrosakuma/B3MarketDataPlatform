@@ -144,6 +144,23 @@ static class MetricsBinder
             Meter.CreateObservableCounter("b3.umdf.feed.ring.dropped",
                 RingDropped,
                 unit: "{packets}", description: "Packets dropped on per-group ring overflow (newest dropped)");
+
+            // Per-channel drop attribution: distinguishes Inc A/B (~118 kpps peak)
+            // from Snap / InstrumentDefinition (~1 kpps drip). A spike here is a
+            // strong signal of which producer outpaced the dispatch thread.
+            IEnumerable<Measurement<long>> RingDroppedByChannel()
+            {
+                foreach (var s in feed.GetChannelDropBreakdown())
+                    yield return new Measurement<long>(
+                        s.DroppedPackets,
+                        Tag("group", $"G{s.GroupId}"),
+                        Tag("channel", s.Channel.ToString()));
+            }
+
+            Meter.CreateObservableCounter("b3.umdf.feed.ring.dropped_by_channel",
+                RingDroppedByChannel,
+                unit: "{packets}",
+                description: "Per-channel breakdown of per-group ring overflow drops (sums to b3.umdf.feed.ring.dropped per group)");
         }
 
         if (multicastMerger is not null)

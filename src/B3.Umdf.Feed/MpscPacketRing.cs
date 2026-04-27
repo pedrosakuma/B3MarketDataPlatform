@@ -29,6 +29,20 @@ internal sealed class MpscPacketRing
     private PaddedLong _consumerSeq;
     private long _droppedPackets;
 
+    // Per-channel drop attribution (index = (int)ChannelType). Drop attribution
+    // matters because IncrementalA/B (~118 kpps peak) are 100x the rate of
+    // SnapshotRecovery / InstrumentDefinition; without per-channel breakdown a
+    // single ring.dropped counter cannot tell whether overflow came from the
+    // hot Inc path or from a misbehaving Snap producer. Updated atomically on
+    // every overflow inside TryEnqueue; the aggregate _droppedPackets is the
+    // sum of these, kept for backward compatibility.
+    private readonly long[] _droppedByChannel = new long[ChannelTypeCount];
+
+    // Hard-coded to match the ChannelType enum (4 values: IncrementalA,
+    // IncrementalB, InstrumentDefinition, SnapshotRecovery). Keep in sync if
+    // the enum gains new members.
+    internal const int ChannelTypeCount = 4;
+
     // 0 = consumer is busy draining; 1 = consumer has parked (or is about to park) and
     // needs an explicit wake. Producers gate the cost of ManualResetEventSlim.Set()
     // (which takes an internal Monitor lock when a waiter exists) on this flag, so the
@@ -40,6 +54,16 @@ internal sealed class MpscPacketRing
     public int Capacity => _slots.Length;
 
     public long DroppedPackets => Volatile.Read(ref _droppedPackets);
+
+    /// <summary>
+    /// Per-channel drop count snapshot (indexed by <see cref="ChannelType"/>).
+    /// Sum across the returned array equals <see cref="DroppedPackets"/>.
+    /// Each element is read atomically; the array as a whole is not a coherent
+    /// snapshot under concurrent producers, but each channel value is at least
+    /// monotonic and consistent with a real point in time.
+    /// </summary>
+    public long DroppedFor(ChannelType channel) =>
+        Volatile.Read(ref _droppedByChannel[(int)channel]);
 
     /// <summary>Approximate current depth (producerSeq - consumerSeq). May briefly read negative under racy reads; clamped to 0.</summary>
     public int ApproximateDepth
@@ -102,6 +126,9 @@ internal sealed class MpscPacketRing
             {
                 // Ring is full at this position.
                 Interlocked.Increment(ref _droppedPackets);
+                int chIdx = (int)packet.Channel;
+                if ((uint)chIdx < (uint)_droppedByChannel.Length)
+                    Interlocked.Increment(ref _droppedByChannel[chIdx]);
                 return false;
             }
             else

@@ -469,6 +469,25 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             yield return (gid, ring.ApproximateDepth, ring.DroppedPackets);
     }
 
+    /// <summary>
+    /// Per-group, per-channel drop breakdown. Sum of per-channel drops within a
+    /// group equals the corresponding entry's <c>DroppedPackets</c> in
+    /// <see cref="GetChannelStats"/>. Use this to attribute ring overflow to a
+    /// specific channel (Inc A/B vs Snap vs InstrumentDefinition) — critical
+    /// because Inc dominates traffic at ~100x the Snap rate, so an undisclosed
+    /// overflow could come from either path.
+    /// </summary>
+    public IEnumerable<(int GroupId, ChannelType Channel, long DroppedPackets)> GetChannelDropBreakdown()
+    {
+        foreach (var (gid, ring) in _rings)
+        {
+            yield return (gid, ChannelType.IncrementalA, ring.DroppedFor(ChannelType.IncrementalA));
+            yield return (gid, ChannelType.IncrementalB, ring.DroppedFor(ChannelType.IncrementalB));
+            yield return (gid, ChannelType.InstrumentDefinition, ring.DroppedFor(ChannelType.InstrumentDefinition));
+            yield return (gid, ChannelType.SnapshotRecovery, ring.DroppedFor(ChannelType.SnapshotRecovery));
+        }
+    }
+
     public void Dispose()
     {
         DisposeAsync().AsTask().GetAwaiter().GetResult();
