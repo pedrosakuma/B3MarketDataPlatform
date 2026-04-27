@@ -31,11 +31,30 @@ public sealed class FeedHandler : IDisposable
     // tail of the universe permanently unknown to downstream consumers.
     private readonly HashSet<ulong> _instrDefSeenSymbols = new();
 
+    // Receive-time of the first SecurityDefinition_12 observed during bootstrap.
+    // Powers the escape valve below; 0 until the first SecDef arrives.
+    private long _instrDefFirstSeenTicks;
+    private long _instrDefStuckEscapeFiredCount;
+
+    /// <summary>
+    /// Maximum time (in milliseconds, measured against
+    /// <see cref="UmdfPacket.ReceivedTimestampTicks"/>) we will wait inside
+    /// <see cref="FeedState.WaitInstrumentDefinition"/> after the first
+    /// SecurityDefinition_12 arrives. Past this window we force-transition to
+    /// <see cref="FeedState.Streaming"/> so that an upstream pathology (e.g.
+    /// <c>TotNoRelatedSym=0</c> on every SecDef, or a SecDef stream that never
+    /// completes) cannot stall the consumer forever. The bootstrap is then
+    /// driven entirely by per-symbol heal once snapshots arrive.
+    /// </summary>
+    public const long InstrDefStuckTimeoutMs = 30_000;
+
     public FeedState State => _state;
     public long PacketCount => _packetCount;
     public long InstrDefPacketCount => _instrDefPacketCount;
     public uint InstrDefReceived => _instrDefReceived;
     public uint InstrDefTotalExpected => _instrDefTotalExpected;
+    /// <summary>Number of times the bootstrap escape valve forced WaitInstrumentDefinition → Streaming because <see cref="InstrDefStuckTimeoutMs"/> elapsed without completion.</summary>
+    public long InstrDefStuckEscapeFiredCount => Volatile.Read(ref _instrDefStuckEscapeFiredCount);
     /// <summary>Repeated SecurityDefinition_12 messages observed during bootstrap (deduplicated by SecurityID).</summary>
     public long InstrDefDuplicateCount => Volatile.Read(ref _instrDefDuplicateCount);
     /// <summary>SecurityDefinition_12 messages whose <c>TotNoRelatedSym</c> contradicted the first observed value (the original total wins).</summary>
@@ -189,6 +208,27 @@ public sealed class FeedHandler : IDisposable
         // decoded (no SecDef → no symbol/decimals/multipliers).
         if (packet.Channel == ChannelType.InstrumentDefinition)
             DispatchAndTrackInstrDef(in packet);
+
+        // Escape valve: B3 spec violations (TotNoRelatedSym=0 on every SecDef,
+        // or a SecDef stream that simply never completes) would otherwise pin
+        // us in WaitInstrumentDefinition forever. Once we have observed at
+        // least one SecDef and the stuck-timeout has elapsed, force-transition
+        // to Streaming. Per-symbol heal then bootstraps every symbol that
+        // actually exists from the snapshot feed; symbols whose SecDef never
+        // arrived stay Unknown until one does.
+        if (_state == FeedState.WaitInstrumentDefinition
+            && _instrDefFirstSeenTicks != 0
+            && packet.ReceivedTimestampTicks - _instrDefFirstSeenTicks >= InstrDefStuckTimeoutMs)
+        {
+            Interlocked.Increment(ref _instrDefStuckEscapeFiredCount);
+            _logger.LogError(
+                "InstrumentDefinition bootstrap stuck for {ElapsedMs}ms (received={Received}, expectedTotal={Expected}); forcing transition to Streaming.",
+                packet.ReceivedTimestampTicks - _instrDefFirstSeenTicks,
+                _instrDefReceived,
+                _instrDefTotalExpected);
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefReceived);
+            TransitionTo(FeedState.Streaming);
+        }
     }
 
     private void HandleStreaming(in UmdfPacket packet)
@@ -248,6 +288,8 @@ public sealed class FeedHandler : IDisposable
             return;
 
         _instrDefPacketCount++;
+        if (_instrDefFirstSeenTicks == 0)
+            _instrDefFirstSeenTicks = packet.ReceivedTimestampTicks;
 
         int offset = PacketHeader.MESSAGE_SIZE;
         while (TryReadNextSbe(span, ref offset, out var sbeSlice, out var templateId))
