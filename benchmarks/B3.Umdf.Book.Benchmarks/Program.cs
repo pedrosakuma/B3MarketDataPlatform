@@ -1,8 +1,19 @@
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
 using B3.Umdf.Book;
+using B3.Umdf.Book.Benchmarks;
 
-BenchmarkRunner.Run<BookSideBenchmarks>();
+if (args.Length > 0 && args[0] == "alloc-probe")
+{
+    OnPacketAllocProbe.Run();
+    return;
+}
+
+// Pass the benchmark class name (or `*`) on the CLI to pick which suite to run, e.g.
+//   dotnet run -c Release -- --filter '*BookManagerOnPacketBenchmarks*'
+//   dotnet run -c Release -- --filter '*BookSideBenchmarks*'
+//   dotnet run -c Release -- alloc-probe        (one-shot allocation probe, not BDN)
+BenchmarkSwitcher.FromAssembly(typeof(BookSideBenchmarks).Assembly).Run(args);
 
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 3, iterationCount: 10)]
