@@ -79,3 +79,39 @@ Incremental") is **not supported by the data**:
 - Forced-heal-every-6s for mini-index futures (observed in production)
   is most likely UDP loss in the network, not consumer-side contention.
 - No opening-auction (~10:00 BRT) capture; Inc peaks could be higher.
+
+## Update — A2 results (`tools/InboundLatencyProbe`)
+
+The A2 probe was implemented to replay PCAPs in-process through
+MultiFeedManager / FeedHandler with BookManager swapped for a
+`LatencyRecorderHandler`. Smoke run on DRV-072 at speed 60×
+(producers paced 60× faster than capture, so 100ms windows that
+contained 118 kpps in real time saw ~7 Mpkts/sec):
+
+- **32M packets pushed in 65s wall, zero drops.**
+- p50 dispatcher latency: **1–3µs** invariant from 100 kpps to
+  3.2 Mpkts/sec.
+- p99 latency: 50–200µs in steady periods; **1.8–3.4 ms** only at
+  sustained 100ms windows of 1+ Mpkts/sec.
+- Worst single bucket: p99=9.4 ms with only 11k samples — likely a
+  state-machine transition coming out of warmup, not steady-state.
+
+Extrapolating linearly to real production rates (118 kpps peak ≈ 60×
+lower than the smoke peak), p99 should sit comfortably under 100µs
+with no drops. **The dispatcher is not the bottleneck.** P9 may
+re-scope to: (a) investigate kernel UDP path / SO_REUSEPORT
+fairness; (b) profile BookManager/parse cost directly; or (c) close
+without further work and revisit only if production telemetry shows
+dispatcher pressure.
+
+### How to reproduce
+```bash
+dotnet run --project tools/InboundLatencyProbe -c Release -- \
+  --feed-a pcap/20250929_MBO_072_DRV_Incremental_FeedA.pcap \
+  --feed-b pcap/20250929_MBO_072_DRV_Incremental_FeedB.pcap \
+  --snap   pcap/20250929_MBO_072_DRV_SnapshotRecovery.pcap \
+  --instr  pcap/20250929_MBO_072_DRV_InstrumentDefinition.pcap \
+  --speed 60 --warmup-s 5 --duration-s 60 --bucket-ms 100 \
+  --out-csv /tmp/latency-DRV-speed60.csv
+```
+
