@@ -55,12 +55,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private long _broadcastBatchesPublished;
     private long _broadcastBatchesDroppedFull;
     private long _broadcastResyncRequests;
+    private long _lastPublishedBatchSequence;
 
     public long BroadcastBatchesPublished => Volatile.Read(ref _broadcastBatchesPublished);
     public long BroadcastBatchesDroppedFull => Volatile.Read(ref _broadcastBatchesDroppedFull);
     public long BroadcastResyncRequests => Volatile.Read(ref _broadcastResyncRequests);
     public int BroadcastRingDepth => _broadcastRing.ApproximateDepth;
     public int BroadcastRingCapacity => _broadcastRing.Capacity;
+    internal long LastPublishedBatchSequence => Volatile.Read(ref _lastPublishedBatchSequence);
 
     private long _eventsReceived;
     private long _eventsFlushed;
@@ -208,6 +210,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public void OnBookCleared(ulong securityId, BookClearSide side)
     {
         if (!_parent.IsSubscribed(securityId)) return;
+        _eventsReceived++;
         PurgeBufferedOrders(securityId, (byte)side);
         PurgeBufferedMarketTiers(securityId, side);
         _clearBuffer.Add((securityId, (byte)side));
@@ -258,6 +261,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public void OnSymbolStaleStatusChanged(ulong securityId, bool isStale)
     {
         if (!_parent.IsSubscribed(securityId)) return;
+        _eventsReceived++;
         _staleStatusBuffer[securityId] = isStale;
 
         // On heal (Stale→Healthy), trigger a fresh book snapshot to all
@@ -329,13 +333,17 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             return;
         }
 
-        // 3. Process this group's routed subscribe/get requests (single-threaded, safe book access)
-        ProcessOwnSubscribeRequests();
-
-        // 4. Flush conflation buffers into _currentBatch (dispatch-side work only —
+        // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
         //    no subscriber fan-out, no ArrayPool rentals for client buffers).
         if (_orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
             FlushBuffers();
+
+        // 4. Process routed subscribe/get requests after current-packet events have
+        //    been serialized, but before the batch is visible to the broadcaster.
+        //    Snapshots use the pending batch sequence as a barrier so clients do not
+        //    receive deltas already included in their snapshot.
+        long snapshotCutoffSequence = PendingBatchSequence;
+        ProcessOwnSubscribeRequests(snapshotCutoffSequence);
 
         // 5. Publish the batch to the broadcaster thread. On full ring, drop + schedule
         //    a resnapshot for each affected security so subscribers recover state.
@@ -371,6 +379,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     /// <summary>True while OnBatchComplete is dropping wire events instead of fanning out.</summary>
     public bool IsFanoutSuppressed => _suppressFanout;
 
+    private long PendingBatchSequence =>
+        _currentBatch is { EventCount: > 0 }
+            ? LastPublishedBatchSequence + 1
+            : LastPublishedBatchSequence;
+
     private void DiscardConflationBuffers()
     {
         // Equivalent of FlushBuffers without producing wire bytes — keep the upstream
@@ -381,12 +394,18 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _clearBuffer.Clear();
         _tradeBuffer.Clear();
         _staleStatusBuffer.Clear();
+        if (_currentBatch is not null)
+        {
+            discarded += _currentBatch.EventCount;
+            BroadcastWorkBatch.Return(_currentBatch);
+            _currentBatch = null;
+        }
         _eventsFlushed += discarded;
     }
 
     // ── Request processing ──
 
-    private void ProcessOwnSubscribeRequests()
+    private void ProcessOwnSubscribeRequests(long bookBatchCutoffSequence)
     {
         // Cap snapshots per batch: each Get/Subscribe runs SendMboSnapshot which allocates
         // a tuple array per side + rents an ArrayPool buffer (book-size proportional).
@@ -400,10 +419,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             switch (req.Kind)
             {
                 case SubscriptionRequestKind.Subscribe:
-                    _parent.HandleSubscribe(req.ClientId, req.Symbol!, req.Flags, BookManager, this);
+                    _parent.HandleSubscribe(req.ClientId, req.Symbol!, req.Flags, BookManager, this, bookBatchCutoffSequence);
                     break;
                 case SubscriptionRequestKind.Get:
-                    _parent.HandleGet(req.ClientId, req.Symbol!, req.Flags, BookManager, this);
+                    _parent.HandleGet(req.ClientId, req.Symbol!, req.Flags, BookManager, this, bookBatchCutoffSequence);
                     break;
             }
         }
@@ -723,6 +742,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             return;
         }
 
+        long sequence = LastPublishedBatchSequence + 1;
+        batch.Sequence = sequence;
+        Volatile.Write(ref _lastPublishedBatchSequence, sequence);
+
         if (_broadcastRing.TryEnqueue(batch))
         {
             Volatile.Write(ref _broadcastBatchesPublished, _broadcastBatchesPublished + 1);
@@ -810,7 +833,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         {
             ref var ev = ref batch.Events[i];
             var bytes = batch.Buffer.AsSpan(ev.Offset, ev.Len);
-            AppendForBookSubscribers(ev.SecId, bytes, ev.LogicalCount);
+            AppendForBookSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
         }
         FlushClientBatches();
     }
@@ -821,14 +844,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     // ArrayPool at high fan-out (e.g. 500 clients × snapshot bursts).
     private const int MaxAccumulatorBytes = 256 * 1024;
 
-    private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
     {
         var subs = _parent.GetSubscribers(securityId);
         if (subs is null || bytes.Length == 0) return;
 
-        foreach (var (clientId, flags) in subs)
+        foreach (var (clientId, state) in subs)
         {
-            if ((flags & DataFlags.Book) == 0) continue;
+            if (!state.WantsBookBatch(batchSequence)) continue;
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
 

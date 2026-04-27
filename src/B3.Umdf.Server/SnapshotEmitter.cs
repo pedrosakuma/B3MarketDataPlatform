@@ -6,7 +6,7 @@ namespace B3.Umdf.Server;
 /// <summary>
 /// Pure-static helpers that serialize per-security snapshots into wire frames and
 /// hand them to a <see cref="ClientSession"/>'s outbound ring. Every method here is
-/// stateless and side-effect-free apart from the single TryEnqueue per call —
+/// stateless and side-effect-free apart from outbound enqueues —
 /// extracted out of <see cref="SubscriptionManager"/> so the manager can focus on
 /// orchestration (subscription state, routing, lifecycle) instead of byte layout.
 ///
@@ -20,19 +20,19 @@ internal static class SnapshotEmitter
     /// Send a server-status frame (ready/initializing) directly. Used both for
     /// fresh-client greeting and for broadcast on RealTime entry.
     /// </summary>
-    public static void SendServerStatus(ClientSession session, bool ready)
+    public static bool SendServerStatus(ClientSession session, bool ready)
     {
         var buf = new byte[5];
         WireProtocol.WriteServerStatus(buf, ready);
-        session.TryEnqueue(buf);
+        return session.TryEnqueue(buf);
     }
 
     /// <summary>Send a SubscribeError frame for the given (code, symbol) tuple.</summary>
-    public static void SendError(ClientSession session, SubscribeErrorCode code, string symbol)
+    public static bool SendError(ClientSession session, SubscribeErrorCode code, string symbol)
     {
         var buf = new byte[WireProtocol.FramingHeaderSize + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
         int len = WireProtocol.WriteSubscribeError(buf, code, symbol);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>
@@ -40,7 +40,7 @@ internal static class SnapshotEmitter
     /// enqueue it as a batch. Pooled buffer ownership transfers to the session on
     /// success; on TryEnqueueBatch failure the session returns it to the pool.
     /// </summary>
-    public static void SendMboSnapshot(ClientSession session, OrderBook book)
+    public static bool SendMboSnapshot(ClientSession session, OrderBook book)
     {
         ulong securityId = book.SecurityId;
         uint lastRptSeq = book.LastRptSeq;
@@ -58,8 +58,9 @@ internal static class SnapshotEmitter
         WriteOrdersDirect(buf, ref offset, securityId, bids);
         WriteOrdersDirect(buf, ref offset, securityId, asks);
 
-        session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
-        SendMarketTierSnapshot(session, book);
+        if (!session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf))
+            return false;
+        return SendMarketTierSnapshot(session, book);
     }
 
     /// <summary>
@@ -68,41 +69,41 @@ internal static class SnapshotEmitter
     /// the empty frame still tells the frontend that the snapshot phase is
     /// complete so it can drop any "loading" placeholders.
     /// </summary>
-    public static void SendEmptyBookSnapshot(ClientSession session, ulong securityId)
+    public static bool SendEmptyBookSnapshot(ClientSession session, ulong securityId)
     {
         var emptyBuf = new byte[WireProtocol.BookSnapshotSize(0, 0)];
         WireProtocol.WriteBookSnapshotHeader(emptyBuf, securityId, 0, 0, 0);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
     }
 
-    private static void SendMarketTierSnapshot(ClientSession session, OrderBook book)
+    private static bool SendMarketTierSnapshot(ClientSession session, OrderBook book)
     {
         Span<byte> buf = stackalloc byte[32];
-        SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Bid, book.MarketOrderQuantity(BookSideType.Bid), book.MarketOrderCount(BookSideType.Bid));
-        SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Ask, book.MarketOrderQuantity(BookSideType.Ask), book.MarketOrderCount(BookSideType.Ask));
+        return SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Bid, book.MarketOrderQuantity(BookSideType.Bid), book.MarketOrderCount(BookSideType.Bid))
+            && SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Ask, book.MarketOrderQuantity(BookSideType.Ask), book.MarketOrderCount(BookSideType.Ask));
     }
 
-    private static void SendMarketTierSide(ClientSession session, Span<byte> buf, ulong securityId, BookSideType side, long totalQty, int orderCount)
+    private static bool SendMarketTierSide(ClientSession session, Span<byte> buf, ulong securityId, BookSideType side, long totalQty, int orderCount)
     {
         if (orderCount == 0 && totalQty == 0)
-            return;
+            return true;
         int len = WireProtocol.WriteMarketTierUpdate(buf, securityId, (byte)side, totalQty, orderCount);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf[..len].ToArray()));
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf[..len].ToArray()));
     }
 
     /// <summary>Send the current <see cref="InstrumentInfo"/> snapshot for a security.</summary>
-    public static void SendInfoSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
+    public static bool SendInfoSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
     {
         var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>
     /// Replay every cached trade in the per-security ring buffer to the session,
     /// one Trade frame per entry. Bounded by <see cref="SubscriptionManager.MaxRecentTrades"/>.
     /// </summary>
-    public static void SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
+    public static bool SendTradeHistory(ClientSession session, ulong securityId, TradeRingBuffer ring)
     {
         foreach (var slot in ring.AsSpan())
         {
@@ -112,8 +113,10 @@ internal static class SnapshotEmitter
             if (slot.Busted != 0) continue;
             var buf = new byte[36];
             int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+            if (!session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len)))
+                return false;
         }
+        return true;
     }
 
     /// <summary>
@@ -124,13 +127,12 @@ internal static class SnapshotEmitter
     /// <see cref="SendEmptyCandleSnapshot"/> so the frontend always sees a
     /// snapshot-complete signal.
     /// </summary>
-    public static void SendCandleHistory(ClientSession session, ulong securityId, CandleAggregator agg)
+    public static bool SendCandleHistory(ClientSession session, ulong securityId, CandleAggregator agg)
     {
         var candles = agg.GetCandles();
         if (candles.Length == 0)
         {
-            SendEmptyCandleSnapshot(session, securityId);
-            return;
+            return SendEmptyCandleSnapshot(session, securityId);
         }
 
         int maxPerBatch = WireProtocol.MaxCandlesPerSnapshot;
@@ -146,12 +148,14 @@ internal static class SnapshotEmitter
             var batch = candles.AsSpan(i, count);
             var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2 + count * WireProtocol.CandleSize];
             int len = WireProtocol.WriteCandleSnapshot(buf, securityId, agg.Resolution, flags, batch);
-            session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+            if (!session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len)))
+                return false;
         }
+        return true;
     }
 
     /// <summary>Send an empty candle snapshot frame so the frontend can drop loading state.</summary>
-    public static void SendEmptyCandleSnapshot(ClientSession session, ulong securityId)
+    public static bool SendEmptyCandleSnapshot(ClientSession session, ulong securityId)
     {
         var buf = new byte[WireProtocol.FramingHeaderSize + 8 + 2 + 1 + 2];
         int len = WireProtocol.WriteCandleSnapshot(
@@ -160,7 +164,7 @@ internal static class SnapshotEmitter
             1,
             (byte)(WireProtocol.CandleFlagFirst | WireProtocol.CandleFlagLast),
             ReadOnlySpan<Candle>.Empty);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
     /// <summary>

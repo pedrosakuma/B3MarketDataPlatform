@@ -25,6 +25,7 @@ internal sealed class BroadcastWorkBatch
 
     public byte[] Buffer = new byte[4096];
     public int BufferLen;
+    public long Sequence;
 
     public EventRecord[] Events = new EventRecord[64];
     public int EventCount;
@@ -33,6 +34,7 @@ internal sealed class BroadcastWorkBatch
     {
         BufferLen = 0;
         EventCount = 0;
+        Sequence = 0;
     }
 
     public void Append(ulong secId, ReadOnlySpan<byte> bytes, int logicalCount)

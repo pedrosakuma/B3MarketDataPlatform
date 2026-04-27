@@ -28,10 +28,10 @@ public sealed class SubscriptionManager : IDisposable
 
     private readonly ConcurrentDictionary<string, ClientSession> _clients = new();
 
-    // Per-security: clientId → DataFlags.
+    // Per-security: clientId → flags + batch sequence barrier.
     // Outer dict is ConcurrentDictionary (lock-free reads).
     // Inner dicts use copy-on-write under _subLock for safe concurrent iteration.
-    private readonly ConcurrentDictionary<ulong, Dictionary<string, DataFlags>> _subscriptions = new();
+    private readonly ConcurrentDictionary<ulong, Dictionary<string, SubscriptionState>> _subscriptions = new();
 
     // Pending unsubscribe requests from WebSocket threads (processed by any group)
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingUnsubscribes = new();
@@ -237,9 +237,9 @@ public sealed class SubscriptionManager : IDisposable
     {
         // Lock-free read: inner dict is a copy-on-write snapshot, safe to iterate.
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-        foreach (var (clientId, flags) in clients)
+        foreach (var (clientId, state) in clients)
         {
-            if ((flags & DataFlags.Book) == 0) continue;
+            if ((state.Flags & DataFlags.Book) == 0) continue;
             if (_clients.TryGetValue(clientId, out var session))
                 session.TryEnqueue(payload);
         }
@@ -253,7 +253,7 @@ public sealed class SubscriptionManager : IDisposable
     /// broadcaster's foreach uses the struct enumerator — avoids boxing one IEnumerator per
     /// per-event call inside the fan-out loop.
     /// </summary>
-    internal Dictionary<string, DataFlags>? GetSubscribers(ulong securityId) =>
+    internal Dictionary<string, SubscriptionState>? GetSubscribers(ulong securityId) =>
         _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
 
     /// <summary>
@@ -264,8 +264,8 @@ public sealed class SubscriptionManager : IDisposable
     internal bool HasAnyBookSubscriber(ulong securityId)
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
-        foreach (var (_, f) in clients)
-            if ((f & DataFlags.Book) != 0) return true;
+        foreach (var (_, state) in clients)
+            if ((state.Flags & DataFlags.Book) != 0) return true;
         return false;
     }
 
@@ -285,9 +285,9 @@ public sealed class SubscriptionManager : IDisposable
         bool any = false;
         var group = GetOwningGroup(securityId);
         if (group is null) return false;
-        foreach (var (clientId, flags) in clients)
+        foreach (var (clientId, state) in clients)
         {
-            if ((flags & DataFlags.Book) == 0) continue;
+            if ((state.Flags & DataFlags.Book) == 0) continue;
             group.EnqueueRequest(clientId, symbol, DataFlags.Book, isGet: true);
             any = true;
         }
@@ -334,9 +334,9 @@ public sealed class SubscriptionManager : IDisposable
     internal void NotifyInfoUpdated(ulong securityId)
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-        foreach (var (clientId, flags) in clients)
+        foreach (var (clientId, state) in clients)
         {
-            if (!flags.HasFlag(DataFlags.Info)) continue;
+            if (!state.WantsInfo) continue;
             if (_clients.TryGetValue(clientId, out var session))
                 session.NotifyInfoAvailable();
         }
@@ -345,7 +345,7 @@ public sealed class SubscriptionManager : IDisposable
     // --- Subscribe handling (called on owning group's thread) ---
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
-        BookManager bookManager, GroupConflationHandler group)
+        BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
@@ -353,33 +353,34 @@ public sealed class SubscriptionManager : IDisposable
         // Send SubscribeOk
         var okBuf = new byte[WireProtocol.FramingHeaderSize + 8 + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
         int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol);
-        session.TryEnqueue(new ReadOnlyMemory<byte>(okBuf, 0, okLen));
+        if (!session.TryEnqueue(new ReadOnlyMemory<byte>(okBuf, 0, okLen)))
+            return;
 
-        // Send snapshots BEFORE activating incremental forwarding.
-        // Safe: we're on the owning group's thread — no concurrent book mutations.
-        SendSnapshots(session, securityId, flags, bookManager, group);
+        // Activate before publishing the already-serialized current batch, but with
+        // a sequence barrier. The broadcaster will skip every queued/current batch
+        // at or below bookBatchCutoffSequence for this subscription, so the snapshot
+        // remains the client's baseline and future incrementals start after it.
+        if (!ActivateSubscription(session, clientId, securityId, flags, bookBatchCutoffSequence, out var activation))
+            return;
 
-        // Activate subscription — incrementals start flowing after this point
-        lock (_subLock)
+        if (!SendSnapshots(session, securityId, flags, bookManager, group))
         {
-            session.AddSubscription(securityId);
-            if (flags.HasFlag(DataFlags.Info))
-                session.AddInfoSubscription(securityId);
-
-            // Copy-on-write: create new inner dict to avoid mutating a dict being iterated
-            _subscriptions.TryGetValue(securityId, out var existing);
-            var newClients = existing is not null ? new Dictionary<string, DataFlags>(existing) : new();
-            newClients[clientId] = flags;
-            _subscriptions[securityId] = newClients;
+            RollbackSubscriptionActivation(session, clientId, securityId, activation);
+            return;
         }
-        MetricsRegistry.WsSubscriptions.Add(1);
+
+        if (activation.IsNew)
+            MetricsRegistry.WsSubscriptions.Add(1);
     }
 
     internal void HandleGet(string clientId, string symbol, DataFlags flags,
-        BookManager bookManager, GroupConflationHandler group)
+        BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
+
+        if (flags.HasFlag(DataFlags.Book))
+            UpdateBookCutoffIfSubscribed(clientId, securityId, bookBatchCutoffSequence);
 
         SendSnapshots(session, securityId, flags, bookManager, group);
     }
@@ -409,26 +410,41 @@ public sealed class SubscriptionManager : IDisposable
     private static void SendError(ClientSession session, SubscribeErrorCode code, string symbol)
         => SnapshotEmitter.SendError(session, code, symbol);
 
-    private void SendSnapshots(ClientSession session, ulong securityId, DataFlags flags,
+    private bool SendSnapshots(ClientSession session, ulong securityId, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group)
     {
         if (flags.HasFlag(DataFlags.Book))
         {
             if (bookManager.Books.TryGetValue(securityId, out var book))
-                SnapshotEmitter.SendMboSnapshot(session, book);
+            {
+                if (!SnapshotEmitter.SendMboSnapshot(session, book))
+                    return false;
+            }
             else
-                SnapshotEmitter.SendEmptyBookSnapshot(session, securityId);
+            {
+                if (!SnapshotEmitter.SendEmptyBookSnapshot(session, securityId))
+                    return false;
+            }
 
             // Send recent trade history from the owning group's ring buffer
             if (group.RecentTrades.TryGetValue(securityId, out var trades))
-                SnapshotEmitter.SendTradeHistory(session, securityId, trades);
+            {
+                if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
+                    return false;
+            }
 
             // Send candle history from the owning group's aggregator.
             // Always send a CandleSnapshot (even empty) so the frontend knows the snapshot phase is complete.
             if (group.Candles.TryGetValue(securityId, out var agg))
-                SnapshotEmitter.SendCandleHistory(session, securityId, agg);
+            {
+                if (!SnapshotEmitter.SendCandleHistory(session, securityId, agg))
+                    return false;
+            }
             else
-                SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId);
+            {
+                if (!SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId))
+                    return false;
+            }
         }
 
         if (flags.HasFlag(DataFlags.Info))
@@ -440,17 +456,116 @@ public sealed class SubscriptionManager : IDisposable
                 {
                     if (mdm.InstrumentData.TryGetValue(securityId, out var info))
                     {
-                        SnapshotEmitter.SendInfoSnapshot(session, securityId, info);
+                        if (!SnapshotEmitter.SendInfoSnapshot(session, securityId, info))
+                            return false;
                         break;
                     }
                 }
             }
         }
+
+        return true;
     }
 
     private void HandleUnsubscribe(string clientId, ulong securityId)
     {
         // Must be called under _subLock
+        RemoveSubscriptionCore(clientId, securityId, enqueueAck: true, adjustMetric: true);
+    }
+
+    private bool ActivateSubscription(
+        ClientSession session,
+        string clientId,
+        ulong securityId,
+        DataFlags flags,
+        long bookBatchCutoffSequence,
+        out SubscriptionActivation activation)
+    {
+        activation = default;
+        lock (_subLock)
+        {
+            _subscriptions.TryGetValue(securityId, out var existing);
+            SubscriptionState previous = default;
+            bool hadPrevious = existing is not null && existing.TryGetValue(clientId, out previous);
+            bool wantsInfo = flags.HasFlag(DataFlags.Info);
+            bool hadInfo = hadPrevious && previous.WantsInfo;
+
+            if (wantsInfo && !hadInfo && !session.AddInfoSubscription(securityId))
+                return false;
+            if (!wantsInfo && hadInfo && !session.RemoveInfoSubscription(securityId))
+                return false;
+
+            session.AddSubscription(securityId);
+
+            // Copy-on-write: create new inner dict to avoid mutating a dict being iterated.
+            var newClients = existing is not null ? new Dictionary<string, SubscriptionState>(existing) : new();
+            newClients[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
+            _subscriptions[securityId] = newClients;
+            activation = new SubscriptionActivation(
+                !hadPrevious,
+                hadPrevious,
+                previous,
+                AddedInfoSubscription: wantsInfo && !hadInfo,
+                RemovedInfoSubscription: !wantsInfo && hadInfo);
+        }
+
+        return true;
+    }
+
+    private readonly record struct SubscriptionActivation(
+        bool IsNew,
+        bool HadPrevious,
+        SubscriptionState PreviousState,
+        bool AddedInfoSubscription,
+        bool RemovedInfoSubscription);
+
+    private void RollbackSubscriptionActivation(
+        ClientSession session,
+        string clientId,
+        ulong securityId,
+        SubscriptionActivation activation)
+    {
+        lock (_subLock)
+        {
+            if (!_subscriptions.TryGetValue(securityId, out var existing)) return;
+            var newClients = new Dictionary<string, SubscriptionState>(existing);
+            if (activation.HadPrevious)
+                newClients[clientId] = activation.PreviousState;
+            else
+                newClients.Remove(clientId);
+
+            if (newClients.Count == 0)
+                _subscriptions.TryRemove(securityId, out _);
+            else
+                _subscriptions[securityId] = newClients;
+        }
+
+        if (activation.IsNew)
+            session.RemoveSubscription(securityId);
+        else if (activation.AddedInfoSubscription)
+            session.RemoveInfoSubscription(securityId);
+        else if (activation.RemovedInfoSubscription)
+            session.AddInfoSubscription(securityId);
+    }
+
+    private void UpdateBookCutoffIfSubscribed(string clientId, ulong securityId, long bookBatchCutoffSequence)
+    {
+        lock (_subLock)
+        {
+            if (!_subscriptions.TryGetValue(securityId, out var existing)) return;
+            if (!existing.TryGetValue(clientId, out var state)) return;
+            if ((state.Flags & DataFlags.Book) == 0) return;
+
+            var newClients = new Dictionary<string, SubscriptionState>(existing)
+            {
+                [clientId] = state.WithMinBroadcastSequence(bookBatchCutoffSequence)
+            };
+            _subscriptions[securityId] = newClients;
+        }
+    }
+
+    private void RemoveSubscriptionCore(string clientId, ulong securityId, bool enqueueAck, bool adjustMetric)
+    {
         if (!_clients.TryGetValue(clientId, out var session)) return;
 
         session.RemoveSubscription(securityId);
@@ -458,10 +573,11 @@ public sealed class SubscriptionManager : IDisposable
         // Copy-on-write
         if (_subscriptions.TryGetValue(securityId, out var existing))
         {
-            var newClients = new Dictionary<string, DataFlags>(existing);
+            var newClients = new Dictionary<string, SubscriptionState>(existing);
             if (newClients.Remove(clientId))
             {
-                MetricsRegistry.WsSubscriptions.Add(-1);
+                if (adjustMetric)
+                    MetricsRegistry.WsSubscriptions.Add(-1);
                 if (newClients.Count == 0)
                     _subscriptions.TryRemove(securityId, out _);
                 else
@@ -469,6 +585,7 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
+        if (!enqueueAck) return;
         var buf = new byte[12];
         int len = WireProtocol.WriteUnsubscribed(buf, securityId);
         session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
@@ -510,7 +627,7 @@ public sealed class SubscriptionManager : IDisposable
             foreach (var secId in toUpdate)
             {
                 if (!_subscriptions.TryGetValue(secId, out var existing)) continue;
-                var newClients = new Dictionary<string, DataFlags>(existing);
+                var newClients = new Dictionary<string, SubscriptionState>(existing);
                 newClients.Remove(clientId);
                 _subscriptions[secId] = newClients;
             }

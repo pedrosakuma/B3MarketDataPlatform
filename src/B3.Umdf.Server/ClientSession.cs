@@ -106,17 +106,20 @@ public sealed class ClientSession : IDisposable
     /// The HashSet remove stays inline (legacy single-thread access pattern); the
     /// info-version delete is routed through the outbound ring so the WriteLoop is
     /// the sole writer to <c>_infoVersions</c>.</summary>
-    public void RemoveSubscription(ulong securityId)
+    public bool RemoveSubscription(ulong securityId)
     {
         _subscriptions.Remove(securityId);
-        TryEnqueueCore(OutboundMessage.RemoveInfoSub(securityId), "remove-info-sub");
+        return RemoveInfoSubscription(securityId);
     }
 
     /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.
     /// Routes through the outbound ring so <c>_infoVersions</c> remains a plain
     /// (lock-free) <see cref="Dictionary{TKey, TValue}"/> mutated only by the WriteLoop.</summary>
-    public void AddInfoSubscription(ulong securityId) =>
+    public bool AddInfoSubscription(ulong securityId) =>
         TryEnqueueCore(OutboundMessage.AddInfoSub(securityId), "add-info-sub");
+
+    public bool RemoveInfoSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.RemoveInfoSub(securityId), "remove-info-sub");
 
     /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
@@ -231,8 +234,7 @@ public sealed class ClientSession : IDisposable
                 // Return pooled producer buffers AFTER SendAsync completes (Payload spans
                 // were copied into coalesceBuf, but returning earlier would invalidate the
                 // backing arrays held in `messages` if SendAsync inspected them later).
-                for (int i = 0; i < pooledToReturn.Count; i++)
-                    ArrayPool<byte>.Shared.Return(pooledToReturn[i]);
+                ReturnPooledBuffers(pooledToReturn);
 
                 // Phase 5: slow-client self-detection.
                 if (CheckSlowClient(ref slowTicks))
@@ -248,8 +250,16 @@ public sealed class ClientSession : IDisposable
         {
             // Ensure any items left in the channel (after Cancel/disconnect) release
             // their pooled buffers so the ArrayPool doesn't accumulate orphans.
+            ReturnPooledBuffers(pooledToReturn);
             DrainAndReturnPooled();
         }
+    }
+
+    private static void ReturnPooledBuffers(List<byte[]> pooledToReturn)
+    {
+        for (int i = 0; i < pooledToReturn.Count; i++)
+            ArrayPool<byte>.Shared.Return(pooledToReturn[i]);
+        pooledToReturn.Clear();
     }
 
     private readonly record struct DrainResult(
