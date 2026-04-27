@@ -334,15 +334,25 @@ else if (multicastConfig is not null)
     }
 
     var multicastSources = new List<MulticastPacketSource>();
+    var clampLogger = loggerFactory.CreateLogger("Multicast.ReplicaClamp");
     foreach (var c in channelConfigs)
     {
-        int replicas = Math.Max(1, c.ReceiveSocketCount);
-        for (int r = 0; r < replicas; r++)
+        // SO_REUSEPORT does NOT load-balance multicast on Linux: every joined
+        // socket receives a full copy of each datagram. Replicas would only
+        // multiply CPU/memory cost without throughput benefit. Clamp to 1 and
+        // warn loudly so an operator who set this hoping for headroom finds out.
+        // See docs/perf/reuseport-validation.md for the empirical proof.
+        if (c.ReceiveSocketCount > 1)
         {
-            multicastSources.Add(new MulticastPacketSource(
-                c,
-                loggerFactory.CreateLogger<MulticastPacketSource>()));
+            clampLogger.LogWarning(
+                "Multicast channel {Type} group {Group} has receiveSocketCount={Count}; clamping to 1. " +
+                "SO_REUSEPORT does not load-balance multicast on Linux (every socket gets a copy). " +
+                "See docs/perf/reuseport-validation.md.",
+                c.Type, c.ChannelGroup, c.ReceiveSocketCount);
         }
+        multicastSources.Add(new MulticastPacketSource(
+            c,
+            loggerFactory.CreateLogger<MulticastPacketSource>()));
     }
 
     // Live mode: receive threads push packets directly into the MultiFeedManager (no merger).

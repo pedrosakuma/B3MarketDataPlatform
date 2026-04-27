@@ -79,9 +79,16 @@ public sealed class MulticastPacketSource : IPacketSource
         socket.ExclusiveAddressUse = false;
         socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 
-        // SO_REUSEPORT (Linux) — required when multiple sockets bind the same multicast (group, port).
-        // The kernel load-balances datagrams across all sockets, multiplying the effective
-        // per-socket receive buffer and parallelizing receive work across threads.
+        // SO_REUSEPORT (Linux) — historically wired here for the "multiple sockets
+        // bind same (group, port)" pattern, but on Linux SO_REUSEPORT does NOT
+        // load-balance multicast: every socket joined to the multicast group
+        // receives a full copy of each datagram (multicast delivery semantics
+        // override REUSEPORT distribution, which only applies to unicast UDP).
+        // The setsockopt is therefore a no-op for our use case — we keep it gated
+        // on ReceiveSocketCount > 1 strictly for backward compatibility with any
+        // operator config that still requests replicas. Program.cs clamps replicas
+        // to 1 with a warning; this branch is effectively unreachable in practice.
+        // See docs/perf/reuseport-validation.md for the empirical proof.
         if (config.ReceiveSocketCount > 1 && OperatingSystem.IsLinux())
         {
             const int SOL_SOCKET = 1;
