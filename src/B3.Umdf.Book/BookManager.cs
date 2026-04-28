@@ -340,6 +340,42 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             ApplyTradingStatus(securityId, status);
     }
 
+    /// <summary>
+    /// SecurityID reuse: the exchange recycled an existing SecurityID for a
+    /// different instrument (canonical identity Symbol/ISIN/MaturityDate
+    /// changed). Treat as a per-symbol epoch reset — clear the book, drop
+    /// any stale-buffered MBO messages tagged with this SecurityID, and
+    /// reset every per-kind registry baseline so the new instrument's
+    /// rptSeq stream is treated as a fresh contiguous sequence.
+    /// </summary>
+    void IMarketDataEventHandler.OnInstrumentReplaced(ulong securityId, string? oldSymbol, string newSymbol)
+    {
+        Interlocked.Increment(ref _instrumentsReplaced);
+        _logger.LogWarning(
+            "InstrumentReplaced: SecurityID={SecurityId} oldSymbol={OldSymbol} newSymbol={NewSymbol} — clearing book + resetting registry baselines",
+            securityId, oldSymbol ?? "<none>", newSymbol);
+
+        if (TryLookupBook(securityId, out var book))
+        {
+            book.Clear();
+            _eventHandler?.OnBookCleared(securityId, BookClearSide.Both);
+        }
+        _staleBuffer.Clear(securityId);
+        // Reset every per-kind registry slot so that the new instrument's
+        // rptSeq=1 stream is contiguous (lastSeen=0, expected=1).
+        for (int k = 0; k <= (int)SymbolGapKind.SecurityStatus; k++)
+            _stateRegistry.ResetSymbolEpoch(securityId, (SymbolGapKind)k);
+    }
+
+    private long _instrumentsReplaced;
+    /// <summary>
+    /// Count of detected SecurityID reuses (canonical identity changed for
+    /// the same SecurityID). Sustained growth indicates either upstream
+    /// definition errors or a recycle policy this consumer should be
+    /// audited against.
+    /// </summary>
+    public long InstrumentsReplaced => Volatile.Read(ref _instrumentsReplaced);
+
     private void ApplyTradingStatus(ulong securityId, int status)
     {
         var book = GetOrCreateBook(securityId);

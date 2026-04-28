@@ -18,4 +18,9 @@ public sealed class CompositeMarketDataEventHandler : IMarketDataEventHandler
     {
         foreach (var h in _handlers) h.OnMarketDataUpdated(securityId, info);
     }
+
+    public void OnInstrumentReplaced(ulong securityId, string? oldSymbol, string newSymbol)
+    {
+        foreach (var h in _handlers) h.OnInstrumentReplaced(securityId, oldSymbol, newSymbol);
+    }
 }

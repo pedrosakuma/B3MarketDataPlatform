@@ -47,6 +47,25 @@ public sealed class MarketDataManager : IFeedEventHandler
     private long _secDefSkippedCount;
 
     /// <summary>
+    /// Count of <c>SecurityDefinition_12</c> messages dropped because their
+    /// <c>SecurityValidityTimestamp</c> regressed below the cached value
+    /// (out-of-order InstrDef arrival or upstream definition error).
+    /// Sustained growth indicates an upstream feed integrity issue.
+    /// </summary>
+    public long SecurityDefinitionsTimestampRegressed => Volatile.Read(ref _secDefTimestampRegressionCount);
+    private long _secDefTimestampRegressionCount;
+
+    /// <summary>
+    /// Count of detected SecurityID reuses (Symbol/ISIN/MaturityDate/SecurityType
+    /// changed for an existing SecurityID). Each detection triggers a
+    /// per-symbol epoch reset via <see cref="IMarketDataEventHandler.OnInstrumentReplaced"/>.
+    /// Should be 0 in normal operation; non-zero values warrant investigation
+    /// of the exchange's SecurityID recycling policy.
+    /// </summary>
+    public long InstrumentIdentityChanged => Volatile.Read(ref _instrumentIdentityChangedCount);
+    private long _instrumentIdentityChangedCount;
+
+    /// <summary>
     /// Count of TRADING_SESSION_CHANGE (SecurityTradingEvent=4) resets applied
     /// to instruments — see B3 spec §14.3 (end-of-day stats reset).
     /// </summary>
@@ -237,35 +256,87 @@ public sealed class MarketDataManager : IFeedEventHandler
         // Defensive: if the wire has no validity timestamp (null sentinel),
         // fall through and parse — we have no key to compare against.
         long? newTsOpt = msg.SecurityValidityTimestamp.Time;
+        ulong oldTs = info.LastSecurityValidityTimestamp;
         if (newTsOpt is { } newTsSigned && newTsSigned > 0)
         {
             ulong newTs = (ulong)newTsSigned;
-            if (info.LastSecurityValidityTimestamp == newTs)
+            if (oldTs == newTs)
             {
                 Interlocked.Increment(ref _secDefSkippedCount);
                 return;
             }
+            // Defensive: a SecDef whose validity timestamp regresses below
+            // the cached value is either an out-of-order arrival on the
+            // InstrDef channel or an upstream error. Ignore it — applying
+            // it would silently roll metadata back to a stale snapshot of
+            // the instrument and confuse downstream consumers.
+            if (oldTs > 0 && newTs < oldTs)
+            {
+                Interlocked.Increment(ref _secDefTimestampRegressionCount);
+                _logger.LogWarning(
+                    "SecDef timestamp regression: securityId={SecurityId} cachedTs={Old} newTs={New} — dropping",
+                    securityId, oldTs, newTs);
+                return;
+            }
             info.LastSecurityValidityTimestamp = newTs;
+        }
+
+        // Capture canonical identity BEFORE we overwrite anything. SecurityID
+        // reuse (recycled after delisting) shows up here as a different
+        // Symbol/ISIN/MaturityDate/SecurityType for the same securityId.
+        // Other fields (price increments, multipliers) can legitimately
+        // change without indicating reuse, so they're excluded from the
+        // identity tuple to avoid false positives on corporate actions.
+        string? oldSymbol = info.Symbol;
+        string? oldIsin = info.IsinNumber;
+        int? oldMaturityDate = info.MaturityDate;
+        int? oldSecurityType = info.SecurityType;
+        bool hadPriorIdentity = !string.IsNullOrEmpty(oldSymbol);
+
+        string newSymbol = Encoding.Latin1.GetString(msg.Symbol.AsTrimmedSpan());
+        int newSecurityType = (int)msg.SecurityType;
+        int? newMaturityDate = (int?)msg.MaturityDate;
+        string newIsin = Encoding.Latin1.GetString(msg.IsinNumber.AsTrimmedSpan());
+
+        bool identityChanged = hadPriorIdentity && (
+            !string.Equals(oldSymbol, newSymbol, StringComparison.Ordinal)
+            || !string.Equals(oldIsin, newIsin, StringComparison.Ordinal)
+            || oldMaturityDate != newMaturityDate
+            || oldSecurityType != newSecurityType);
+
+        if (identityChanged)
+        {
+            Interlocked.Increment(ref _instrumentIdentityChangedCount);
+            // info.Reset() wipes ALL dynamic fields (prices, watermarks,
+            // status, etc.) so the new instrument starts clean. The new
+            // SecurityDefinition body below repopulates static fields.
+            // LastSecurityValidityTimestamp was set above and survives.
+            ulong preservedTs = info.LastSecurityValidityTimestamp;
+            info.Reset();
+            info.LastSecurityValidityTimestamp = preservedTs;
+            // Notify downstream (BookManager clears book + resets registry
+            // baselines for every SymbolGapKind, drops stale buffers).
+            _eventHandler?.OnInstrumentReplaced(securityId, oldSymbol, newSymbol);
         }
 
         string? oldGroup = info.SecurityGroup;
         string newGroup = Encoding.Latin1.GetString(msg.SecurityGroup.AsTrimmedSpan());
         info.SecurityGroup = newGroup;
         UpdateGroupMembership(securityId, info, oldGroup, newGroup);
-        info.Symbol = Encoding.Latin1.GetString(msg.Symbol.AsTrimmedSpan());
+        info.Symbol = newSymbol;
         info.Asset = Encoding.Latin1.GetString(msg.Asset.AsTrimmedSpan());
         info.CfiCode = Encoding.Latin1.GetString(msg.CfiCode.AsTrimmedSpan());
         info.Currency = Encoding.Latin1.GetString(msg.Currency.AsTrimmedSpan());
-        info.IsinNumber = Encoding.Latin1.GetString(msg.IsinNumber.AsTrimmedSpan());
+        info.IsinNumber = newIsin;
 
-        info.SecurityType = (int)msg.SecurityType;
+        info.SecurityType = newSecurityType;
         info.SecuritySubType = msg.SecuritySubType;
         info.Product = (int)msg.Product;
         info.MinPriceIncrement = msg.MinPriceIncrement.Mantissa;
         info.PriceDivisor = msg.PriceDivisor.Mantissa;
         info.ContractMultiplier = msg.ContractMultiplier.Mantissa;
         info.StrikePrice = msg.StrikePrice.Mantissa;
-        info.MaturityDate = (int?)msg.MaturityDate;
+        info.MaturityDate = newMaturityDate;
         info.PutOrCall = msg.PutOrCall is { } poc ? (int)poc : null;
         info.ExerciseStyle = msg.ExerciseStyle is { } es ? (int)es : null;
         info.MarketSegmentID = msg.MarketSegmentID;

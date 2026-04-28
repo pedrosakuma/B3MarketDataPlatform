@@ -56,7 +56,11 @@ public sealed class SymbolRegistry : IFeedEventHandler
     public bool TryPromote()
     {
         int liveCount = _byId.Count;
-        if (liveCount <= _lastFrozenCount)
+        // _lastFrozenCount tracks the last snapshot baseline. We use a
+        // signed ref-style invariant: setting it to -1 forces re-promote
+        // even when count hasn't changed (used after a symbol overwrite —
+        // the count is unchanged but a frozen entry is stale).
+        if (liveCount == _lastFrozenCount)
             return false;
 
         _frozenBySymbol = _bySymbol.ToFrozenDictionary(StringComparer.OrdinalIgnoreCase);
@@ -91,8 +95,22 @@ public sealed class SymbolRegistry : IFeedEventHandler
                 return;
             }
 
+            // SecurityID reuse: if this securityId was previously mapped to
+            // a different symbol, the old _bySymbol entry would otherwise
+            // linger forever (resolving the old symbol to the now-recycled
+            // securityId — silent corruption). Remove it.
+            if (_byId.TryGetValue(securityId, out var priorSymbol)
+                && !string.Equals(priorSymbol, symbol, StringComparison.OrdinalIgnoreCase))
+            {
+                _bySymbol.TryRemove(new KeyValuePair<string, ulong>(priorSymbol, securityId));
+            }
+
             _bySymbol[symbol] = securityId;
             _byId[securityId] = symbol;
+            // Force the frozen snapshot to refresh on next TryPromote() — count
+            // didn't change but content did, so the frozen layer would otherwise
+            // continue serving the stale mapping.
+            _lastFrozenCount = -1;
         }
     }
 
