@@ -100,6 +100,14 @@ public sealed class SymbolStateRegistry
     private readonly ILogger _logger;
     private readonly IClock _clock;
     private Action<ulong, bool>? _onMboStaleStatusChanged;
+
+    /// <summary>
+    /// Optional observer for forced/authoritative resets. Invoked once per
+    /// accepted reset, after counters update and before the heal completes.
+    /// Args: (securityId, snapshotRptSeq, unsafeDelta, discardedTailDelta).
+    /// Set once during wiring; safe to leave null.
+    /// </summary>
+    private Action<ulong, ulong, long, long>? _onAuthoritativeReset;
     private long _staleSnapshotIgnored;
     private long _staleAuthoritativeReset;
     private long _lastAuthResetUnsafeDelta;
@@ -149,6 +157,15 @@ public sealed class SymbolStateRegistry
     public void SetMboStaleStatusCallback(Action<ulong, bool>? callback)
     {
         _onMboStaleStatusChanged = callback;
+    }
+
+    /// <summary>
+    /// Wires the audit observer for authoritative-reset events. See
+    /// <see cref="_onAuthoritativeReset"/> for the argument tuple.
+    /// </summary>
+    public void SetAuthoritativeResetCallback(Action<ulong, ulong, long, long>? callback)
+    {
+        _onAuthoritativeReset = callback;
     }
 
     /// <summary>Per-symbol state holder. Mutations require holding <see cref="Sync"/>.</summary>
@@ -393,6 +410,9 @@ public sealed class SymbolStateRegistry
         int idx = (int)kind;
         HealResult result;
         bool fireMboHealedCallback = false;
+        bool fireAuthResetCallback = false;
+        long authResetUnsafeDelta = 0;
+        long authResetDiscardedTailDelta = 0;
         lock (entry.Sync)
         {
             var prev = entry.States[idx];
@@ -456,6 +476,10 @@ public sealed class SymbolStateRegistry
                 Interlocked.Add(ref _sumAuthResetDiscardedTailDelta, discardedTailDelta);
                 UpdateMaxIfGreater(ref _maxAuthResetUnsafeDelta, unsafeDelta);
                 UpdateMaxIfGreater(ref _maxAuthResetDiscardedTailDelta, discardedTailDelta);
+
+                fireAuthResetCallback = true;
+                authResetUnsafeDelta = unsafeDelta;
+                authResetDiscardedTailDelta = discardedTailDelta;
 
                 long staleForMs = _clock.NowTicks - entry.StaleSinceTicks[idx];
                 _logger.LogWarning(
@@ -546,6 +570,8 @@ public sealed class SymbolStateRegistry
         // Invoke the (Mbo) healed callback OUTSIDE the per-symbol lock — same
         // discipline as Observe's stale-status callback path.
         if (fireMboHealedCallback) _onMboStaleStatusChanged?.Invoke(securityId, false);
+        if (fireAuthResetCallback)
+            _onAuthoritativeReset?.Invoke(securityId, snapshotRptSeq, authResetUnsafeDelta, authResetDiscardedTailDelta);
 
         return result;
     }

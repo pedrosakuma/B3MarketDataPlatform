@@ -35,6 +35,16 @@ public sealed class WebSocketHost : IAsyncDisposable
     /// <summary>Optional provider for last-packet timestamps per group.</summary>
     public Func<IReadOnlyDictionary<string, long>>? LastPacketTimestampProvider { get; set; }
 
+    /// <summary>
+    /// Optional provider for the recovery audit trail. When set, exposes
+    /// <c>GET /api/recovery/recent?limit=N</c> returning a JSON snapshot
+    /// of the most recent recovery events (newest first).
+    /// </summary>
+    public Func<int, IReadOnlyList<RecoveryEvent>>? RecoveryEventProvider { get; set; }
+
+    /// <summary>Optional accessor for total events recorded since process start (for the audit-trail endpoint).</summary>
+    public Func<long>? RecoveryEventTotalProvider { get; set; }
+
     public WebSocketHost(
         SubscriptionManager subscriptionManager,
         ILogger<WebSocketHost>? logger = null,
@@ -84,6 +94,7 @@ public sealed class WebSocketHost : IAsyncDisposable
         MapHealthEndpoints(_app);
         MapSymbolEndpoints(_app);
         MapInstrumentEndpoint(_app);
+        MapRecoveryEndpoint(_app);
         MapWebSocketEndpoint(_app, ct);
 
         await _app.StartAsync(ct);
@@ -152,6 +163,41 @@ public sealed class WebSocketHost : IAsyncDisposable
             var list = symbols.Take(max).ToArray();
             return Results.Json(new SymbolsResponse { Count = registry.Count, Matched = list.Length, Symbols = list },
                 AppJsonContext.Default.SymbolsResponse);
+        });
+    }
+
+    private void MapRecoveryEndpoint(WebApplication app)
+    {
+        // /api/recovery/recent surfaces the in-memory ring buffer of recent
+        // recovery audit events for ops triage. When no provider is wired
+        // (tests, embedded scenarios) the endpoint returns an empty list
+        // rather than 404 so the contract stays stable.
+        app.MapGet("/api/recovery/recent", (int? limit) =>
+        {
+            var capped = Math.Clamp(limit ?? 50, 1, 1000);
+            var events = RecoveryEventProvider?.Invoke(capped) ?? Array.Empty<RecoveryEvent>();
+            var dto = new RecoveryEventLogResponse
+            {
+                TotalRecorded = RecoveryEventTotalProvider?.Invoke() ?? 0,
+                Returned = events.Count,
+                Events = new RecoveryEventDto[events.Count],
+            };
+            for (int i = 0; i < events.Count; i++)
+            {
+                var e = events[i];
+                dto.Events[i] = new RecoveryEventDto
+                {
+                    TimestampUnixMs = e.TimestampUnixMs,
+                    Kind = (int)e.Kind,
+                    KindName = e.Kind.ToString(),
+                    GroupId = e.GroupId,
+                    SecurityId = e.SecurityId,
+                    SnapshotRptSeq = e.SnapshotRptSeq,
+                    PriorRptSeq = e.PriorRptSeq,
+                    Detail = e.Detail,
+                };
+            }
+            return Results.Json(dto, AppJsonContext.Default.RecoveryEventLogResponse);
         });
     }
 

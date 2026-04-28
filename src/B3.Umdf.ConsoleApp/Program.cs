@@ -357,6 +357,12 @@ Console.WriteLine();
 
 var stats = new Stats();
 
+// Bounded ring buffer of recovery audit-trail events. Capacity sized for
+// recent-incident triage (256 entries, ~24 KB total). Surfaced via
+// /api/recovery/recent and fed by FeedHandler/SymbolStateRegistry/MDM hooks
+// wired below.
+var recoveryEventLog = new RecoveryEventLog(capacity: 256);
+
 // Wire up subscription manager if WebSocket port is specified
 SubscriptionManager? subscriptionManager = null;
 WebSocketHost? wsHost = null;
@@ -399,6 +405,20 @@ foreach (var gid in groupIds)
     {
         StaleEscapeTimeoutMs = settings.StaleEscapeTimeoutMs,
     };
+    // Capture forced/authoritative-reset events into the audit ring. Cheap:
+    // fires only when a stuck-Stale snapshot is accepted (rare, ops-relevant).
+    int gidForCallback = gid;
+    groupRegistry.SetAuthoritativeResetCallback((securityId, snapRptSeq, unsafeDelta, discardedTailDelta) =>
+    {
+        recoveryEventLog.Record(new RecoveryEvent(
+            TimestampUnixMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            Kind: RecoveryEventKind.ForcedHealAccepted,
+            GroupId: gidForCallback,
+            SecurityId: securityId,
+            SnapshotRptSeq: (long)snapRptSeq,
+            PriorRptSeq: null,
+            Detail: $"unsafeDelta={unsafeDelta} discardedTail={discardedTailDelta}"));
+    });
     // Multi-tier dynamic-grow cap ladder + global byte cap come from AppSettings.
     // Defaults: [8k, 64k, 256k, 1M] per-symbol ladder, 512 MB global per group.
     var groupStaleBuffer = new StaleMboBuffer(staleBufferLogger,
@@ -413,7 +433,8 @@ foreach (var gid in groupIds)
         bookHandler = new CompositeBookEventHandler(stats, gh);
         var bm = new BookManager(bookHandler, bmLogger,
             stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
-        mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm);
+        mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm,
+            new RecoveryEventLoggerHandler(recoveryEventLog, gid));
         gh.SetBookManager(bm);
         gh.StartBroadcaster(gid);
         groupHandlers.Add(gh);
@@ -424,7 +445,8 @@ foreach (var gid in groupIds)
         bookHandler = stats;
         var bm = new BookManager(bookHandler, bmLogger,
             stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
-        mdHandler = new CompositeMarketDataEventHandler(stats, bm);
+        mdHandler = new CompositeMarketDataEventHandler(stats, bm,
+            new RecoveryEventLoggerHandler(recoveryEventLog, gid));
         bookManagers.Add(bm);
     }
 
@@ -518,6 +540,11 @@ if (subscriptionManager is not null)
         wsHost.FeedStateProvider = () => new Dictionary<string, string> { ["G0"] = sf.State.ToString() };
         wsHost.LastPacketTimestampProvider = () => new Dictionary<string, long> { ["G0"] = sf.LastPacketTicks };
     }
+
+    // Recovery audit-trail surface — newest-first snapshot of the in-memory
+    // ring buffer. Capped per-call (default 50, max 1000) by the endpoint.
+    wsHost.RecoveryEventProvider = max => recoveryEventLog.Snapshot(max);
+    wsHost.RecoveryEventTotalProvider = () => recoveryEventLog.TotalRecorded;
 
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
 }
@@ -738,5 +765,35 @@ sealed class Stats : IBookEventHandler, IMarketDataEventHandler
     {
         EpochResetCount++;
         LastEpochResetReason = reason;
+    }
+}
+
+/// <summary>
+/// IMarketDataEventHandler that records OnInstrumentReplaced events into
+/// the process-wide <see cref="RecoveryEventLog"/>. Allocation per event
+/// is one boxed string + one Record struct — only fires on identity-change
+/// arrivals which are expected to be ~zero in normal sessions.
+/// </summary>
+sealed class RecoveryEventLoggerHandler : IMarketDataEventHandler
+{
+    private readonly RecoveryEventLog _log;
+    private readonly int _groupId;
+
+    public RecoveryEventLoggerHandler(RecoveryEventLog log, int groupId)
+    {
+        _log = log;
+        _groupId = groupId;
+    }
+
+    public void OnInstrumentReplaced(ulong securityId, string? oldSymbol, string newSymbol)
+    {
+        _log.Record(new RecoveryEvent(
+            TimestampUnixMs: DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            Kind: RecoveryEventKind.InstrumentReplaced,
+            GroupId: _groupId,
+            SecurityId: securityId,
+            SnapshotRptSeq: null,
+            PriorRptSeq: null,
+            Detail: $"{oldSymbol ?? "<null>"}→{newSymbol}"));
     }
 }

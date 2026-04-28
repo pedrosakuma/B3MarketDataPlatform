@@ -89,11 +89,35 @@ public sealed class InstrAttribResponse
     public int Value { get; set; }
 }
 
+/// <summary>Single recovery audit-trail entry surfaced by /api/recovery/recent.</summary>
+public sealed class RecoveryEventDto
+{
+    public long TimestampUnixMs { get; set; }
+    public int Kind { get; set; }
+    public string KindName { get; set; } = "";
+    public int GroupId { get; set; }
+    public ulong? SecurityId { get; set; }
+    public long? SnapshotRptSeq { get; set; }
+    public long? PriorRptSeq { get; set; }
+    public string? Detail { get; set; }
+}
+
+public sealed class RecoveryEventLogResponse
+{
+    /// <summary>Total events recorded since process start (may exceed the ring capacity).</summary>
+    public long TotalRecorded { get; set; }
+    /// <summary>Number of events returned in this response (newest first, &lt;= limit).</summary>
+    public int Returned { get; set; }
+    public RecoveryEventDto[] Events { get; set; } = Array.Empty<RecoveryEventDto>();
+}
+
 [JsonSerializable(typeof(HealthResponse))]
 [JsonSerializable(typeof(SymbolsResponse))]
 [JsonSerializable(typeof(InstrumentInfoResponse))]
 [JsonSerializable(typeof(UnderlyingResponse))]
 [JsonSerializable(typeof(LegResponse))]
 [JsonSerializable(typeof(InstrAttribResponse))]
+[JsonSerializable(typeof(RecoveryEventLogResponse))]
+[JsonSerializable(typeof(RecoveryEventDto))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public partial class AppJsonContext : JsonSerializerContext;
