@@ -427,3 +427,51 @@ P11 closes the 5x-replay allocation hotspots cleanly. Next candidates
 list above, but their absolute weight at REPLAY_SPEED=5 is now small
 enough that GC pressure is no longer the system's bottleneck — CPU
 spent in SBE parse + book mutation is the natural successor focus.
+
+---
+
+## P11 validation — CPU profile (post-fix)
+
+**Date:** 2026-04-28. Capture: 600 s `dotnet-trace` with the
+`dotnet-sampled-thread-time` profile (cross-platform CPU sampling that
+attributes time to ALL threads, including blocked waiters), at the same
+5x replay load (75k events/s, 18 402 books).
+
+Trace: `profiles/p11-cpu.nettrace` (38.8 MB, 3.7 M samples / 510 s).
+
+### Top sample categories
+
+| Category                                                       | %      | Notes |
+|----------------------------------------------------------------|--------|-------|
+| `Monitor.Wait` + `LifoSemaphore.WaitForSignal` + `WaitOne`     | 65.6   | Idle waiter threads (thread pool, sessions, conflation, etc.) |
+| `Thread.PollGCWorker`                                          | 15.3   | Safe-point poll — became prominent because GC pressure vanished |
+| `?!?` (unresolved native) + `Interop+Sys.Read` + `Thread.Sleep`| 18.0   | Syscalls / file watcher / replayer pacing |
+| `TimestampMergedReplayer.TryReceive`                           | 0.73   | PCAP replay busy-spin (already known from P10-3) |
+| `MultiFeedManager.RunSyncDispatch`                             | 0.12   | Per-group dispatch loop |
+| **All `B3.Umdf.*` hot path methods combined**                  | **<1.5** | Sum across HandleOrder, HandleDeleteOrder, RouteMbo, BookSide, etc. |
+
+### Top productive methods (absolute samples, post-P11)
+
+| Samples | Method |
+|---------|--------|
+| 508     | `BookManager.HandleDeleteOrder` |
+| 283     | `BookSide.AddToPriceLevels` |
+| 213     | `BookManager.HandleOrder` |
+| 190     | `BookManager.OnMarketDataUpdated` |
+| 177     | `BookSide.BestPrice` |
+| 127     | `BookManager.RouteMbo` |
+| 92      | `MarketDataManager.HandleSecurityGroupPhase` |
+| **29**  | `MarketDataManager.HandleSecurityDefinition` ← virtually gone (P11-2 effect) |
+
+### Verdict
+
+**There is no actionable CPU target.** The system spends ~85 % of
+thread-time in idle waits / syscalls / PollGC, and **less than 1.5 %**
+in the consumer's hot path. Docker reports ~2 cores total, well within
+the 2 vCPU container limit. Allocation pressure was genuinely the only
+bottleneck and P11 closed it.
+
+For substantially higher throughput than 75 k events/s the next levers
+would be structural rather than micro-optimization (consolidate dispatch
+threads, switch to a lock-free MPSC ring per channel pair, etc.). Until
+the production load demands that, P11 is the natural stopping point.
