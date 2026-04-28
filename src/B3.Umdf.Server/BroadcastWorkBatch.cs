@@ -15,12 +15,30 @@ namespace B3.Umdf.Server;
 /// </summary>
 internal sealed class BroadcastWorkBatch
 {
+    /// <summary>
+    /// Discriminator for routing events on the broadcaster thread.
+    /// </summary>
+    public enum EventKind : byte
+    {
+        /// <summary>Default: route to subscribers of <see cref="EventRecord.SecId"/>
+        /// that have <c>DataFlags.Book</c>. Existing book/trade/info path.</summary>
+        BookSubscribers = 0,
+        /// <summary>News scoped to <see cref="EventRecord.SecId"/>: route to
+        /// subscribers of that securityId that have <c>DataFlags.News</c>.</summary>
+        NewsForSecurity = 1,
+        /// <summary>Global news (<see cref="EventRecord.SecId"/> = 0): route to
+        /// every connected client with <c>DataFlags.News</c>, regardless of
+        /// per-symbol subscriptions.</summary>
+        NewsGlobal = 2,
+    }
+
     public struct EventRecord
     {
         public ulong SecId;
         public int Offset;
         public int Len;
         public int LogicalCount;
+        public EventKind Kind;
     }
 
     public byte[] Buffer = new byte[4096];
@@ -38,6 +56,9 @@ internal sealed class BroadcastWorkBatch
     }
 
     public void Append(ulong secId, ReadOnlySpan<byte> bytes, int logicalCount)
+        => Append(secId, bytes, logicalCount, EventKind.BookSubscribers);
+
+    public void Append(ulong secId, ReadOnlySpan<byte> bytes, int logicalCount, EventKind kind)
     {
         if (bytes.Length == 0) return;
         int newLen = BufferLen + bytes.Length;
@@ -58,6 +79,7 @@ internal sealed class BroadcastWorkBatch
             Offset = BufferLen,
             Len = bytes.Length,
             LogicalCount = logicalCount,
+            Kind = kind,
         };
         BufferLen = newLen;
     }

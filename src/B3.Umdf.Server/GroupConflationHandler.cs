@@ -345,6 +345,118 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     }
 
     /// <summary>
+    /// P13: handle a fully-reassembled News_5 delivery from MarketDataManager.
+    /// Runs on the dispatch (feed) thread; spans are valid only for the call.
+    /// We synchronously serialize NewsBegin + NewsChunk(s) + NewsEnd wire frames
+    /// into the current batch buffer (rented byte storage), and tag each frame
+    /// with the routing kind so the broadcaster thread can fan out to the
+    /// right subscriber set without re-touching the source spans.
+    ///
+    /// <para>Routing:</para>
+    /// <list type="bullet">
+    ///   <item><description><c>securityId != 0</c>: only clients subscribed to
+    ///   that securityId AND with <see cref="DataFlags.News"/>.</description></item>
+    ///   <item><description><c>securityId == 0</c> (global): every connected
+    ///   client with <see cref="DataFlags.News"/>, regardless of per-symbol
+    ///   subscriptions.</description></item>
+    /// </list>
+    ///
+    /// <para>Recovery suppression intentionally does NOT apply to news — news
+    /// is independent of book consistency.</para>
+    /// </summary>
+    public void OnNews(
+        ulong securityIdOrZero,
+        ulong newsId,
+        byte source,
+        ushort language,
+        long origTimeNanos,
+        ReadOnlySpan<byte> headline,
+        ReadOnlySpan<byte> text,
+        ReadOnlySpan<byte> url)
+    {
+        bool isGlobal = securityIdOrZero == 0;
+
+        // Skip serialization entirely if no candidate subscriber exists.
+        if (isGlobal)
+        {
+            if (!_parent.HasAnyNewsSubscriberAnywhere()) return;
+        }
+        else
+        {
+            if (!_parent.HasAnyNewsSubscriberFor(securityIdOrZero)) return;
+        }
+
+        var kind = isGlobal
+            ? BroadcastWorkBatch.EventKind.NewsGlobal
+            : BroadcastWorkBatch.EventKind.NewsForSecurity;
+
+        _currentBatch ??= BroadcastWorkBatch.Rent();
+        _eventsReceived++;
+
+        // 1. NewsBegin
+        Span<byte> beginBuf = stackalloc byte[WireProtocol.NewsBeginTotalSize];
+        int beginLen = WireProtocol.WriteNewsBegin(
+            beginBuf, securityIdOrZero, newsId, source, language, origTimeNanos,
+            (uint)headline.Length, (uint)text.Length, (uint)url.Length);
+        _currentBatch.Append(securityIdOrZero, beginBuf[..beginLen], logicalCount: 1, kind);
+
+        // 2. Per-field chunks
+        AppendNewsField(newsId, WireProtocol.NewsField.Headline, headline, kind, securityIdOrZero, isLastField: false);
+        AppendNewsField(newsId, WireProtocol.NewsField.Text, text, kind, securityIdOrZero, isLastField: false);
+        AppendNewsField(newsId, WireProtocol.NewsField.Url, url, kind, securityIdOrZero, isLastField: true);
+    }
+
+    private void AppendNewsField(
+        ulong newsId,
+        WireProtocol.NewsField field,
+        ReadOnlySpan<byte> data,
+        BroadcastWorkBatch.EventKind kind,
+        ulong secIdRoute,
+        bool isLastField)
+    {
+        const int maxFrag = WireProtocol.NewsChunkMaxFragment;
+        const int stackThreshold = 4096;
+        int offset = 0;
+
+        if (data.Length == 0)
+        {
+            int frameSize = WireProtocol.NewsChunkTotalSize(0);
+            Span<byte> frame = stackalloc byte[frameSize];
+            int len = WireProtocol.WriteNewsChunk(frame, newsId, field, ReadOnlySpan<byte>.Empty,
+                isFinal: isLastField);
+            _currentBatch!.Append(secIdRoute, frame[..len], logicalCount: 1, kind);
+            return;
+        }
+
+        Span<byte> stackFrame = stackalloc byte[stackThreshold];
+        while (offset < data.Length)
+        {
+            int take = Math.Min(maxFrag, data.Length - offset);
+            int frameSize = WireProtocol.NewsChunkTotalSize(take);
+            bool last = isLastField && (offset + take == data.Length);
+            if (frameSize <= stackThreshold)
+            {
+                int len = WireProtocol.WriteNewsChunk(stackFrame, newsId, field, data.Slice(offset, take), last);
+                _currentBatch!.Append(secIdRoute, stackFrame[..len], logicalCount: 1, kind);
+            }
+            else
+            {
+                byte[] rented = ArrayPool<byte>.Shared.Rent(frameSize);
+                try
+                {
+                    int len = WireProtocol.WriteNewsChunk(rented.AsSpan(), newsId, field, data.Slice(offset, take), last);
+                    _currentBatch!.Append(secIdRoute, rented.AsSpan(0, len), logicalCount: 1, kind);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
+            }
+            offset += take;
+        }
+    }
+
+    /// <summary>
     /// Called after each packet is fully processed on the owning group's thread.
     /// Drains pending requests, flushes conflation buffers into the current broadcast
     /// batch, then publishes the batch to the broadcaster thread.
@@ -871,9 +983,95 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         {
             ref var ev = ref batch.Events[i];
             var bytes = batch.Buffer.AsSpan(ev.Offset, ev.Len);
-            AppendForBookSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+            switch (ev.Kind)
+            {
+                case BroadcastWorkBatch.EventKind.BookSubscribers:
+                    AppendForBookSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    break;
+                case BroadcastWorkBatch.EventKind.NewsForSecurity:
+                    AppendForNewsSubscribers(ev.SecId, bytes, ev.LogicalCount);
+                    break;
+                case BroadcastWorkBatch.EventKind.NewsGlobal:
+                    AppendForGlobalNewsSubscribers(bytes, ev.LogicalCount);
+                    break;
+            }
         }
         FlushClientBatches();
+    }
+
+    /// <summary>Per-symbol news fan-out: clients subscribed to <paramref name="securityId"/>
+    /// who have <see cref="DataFlags.News"/> set. Mirrors
+    /// <see cref="AppendForBookSubscribers"/> but skips the broadcast-sequence gating
+    /// (news is independent of book-snapshot epochs).</summary>
+    private void AppendForNewsSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+        foreach (var (clientId, state) in subs)
+        {
+            if (!state.WantsNews) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+            AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    /// <summary>Global news fan-out: every connected client whose state on any
+    /// security has <see cref="DataFlags.News"/> set. Each client receives the
+    /// frame at most once even if subscribed to many securities.</summary>
+    private void AppendForGlobalNewsSubscribers(ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        if (bytes.Length == 0) return;
+        foreach (var (_, session) in _parent.EnumerateAllClients())
+        {
+            if (!session.HasAnyNewsSubscription) continue;
+            AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    /// <summary>Shared accumulator append used by per-symbol and global news fan-out.
+    /// Extracted so the buffer-grow / flush-on-cap policy stays consistent with
+    /// <see cref="AppendForBookSubscribers"/>.</summary>
+    private void AppendToClient(ClientSession session, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        ref var acc = ref CollectionsMarshal.GetValueRefOrAddDefault(_clientBatches, session, out bool exists);
+        if (!exists)
+        {
+            acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024));
+            acc.Offset = 0;
+            acc.LogicalCount = 0;
+        }
+        if (acc.Offset + bytes.Length > acc.Buffer.Length)
+        {
+            int desired = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
+            if (desired <= MaxAccumulatorBytes)
+            {
+                var newBuf = ArrayPool<byte>.Shared.Rent(desired);
+                acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
+                ArrayPool<byte>.Shared.Return(acc.Buffer);
+                acc.Buffer = newBuf;
+            }
+            else
+            {
+                if (acc.Offset > 0)
+                {
+                    session.TryEnqueueBatch(
+                        new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset),
+                        acc.LogicalCount,
+                        pooledArray: acc.Buffer);
+                }
+                else
+                {
+                    ArrayPool<byte>.Shared.Return(acc.Buffer);
+                }
+                acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length, 1024));
+                acc.Offset = 0;
+                acc.LogicalCount = 0;
+            }
+        }
+        bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
+        acc.Offset += bytes.Length;
+        acc.LogicalCount += logicalCount;
     }
 
     // Hard cap on per-client per-batch accumulator size. Beyond this, the partial
@@ -892,48 +1090,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             if (!state.WantsBookBatch(batchSequence)) continue;
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
-
-            ref var acc = ref CollectionsMarshal.GetValueRefOrAddDefault(_clientBatches, session, out bool exists);
-            if (!exists)
-            {
-                acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024));
-                acc.Offset = 0;
-                acc.LogicalCount = 0;
-            }
-            if (acc.Offset + bytes.Length > acc.Buffer.Length)
-            {
-                int desired = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
-                if (desired <= MaxAccumulatorBytes)
-                {
-                    var newBuf = ArrayPool<byte>.Shared.Rent(desired);
-                    acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
-                    ArrayPool<byte>.Shared.Return(acc.Buffer);
-                    acc.Buffer = newBuf;
-                }
-                else
-                {
-                    // Cap reached: flush what we already have to the client and
-                    // start a fresh accumulator for the current event.
-                    if (acc.Offset > 0)
-                    {
-                        session.TryEnqueueBatch(
-                            new ReadOnlyMemory<byte>(acc.Buffer, 0, acc.Offset),
-                            acc.LogicalCount,
-                            pooledArray: acc.Buffer);
-                    }
-                    else
-                    {
-                        ArrayPool<byte>.Shared.Return(acc.Buffer);
-                    }
-                    int initial = Math.Max(bytes.Length * 2, 1024);
-                    acc.Buffer = ArrayPool<byte>.Shared.Rent(initial);
-                    acc.Offset = 0;
-                    acc.LogicalCount = 0;
-                }
-            }
-            bytes.CopyTo(acc.Buffer.AsSpan(acc.Offset));
-            acc.Offset += bytes.Length;
-            acc.LogicalCount += logicalCount;
+            AppendToClient(session, bytes, logicalCount);
         }
     }
 

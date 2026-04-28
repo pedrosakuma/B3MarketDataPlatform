@@ -14,4 +14,26 @@ public interface IMarketDataEventHandler
     /// epoch reset: clear book, drop stale buffers, reset registry baselines.
     /// </summary>
     void OnInstrumentReplaced(ulong securityId, string? oldSymbol, string newSymbol) { }
+
+    /// <summary>
+    /// Fired once per fully-reassembled <c>News_5</c> delivery (P13). The
+    /// <paramref name="securityIdOrZero"/> is 0 for global market-wide news
+    /// and non-zero for instrument-scoped news.
+    /// <para>
+    /// CONTRACT: <paramref name="headline"/>, <paramref name="text"/> and
+    /// <paramref name="url"/> spans are valid ONLY for the duration of this
+    /// call. Implementations MUST consume them synchronously (copy or write to
+    /// the wire) before returning. Backing buffers are returned to
+    /// <c>ArrayPool</c> immediately after this method returns.
+    /// </para>
+    /// </summary>
+    void OnNews(
+        ulong securityIdOrZero,
+        ulong newsId,
+        byte source,
+        ushort language,
+        long origTimeNanos,
+        ReadOnlySpan<byte> headline,
+        ReadOnlySpan<byte> text,
+        ReadOnlySpan<byte> url) { }
 }

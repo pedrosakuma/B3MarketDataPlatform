@@ -38,9 +38,15 @@ straight from the B3 SBE XML schema.
   there is no Recovery state to enter (see RESILIENCE.md §4). Cold-start
   fanout suppression and a mass-stale fanout gate remain as residual
   defenses for analogous failure modes.
-- **WebSocket subscription server** — compact binary protocol with `Book`
-  and `Info` channels, unary `Get`, candle history (10 h of 1 s candles),
-  and 2 s rankings broadcast.
+- **WebSocket subscription server** — compact binary protocol with `Book`,
+  `Info`, and `News` channels (opt-in), unary `Get`, candle history (10 h of
+  1 s candles), and 2 s rankings broadcast.
+- **News pipeline (`News_5`)** — multi-part SBE reassembly with strict per-part
+  validation, 5 s TTL, 16 MiB inflight cap, and zero-copy span delivery.
+  Fragmented over the wire as `NewsBegin`/`NewsChunk`/`NewsEnd` so payloads
+  larger than the `u16` framing length still flow through the same client
+  pipeline. (Note: zero `News_5` occurrences observed in 8 sample PCAPs;
+  pipeline is verified via synthetic fixtures.)
 - **Layered backpressure** — bounded per-client outbound ring, hard
   pending-bytes cap with disconnect, outlier sweep, fanout suppression
   during recovery; clients can never impair feed consumption.
@@ -132,12 +138,12 @@ straight from the B3 SBE XML schema.
 
 | Project | Tests | Description |
 |---------|-------|-------------|
-| `B3.Umdf.Book.Tests` | 108 | Order book operations, book side, snapshot apply, symbol-state registry, stale buffer, candle aggregator, concurrency stress |
-| `B3.Umdf.Feed.Tests` | 20 | Feed handler, gap detection, A/B dedup, MultiFeedManager dispatch |
+| `B3.Umdf.Book.Tests` | 193 | Order book ops, snapshot apply, per-symbol registry, stale buffer (drop-oldest + protected floor), forced-heal escape, SecurityID reuse, candle aggregator, news reassembler, concurrency stress |
+| `B3.Umdf.Feed.Tests` | 51 | Feed handler, gap detection, A/B dedup, channel-handler reorder buffer (256 packets), MultiFeedManager dispatch |
 | `B3.Umdf.PcapReplay.Tests` | 18 | PCAP reader, UDP/VLAN/SLL extraction, timestamp-merge ordering |
-| `B3.Umdf.Transport.Tests` | 14 | Packet source, multicast config, batch receive |
-| `B3.Umdf.Server.Tests` | 57 | Subscription manager, snapshot emitter, outlier sweep, conflation, client session, settings, backpressure |
-| `B3.Umdf.ConsoleApp.Tests` | 29 | CLI option parsing, env-var precedence, multicast config validation |
+| `B3.Umdf.Transport.Tests` | 16 | Packet source, multicast config, batch receive (`recvmmsg`) |
+| `B3.Umdf.Server.Tests` | 103 | Subscription manager, snapshot emitter, outlier sweep, conflation, epoch reset, trade bust, news fan-out, wire protocol, client session, backpressure |
+| `B3.Umdf.ConsoleApp.Tests` | 30 | CLI option parsing, env-var precedence, multicast config validation |
 
 ```bash
 dotnet build

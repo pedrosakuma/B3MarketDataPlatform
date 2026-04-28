@@ -137,6 +137,10 @@ pooled or reused buffers:
   add/delete frames are ~40 bytes).
 - **Conflation `Dictionary`s** (`_orderBuffer`, `_clearBuffer`,
   `_tradeBuffer`) reused across packets — only `.Clear()` between flushes.
+- **No closure capture on the hot MBO route.** `RouteMbo` was rewritten
+  in P11 to take an explicit `(BookManager bm, in MboMessage msg)` instead
+  of capturing locals into a delegate; this removed a per-message display-class
+  allocation that dominated MBO-heavy bursts.
 
 ## 9. Lock-free subscription reads
 

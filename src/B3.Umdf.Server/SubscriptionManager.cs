@@ -257,7 +257,38 @@ public sealed class SubscriptionManager : IDisposable
         _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
 
     /// <summary>
-    /// Lock-free quick check used by the dispatch thread to skip buffering wire bytes
+    /// Lock-free quick check used by the dispatch thread to skip serializing
+    /// instrument-scoped news bytes for securities with no News-flag subscriber.
+    /// </summary>
+    internal bool HasAnyNewsSubscriberFor(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        foreach (var (_, state) in clients)
+            if (state.WantsNews) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Lock-free check: any connected client has the News flag on at least one
+    /// subscription? Used to skip serializing global news entirely when no one
+    /// is listening. Iterates all subscription buckets — cheap when most
+    /// clients use News (early-return) and bounded by symbol count otherwise.
+    /// </summary>
+    internal bool HasAnyNewsSubscriberAnywhere()
+    {
+        foreach (var kv in _subscriptions)
+        {
+            foreach (var (_, state) in kv.Value)
+                if (state.WantsNews) return true;
+        }
+        return false;
+    }
+
+    /// <summary>Enumerate all currently connected clients (broadcaster thread use).
+    /// Returns the live ConcurrentDictionary view; safe to enumerate under concurrent mutation.</summary>
+    internal IEnumerable<KeyValuePair<string, ClientSession>> EnumerateAllClients() => _clients;
+
+    /// <summary>Lock-free quick check used by the dispatch thread to skip buffering wire bytes
     /// for securities that have no Book-flag subscriber. Returns true if at least one
     /// current subscriber has <see cref="DataFlags.Book"/> set.
     /// </summary>
@@ -497,6 +528,11 @@ public sealed class SubscriptionManager : IDisposable
 
             session.AddSubscription(securityId);
 
+            bool wantsNews = (flags & DataFlags.News) != 0;
+            bool hadNews = hadPrevious && previous.WantsNews;
+            if (wantsNews && !hadNews) session.IncrementNewsSubscriptions();
+            else if (!wantsNews && hadNews) session.DecrementNewsSubscriptions();
+
             // Copy-on-write: create new inner dict to avoid mutating a dict being iterated.
             var newClients = existing is not null ? new Dictionary<string, SubscriptionState>(existing) : new();
             newClients[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
@@ -506,7 +542,9 @@ public sealed class SubscriptionManager : IDisposable
                 hadPrevious,
                 previous,
                 AddedInfoSubscription: wantsInfo && !hadInfo,
-                RemovedInfoSubscription: !wantsInfo && hadInfo);
+                RemovedInfoSubscription: !wantsInfo && hadInfo,
+                AddedNewsSubscription: wantsNews && !hadNews,
+                RemovedNewsSubscription: !wantsNews && hadNews);
         }
 
         return true;
@@ -517,7 +555,9 @@ public sealed class SubscriptionManager : IDisposable
         bool HadPrevious,
         SubscriptionState PreviousState,
         bool AddedInfoSubscription,
-        bool RemovedInfoSubscription);
+        bool RemovedInfoSubscription,
+        bool AddedNewsSubscription,
+        bool RemovedNewsSubscription);
 
     private void RollbackSubscriptionActivation(
         ClientSession session,
@@ -546,6 +586,10 @@ public sealed class SubscriptionManager : IDisposable
             session.RemoveInfoSubscription(securityId);
         else if (activation.RemovedInfoSubscription)
             session.AddInfoSubscription(securityId);
+
+        // Mirror the news-counter delta applied during activation.
+        if (activation.AddedNewsSubscription) session.DecrementNewsSubscriptions();
+        else if (activation.RemovedNewsSubscription) session.IncrementNewsSubscriptions();
     }
 
     private void UpdateBookCutoffIfSubscribed(string clientId, ulong securityId, long bookBatchCutoffSequence)
@@ -573,11 +617,13 @@ public sealed class SubscriptionManager : IDisposable
         // Copy-on-write
         if (_subscriptions.TryGetValue(securityId, out var existing))
         {
+            bool removedHadNews = existing.TryGetValue(clientId, out var prev) && prev.WantsNews;
             var newClients = new Dictionary<string, SubscriptionState>(existing);
             if (newClients.Remove(clientId))
             {
                 if (adjustMetric)
                     MetricsRegistry.WsSubscriptions.Add(-1);
+                if (removedHadNews) session.DecrementNewsSubscriptions();
                 if (newClients.Count == 0)
                     _subscriptions.TryRemove(securityId, out _);
                 else
@@ -601,8 +647,10 @@ public sealed class SubscriptionManager : IDisposable
 
         foreach (var (secId, clients) in _subscriptions)
         {
-            if (!clients.ContainsKey(clientId)) continue;
+            if (!clients.TryGetValue(clientId, out var prev)) continue;
             removedSubscriptions++;
+            if (prev.WantsNews && _clients.TryGetValue(clientId, out var s))
+                s.DecrementNewsSubscriptions();
 
             if (clients.Count == 1)
             {

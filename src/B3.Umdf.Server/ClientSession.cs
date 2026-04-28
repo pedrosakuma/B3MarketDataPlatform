@@ -99,6 +99,24 @@ public sealed class ClientSession : IDisposable
 
     public bool IsSubscribed(ulong securityId) => _subscriptions.Contains(securityId);
 
+    private int _newsSubscriptionCount;
+
+    /// <summary>Fast lock-free check used by the global-news fan-out path to skip
+    /// clients with zero News-flag subscriptions. Tracked by ref-counting in
+    /// <see cref="SubscriptionManager"/> on every subscribe/unsubscribe transition
+    /// where the <see cref="DataFlags.News"/> bit changes for this session.</summary>
+    public bool HasAnyNewsSubscription => Volatile.Read(ref _newsSubscriptionCount) > 0;
+
+    internal void IncrementNewsSubscriptions() => Interlocked.Increment(ref _newsSubscriptionCount);
+
+    internal void DecrementNewsSubscriptions()
+    {
+        // Defensive: never let the counter go negative; one missed delta would otherwise
+        // permanently disable global-news fan-out for this session.
+        int updated = Interlocked.Decrement(ref _newsSubscriptionCount);
+        if (updated < 0) Interlocked.Exchange(ref _newsSubscriptionCount, 0);
+    }
+
     /// <summary>Add a subscription. Called on the feed thread.</summary>
     public void AddSubscription(ulong securityId) => _subscriptions.Add(securityId);
 

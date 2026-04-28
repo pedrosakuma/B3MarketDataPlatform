@@ -56,6 +56,23 @@ public enum MessageType : ushort
     /// that message targets per-row dimming for subscribed symbols, this one drives the
     /// global "Recovering N/M symbols" banner.</summary>
     RecoveryProgress = 0x0080,
+
+    /// <summary>Server → Client: start of a News delivery (template SBE 5).
+    /// Carries the metadata header (securityId, newsId, source, lang, origTime,
+    /// total lengths) but NOT the variable-length text payloads — those follow
+    /// as zero or more <see cref="NewsChunk"/> messages and a final
+    /// <see cref="NewsEnd"/>. Fragmentation is required because the framing
+    /// header uses u16 length (max ~65 KB) but a reassembled News may exceed
+    /// that. All News fragments for a given delivery share the same newsId.</summary>
+    NewsBegin = 0x0090,
+    /// <summary>Server → Client: a single payload fragment for an in-flight News
+    /// delivery. Carries newsId + field discriminator (0=Headline,1=Text,2=URL)
+    /// + bytes. Up to 60 KB per fragment.</summary>
+    NewsChunk = 0x0091,
+    /// <summary>Server → Client: explicit terminator for a News delivery.
+    /// Lets clients release per-news buffers and surface the assembled news to
+    /// the UI exactly once.</summary>
+    NewsEnd = 0x0092,
 }
 
 public enum SubscribeErrorCode : byte
@@ -76,7 +93,15 @@ public enum DataFlags : byte
     Book = 0x01,
     /// <summary>InfoSnapshot + incremental market data / security status updates.</summary>
     Info = 0x02,
+    /// <summary>News deliveries (NewsBegin/Chunk/End). Opt-in: clients without this
+    /// bit receive no news, even for symbols they're subscribed to. Both
+    /// instrument-scoped and global news flow through this flag.</summary>
+    News = 0x04,
+    /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
+    /// does NOT include News.</summary>
     All = Book | Info,
+    /// <summary>Convenience alias for "every data class": Book + Info + News.</summary>
+    Everything = Book | Info | News,
 }
 
 /// <summary>
@@ -509,6 +534,147 @@ public static class WireProtocol
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Volume); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], c.Avg); offset += 8;
         return offset;
+    }
+
+    // --- News (fragmented, version=1) ---
+
+    /// <summary>Current wire version for News frames. Increment on schema changes
+    /// so old clients can detect and reject (or upgrade) frames they don't grok.</summary>
+    public const byte NewsFrameVersion = 1;
+
+    /// <summary>Field discriminator carried in each <see cref="MessageType.NewsChunk"/>
+    /// to tell the client which logical buffer (Headline / Text / URL) the bytes belong to.</summary>
+    public enum NewsField : byte
+    {
+        Headline = 0,
+        Text = 1,
+        Url = 2,
+    }
+
+    /// <summary>Fixed payload size of a NewsBegin (after framing header).
+    /// 1 (version) + 8 (securityId) + 8 (newsId) + 1 (source) + 2 (lang) + 8 (origTime)
+    /// + 4 (totalHeadlineLen) + 4 (totalTextLen) + 4 (totalUrlLen) = 40 bytes.</summary>
+    public const int NewsBeginPayloadSize = 1 + 8 + 8 + 1 + 2 + 8 + 4 + 4 + 4;
+
+    /// <summary>Total wire size of a NewsBegin (framing + payload).</summary>
+    public const int NewsBeginTotalSize = FramingHeaderSize + NewsBeginPayloadSize;
+
+    /// <summary>Maximum bytes allowed in a single NewsChunk fragment payload.
+    /// Sized to leave comfortable headroom under the u16 framing length cap
+    /// (max ~65 KB) after accounting for chunk header.</summary>
+    public const int NewsChunkMaxFragment = 60 * 1024;
+
+    /// <summary>Header overhead of a NewsChunk/NewsEnd payload (after framing).
+    /// 1 (version) + 8 (newsId) + 1 (field) + 2 (fragmentLen) = 12 bytes.</summary>
+    public const int NewsChunkHeaderSize = 1 + 8 + 1 + 2;
+
+    /// <summary>Total wire size for a NewsChunk/NewsEnd carrying <paramref name="fragmentLen"/> payload bytes.</summary>
+    public static int NewsChunkTotalSize(int fragmentLen) => FramingHeaderSize + NewsChunkHeaderSize + fragmentLen;
+
+    /// <summary>
+    /// Write a NewsBegin frame. <paramref name="securityIdOrZero"/> = 0 means global news.
+    /// Total length: <see cref="NewsBeginTotalSize"/>. Returns bytes written.
+    /// </summary>
+    public static int WriteNewsBegin(
+        Span<byte> dest,
+        ulong securityIdOrZero,
+        ulong newsId,
+        byte source,
+        ushort language,
+        long origTimeNanos,
+        uint totalHeadlineLen,
+        uint totalTextLen,
+        uint totalUrlLen)
+    {
+        const ushort totalLen = (ushort)NewsBeginTotalSize;
+        WriteFramingHeader(dest, totalLen, MessageType.NewsBegin);
+        int o = FramingHeaderSize;
+        dest[o++] = NewsFrameVersion;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[o..], securityIdOrZero); o += 8;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[o..], newsId); o += 8;
+        dest[o++] = source;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[o..], language); o += 2;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[o..], origTimeNanos); o += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], totalHeadlineLen); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], totalTextLen); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], totalUrlLen); o += 4;
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Write a NewsChunk (intermediate fragment) or NewsEnd (final fragment).
+    /// <paramref name="fragment"/> length must be ≤ <see cref="NewsChunkMaxFragment"/>.
+    /// Use <paramref name="isFinal"/>=true to emit the terminator.
+    /// Returns total bytes written.
+    /// </summary>
+    public static int WriteNewsChunk(
+        Span<byte> dest,
+        ulong newsId,
+        NewsField field,
+        ReadOnlySpan<byte> fragment,
+        bool isFinal)
+    {
+        if (fragment.Length > NewsChunkMaxFragment)
+            throw new ArgumentOutOfRangeException(nameof(fragment), $"News fragment exceeds {NewsChunkMaxFragment} bytes");
+        ushort totalLen = (ushort)(FramingHeaderSize + NewsChunkHeaderSize + fragment.Length);
+        WriteFramingHeader(dest, totalLen, isFinal ? MessageType.NewsEnd : MessageType.NewsChunk);
+        int o = FramingHeaderSize;
+        dest[o++] = NewsFrameVersion;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[o..], newsId); o += 8;
+        dest[o++] = (byte)field;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[o..], (ushort)fragment.Length); o += 2;
+        fragment.CopyTo(dest[o..]);
+        return totalLen;
+    }
+
+    /// <summary>Parse a NewsBegin payload (the bytes after the 4-byte framing header).</summary>
+    public static bool TryReadNewsBegin(
+        ReadOnlySpan<byte> payload,
+        out byte version,
+        out ulong securityIdOrZero,
+        out ulong newsId,
+        out byte source,
+        out ushort language,
+        out long origTimeNanos,
+        out uint totalHeadlineLen,
+        out uint totalTextLen,
+        out uint totalUrlLen)
+    {
+        version = 0; securityIdOrZero = 0; newsId = 0; source = 0; language = 0;
+        origTimeNanos = 0; totalHeadlineLen = 0; totalTextLen = 0; totalUrlLen = 0;
+        if (payload.Length < NewsBeginPayloadSize) return false;
+        int o = 0;
+        version = payload[o++];
+        securityIdOrZero = BinaryPrimitives.ReadUInt64LittleEndian(payload[o..]); o += 8;
+        newsId = BinaryPrimitives.ReadUInt64LittleEndian(payload[o..]); o += 8;
+        source = payload[o++];
+        language = BinaryPrimitives.ReadUInt16LittleEndian(payload[o..]); o += 2;
+        origTimeNanos = BinaryPrimitives.ReadInt64LittleEndian(payload[o..]); o += 8;
+        totalHeadlineLen = BinaryPrimitives.ReadUInt32LittleEndian(payload[o..]); o += 4;
+        totalTextLen = BinaryPrimitives.ReadUInt32LittleEndian(payload[o..]); o += 4;
+        totalUrlLen = BinaryPrimitives.ReadUInt32LittleEndian(payload[o..]);
+        return true;
+    }
+
+    /// <summary>Parse a NewsChunk or NewsEnd payload. Returns the raw fragment as a slice
+    /// of the input span — caller must copy if it must outlive the buffer.</summary>
+    public static bool TryReadNewsChunk(
+        ReadOnlySpan<byte> payload,
+        out byte version,
+        out ulong newsId,
+        out NewsField field,
+        out ReadOnlySpan<byte> fragment)
+    {
+        version = 0; newsId = 0; field = NewsField.Headline; fragment = default;
+        if (payload.Length < NewsChunkHeaderSize) return false;
+        int o = 0;
+        version = payload[o++];
+        newsId = BinaryPrimitives.ReadUInt64LittleEndian(payload[o..]); o += 8;
+        field = (NewsField)payload[o++];
+        ushort fragLen = BinaryPrimitives.ReadUInt16LittleEndian(payload[o..]); o += 2;
+        if (payload.Length < o + fragLen) return false;
+        fragment = payload.Slice(o, fragLen);
+        return true;
     }
 
 }

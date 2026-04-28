@@ -314,6 +314,46 @@ A subscriber to a healing symbol sees:
 The row-level dim is intentional: any kind being Stale flags the symbol
 as "not fully consistent", even when most data keeps flowing.
 
+### 2.8 Drop-oldest stale buffer with monotonic `MinHeal`
+
+Per-symbol stale buffers (`StaleMboBuffer`) cap at **8 192** messages
+(normal) / **65 536** (hot list — mini-index futures). When the cap is
+hit the buffer drops the **oldest** queued incremental, not the newest:
+keeping the freshest tail maximises the chance that an arriving snapshot
+covers the gap. Each eviction calls
+`SymbolStateRegistry.BumpMinHeal(secId, evictedRptSeq + 1)` so the
+acceptance floor for the next snapshot stays monotonic with the buffer's
+earliest retained sequence — a snapshot older than the bumped floor is
+rejected immediately, with no risk of replaying stale data over a fresher
+book.
+
+### 2.9 Forced-heal escape valve for hot symbols
+
+Hot symbols (mini-index futures, `WIN*` / `WDO*`) routinely outpace
+B3's snapshot rotation cadence: snapshot-A may publish `rptSeq=N` while
+incrementals are already at `N + 5 000`. The standard heal would loop
+forever rejecting snapshots as too old. `SymbolStateRegistry` therefore
+enforces a **5 s `ForcedHealAfter`** timeout per `(secId, kind)`: when
+the symbol stays Stale beyond it, the next snapshot is **accepted even
+if its `rptSeq` lags `MinHeal`**. Baseline jumps to the snapshot's
+high-water `rptSeq` and the stale buffer is dropped. This trades a
+silent loss in the `(snapshot.rptSeq, high-water]` window for liveness
+on chronically hot symbols. The forced-heal counter is exposed via the
+`b3.umdf.symbol.forced_heal` metric so operators can see it firing.
+
+### 2.10 SecurityID reuse handling
+
+B3 occasionally re-uses a `SecurityID` across instrument lifecycle
+boundaries (expiry of one contract, listing of a fresh one with the
+same numeric ID on a later session). The consumer detects reuse via
+`SecurityDefinition_3` deltas (`Symbol`/`SecurityType`/`MaturityDate`
+mismatch on a known ID) and does a **clean reset** of all per-symbol
+state for that ID: order book cleared, `rptSeq` baselines reset, candle
+history dropped, stale buffers and protected floors cleared,
+subscriptions notified via the snapshot path. The new instrument starts
+from `WaitInstrumentDefinition` like any cold-start symbol — no leftover
+state from the previous occupant can leak into the new one.
+
 ## 3. A/B reorder buffer
 
 B3 publishes incremental data on **two equivalent multicast groups (A and
@@ -486,7 +526,7 @@ Total consumer memory has hard upper bounds at every layer:
 | Per-client outbound (bytes) | `UMDF_CLIENT_MAX_PENDING_BYTES` | 4 MiB |
 | Per-group dispatch ring (packets) | `UMDF_DISPATCH_RING_CAPACITY` | 65 536 |
 | Per-group broadcaster ring (work batches) | compile-time | 256 |
-| Per-symbol stale MBO buffer | compile-time | 256 messages × N symbols |
+| Per-symbol stale MBO buffer | compile-time | 8 192 messages normal / 65 536 hot, **drop-oldest** |
 | Per-security candle buffer | compile-time (`MaxRetainedCandles`) | 36 000 (10 h @ 1 s) |
 | Pinned UDP buffer pool | compile-time | sized to recvmmsg batch × N groups |
 

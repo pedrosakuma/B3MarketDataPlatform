@@ -91,6 +91,28 @@ public sealed class MarketDataManager : IFeedEventHandler
         GapTracker = new SymbolGapTracker(_logger);
         _stateRegistry = stateRegistry ?? throw new ArgumentNullException(nameof(stateRegistry),
             "SymbolStateRegistry is required.");
+        _newsReassembler = new NewsReassembler(EmitNews);
+    }
+
+    private readonly NewsReassembler _newsReassembler;
+
+    /// <summary>News reassembly statistics (P13). Exposed for metrics/tests.</summary>
+    public long NewsPartsReceived => _newsReassembler.PartsReceived;
+    public long NewsReassembled => _newsReassembler.Reassembled;
+    public long NewsDroppedCap => _newsReassembler.DroppedCap;
+    public long NewsDroppedTtl => _newsReassembler.DroppedTtl;
+    public long NewsDroppedNoId => _newsReassembler.DroppedNoId;
+    public long NewsDroppedInconsistent => _newsReassembler.DroppedInconsistent;
+    public long NewsDroppedInvalidPart => _newsReassembler.DroppedInvalidPart;
+    public int NewsInflight => _newsReassembler.Inflight;
+    public long NewsInflightBytes => _newsReassembler.InflightBytes;
+
+    private void EmitNews(
+        ulong securityIdOrZero, ulong newsId, byte source, ushort language, long origTimeNanos,
+        ReadOnlySpan<byte> headline, ReadOnlySpan<byte> text, ReadOnlySpan<byte> url)
+    {
+        _eventHandler?.OnNews(securityIdOrZero, newsId, source, language, origTimeNanos,
+            headline, text, url);
     }
 
     private readonly SymbolStateRegistry _stateRegistry;
@@ -199,7 +221,11 @@ public sealed class MarketDataManager : IFeedEventHandler
         public void OnSequence_2(in Sequence_2DataReader reader, int blockLength, int version) { }
         public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) { }
         public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) { }
-        public void OnNews_5(in News_5DataReader reader, int blockLength, int version) => Interlocked.Increment(ref Owner._newsMessagesObservedCount);
+        public void OnNews_5(in News_5DataReader reader, int blockLength, int version)
+        {
+            Interlocked.Increment(ref Owner._newsMessagesObservedCount);
+            Owner.HandleNews(in reader);
+        }
         public void OnSnapshotFullRefresh_Header_30(in SnapshotFullRefresh_Header_30DataReader reader, int blockLength, int version) { }
         public void OnOrder_MBO_50(in Order_MBO_50DataReader reader, int blockLength, int version) { }
         public void OnDeleteOrder_MBO_51(in DeleteOrder_MBO_51DataReader reader, int blockLength, int version) { }
@@ -809,5 +835,62 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.BumpVersion();
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
+    }
+
+    /// <summary>
+    /// P13: parse a News_5 message and route to the multi-part reassembler.
+    /// VarData (Headline, Text, URLLink) is read directly from the underlying
+    /// buffer (no allocation, no closures) since the SBE-generated
+    /// <c>ReadGroups</c> requires delegate callbacks. Layout after the 36-byte
+    /// block: [u16 hLen][headline bytes][u16 tLen][text bytes][u16 uLen][url bytes].
+    /// </summary>
+    private void HandleNews(in News_5DataReader reader)
+    {
+        ref readonly var msg = ref reader.Data;
+        var buf = reader.Buffer;
+        int o = News_5Data.MESSAGE_SIZE;
+
+        ReadOnlySpan<byte> headline = ReadOnlySpan<byte>.Empty;
+        ReadOnlySpan<byte> text = ReadOnlySpan<byte>.Empty;
+        ReadOnlySpan<byte> url = ReadOnlySpan<byte>.Empty;
+
+        // Defensive: each var-data segment requires 2 bytes for length prefix
+        // plus its declared payload. Truncated buffers fail open (drop fragment,
+        // pass empty) rather than throw — same posture as other Handle* methods.
+        if (buf.Length >= o + 2)
+        {
+            ushort hLen = (ushort)(buf[o] | (buf[o + 1] << 8));
+            o += 2;
+            if (buf.Length >= o + hLen) { headline = buf.Slice(o, hLen); o += hLen; } else o = buf.Length;
+        }
+        if (buf.Length >= o + 2)
+        {
+            ushort tLen = (ushort)(buf[o] | (buf[o + 1] << 8));
+            o += 2;
+            if (buf.Length >= o + tLen) { text = buf.Slice(o, tLen); o += tLen; } else o = buf.Length;
+        }
+        if (buf.Length >= o + 2)
+        {
+            ushort uLen = (ushort)(buf[o] | (buf[o + 1] << 8));
+            o += 2;
+            if (buf.Length >= o + uLen) { url = buf.Slice(o, uLen); }
+        }
+
+        ulong securityId = msg.SecurityID ?? 0UL;
+        ulong newsId = msg.NewsID ?? 0UL;
+        long origTime = (long)(msg.OrigTime.Time ?? 0UL);
+        // LanguageCode is a 2-byte ISO-639-1 InlineArray at offset 10 of the
+        // SBE block. Read raw bytes as ushort (little-endian on this wire);
+        // wire layer treats it as opaque ushort.
+        ushort language = buf.Length >= 12
+            ? (ushort)(buf[10] | (buf[11] << 8))
+            : (ushort)0;
+
+        _newsReassembler.Submit(
+            securityId, newsId,
+            (byte)msg.NewsSource, language,
+            msg.PartCount, msg.PartNumber,
+            origTime, msg.TotalTextLength,
+            headline, text, url);
     }
 }

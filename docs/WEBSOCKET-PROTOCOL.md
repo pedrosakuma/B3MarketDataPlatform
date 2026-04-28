@@ -44,6 +44,9 @@ Get               0x0003        Unsubscribed        0x0012
                                 ServerStatus        0x0050
                                 CandleSnapshot      0x0060
                                 CandleUpdate        0x0061
+                                NewsBegin           0x0090
+                                NewsChunk           0x0091
+                                NewsEnd             0x0092
 ```
 
 ## Client → Server
@@ -61,7 +64,13 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x00` | None | Treated as `All` |
 | `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `Trade`, `BookCleared`) |
 | `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
-| `0x03` | All  | Both channels |
+| `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News) |
+| `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
+| `0x07` | Everything | `Book` + `Info` + `News` |
+
+> **News is opt-in.** Existing clients that send `0x03` (or `0x00`) keep
+> the legacy behaviour and never receive news frames. Set the `News` bit
+> explicitly to enable.
 
 Behavior:
 
@@ -185,6 +194,38 @@ of `CandleSnapshot` frames:
   - `0x02` (`Last`) — final batch.
 - After the snapshot, live `CandleUpdate` messages stream the most recent
   bucket as it ticks.
+
+### News (opt-in via `DataFlags.News`)
+
+News deliveries are split across three message types so that bodies larger
+than the `u16` framing length (~64 KiB) still fit in the protocol. A single
+logical news item is emitted as exactly one `NewsBegin`, then `N`
+`NewsChunk` frames (one or more per field, in `Headline → Text → URL`
+order), then exactly one `NewsEnd` (which carries the *last* fragment of
+the URL field). Each frame starts with a `u8` version byte (current
+version: `1`).
+
+| Message | Type | Payload (after framing header) |
+|---------|------|--------------------------------|
+| **NewsBegin** | `0x0090` | `[ver u8][secId u64 (0 = global)][newsId u64 (0 = no id)][source u8][language u16][origTimeNanos i64][totalHeadlineLen u32][totalTextLen u32][totalUrlLen u32]` |
+| **NewsChunk** | `0x0091` | `[ver u8][newsId u64][field u8][fragLen u16][fragment bytes]` |
+| **NewsEnd**   | `0x0092` | *(same layout as NewsChunk; signals the final fragment of the news)* |
+
+`field` discriminator: `0` = Headline, `1` = Text, `2` = URL. Fragments
+within a field arrive contiguously and in order. Fragment payload size is
+capped at **60 KiB** per chunk; clients should buffer per-`(newsId, field)`
+until the next field starts (or `NewsEnd` arrives) and concatenate.
+
+Routing:
+
+- `secId != 0` — delivered only to clients subscribed to that `securityId`
+  with the `News` flag set.
+- `secId == 0` — global news; delivered to *every* connected client that
+  has the `News` flag set on **any** subscription. The server keeps a
+  per-session refcount so this is an O(clients) check, not O(securities).
+
+Clients with the `News` flag will not receive news that arrives **before**
+they subscribe — the server has no replay buffer for news.
 
 ## Subscription flow
 
