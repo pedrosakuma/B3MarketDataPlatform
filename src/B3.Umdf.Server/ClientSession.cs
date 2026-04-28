@@ -243,8 +243,17 @@ public sealed class ClientSession : IDisposable
                 // Phase 4: send + accounting.
                 if (offset > 0)
                 {
+                    // Pass CancellationToken.None: ManagedWebSocket.SendFrameAsync routes
+                    // any cancelable token through SendFrameFallbackAsync, which boxes an
+                    // async state machine and allocates a CancellationTokenRegistration per
+                    // frame. The non-cancelable fast path (SendFrameLockAcquiredNonCancelableAsync)
+                    // returns ValueTask.CompletedTask synchronously when the underlying stream
+                    // write+flush complete inline. We observe shutdown via the loop-top check on
+                    // ct.IsCancellationRequested and on ParkUntilProducerAsync(ct); a coalesced
+                    // batch is bounded in size and completes in milliseconds, so letting an
+                    // in-flight send finish is preferable to a torn frame.
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
-                        WebSocketMessageType.Binary, true, ct);
+                        WebSocketMessageType.Binary, true, CancellationToken.None);
                     int totalMessages = drained.LogicalCount + infoMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
