@@ -66,6 +66,18 @@ public sealed class MarketDataManager : IFeedEventHandler
     private long _instrumentIdentityChangedCount;
 
     /// <summary>
+    /// Count of <c>News_5</c> messages observed on the wire. The consumer does
+    /// not currently surface news payloads to subscribers (no
+    /// downstream channel for free-text market notifications); this counter
+    /// gives operators visibility into how often these messages arrive so a
+    /// future decision to wire them up can be informed by real volume.
+    /// P12-9 audit: this is the only template that arrives in production
+    /// flows but has no application-level handler.
+    /// </summary>
+    public long NewsMessagesObserved => Volatile.Read(ref _newsMessagesObservedCount);
+    private long _newsMessagesObservedCount;
+
+    /// <summary>
     /// Count of TRADING_SESSION_CHANGE (SecurityTradingEvent=4) resets applied
     /// to instruments — see B3 spec §14.3 (end-of-day stats reset).
     /// </summary>
@@ -187,7 +199,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         public void OnSequence_2(in Sequence_2DataReader reader, int blockLength, int version) { }
         public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) { }
         public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) { }
-        public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { }
+        public void OnNews_5(in News_5DataReader reader, int blockLength, int version) => Interlocked.Increment(ref Owner._newsMessagesObservedCount);
         public void OnSnapshotFullRefresh_Header_30(in SnapshotFullRefresh_Header_30DataReader reader, int blockLength, int version) { }
         public void OnOrder_MBO_50(in Order_MBO_50DataReader reader, int blockLength, int version) { }
         public void OnDeleteOrder_MBO_51(in DeleteOrder_MBO_51DataReader reader, int blockLength, int version) { }

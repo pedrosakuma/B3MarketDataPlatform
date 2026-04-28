@@ -298,7 +298,7 @@ internal sealed class StatsPrinter
             Console.WriteLine($"                dropDup={totalDropDup:N0}  liveResync={totalLiveResync:N0}  channelGapsAbsorbed={totalAbsorbed:N0}");
             Console.WriteLine($"                floorPin: hotProm={totalHotProm:N0} evictSafe={totalEvictSafe:N0} evictUnsafe={totalEvictUnsafe:N0}  drop[psCap={totalDropPSCap:N0} gCap={totalDropGCap:N0}]  authReset={totalAuthReset:N0}");
 
-            long totReplaced = 0, totIdChg = 0, totTsReg = 0, totSecDefSkipped = 0;
+            long totReplaced = 0, totIdChg = 0, totTsReg = 0, totSecDefSkipped = 0, totNews = 0;
             for (int i = 0; i < _bookManagers.Count; i++)
                 totReplaced += _bookManagers[i].InstrumentsReplaced;
             for (int i = 0; i < _marketDataManagers.Count; i++)
@@ -306,8 +306,9 @@ internal sealed class StatsPrinter
                 totIdChg += _marketDataManagers[i].InstrumentIdentityChanged;
                 totTsReg += _marketDataManagers[i].SecurityDefinitionsTimestampRegressed;
                 totSecDefSkipped += _marketDataManagers[i].SecurityDefinitionsSkipped;
+                totNews += _marketDataManagers[i].NewsMessagesObserved;
             }
-            Console.WriteLine($"  RefData:      secDefSkipped={totSecDefSkipped:N0}  identityChg={totIdChg:N0}  tsRegressed={totTsReg:N0}  replaced={totReplaced:N0}");
+            Console.WriteLine($"  RefData:      secDefSkipped={totSecDefSkipped:N0}  identityChg={totIdChg:N0}  tsRegressed={totTsReg:N0}  replaced={totReplaced:N0}  news={totNews:N0}");
         }
     }
 

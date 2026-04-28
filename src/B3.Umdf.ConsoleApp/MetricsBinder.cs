@@ -738,6 +738,10 @@ static class MetricsBinder
             () => PerGroupMd(m => m.InstrumentIdentityChanged),
             unit: "{instruments}", description: "SecurityDefinition arrivals where the canonical identity (Symbol/ISIN/MaturityDate/SecurityType) differs from the cached value — i.e. the exchange recycled the SecurityID for a different instrument (P12-3)");
 
+        Meter.CreateObservableCounter("b3.umdf.instruments.news_observed",
+            () => PerGroupMd(m => m.NewsMessagesObserved),
+            unit: "{messages}", description: "News_5 messages observed on the market data feed. Currently no application-level handler — exposed so operators can quantify volume before deciding whether to surface news to subscribers (P12-9 audit).");
+
         Meter.CreateObservableGauge("b3.umdf.symbols.registered",
             () => symbolRegistry.Count,
             description: "Total registered symbols");
