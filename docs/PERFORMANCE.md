@@ -106,6 +106,16 @@ hundreds of concurrent connections (commit `040cfa4`).
 > highest CPU). 10–20 ms = sweet spot for hundreds of clients. >50 ms
 > increases per-client pending memory materially.
 
+> **Fast-path `SendAsync`** (commit `38c8ebe`): the per-client write loop
+> passes `CancellationToken.None` to `WebSocket.SendAsync`. `ManagedWebSocket`
+> routes any cancelable token through `SendFrameFallbackAsync`, which boxes
+> an `async` state machine and allocates a `CancellationTokenRegistration`
+> per frame. The non-cancelable path (`SendFrameLockAcquiredNonCancelableAsync`)
+> returns `ValueTask.CompletedTask` synchronously when the underlying stream
+> write+flush complete inline. Shutdown is still observed at the loop top
+> (`ct.IsCancellationRequested`) and at `ParkUntilProducerAsync(ct)`; a
+> coalesced batch is bounded in size and completes in milliseconds.
+
 ## 7. Snapshot rate-limit on the dispatch thread
 
 Each `Subscribe`/`Get` request runs `SendMboSnapshot` on the dispatch
@@ -129,8 +139,13 @@ thread's allocation rate bounded (commit `d2099bb`).
 Allocation is the most reliable path to GC pauses. The hot paths all use
 pooled or reused buffers:
 
-- **`ArrayPool<byte>`** for snapshot payloads, per-flush per-client
-  broadcast buffers (commits `4027e82`, `2364ee7`).
+- **`ArrayPool<byte>`** for snapshot payloads (commit `4027e82`).
+- **`BroadcastBufferPool`** for per-flush per-client broadcast buffers
+  (commit `ac2dc9f`). Replaces `ArrayPool<byte>.Shared` on this fan-out
+  path because under high subscriber counts the shared pool's per-bucket
+  `Monitor` became visible in profiles (~47 % of `Monitor.Enter_Slowpath`
+  samples on the 100-client / 5× replay scenario). The dedicated pool
+  uses lock-free `ConcurrentQueue` per bucket (1 KiB–256 KiB).
 - **`PinnedBufferPool`** for UDP receive (POH-resident, no GC compaction).
 - **Reused `UmdfPacket[64]`** for `recvmmsg` batch receive.
 - **`stackalloc Span<byte>`** for fixed-size wire encodings (e.g. order
@@ -142,23 +157,42 @@ pooled or reused buffers:
   of capturing locals into a delegate; this removed a per-message display-class
   allocation that dominated MBO-heavy bursts.
 
-## 9. Lock-free subscription reads
+## 9. Lock-free subscription reads (and lock-free cutoff updates)
 
-Subscription mutations (subscribe/unsubscribe) are rare and serialized
-under a single light-weight `_subLock`. Reads on the hot path are
-**lock-free**: the inner `Dictionary<string, DataFlags>` is a
-**copy-on-write snapshot** and the outer `ConcurrentDictionary` provides
-lock-free `TryGetValue`. Iteration during a fanout never blocks subscribe.
+Subscription **mutations** (subscribe/unsubscribe and any flag change)
+are rare and serialized under a single light-weight `_subLock` using a
+**copy-on-write** of the inner `Dictionary<string, SubscriptionState>`.
+The outer `ConcurrentDictionary` provides lock-free `TryGetValue`, so
+iteration during a fanout never blocks subscribe.
 
 ```csharp
 // Hot path: per-event, ~10× per packet
 internal void BroadcastToSubscribers(ulong securityId, ReadOnlyMemory<byte> payload)
 {
     if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-    foreach (var (clientId, flags) in clients)        // safe: copy-on-write
+    foreach (var (clientId, state) in clients)        // safe: copy-on-write
     { ... }
 }
 ```
+
+`SubscriptionState` itself uses a **hybrid mutability model**:
+
+- `Flags` is immutable after construction. Flag changes go through the
+  CoW path above, preserving the membership/flag snapshot for broadcasters.
+- `MinBroadcastSequenceExclusive` (the per-client book broadcast cutoff,
+  advanced after every `Get` snapshot to act as a sequence barrier) is a
+  mutable cell, advanced lock-free via a CAS-max
+  (`AdvanceMinBroadcastSequence`). CoW snapshots share the same state
+  reference for unchanged subscriptions, so a cutoff advance is
+  immediately visible to broadcasters iterating any snapshot — exactly
+  what the cutoff-as-barrier requires.
+
+Why this matters: every `Get` previously took `_subLock` and cloned the
+whole inner dictionary just to bump one `long`. Under stress (200
+clients × 30 symbols × 7× replay) this single function was the largest
+Monitor.Enter caller in the whole system (~29 % of all lock samples).
+The lock-free CAS-max eliminates it from the top callers entirely with
+zero allocation per Get.
 
 ## 10. `recvmmsg` / `sendmmsg` batching
 
