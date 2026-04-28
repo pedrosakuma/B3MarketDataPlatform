@@ -15,6 +15,22 @@ public sealed class InstrumentInfo
     /// <summary>Increment the version counter after updating fields. Feed-thread-only.</summary>
     public void BumpVersion() => ++_version;
 
+    /// <summary>
+    /// Last observed <c>SecurityValidityTimestamp</c> from
+    /// <c>SecurityDefinition_12</c>, in seconds since epoch. The exchange bumps
+    /// this field only when the definition actually changes (corporate action,
+    /// contract adjustment, new listing). The InstrDef channel re-broadcasts
+    /// every SecDef every few seconds, so caching the last-seen value lets
+    /// <c>MarketDataManager.HandleSecurityDefinition</c> short-circuit the
+    /// entire parse + 6 string allocations + 4 handler delegates + closure when
+    /// nothing changed (~99 % of invocations under steady state). Default 0
+    /// means "never observed" — always parse on first sight.
+    /// Feed-thread-only writer (one MDM per group, dispatched single-thread by
+    /// <see cref="B3.Umdf.Feed.MultiFeedManager"/>); reads from other threads
+    /// are tolerated as a best-effort optimization.
+    /// </summary>
+    public ulong LastSecurityValidityTimestamp { get; set; }
+
     // SecurityStatus (3)
     public int? TradingStatus { get; set; }
     public int? TradingEvent { get; set; }

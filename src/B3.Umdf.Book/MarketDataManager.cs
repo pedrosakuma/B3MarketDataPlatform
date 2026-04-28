@@ -36,6 +36,17 @@ public sealed class MarketDataManager : IFeedEventHandler
     public long ParseErrors => Volatile.Read(ref _parseErrors);
 
     /// <summary>
+    /// Number of <c>SecurityDefinition_12</c> messages skipped because their
+    /// <c>SecurityValidityTimestamp</c> matched the cached value on the
+    /// instrument (P11-2 early-out). Under steady state this should track
+    /// 99 %+ of all SecDef receptions, since the exchange re-broadcasts the
+    /// same definition every few seconds.
+    /// </summary>
+    public long SecurityDefinitionsSkipped => Volatile.Read(ref _secDefSkippedCount);
+
+    private long _secDefSkippedCount;
+
+    /// <summary>
     /// Count of TRADING_SESSION_CHANGE (SecurityTradingEvent=4) resets applied
     /// to instruments — see B3 spec §14.3 (end-of-day stats reset).
     /// </summary>
@@ -214,6 +225,28 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+
+        // P11-2: skip-if-unchanged early-out. The InstrDef channel re-broadcasts
+        // every SecurityDefinition every few seconds, but the exchange only
+        // bumps SecurityValidityTimestamp when the definition actually changes
+        // (corporate action / contract adjustment / new listing). Cache the
+        // last-seen value on the instrument and bail before the expensive
+        // parse + 6 string allocations + ReadGroups (4 handler delegates +
+        // closure + lists). Profiling at 5x replay attributed ~1.6 GB / 600 s
+        // (~31 % of total sampled allocations) to this method's hot body.
+        // Defensive: if the wire has no validity timestamp (null sentinel),
+        // fall through and parse — we have no key to compare against.
+        long? newTsOpt = msg.SecurityValidityTimestamp.Time;
+        if (newTsOpt is { } newTsSigned && newTsSigned > 0)
+        {
+            ulong newTs = (ulong)newTsSigned;
+            if (info.LastSecurityValidityTimestamp == newTs)
+            {
+                Interlocked.Increment(ref _secDefSkippedCount);
+                return;
+            }
+            info.LastSecurityValidityTimestamp = newTs;
+        }
 
         string? oldGroup = info.SecurityGroup;
         string newGroup = Encoding.Latin1.GetString(msg.SecurityGroup.AsTrimmedSpan());
