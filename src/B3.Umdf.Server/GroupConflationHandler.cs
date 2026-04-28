@@ -1037,7 +1037,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         ref var acc = ref CollectionsMarshal.GetValueRefOrAddDefault(_clientBatches, session, out bool exists);
         if (!exists)
         {
-            acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length * 4, 1024));
+            acc.Buffer = BroadcastBufferPool.Shared.Rent(Math.Max(bytes.Length * 4, 1024));
             acc.Offset = 0;
             acc.LogicalCount = 0;
         }
@@ -1046,9 +1046,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             int desired = Math.Max(acc.Buffer.Length * 2, acc.Offset + bytes.Length);
             if (desired <= MaxAccumulatorBytes)
             {
-                var newBuf = ArrayPool<byte>.Shared.Rent(desired);
+                var newBuf = BroadcastBufferPool.Shared.Rent(desired);
                 acc.Buffer.AsSpan(0, acc.Offset).CopyTo(newBuf);
-                ArrayPool<byte>.Shared.Return(acc.Buffer);
+                BroadcastBufferPool.Shared.Return(acc.Buffer);
                 acc.Buffer = newBuf;
             }
             else
@@ -1062,9 +1062,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 }
                 else
                 {
-                    ArrayPool<byte>.Shared.Return(acc.Buffer);
+                    BroadcastBufferPool.Shared.Return(acc.Buffer);
                 }
-                acc.Buffer = ArrayPool<byte>.Shared.Rent(Math.Max(bytes.Length, 1024));
+                acc.Buffer = BroadcastBufferPool.Shared.Rent(Math.Max(bytes.Length, 1024));
                 acc.Offset = 0;
                 acc.LogicalCount = 0;
             }
@@ -1102,7 +1102,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             var acc = kv.Value;
             if (acc.Offset == 0)
             {
-                ArrayPool<byte>.Shared.Return(acc.Buffer);
+                BroadcastBufferPool.Shared.Return(acc.Buffer);
                 continue;
             }
             kv.Key.TryEnqueueBatch(

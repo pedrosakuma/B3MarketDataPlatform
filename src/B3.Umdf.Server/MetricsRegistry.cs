@@ -26,4 +26,13 @@ public sealed class MetricsRegistry
     public static readonly Counter<long> WsSlowDisconnects = Meter.CreateCounter<long>("umdf.ws.slow_disconnects");
     public static readonly Counter<long> WsSubscriptions = Meter.CreateCounter<long>("umdf.ws.subscriptions");
     public static readonly Counter<long> WsMessagesConflated = Meter.CreateCounter<long>("umdf.ws.messages.conflated");
+
+    // BroadcastBufferPool metrics — retention/efficiency of the pool that
+    // backs the broadcast → write-loop ownership transfer (replaces
+    // ArrayPool<byte>.Shared on that path to avoid per-bucket Monitor
+    // contention from cross-thread Returns).
+    public static readonly Counter<long> BroadcastBufferRentHits = Meter.CreateCounter<long>("umdf.broadcast_pool.rent_hits");
+    public static readonly Counter<long> BroadcastBufferRentMisses = Meter.CreateCounter<long>("umdf.broadcast_pool.rent_misses");
+    public static readonly Counter<long> BroadcastBufferReturnDrops = Meter.CreateCounter<long>("umdf.broadcast_pool.return_drops");
+    public static readonly Counter<long> BroadcastBufferOversizeRents = Meter.CreateCounter<long>("umdf.broadcast_pool.oversize_rents");
 }

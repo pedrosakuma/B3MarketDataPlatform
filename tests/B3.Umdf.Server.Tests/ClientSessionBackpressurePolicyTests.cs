@@ -31,7 +31,7 @@ public class ClientSessionBackpressurePolicyTests
         // Coalesced batch with a pooled buffer pushes the budget over.
         // Contract: returns false, trips the slow-consumer disconnect, and
         // returns the pooled array (no leak).
-        var pool = ArrayPool<byte>.Shared.Rent(64);
+        var pool = BroadcastBufferPool.Shared.Rent(64);
         bool accepted = session.TryEnqueueBatch(
             new ReadOnlyMemory<byte>(pool, 0, 32),
             logicalMessageCount: 4,
@@ -50,7 +50,7 @@ public class ClientSessionBackpressurePolicyTests
         var session = new ClientSession(ws, channelCapacity: 1024, maxPendingBytes: 0);
         session.Cancel();
 
-        var pool = ArrayPool<byte>.Shared.Rent(32);
+        var pool = BroadcastBufferPool.Shared.Rent(32);
         bool accepted = session.TryEnqueueBatch(
             new ReadOnlyMemory<byte>(pool, 0, 16),
             logicalMessageCount: 2,
@@ -66,7 +66,7 @@ public class ClientSessionBackpressurePolicyTests
     {
         var ws = new FakeWebSocket();
         var session = new ClientSession(ws, channelCapacity: 1024, maxPendingBytes: 0);
-        var pool = ArrayPool<byte>.Shared.Rent(32);
+        var pool = BroadcastBufferPool.Shared.Rent(32);
 
         // Empty batch (Memory.IsEmpty) must short-circuit and still return
         // the pooled array — caller should not have to special-case zero
@@ -104,7 +104,7 @@ public class ClientSessionBackpressurePolicyTests
         Assert.False(session.TryEnqueue(new byte[1]));
         Assert.False(session.TryEnqueue(new byte[1]));
         Assert.False(session.NotifyInfoAvailable());
-        var pool = ArrayPool<byte>.Shared.Rent(8);
+        var pool = BroadcastBufferPool.Shared.Rent(8);
         Assert.False(session.TryEnqueueBatch(new ReadOnlyMemory<byte>(pool, 0, 4), 1, pool));
 
         Assert.Equal(depthAtDisconnect, session.QueueDepth);

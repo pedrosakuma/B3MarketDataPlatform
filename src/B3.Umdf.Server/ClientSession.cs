@@ -168,16 +168,18 @@ public sealed class ClientSession : IDisposable
     /// per-message path; only the queue-write count is reduced.
     ///
     /// When <paramref name="pooledArray"/> is provided, ownership transfers to the
-    /// session: the write loop returns it to <see cref="ArrayPool{T}.Shared"/> after
-    /// the WS frame is sent. If the channel is full and the client is disconnected,
-    /// the array is returned synchronously here. Empty/zero-count batches are no-ops
-    /// and the array (if any) is returned immediately.
+    /// session: the write loop returns it to <see cref="BroadcastBufferPool.Shared"/>
+    /// after the WS frame is sent. If the channel is full and the client is
+    /// disconnected, the array is returned synchronously here. Empty/zero-count
+    /// batches are no-ops and the array (if any) is returned immediately.
+    /// The pooled array MUST originate from <see cref="BroadcastBufferPool.Shared"/>;
+    /// arrays from elsewhere will be silently dropped to the GC on return.
     /// </summary>
     public bool TryEnqueueBatch(ReadOnlyMemory<byte> batch, int logicalMessageCount, byte[]? pooledArray = null)
     {
         if (batch.IsEmpty || logicalMessageCount <= 0)
         {
-            if (pooledArray is not null) ArrayPool<byte>.Shared.Return(pooledArray);
+            if (pooledArray is not null) BroadcastBufferPool.Shared.Return(pooledArray);
             return true;
         }
         return TryEnqueueCore(new OutboundMessage(batch, logicalCount: logicalMessageCount, pooledArray: pooledArray), "batch");
@@ -276,7 +278,7 @@ public sealed class ClientSession : IDisposable
     private static void ReturnPooledBuffers(List<byte[]> pooledToReturn)
     {
         for (int i = 0; i < pooledToReturn.Count; i++)
-            ArrayPool<byte>.Shared.Return(pooledToReturn[i]);
+            BroadcastBufferPool.Shared.Return(pooledToReturn[i]);
         pooledToReturn.Clear();
     }
 
@@ -417,7 +419,7 @@ public sealed class ClientSession : IDisposable
         if (_cts.IsCancellationRequested)
         {
             if (outbound.PooledArray is { } pooled)
-                ArrayPool<byte>.Shared.Return(pooled);
+                BroadcastBufferPool.Shared.Return(pooled);
             return false;
         }
 
@@ -433,7 +435,7 @@ public sealed class ClientSession : IDisposable
             if (current + payloadLen > _maxPendingBytes)
             {
                 if (outbound.PooledArray is { } pooledOver)
-                    ArrayPool<byte>.Shared.Return(pooledOver);
+                    BroadcastBufferPool.Shared.Return(pooledOver);
                 DisconnectSlowConsumer(
                     $"pending-bytes budget exceeded while enqueuing {itemKind} (pending={current}+{payloadLen} > {_maxPendingBytes})");
                 return false;
@@ -449,7 +451,7 @@ public sealed class ClientSession : IDisposable
             Interlocked.Add(ref _pendingBytes, -payloadLen);
 
         if (outbound.PooledArray is { } pooled2)
-            ArrayPool<byte>.Shared.Return(pooled2);
+            BroadcastBufferPool.Shared.Return(pooled2);
 
         DisconnectSlowConsumer(
             $"outbound queue full while enqueuing {itemKind} (depth={QueueDepth}/{ChannelCapacity})");
@@ -463,7 +465,7 @@ public sealed class ClientSession : IDisposable
             if (outbound.Payload.Length > 0 && _maxPendingBytes > 0)
                 Interlocked.Add(ref _pendingBytes, -outbound.Payload.Length);
             if (outbound.PooledArray is { } pooled)
-                ArrayPool<byte>.Shared.Return(pooled);
+                BroadcastBufferPool.Shared.Return(pooled);
         }
     }
 

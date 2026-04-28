@@ -50,7 +50,7 @@ internal static class SnapshotEmitter
         int headerSize = WireProtocol.BookSnapshotSize(0, 0);
         int totalOrders = bids.OrderCount + asks.OrderCount;
         int needed = headerSize + totalOrders * 37;
-        var buf = ArrayPool<byte>.Shared.Rent(needed);
+        var buf = BroadcastBufferPool.Shared.Rent(needed);
 
         WireProtocol.WriteBookSnapshotHeader(buf, securityId, lastRptSeq, 0, 0);
         int offset = headerSize;
