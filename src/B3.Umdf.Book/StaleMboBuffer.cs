@@ -210,6 +210,25 @@ public sealed class StaleMboBuffer
     /// </summary>
     public bool Enqueue(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<uint>? onEvictedOldest = null, int blockLength = -1)
     {
+        return Enqueue<Action<uint>?>(
+            securityId, templateId, rptSeq, sendingTimeNs, body,
+            static (callback, evicted) => callback?.Invoke(evicted),
+            onEvictedOldest,
+            blockLength);
+    }
+
+    /// <summary>
+    /// Allocation-free variant of <see cref="Enqueue(ulong, ushort, uint, ulong, ReadOnlySpan{byte}, Action{uint}?, int)"/>.
+    /// The eviction callback receives the caller-supplied <paramref name="state"/>
+    /// alongside the evicted rptSeq, so callers can use a <c>static</c> lambda
+    /// (or an existing cached delegate) without forcing the C# compiler to hoist
+    /// a per-call closure object. Hot-path callers (<c>BookManager.RouteMbo</c>)
+    /// MUST use this overload to keep the steady Apply path zero-alloc — the
+    /// non-generic overload above retains a captured-arg closure for tests and
+    /// other low-rate callers.
+    /// </summary>
+    public bool Enqueue<TState>(ulong securityId, ushort templateId, uint rptSeq, ulong sendingTimeNs, ReadOnlySpan<byte> body, Action<TState, uint> onEvictedOldest, TState state, int blockLength = -1)
+    {
         // Default blockLength to body.Length when caller doesn't differentiate
         // (test paths that don't carry a separate wire blockLength).
         if (blockLength < 0) blockLength = body.Length;
@@ -277,7 +296,7 @@ public sealed class StaleMboBuffer
                     "StaleMboBuffer: symbol {SecurityId} promoted to level {Level} (cap {NewCap}); previous cap {OldCap} exceeded",
                     securityId, promotedToLevel, _capLevels[promotedToLevel], _capLevels[promotedToLevel - 1]);
         }
-        if (evicted && !safeEviction) onEvictedOldest?.Invoke(evictedRptSeq);
+        if (evicted && !safeEviction) onEvictedOldest(state, evictedRptSeq);
         return true;
     }
 

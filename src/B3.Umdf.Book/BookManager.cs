@@ -255,14 +255,19 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             case SymbolStateRegistry.ObserveAction.Apply:
                 return true;
             case SymbolStateRegistry.ObserveAction.Buffer:
+                // Use the generic Enqueue<TState> overload with a static lambda
+                // so the steady Apply-path RouteMbo invocation does NOT allocate
+                // a per-call DisplayClass closure (P11-1: was 35 % of total
+                // sampled allocations under peak load).
                 if (_staleBuffer.Enqueue(securityId, templateId, rptSeq, _currentSendingTimeNs, body,
-                        evictedRptSeq =>
+                        static (state, evictedRptSeq) =>
                         {
                             // Buffer evicted its oldest entry to make room for this newer message.
                             // Advance MinHeal to evictedRptSeq so future snapshots must be at-least
                             // that fresh — otherwise we'd silently leave a hole in [snap+1..evicted].
-                            _stateRegistry!.BumpMinHeal(securityId, SymbolGapKind.Mbo, evictedRptSeq);
+                            state.registry.BumpMinHeal(state.securityId, SymbolGapKind.Mbo, evictedRptSeq);
                         },
+                        (registry: _stateRegistry!, securityId),
                         blockLength: blockLength))
                     Interlocked.Increment(ref _bufferedMboMessages);
                 return false;
