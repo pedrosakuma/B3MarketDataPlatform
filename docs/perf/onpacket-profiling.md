@@ -280,3 +280,91 @@ future P11 phase if one of the following triggers fires:
 
 The traces and analyzer are kept in-tree so the analysis is
 reproducible — no PerfView / Visual Studio install required.
+
+---
+
+## 5x replay capture (2026-04-28) — actionable findings
+
+The 1x capture above was insufficient: with EQT/084 idle and DRV at
+~1 300 events/s the consumer was an order of magnitude below typical
+peak. A second capture at **REPLAY_SPEED=5** with both EQT and DRV
+streaming reproduced realistic peak conditions: ~75 k events/s,
+~98 k packets/s, 18 396 books active, 45 M events processed in the
+600 s window.
+
+Trace files (gitignored):
+
+- `profiles/gc-verbose-5x-20260428T000043.nettrace` (15 MB)
+- `profiles/counters-5x-20260428T000130.csv`
+
+### Counters under load
+
+| Metric                            | Avg            | Peak             |
+| --------------------------------- | -------------- | ---------------- |
+| Heap allocation rate              | **6.00 MB/s**  | 21.5 MB/s        |
+| Gen1 size at last collection      | **466 MB**     | 756 MB           |
+| Gen2 size at last collection      | 451 MB         | 586 MB           |
+| LOH size                          | 59 MB          | 79 MB            |
+| **GC pause time**                 | **10 ms/s**    | **410 ms** ⚠️    |
+| Working set                       | **7.73 GB**    | 10.9 GB          |
+| User CPU                          | 1.90 s/s/2cpu  | 2.06 s/s         |
+
+The 410 ms GC pause is the headline: a single Gen1/Gen2 collection
+under sustained load stalls the consumer for almost half a second.
+Any time-sensitive downstream (websocket clients, gap detection on the
+incoming feed) sees this as a latency spike.
+
+### Top allocators at peak (3 462 MB sampled / 600 s)
+
+| Bytes   | %    | Type                                                         |
+| ------- | ---- | ------------------------------------------------------------ |
+| **1208 MB** | **34.9** | **`<>c__DisplayClass96_0`** — closure in `BookManager.RouteMbo` |
+| 755 MB  | 21.8 | `System.String`                                              |
+| 135 MB  |  3.9 | `NoInstrAttribsHandler`                                      |
+| 130 MB  |  3.8 | `NoUnderlyingsHandler`                                       |
+| 130 MB  |  3.8 | `Callback`                                                   |
+| 128 MB  |  3.7 | `NoLegsHandler`                                              |
+| 115 MB  |  3.3 | `InstrAttribInfo[]`                                          |
+| 102 MB  |  3.0 | `<>c__DisplayClass36_0` — closure in `HandleSecurityDefinition` |
+|  90 MB  |  2.6 | `Candle[]`                                                   |
+|  88 MB  |  2.6 | `UnderlyingInfo[]`                                           |
+
+By **leaf method**:
+
+| Bytes   | %    | Caller                                                          |
+| ------- | ---- | --------------------------------------------------------------- |
+| **1208 MB** | **34.9** | **`BookManager.RouteMbo`** ← lambda allocates per-call closure  |
+| **1082 MB** | **31.3** | **`MarketDataManager.HandleSecurityDefinition`** ← cyclical  |
+| 444 MB  | 12.8 | `SecurityDefinition_12DataReader.ReadGroups` (handler invocations) |
+| 209 MB  |  6.1 | `List<__Canon>.AddWithResize` (price-level lists)               |
+| 147 MB  |  4.2 | `SnapshotApplier.OnHeader` (PendingSnapshot)                    |
+|  94 MB  |  2.7 | `List<OrderBookEntry>.AddWithResize`                            |
+|  90 MB  |  2.6 | `CandleAggregator.AppendCandle`                                 |
+|  87 MB  |  2.5 | `MessageDispatcher.Dispatch`                                    |
+
+GC counts during the 600 s window: **Gen0 = 53, Gen1 = 1, Gen2 = 1**.
+Gen0 is healthy (~12 s between collections), but each Gen1+ that does
+fire promotes the closure-and-handler churn into long-lived survivor
+space, which is why the working set inflates to 7.7 GB sustained.
+
+### Actionable verdict
+
+The "deferred to a future P11" framing in the 1x section above is
+**no longer accurate at peak load**. Under realistic peak the closure
+in `RouteMbo` alone dominates the entire allocation budget — fixing it
+single-handedly cuts heap pressure by ~⅓, with no algorithmic risk.
+The recommended P11 scope is:
+
+| # | Fix                                                              | Expected gain | Risk |
+| - | ---------------------------------------------------------------- | ------------- | ---- |
+| 1 | `StaleMboBuffer.Enqueue<TState>` overload + static delegate in `RouteMbo` to eliminate `<>c__DisplayClass96_0` | ~2 MB/s saved (35 % of total) | low |
+| 2 | Cache `NoUnderlyingsHandler` / `NoLegsHandler` / `NoInstrAttribsHandler` / `Callback` as fields on `MarketDataManager`; eliminate `<>c__DisplayClass36_0` | ~0.9 MB/s (15 %) | low |
+| 3 | Pool `PendingSnapshot` per symbol (the buffer-swap pattern in `ApplySnapshotStaging` already supports reuse) | ~0.25 MB/s (4 %) | medium |
+| 4 | Intern symbol names + cache metric-tag strings | ~1.0 MB/s (17 %) — assumes most strings are tag-formatting | medium |
+
+After (1)+(2) alone we expect alloc rate to drop from 6 MB/s to
+**≈ 3 MB/s** and Gen1/Gen2 pressure roughly halved, which should bring
+the worst-case GC pause back below 100 ms.
+
+(3) and (4) are larger surgeries with lower per-fix ROI; revisit after
+(1)+(2) is measured.
