@@ -145,7 +145,8 @@ internal sealed class StatsPrinter
             long buffered = bm.BufferedMboMessages - bm.ReplayedMboMessages;
             long stalePending = bm.StaleBuffer.EnqueuedCount - bm.StaleBuffer.DrainedCount;
             long bufBytes = bm.StaleBuffer.TotalBytes;
-            if (snap.TotalStaleSymbols > 0 || stalePending > 0 || bm.SnapshotsHealed > 0)
+            long authReset = reg.StaleAuthoritativeResetCount;
+            if (snap.TotalStaleSymbols > 0 || stalePending > 0 || bm.SnapshotsHealed > 0 || authReset > 0)
             {
                 string gate = (_groupHandlers is not null && i < _groupHandlers.Count && _groupHandlers[i].IsFanoutSuppressed)
                     ? " gate:on" : "";
@@ -162,8 +163,18 @@ internal sealed class StatsPrinter
                 string floor = (evictUnsafe > 0 || evictSafe > 0 || hotProm > 0 || upperProm > 0)
                     ? $" floorPin[hotProm:{hotProm}{promExtra} evictSafe:{evictSafe:N0} evictUnsafe:{evictUnsafe:N0}]"
                     : "";
+                // Forced-heal escape valve: surface count + worst-case severity peek
+                // (max unsafeDelta is the strongest single signal of how much data
+                // the escape silenced). Only emit when non-zero so quiet groups stay quiet.
+                string forced = "";
+                if (authReset > 0)
+                {
+                    uint maxUnsafe = reg.MaxAuthoritativeResetUnsafeDelta;
+                    uint maxDiscarded = reg.MaxAuthoritativeResetDiscardedTailDelta;
+                    forced = $" forcedHeal[count:{authReset:N0} maxUnsafe:{maxUnsafe:N0} maxDiscardedTail:{maxDiscarded:N0}]";
+                }
                 perSymbolParts.Add(
-                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}");
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}{forced}");
             }
         }
         if (_multiFeed is not null)

@@ -64,6 +64,24 @@ static class MetricsBinder
                     Tag("group", $"G{groupIds[i]}"));
         }
 
+        IEnumerable<Measurement<long>> PerGroupMd(Func<MarketDataManager, long> selector)
+        {
+            for (int i = 0; i < marketDataManagers.Count; i++)
+                yield return new Measurement<long>(selector(marketDataManagers[i]),
+                    Tag("group", $"G{groupIds[i]}"));
+        }
+
+        IEnumerable<Measurement<long>> PerGroupRegistry(Func<SymbolStateRegistry, long> selector)
+        {
+            for (int i = 0; i < bookManagers.Count; i++)
+            {
+                var reg = bookManagers[i].StateRegistry;
+                if (reg is null) continue;
+                yield return new Measurement<long>(selector(reg),
+                    Tag("group", $"G{groupIds[i]}"));
+            }
+        }
+
         // ── Feed counters ──
 
         Meter.CreateObservableCounter("b3.umdf.feed.packets",
@@ -439,6 +457,29 @@ static class MetricsBinder
             },
             unit: "{snapshots}", description: "Snapshots accepted as authoritative reset (stuck-Stale escape after StaleEscapeTimeoutMs); buffered tail discarded");
 
+        // Severity instrumentation for authoritative reset.
+        // unsafeDelta        = MinHeal - snap   (proven-unbridgeable gap, lower bound)
+        // discardedTailDelta = highWater - snap (live tail abandoned by empty-drain)
+        // Exposed as last/max/sum so dashboards can alert on magnitude.
+        Meter.CreateObservableGauge("b3.umdf.persymbol.authoritative_reset_unsafe_delta_last",
+            () => PerGroupRegistry(r => (long)r.LastAuthoritativeResetUnsafeDelta),
+            unit: "{rptseq}", description: "Last authoritative-reset unsafe delta (MinHeal - snapRptSeq) per group");
+        Meter.CreateObservableGauge("b3.umdf.persymbol.authoritative_reset_unsafe_delta_max",
+            () => PerGroupRegistry(r => (long)r.MaxAuthoritativeResetUnsafeDelta),
+            unit: "{rptseq}", description: "Max authoritative-reset unsafe delta observed since process start");
+        Meter.CreateObservableCounter("b3.umdf.persymbol.authoritative_reset_unsafe_delta_sum",
+            () => PerGroupRegistry(r => (long)r.SumAuthoritativeResetUnsafeDelta),
+            unit: "{rptseq}", description: "Cumulative sum of authoritative-reset unsafe deltas (proven lost message count lower bound)");
+        Meter.CreateObservableGauge("b3.umdf.persymbol.authoritative_reset_discarded_tail_delta_last",
+            () => PerGroupRegistry(r => (long)r.LastAuthoritativeResetDiscardedTailDelta),
+            unit: "{rptseq}", description: "Last authoritative-reset discarded-tail delta (priorHighWater - snapRptSeq)");
+        Meter.CreateObservableGauge("b3.umdf.persymbol.authoritative_reset_discarded_tail_delta_max",
+            () => PerGroupRegistry(r => (long)r.MaxAuthoritativeResetDiscardedTailDelta),
+            unit: "{rptseq}", description: "Max authoritative-reset discarded-tail delta observed since process start");
+        Meter.CreateObservableCounter("b3.umdf.persymbol.authoritative_reset_discarded_tail_delta_sum",
+            () => PerGroupRegistry(r => (long)r.SumAuthoritativeResetDiscardedTailDelta),
+            unit: "{rptseq}", description: "Cumulative sum of authoritative-reset discarded-tail deltas (live tail messages abandoned)");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_skipped_healthy_ahead",
             () => PerGroupBook(bm => bm.SnapshotsSkippedHealthyAhead),
             unit: "{snapshots}", description: "Snapshots ignored because symbol is already Healthy with a more recent book.LastRptSeq than the snapshot baseline (always-on snapshot stream noise)");
@@ -668,6 +709,10 @@ static class MetricsBinder
         Meter.CreateObservableGauge("b3.umdf.instruments.active",
             () => PerGroupMdInt(m => m.InstrumentData.Count),
             description: "Active instruments per group");
+
+        Meter.CreateObservableCounter("b3.umdf.instruments.security_definitions_skipped",
+            () => PerGroupMd(m => m.SecurityDefinitionsSkipped),
+            unit: "{messages}", description: "SecurityDefinition messages skipped because their content was unchanged from the cached version (P11-2 skip-if-unchanged)");
 
         Meter.CreateObservableGauge("b3.umdf.symbols.registered",
             () => symbolRegistry.Count,
