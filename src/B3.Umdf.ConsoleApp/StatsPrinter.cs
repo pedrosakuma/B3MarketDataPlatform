@@ -194,6 +194,23 @@ internal sealed class StatsPrinter
             Console.WriteLine(line);
         }
 
+        // Reference-data drift signals: surfaced only when non-zero so quiet
+        // groups stay quiet. Identity changes / timestamp regressions are
+        // expected to be ~0 in normal sessions; any non-zero value warrants
+        // attention (delisting reuse or out-of-order InstrDef arrivals).
+        long totalReplaced = 0, totalIdentityChanged = 0, totalTsRegressed = 0;
+        for (int i = 0; i < _bookManagers.Count; i++)
+            totalReplaced += _bookManagers[i].InstrumentsReplaced;
+        for (int i = 0; i < _marketDataManagers.Count; i++)
+        {
+            totalIdentityChanged += _marketDataManagers[i].InstrumentIdentityChanged;
+            totalTsRegressed += _marketDataManagers[i].SecurityDefinitionsTimestampRegressed;
+        }
+        if (totalReplaced > 0 || totalIdentityChanged > 0 || totalTsRegressed > 0)
+        {
+            Console.WriteLine($"   refData: replaced:{totalReplaced:N0} identityChg:{totalIdentityChanged:N0} tsRegressed:{totalTsRegressed:N0}");
+        }
+
         var crossedParts = new List<string>();
         for (int i = 0; i < _bookManagers.Count; i++)
         {
@@ -280,6 +297,17 @@ internal sealed class StatsPrinter
             Console.WriteLine($"  PerSymbol:    stale={totalStaleSymbols}/{totalSymbolsTracked}  healed={totalHealed:N0}  buffered={totalBuffered:N0}  replayed={totalReplayed:N0}");
             Console.WriteLine($"                dropDup={totalDropDup:N0}  liveResync={totalLiveResync:N0}  channelGapsAbsorbed={totalAbsorbed:N0}");
             Console.WriteLine($"                floorPin: hotProm={totalHotProm:N0} evictSafe={totalEvictSafe:N0} evictUnsafe={totalEvictUnsafe:N0}  drop[psCap={totalDropPSCap:N0} gCap={totalDropGCap:N0}]  authReset={totalAuthReset:N0}");
+
+            long totReplaced = 0, totIdChg = 0, totTsReg = 0, totSecDefSkipped = 0;
+            for (int i = 0; i < _bookManagers.Count; i++)
+                totReplaced += _bookManagers[i].InstrumentsReplaced;
+            for (int i = 0; i < _marketDataManagers.Count; i++)
+            {
+                totIdChg += _marketDataManagers[i].InstrumentIdentityChanged;
+                totTsReg += _marketDataManagers[i].SecurityDefinitionsTimestampRegressed;
+                totSecDefSkipped += _marketDataManagers[i].SecurityDefinitionsSkipped;
+            }
+            Console.WriteLine($"  RefData:      secDefSkipped={totSecDefSkipped:N0}  identityChg={totIdChg:N0}  tsRegressed={totTsReg:N0}  replaced={totReplaced:N0}");
         }
     }
 

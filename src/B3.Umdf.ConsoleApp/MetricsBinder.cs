@@ -276,6 +276,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.DeleteNotFound),
             description: "Delete operations on non-existent orders");
 
+        Meter.CreateObservableCounter("b3.umdf.book.instruments_replaced",
+            () => PerGroupBook(bm => bm.InstrumentsReplaced),
+            unit: "{instruments}", description: "Per-symbol epoch resets triggered by SecurityID identity change (delisting reuse) — book cleared, stale buffer dropped, all baselines reset (P12-3)");
+
         // ── Per-symbol gap detection (Phase 0 — shadow only, no behavior change) ──
         // Counts gaps detected via per-security rptSeq comparison. Provides
         // production data to size the upcoming per-symbol recovery refactor.
@@ -442,6 +446,18 @@ static class MetricsBinder
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_too_old",
             () => PerGroupBook(bm => bm.SnapshotsRejectedTooOld),
             unit: "{snapshots}", description: "Snapshots rejected because LastRptSeq is older than the symbol's MinHealRptSeq (would leave a hole)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_stale_version",
+            () => PerGroupBook(bm => bm.SnapshotsRejectedStaleVersion),
+            unit: "{snapshots}", description: "Snapshots rejected because they belong to an older SequenceVersion than the active epoch (post-rollover stragglers)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_abandoned",
+            () => PerGroupBook(bm => bm.SnapshotsAbandoned),
+            unit: "{snapshots}", description: "Snapshots abandoned mid-flight (e.g. truncated before CompleteSnapshot, replaced by a newer snapshot for the same symbol)");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_aborted_by_epoch",
+            () => PerGroupBook(bm => bm.SnapshotsAbortedByEpoch),
+            unit: "{snapshots}", description: "Snapshots aborted because a per-symbol epoch reset (SequenceVersion bump or instrument replacement) invalidated the in-progress baseline");
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_authoritative_reset",
             () =>
@@ -713,6 +729,14 @@ static class MetricsBinder
         Meter.CreateObservableCounter("b3.umdf.instruments.security_definitions_skipped",
             () => PerGroupMd(m => m.SecurityDefinitionsSkipped),
             unit: "{messages}", description: "SecurityDefinition messages skipped because their content was unchanged from the cached version (P11-2 skip-if-unchanged)");
+
+        Meter.CreateObservableCounter("b3.umdf.instruments.security_definitions_timestamp_regressed",
+            () => PerGroupMd(m => m.SecurityDefinitionsTimestampRegressed),
+            unit: "{messages}", description: "SecurityDefinition messages dropped because their SecurityValidityTimestamp is older than the cached value — out-of-order arrivals that would silently roll metadata back (P12-3)");
+
+        Meter.CreateObservableCounter("b3.umdf.instruments.identity_changed",
+            () => PerGroupMd(m => m.InstrumentIdentityChanged),
+            unit: "{instruments}", description: "SecurityDefinition arrivals where the canonical identity (Symbol/ISIN/MaturityDate/SecurityType) differs from the cached value — i.e. the exchange recycled the SecurityID for a different instrument (P12-3)");
 
         Meter.CreateObservableGauge("b3.umdf.symbols.registered",
             () => symbolRegistry.Count,
