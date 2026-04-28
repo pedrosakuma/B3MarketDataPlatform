@@ -119,6 +119,24 @@ public sealed class ChannelHandler : IDisposable
         }
         else if (version != _currentSequenceVersion)
         {
+            // Spec §6.5.5.1: SequenceVersion is monotonically increasing per
+            // session. A packet whose version is OLDER than the established
+            // current is a stale reorder-arrival from before the rollover —
+            // upstream (BookManager / SymbolStateRegistry) has already reset
+            // its V1 state. Replaying it would corrupt the V2 epoch. Drop
+            // silently as a duplicate (the other feed delivered the V2
+            // version first).
+            //
+            // ushort comparison would wrap if version actually rolls past
+            // 65535 (impossible in practice — weekly bumps for ~1259 years).
+            // We treat that hypothetical wrap conservatively: only accept
+            // strict-greater within a 16-bit window, which keeps the gate
+            // robust against any single misordered packet.
+            if (version < _currentSequenceVersion)
+            {
+                _duplicatesSkipped++;
+                return GapResult.Duplicate;
+            }
             HandleSequenceVersionChange(version, seq);
             // Fall through with the post-reset _expectedSeqNum so this
             // packet (the first of the new version) is processed normally.
