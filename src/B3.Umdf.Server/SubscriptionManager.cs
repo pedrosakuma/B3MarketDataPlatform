@@ -516,10 +516,10 @@ public sealed class SubscriptionManager : IDisposable
         lock (_subLock)
         {
             _subscriptions.TryGetValue(securityId, out var existing);
-            SubscriptionState previous = default;
-            bool hadPrevious = existing is not null && existing.TryGetValue(clientId, out previous);
+            SubscriptionState? previous = null;
+            bool hadPrevious = existing is not null && existing.TryGetValue(clientId, out previous!);
             bool wantsInfo = flags.HasFlag(DataFlags.Info);
-            bool hadInfo = hadPrevious && previous.WantsInfo;
+            bool hadInfo = hadPrevious && previous!.WantsInfo;
 
             if (wantsInfo && !hadInfo && !session.AddInfoSubscription(securityId))
                 return false;
@@ -529,7 +529,7 @@ public sealed class SubscriptionManager : IDisposable
             session.AddSubscription(securityId);
 
             bool wantsNews = (flags & DataFlags.News) != 0;
-            bool hadNews = hadPrevious && previous.WantsNews;
+            bool hadNews = hadPrevious && previous!.WantsNews;
             if (wantsNews && !hadNews) session.IncrementNewsSubscriptions();
             else if (!wantsNews && hadNews) session.DecrementNewsSubscriptions();
 
@@ -553,7 +553,7 @@ public sealed class SubscriptionManager : IDisposable
     private readonly record struct SubscriptionActivation(
         bool IsNew,
         bool HadPrevious,
-        SubscriptionState PreviousState,
+        SubscriptionState? PreviousState,
         bool AddedInfoSubscription,
         bool RemovedInfoSubscription,
         bool AddedNewsSubscription,
@@ -570,7 +570,7 @@ public sealed class SubscriptionManager : IDisposable
             if (!_subscriptions.TryGetValue(securityId, out var existing)) return;
             var newClients = new Dictionary<string, SubscriptionState>(existing);
             if (activation.HadPrevious)
-                newClients[clientId] = activation.PreviousState;
+                newClients[clientId] = activation.PreviousState!;
             else
                 newClients.Remove(clientId);
 
@@ -592,20 +592,21 @@ public sealed class SubscriptionManager : IDisposable
         else if (activation.RemovedNewsSubscription) session.IncrementNewsSubscriptions();
     }
 
+    /// <summary>
+    /// Advance the per-client book broadcast cutoff after a Get snapshot. Lock-free:
+    /// reads the lock-free outer <see cref="_subscriptions"/> and the lock-free inner
+    /// dictionary snapshot, then performs a CAS-max on the mutable cutoff cell of the
+    /// shared <see cref="SubscriptionState"/>. CoW snapshots share the state reference,
+    /// so the new cutoff is immediately visible to broadcasters iterating any snapshot.
+    /// Safe against concurrent Subscribe/Unsubscribe (worst case: a stale state object
+    /// no longer reachable from the current snapshot is updated harmlessly).
+    /// </summary>
     private void UpdateBookCutoffIfSubscribed(string clientId, ulong securityId, long bookBatchCutoffSequence)
     {
-        lock (_subLock)
-        {
-            if (!_subscriptions.TryGetValue(securityId, out var existing)) return;
-            if (!existing.TryGetValue(clientId, out var state)) return;
-            if ((state.Flags & DataFlags.Book) == 0) return;
-
-            var newClients = new Dictionary<string, SubscriptionState>(existing)
-            {
-                [clientId] = state.WithMinBroadcastSequence(bookBatchCutoffSequence)
-            };
-            _subscriptions[securityId] = newClients;
-        }
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        if (!clients.TryGetValue(clientId, out var state)) return;
+        if ((state.Flags & DataFlags.Book) == 0) return;
+        state.AdvanceMinBroadcastSequence(bookBatchCutoffSequence);
     }
 
     private void RemoveSubscriptionCore(string clientId, ulong securityId, bool enqueueAck, bool adjustMetric)
