@@ -6,15 +6,35 @@ namespace B3.Umdf.Book;
 public sealed class BookSide
 {
     private readonly BookSideType _side;
-    private readonly Dictionary<ulong, OrderBookEntry> _orders = new(128);
+    private readonly Dictionary<ulong, OrderBookEntry> _orders = new(512);
 
     // Price levels sorted with BEST at the END of the list.
     // Bids: ascending (lowest→highest, best=highest at end)
     // Asks: descending (highest→lowest, best=lowest at end)
     // Most activity is near top-of-book → inserts/removes near the end = O(1) amortized.
-    private readonly List<(long Price, List<OrderBookEntry> Orders)> _levels = new(64);
+    //
+    // Each PriceLevel caches TotalQty and Count so BestPrice() (called from
+    // BookManager.CheckCrossing on every mutation) is O(1) — no per-order
+    // foreach. Aggregates are maintained incrementally on every mutation;
+    // Validate() cross-checks them against the per-level order list.
+    private readonly List<PriceLevel> _levels = new(128);
     private readonly bool _ascending;
     private readonly Stack<List<OrderBookEntry>> _listPool = new(32);
+
+    private const int InitialOrdersPerLevelCapacity = 8;
+    private const int ListPoolPrewarmCount = 8;
+
+    /// <summary>
+    /// Per-price-level state. Stored by value in <see cref="_levels"/>; mutated in-place
+    /// via <see cref="CollectionsMarshal.AsSpan{T}(List{T})"/> to avoid copy-modify-write.
+    /// </summary>
+    private struct PriceLevel
+    {
+        public long Price;
+        public List<OrderBookEntry> Orders;
+        public long TotalQty;
+        public int Count;
+    }
 
     public BookSideType Side => _side;
     public int OrderCount => _orders.Count;
@@ -68,6 +88,8 @@ public sealed class BookSide
     {
         _side = side;
         _ascending = side == BookSideType.Bid;
+        for (int i = 0; i < ListPoolPrewarmCount; i++)
+            _listPool.Push(new List<OrderBookEntry>(InitialOrdersPerLevelCapacity));
     }
 
     /// <summary>
@@ -91,7 +113,14 @@ public sealed class BookSide
         ref var slot = ref CollectionsMarshal.GetValueRefOrNullRef(_orders, orderId);
         if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref slot))
             return;
-        RemoveFromPriceLevelsByPrice(slot.PriceLevelIndex, oldPrice);
+        // The per-level list at oldPrice still holds the pre-move copy; read the
+        // qty from there so TotalQty bookkeeping is correct even if the caller
+        // also mutated Quantity at the same time.
+        int oldLevelIdx = FindPriceLevel(oldPrice);
+        long oldQty = oldLevelIdx >= 0
+            ? _levels[oldLevelIdx].Orders[slot.PriceLevelIndex].Quantity
+            : slot.Quantity;
+        RemoveFromPriceLevelsByPrice(slot.PriceLevelIndex, oldPrice, oldQty);
         AddToPriceLevels(ref slot);
         AssertValid();
     }
@@ -105,6 +134,7 @@ public sealed class BookSide
         {
             long existingPrice = slot.Price;
             int existingIdx = slot.PriceLevelIndex;
+            long existingQty = slot.Quantity;
             if (existingPrice == entry.Price)
             {
                 // Same-price: swap entry in-place, no level restructuring
@@ -112,11 +142,15 @@ public sealed class BookSide
                 slot.PriceLevelIndex = existingIdx;
                 int levelIdx = FindPriceLevel(entry.Price);
                 if (levelIdx >= 0)
-                    CollectionsMarshal.AsSpan(_levels[levelIdx].Orders)[existingIdx] = slot;
+                {
+                    var levelsSpan = CollectionsMarshal.AsSpan(_levels);
+                    CollectionsMarshal.AsSpan(levelsSpan[levelIdx].Orders)[existingIdx] = slot;
+                    levelsSpan[levelIdx].TotalQty += entry.Quantity - existingQty;
+                }
                 AssertValid();
                 return true;
             }
-            RemoveFromPriceLevelsByPrice(existingIdx, existingPrice);
+            RemoveFromPriceLevelsByPrice(existingIdx, existingPrice, existingQty);
         }
 
         slot = entry;
@@ -129,7 +163,7 @@ public sealed class BookSide
     {
         if (!_orders.TryGetValue(orderId, out var entry))
             return false;
-        RemoveFromPriceLevelsByPrice(entry.PriceLevelIndex, entry.Price);
+        RemoveFromPriceLevelsByPrice(entry.PriceLevelIndex, entry.Price, entry.Quantity);
         _orders.Remove(orderId);
         AssertValid();
         return true;
@@ -148,14 +182,19 @@ public sealed class BookSide
         int levelIdx = FindPriceLevel(slot.Price);
         if (levelIdx < 0)
             return;
-        CollectionsMarshal.AsSpan(_levels[levelIdx].Orders)[slot.PriceLevelIndex] = slot;
+        var levelsSpan = CollectionsMarshal.AsSpan(_levels);
+        ref var levelRef = ref levelsSpan[levelIdx];
+        var ordersSpan = CollectionsMarshal.AsSpan(levelRef.Orders);
+        long oldQty = ordersSpan[slot.PriceLevelIndex].Quantity;
+        ordersSpan[slot.PriceLevelIndex] = slot;
+        levelRef.TotalQty += slot.Quantity - oldQty;
     }
 
     public void Clear()
     {
         _orders.Clear();
-        foreach (var (_, list) in _levels)
-            ReturnList(list);
+        foreach (var lvl in _levels)
+            ReturnList(lvl.Orders);
         _levels.Clear();
     }
 
@@ -163,11 +202,8 @@ public sealed class BookSide
     {
         if (_levels.Count == 0)
             return null;
-        var best = _levels[^1];
-        long totalQty = 0;
-        foreach (var o in best.Orders)
-            totalQty += o.Quantity;
-        return (best.Price, totalQty);
+        ref var best = ref CollectionsMarshal.AsSpan(_levels)[_levels.Count - 1];
+        return (best.Price, best.TotalQty);
     }
 
     /// <summary>
@@ -179,10 +215,10 @@ public sealed class BookSide
         var errors = new List<string>();
 
         // 1. No empty price levels
-        foreach (var (price, list) in _levels)
+        foreach (var lvl in _levels)
         {
-            if (list.Count == 0)
-                errors.Add($"Empty price level at {price}");
+            if (lvl.Orders.Count == 0)
+                errors.Add($"Empty price level at {lvl.Price}");
         }
 
         // 2. Price levels must be sorted (worst→best)
@@ -197,8 +233,11 @@ public sealed class BookSide
 
         // 3. Every order in _orders must be in exactly one price level at the correct price
         var ordersInLevels = new Dictionary<ulong, long>();
-        foreach (var (price, list) in _levels)
+        foreach (var lvl in _levels)
         {
+            long price = lvl.Price;
+            var list = lvl.Orders;
+            long sumQty = 0;
             for (int i = 0; i < list.Count; i++)
             {
                 var entry = list[i];
@@ -211,7 +250,15 @@ public sealed class BookSide
 
                 if (!ordersInLevels.TryAdd(entry.OrderId, price))
                     errors.Add($"Order {entry.OrderId} appears in multiple price levels ({ordersInLevels[entry.OrderId]} and {price})");
+
+                sumQty += entry.Quantity;
             }
+
+            // Cached aggregates must match the per-order truth.
+            if (lvl.Count != list.Count)
+                errors.Add($"Price level {price} has Count={lvl.Count} but {list.Count} orders");
+            if (lvl.TotalQty != sumQty)
+                errors.Add($"Price level {price} has TotalQty={lvl.TotalQty} but Σ={sumQty}");
         }
 
         // 4. Counts must match
@@ -248,9 +295,12 @@ public sealed class BookSide
         int idx = FindPriceLevel(entry.Price);
         if (idx >= 0)
         {
-            var orders = _levels[idx].Orders;
-            entry.PriceLevelIndex = orders.Count;
-            orders.Add(entry);
+            var levelsSpan = CollectionsMarshal.AsSpan(_levels);
+            ref var lvl = ref levelsSpan[idx];
+            entry.PriceLevelIndex = lvl.Orders.Count;
+            lvl.Orders.Add(entry);
+            lvl.TotalQty += entry.Quantity;
+            lvl.Count++;
         }
         else
         {
@@ -258,16 +308,24 @@ public sealed class BookSide
             var orders = RentList();
             entry.PriceLevelIndex = 0;
             orders.Add(entry);
-            _levels.Insert(insertIdx, (entry.Price, orders));
+            _levels.Insert(insertIdx, new PriceLevel
+            {
+                Price = entry.Price,
+                Orders = orders,
+                TotalQty = entry.Quantity,
+                Count = 1,
+            });
         }
     }
 
-    private void RemoveFromPriceLevelsByPrice(int orderIdx, long price)
+    private void RemoveFromPriceLevelsByPrice(int orderIdx, long price, long removedQty)
     {
         int levelIdx = FindPriceLevel(price);
         if (levelIdx < 0) return;
 
-        var orders = _levels[levelIdx].Orders;
+        var levelsSpan = CollectionsMarshal.AsSpan(_levels);
+        ref var lvl = ref levelsSpan[levelIdx];
+        var orders = lvl.Orders;
 
         // Swap-remove: O(1) — swap with last, remove last
         int lastIdx = orders.Count - 1;
@@ -283,6 +341,8 @@ public sealed class BookSide
                 slot.PriceLevelIndex = orderIdx;
         }
         orders.RemoveAt(lastIdx);
+        lvl.TotalQty -= removedQty;
+        lvl.Count--;
 
         if (orders.Count == 0)
         {
@@ -322,7 +382,7 @@ public sealed class BookSide
             list.Clear();
             return list;
         }
-        return new List<OrderBookEntry>();
+        return new List<OrderBookEntry>(InitialOrdersPerLevelCapacity);
     }
 
     private void ReturnList(List<OrderBookEntry> list) => _listPool.Push(list);

@@ -81,10 +81,10 @@ public class BookSideBenchmarks
     }
 
     [Benchmark(Baseline = true)]
-    public int Current_SortedDictionary()
+    public long Current_SortedDictionary()
     {
         var side = new BookSide(BookSideType.Bid);
-        int ops = 0;
+        long bboAccumulator = 0;
 
         foreach (var (orderId, price, qty, isDel) in _operations)
         {
@@ -92,19 +92,22 @@ public class BookSideBenchmarks
                 side.Remove(orderId);
             else
                 side.AddOrUpdate(new OrderBookEntry { OrderId = orderId, Price = price, Quantity = qty });
-            ops++;
+
+            // Mirror BookManager.CheckCrossing: top-of-book is read on every mutation.
+            // The accumulator prevents the JIT from eliding BestPrice() as dead code.
+            var best = side.BestPrice();
+            if (best.HasValue)
+                bboAccumulator += best.Value.Price + best.Value.TotalQty;
         }
 
-        // Simulate top-of-book read (common hot path)
-        _ = side.BestPrice();
-        return ops;
+        return bboAccumulator;
     }
 
     [Benchmark]
-    public int InvertedList_SwapRemove()
+    public long InvertedList_SwapRemove()
     {
         var side = new InvertedBookSide(BookSideType.Bid);
-        int ops = 0;
+        long bboAccumulator = 0;
 
         foreach (var (orderId, price, qty, isDel) in _operations)
         {
@@ -112,11 +115,13 @@ public class BookSideBenchmarks
                 side.Remove(orderId);
             else
                 side.AddOrUpdate(new InvertedOrderEntry { OrderId = orderId, Price = price, Quantity = qty });
-            ops++;
+
+            var best = side.BestPrice();
+            if (best.HasValue)
+                bboAccumulator += best.Value.Price + best.Value.TotalQty;
         }
 
-        _ = side.BestPrice();
-        return ops;
+        return bboAccumulator;
     }
 }
 
