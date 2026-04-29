@@ -154,6 +154,36 @@ public class GroupConflationHandlerTradeTelemetryTests
     }
 
     [Fact]
+    public void OnForwardTrade_ColdSymbol_DoesNotHydrateRing_ButStillAggregatesCandle()
+    {
+        // Symmetric to OnTrade_ColdSymbol_DoesNotHydrateRing_ButStillAggregatesCandle:
+        // Forward trades (replayed during snapshot recovery / mid-session catch-up)
+        // also feed the candle aggregator + InfoSnapshot last-price even when no
+        // client is subscribed. The ring + buffer fan-out are skipped (best-effort
+        // history). Late subscribers must not see chart gaps regardless of which
+        // path delivered the trade.
+        var w = NewWiring();
+        try
+        {
+            w.Group.OnForwardTrade(SecurityId, price: 100, quantity: 5, tradeId: 1, sendingTimeNs: 0);
+            w.Group.OnBatchComplete();
+
+            // Live-tape side: skipped.
+            Assert.False(w.Group.RecentTrades.ContainsKey(SecurityId));
+            Assert.Equal(0, w.Group.TradesReceivedTotal);
+            Assert.Equal(0, w.Group.TradesEmittedTotal);
+
+            // Aggregation side: still happens.
+            Assert.True(w.Group.Candles.ContainsKey(SecurityId),
+                "Candles must aggregate for cold symbols on the forward-trade path too.");
+        }
+        finally
+        {
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
     public void OnTrade_WarmSymbol_HydratesRingFromFirstSubscriber()
     {
         // Documents the Phase C trade-off: a future subscriber to a previously
