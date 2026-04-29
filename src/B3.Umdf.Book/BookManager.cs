@@ -558,6 +558,19 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public void OnPacketProcessed() { _eventHandler?.OnBatchComplete(); }
 
     /// <summary>
+    /// Forwards the dispatch-loop idle/timeout signal so deferred flush windows
+    /// (e.g. <see cref="GroupConflationHandler"/>) can flush a sparse trickle
+    /// of events even when no further upstream packets arrive.
+    /// </summary>
+    public void FlushIfDue() { _eventHandler?.FlushIfDue(); }
+
+    /// <summary>
+    /// Forwards the dispatch-loop shutdown drain so the last conflation window
+    /// of buffered events is published instead of silently dropped.
+    /// </summary>
+    public void FlushNow() { _eventHandler?.FlushNow(); }
+
+    /// <summary>
     /// Spec §6.5.5.1 — SequenceVersion increment (weekly rollover / failover):
     /// the upstream feed restarts with SequenceNumber=1 in the new version.
     /// Treat as a full epoch reset (drop books, clear pending snapshots,

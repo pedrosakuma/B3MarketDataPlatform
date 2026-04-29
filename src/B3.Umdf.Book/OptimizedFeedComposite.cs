@@ -63,4 +63,16 @@ public sealed class OptimizedFeedComposite : IFeedEventHandler
         _md.OnSequenceVersionChanged(newVersion);
         ((IFeedEventHandler)_reg).OnSequenceVersionChanged(newVersion);
     }
+
+    public void FlushIfDue()
+    {
+        // Only BookManager forwards to GroupConflationHandler; MD/SymbolRegistry
+        // do not buffer wire fan-out so the default no-op is fine.
+        ((IFeedEventHandler)_book).FlushIfDue();
+    }
+
+    public void FlushNow()
+    {
+        ((IFeedEventHandler)_book).FlushNow();
+    }
 }

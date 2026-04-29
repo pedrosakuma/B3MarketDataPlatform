@@ -187,6 +187,26 @@ internal sealed class MpscPacketRing
         finally { Volatile.Write(ref _consumerWaiting, 0); }
     }
 
+    /// <summary>
+    /// Bounded variant of <see cref="WaitForItems(CancellationToken)"/>. Returns true
+    /// if signaled within <paramref name="timeoutMs"/> (items likely available), false
+    /// on timeout. Replicates the exact reset/publish-flag/recheck pattern to preserve
+    /// the wakeup invariant — a producer enqueuing during the race window will not be
+    /// missed.
+    /// </summary>
+    public bool WaitForItems(int timeoutMs, CancellationToken ct)
+    {
+        _itemsAvailable.Reset();
+        Interlocked.Exchange(ref _consumerWaiting, 1);
+        if (TryDequeueAvailable())
+        {
+            Volatile.Write(ref _consumerWaiting, 0);
+            return true;
+        }
+        try { return _itemsAvailable.Wait(timeoutMs, ct); }
+        finally { Volatile.Write(ref _consumerWaiting, 0); }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool TryDequeueAvailable()
     {

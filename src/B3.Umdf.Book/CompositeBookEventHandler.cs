@@ -78,4 +78,14 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
     {
         foreach (var h in _handlers) h.OnEpochReset(reason);
     }
+
+    public void FlushIfDue()
+    {
+        foreach (var h in _handlers) h.FlushIfDue();
+    }
+
+    public void FlushNow()
+    {
+        foreach (var h in _handlers) h.FlushNow();
+    }
 }

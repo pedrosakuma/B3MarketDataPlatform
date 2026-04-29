@@ -92,6 +92,28 @@ public sealed class FeedHandler : IDisposable
     private long _perSymbolGapsAbsorbed;
 
     /// <summary>
+    /// Forward an idle-flush signal from the dispatch loop down to handlers that
+    /// implement deferred conflation (e.g. <c>GroupConflationHandler</c> in the
+    /// server). Default <see cref="IFeedEventHandler.FlushIfDue"/> is a no-op so
+    /// non-server handlers stay unchanged.
+    /// </summary>
+    public void FlushIfDue()
+    {
+        _eventHandler.FlushIfDue();
+        _marketDataHandler?.FlushIfDue();
+    }
+
+    /// <summary>
+    /// Forward an unconditional shutdown drain so the last conflation window of
+    /// buffered events is published instead of silently dropped at process exit.
+    /// </summary>
+    public void FlushNow()
+    {
+        _eventHandler.FlushNow();
+        _marketDataHandler?.FlushNow();
+    }
+
+    /// <summary>
     /// Number of channel-level gaps that were absorbed by advancing past the
     /// missing SeqNum without dropping the FeedHandler out of Streaming.
     /// Per-symbol routing is responsible for healing affected instruments.

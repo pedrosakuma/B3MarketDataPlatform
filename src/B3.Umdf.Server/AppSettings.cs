@@ -106,6 +106,18 @@ public sealed class AppSettings
     public int ClientCoalesceWindowMs { get; set; } = 10;
 
     /// <summary>
+    /// Server-side semantic conflation window (milliseconds) applied inside
+    /// GroupConflationHandler. 0 (default) preserves legacy per-packet behavior.
+    /// When > 0, FlushBuffers() is deferred until WindowMs has elapsed since the
+    /// first dirty event (debounce-style), allowing (secId,side,price) /
+    /// (secId,price) / per-secId aggregations to span multiple upstream B3 packets.
+    /// Forced flush boundaries (pre-snapshot cutoff, TradeBust, shutdown) preserve
+    /// correctness. End-to-end latency cap = WindowMs. Recommended 10ms (matches
+    /// client coalesce window). CLI: env UMDF_SERVER_FLUSH_WINDOW_MS.
+    /// </summary>
+    public int ServerFlushWindowMs { get; set; } = 0;
+
+    /// <summary>
     /// Maximum number of subscribe/get snapshot requests the dispatch thread will
     /// service per packet batch. Snapshots allocate (CopyOrderData + ArrayPool rent)
     /// and are queued onto per-client outbound rings. Without a per-batch cap, an
@@ -277,6 +289,8 @@ public sealed class AppSettings
             ClientOutlierIntervalMs = outlierMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_COALESCE_WINDOW_MS"), out var coalesceMs))
             ClientCoalesceWindowMs = coalesceMs;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SERVER_FLUSH_WINDOW_MS"), out var serverFlushMs) && serverFlushMs >= 0)
+            ServerFlushWindowMs = serverFlushMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH"), out var maxSnapPerBatch))
             MaxSnapshotRequestsPerBatch = maxSnapPerBatch;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SHUTDOWN_DRAIN_SECONDS"), out var sd))

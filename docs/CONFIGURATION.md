@@ -37,6 +37,7 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size (msgs) |
 | `UMDF_CLIENT_MAX_PENDING_BYTES` | — | `4194304` | Per-client outbound hard byte cap; client is disconnected as slow consumer when exceeded |
 | `UMDF_CLIENT_COALESCE_WINDOW_MS` | — | `10` | Per-client outbound coalesce window; trades a few ms of latency for fewer syscalls under high client counts |
+| `UMDF_SERVER_FLUSH_WINDOW_MS` | — | `0` | Server-side conflation flush window in ms. `0` = legacy per-packet flush. `> 0` defers `GroupConflationHandler.FlushBuffers` so conflation (LEVEL_UPDATE last-write-wins, CANDLE_UPDATE per-window, TRADE same-price summation, MBO add+delete cancellation) extends across multiple upstream B3 packets. Recommended: `10`. See `docs/PERFORMANCE.md` § 6 |
 | `UMDF_SLOW_CLIENT_THRESHOLD` | — | `0.75` | Fraction of queue capacity considered congested |
 | `UMDF_SLOW_CLIENT_MAX_TICKS` | — | `100` | Consecutive congested write cycles before disconnect |
 | `UMDF_CLIENT_OUTLIER_INTERVAL_MS` | — | `1000` | Outlier-sweep period; `0` disables sweep |

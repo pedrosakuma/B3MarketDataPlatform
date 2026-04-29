@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using B3.Umdf.Book;
 using B3.Umdf.Mbo.Sbe.V16;
@@ -154,11 +155,52 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public long EventsReceived => Volatile.Read(ref _eventsReceived);
     public long EventsFlushed => Volatile.Read(ref _eventsFlushed);
 
-    internal GroupConflationHandler(SubscriptionManager parent, int broadcastRingCapacity = 256, int maxSnapshotRequestsPerBatch = 32)
+    // ── Server flush window (debounce) ─────────────────────────────────────────
+    // 0 = legacy behavior (flush on every OnBatchComplete). > 0 = defer
+    // FlushBuffers() until WindowMs has elapsed since the FIRST dirty event
+    // since the last flush. Forced-flush boundaries (pre-snapshot cutoff,
+    // TradeBust direct-to-batch, shutdown, suppression on) preserve correctness.
+    private readonly int _flushWindowMs;
+    private long _firstDirtyTicks; // 0 = no pending dirty events
+    private long _buffersDeferredFlushCount;
+
+    /// <summary>Diagnostic: number of OnBatchComplete invocations that
+    /// deferred a buffer flush because the temporal window had not elapsed.</summary>
+    public long BuffersDeferredFlushCount => Volatile.Read(ref _buffersDeferredFlushCount);
+
+    /// <summary>Configured server flush window, milliseconds. 0 = legacy.</summary>
+    public int FlushWindowMs => _flushWindowMs;
+
+    internal GroupConflationHandler(SubscriptionManager parent, int broadcastRingCapacity = 256, int maxSnapshotRequestsPerBatch = 32, int flushWindowMs = 0)
     {
+        if (flushWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(flushWindowMs));
         _parent = parent;
         _broadcastRing = new BroadcastRing(broadcastRingCapacity);
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
+        _flushWindowMs = flushWindowMs;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool BuffersDirty() =>
+        _orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 ||
+        _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0 || _levelBuffer.Count != 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void MarkDirtyIfNeeded()
+    {
+        if (_firstDirtyTicks == 0 && BuffersDirty())
+            _firstDirtyTicks = Environment.TickCount64;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool WindowElapsed() =>
+        _firstDirtyTicks != 0 && (Environment.TickCount64 - _firstDirtyTicks) >= _flushWindowMs;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void FlushAndClearWindow()
+    {
+        FlushBuffers();
+        _firstDirtyTicks = 0;
     }
 
     /// <summary>
@@ -312,6 +354,27 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             ring.MarkBust(tradeId);
 
         if (!_parent.IsSubscribed(securityId)) return;
+
+        // Direct-to-batch path: under the temporal flush window, a buffered
+        // trade for this security would otherwise be flushed AFTER the bust,
+        // inverting wire ordering. Force a trade-buffer flush first if there
+        // is a pending trade for this security.
+        if (_flushWindowMs > 0 && _tradeBuffer.Count > 0)
+        {
+            bool hasPendingForSec = false;
+            foreach (var k in _tradeBuffer.Keys)
+            {
+                if (k.SecurityId == securityId) { hasPendingForSec = true; break; }
+            }
+            if (hasPendingForSec)
+            {
+                // Flush the entire trade buffer (cheap; rare path) so the bust
+                // strictly follows any buffered trade frames for this security.
+                _eventsFlushed += FlushTradeBuffer();
+                if (!BuffersDirty()) _firstDirtyTicks = 0;
+            }
+        }
+
         Span<byte> tmp = stackalloc byte[20];
         int len = WireProtocol.WriteTradeBust(tmp, securityId, tradeId);
         AppendTradeEventToBatch(securityId, tmp[..len], logicalCount: 1);
@@ -529,23 +592,101 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             // RealTime entry) schedules a fresh snapshot for every Book subscriber.
             // Subscribe/Get requests stay queued and drain when fanout resumes.
             DiscardConflationBuffers();
+            _firstDirtyTicks = 0;
             return;
         }
 
-        // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
-        //    no subscriber fan-out, no ArrayPool rentals for client buffers).
-        if (_orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0 || _levelBuffer.Count != 0)
-            FlushBuffers();
+        // 3. Buffer-window state: track first dirty event for debounce semantics.
+        MarkDirtyIfNeeded();
 
-        // 4. Process routed subscribe/get requests after current-packet events have
+        // 4. Flush conflation buffers into _currentBatch unless deferred by the
+        //    temporal window. Forced-flush boundaries below override the window.
+        bool windowOk = _flushWindowMs == 0 || WindowElapsed();
+        bool dirty = BuffersDirty();
+        bool hasPendingSubscribes = !_pendingSubscribeRequests.IsEmpty;
+
+        // 4a. Pre-snapshot forced flush: if any subscribe/get request is pending,
+        //     buffered deltas MUST reach the broadcast batch BEFORE we compute the
+        //     snapshot cutoff sequence — otherwise a new subscriber's snapshot would
+        //     reflect state past the cutoff while the cutoff still allows a future
+        //     batch carrying the same deltas to slip through. (Snapshot cutoff
+        //     correctness invariant.)
+        if (dirty && hasPendingSubscribes)
+        {
+            FlushAndClearWindow();
+        }
+        else if (windowOk && dirty)
+        {
+            FlushAndClearWindow();
+        }
+        else if (dirty)
+        {
+            Volatile.Write(ref _buffersDeferredFlushCount, _buffersDeferredFlushCount + 1);
+        }
+
+        // 5. Process routed subscribe/get requests after current-packet events have
         //    been serialized, but before the batch is visible to the broadcaster.
         //    Snapshots use the pending batch sequence as a barrier so clients do not
         //    receive deltas already included in their snapshot.
         long snapshotCutoffSequence = PendingBatchSequence;
         ProcessOwnSubscribeRequests(snapshotCutoffSequence);
 
-        // 5. Publish the batch to the broadcaster thread. On full ring, drop + schedule
+        // 6. Publish the batch to the broadcaster thread. On full ring, drop + schedule
         //    a resnapshot for each affected security so subscribers recover state.
+        PublishCurrentBatch();
+    }
+
+    /// <summary>
+    /// Idle-flush hook invoked by the dispatch loop when no upstream packets
+    /// arrive within <see cref="FlushWindowMs"/>. Bounds end-to-end latency to
+    /// <see cref="FlushWindowMs"/> for sparse-trickle traffic. Single-thread
+    /// (dispatch) only.
+    /// </summary>
+    public void FlushIfDue()
+    {
+        if (_flushWindowMs == 0) return;
+
+        // Refresh dynamic suppression sources first so a freshly-active source
+        // discards rather than fans out partial state.
+        PreBatchEvaluator?.Invoke();
+
+        if (_suppressFanout)
+        {
+            if (BuffersDirty())
+            {
+                DiscardConflationBuffers();
+                _firstDirtyTicks = 0;
+            }
+            return;
+        }
+
+        if (BuffersDirty() && WindowElapsed())
+        {
+            FlushAndClearWindow();
+            PublishCurrentBatch();
+        }
+    }
+
+    /// <summary>
+    /// Unconditional shutdown drain. If suppressed, buffers are discarded;
+    /// otherwise flushed and published. Single-thread (dispatch) only.
+    /// </summary>
+    public void FlushNow()
+    {
+        if (_suppressFanout)
+        {
+            if (BuffersDirty())
+            {
+                DiscardConflationBuffers();
+                _firstDirtyTicks = 0;
+            }
+            return;
+        }
+
+        if (BuffersDirty())
+        {
+            FlushAndClearWindow();
+        }
         PublishCurrentBatch();
     }
 
@@ -571,6 +712,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (next == prev) return;
         _suppressionMask = next;
         _suppressFanout = next != SuppressionSource.None;
+        // Transitioned None → suppressed: discard any deltas buffered under the
+        // temporal window. Without this, a window deferred from before the
+        // suppression toggle would later flush stale events between recovery and
+        // the post-resync snapshot. Caller is required to be on the dispatch
+        // thread (see XML doc on SetFanoutSuppressed).
+        if (prev == SuppressionSource.None && next != SuppressionSource.None)
+        {
+            if (BuffersDirty())
+            {
+                DiscardConflationBuffers();
+                _firstDirtyTicks = 0;
+            }
+        }
         if (prev != SuppressionSource.None && next == SuppressionSource.None)
             _parent.RequestResyncForAllSubscribersInGroup(this);
     }

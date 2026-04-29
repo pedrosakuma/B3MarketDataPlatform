@@ -91,20 +91,47 @@ decoupling, dispatch sustains 100 k+ events/s on a single core.
 
 ## 6. Coalesced per-client batching
 
-Events are coalesced into a single WS frame via two complementary windows:
+Events are coalesced into a single WS frame via three complementary windows:
 
 | Layer | Window | Purpose |
 | ----- | ------ | ------- |
-| **Server-side flush** | 1 packet (per `OnBatchComplete`) | Drop redundant updates; same-order add+delete cancels; same-price trades sum quantities |
+| **Server-side flush** (per group) | `UMDF_SERVER_FLUSH_WINDOW_MS` (default `0` = per packet) | When `> 0`, defers `FlushBuffers` so conflation spans multiple upstream B3 packets — `LEVEL_UPDATE` (last-write-wins per `secId,side,price`), `CANDLE_UPDATE` (one per security per window), `TRADE` (same-price summation), `OrderAdded`+`OrderDeleted` cancellation all extend across the window |
+| **Server-side flush** (per packet) | 1 packet (per `OnBatchComplete`) | Default. Conflation effective only within a single B3 packet |
 | **Per-client write loop** | `UMDF_CLIENT_COALESCE_WINDOW_MS` (default 10 ms) | After the first item, wait *N* ms before draining → larger frames, fewer pipe-lock acquisitions |
+
+The two server-side modes are mutually exclusive: `UMDF_SERVER_FLUSH_WINDOW_MS=0`
+preserves legacy per-packet behavior; any positive value enables debounce-style
+deferral (flush fires `WindowMs` after the first dirty event since the previous
+flush). Forced flushes still occur at: pre-snapshot cutoffs (subscribe/get
+requests), trade-bust ordering boundaries, and shutdown.
 
 Empirically, raising the per-client window from 0 → 10 ms reduces total
 syscalls by ~6× without measurably increasing client-perceived latency for
 hundreds of concurrent connections (commit `040cfa4`).
 
-> The window is a **soft latency knob**. 0 = immediate (lowest latency,
-> highest CPU). 10–20 ms = sweet spot for hundreds of clients. >50 ms
+Measured impact of `UMDF_SERVER_FLUSH_WINDOW_MS` on WINV25 incremental traffic
+(MBO+MBP+trades, single client, ~30k events/s upstream):
+
+| Window | LEVEL_UPDATE/s | CANDLE_UPDATE/s | TRADE/s | Incremental B/s |
+| -----: | -------------: | --------------: | ------: | --------------: |
+| `0` (default) | 7,030 | 1,070 | 1,100 | ~617 kB/s |
+| `10` | 2,530 (2.8×↓) | 79 (13.6×↓) | 175 (6.3×↓) | ~309 kB/s (2×↓) |
+| `25` | 2,380 (3×↓) | 34 (32×↓) | 82 (13×↓) | ~283 kB/s |
+
+> The server window is a **soft latency knob**. `0` = immediate (lowest latency,
+> highest fanout CPU). `10` ms = recommended sweet spot — bounds added latency
+> at the window value while halving incremental bandwidth and collapsing
+> `CANDLE_UPDATE` toward the natural ~10 Hz visualization rate. HFT-style
+> consumers that need every mutation should keep `0`.
+
+> The per-client window is also a **soft latency knob**. 0 = immediate (lowest
+> latency, highest CPU). 10–20 ms = sweet spot for hundreds of clients. >50 ms
 > increases per-client pending memory materially.
+
+> **Direct-to-batch events** (News, TradeBust) bypass the conflation buffers
+> and publish at every packet boundary regardless of `UMDF_SERVER_FLUSH_WINDOW_MS`.
+> `OnTradeBust` force-flushes any pending trade for the same security first to
+> preserve wire ordering.
 
 > **Fast-path `SendAsync`** (commit `38c8ebe`): the per-client write loop
 > passes `CancellationToken.None` to `WebSocket.SendAsync`. `ManagedWebSocket`

@@ -35,4 +35,20 @@ public interface IFeedEventHandler
     /// equivalent to <see cref="OnSequenceReset"/>.
     /// </summary>
     void OnSequenceVersionChanged(ushort newVersion) { }
+
+    /// <summary>
+    /// Optional hook for handlers that defer wire fan-out (e.g. server-side
+    /// temporal conflation window). Called by the dispatch loop on idle wakeups
+    /// (no packets pending). Implementations should flush only if the configured
+    /// window has elapsed since the first dirty event since the last flush.
+    /// Default no-op preserves legacy behavior.
+    /// </summary>
+    void FlushIfDue() { }
+
+    /// <summary>
+    /// Unconditional flush invoked by the dispatch loop at shutdown to prevent
+    /// silently dropping the last conflation window of buffered events. Default
+    /// no-op preserves legacy behavior.
+    /// </summary>
+    void FlushNow() { }
 }

@@ -33,6 +33,7 @@ int slowClientMaxTicks = settings.SlowClientMaxTicks;
 long clientMaxPendingBytes = settings.ClientMaxPendingBytes;
 int clientCoalesceWindowMs = settings.ClientCoalesceWindowMs;
 int maxSnapshotRequestsPerBatch = settings.MaxSnapshotRequestsPerBatch;
+int serverFlushWindowMs = settings.ServerFlushWindowMs;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
@@ -376,7 +377,8 @@ if (wsPort is not null)
         outlierMultiplier: settings.ClientOutlierMultiplier,
         outlierMinBytes: settings.ClientOutlierMinBytes,
         outlierPressurePct: settings.ClientOutlierPressurePct,
-        outlierIntervalMs: settings.ClientOutlierIntervalMs);
+        outlierIntervalMs: settings.ClientOutlierIntervalMs,
+        serverFlushWindowMs: serverFlushWindowMs);
 
 // Create per-group BookManager + MarketDataManager + FeedHandler
 var bookManagers = new List<BookManager>();
@@ -485,6 +487,7 @@ if (groupIds.Count > 1)
             groupRingCapacity: groupRingCapacity);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
+    multiFeed.FlushWindowMs = serverFlushWindowMs;
 }
 else
 {

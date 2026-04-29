@@ -48,6 +48,23 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     private int _anyReadyFired;
     private readonly ILogger<MultiFeedManager> _logger;
     private readonly int _ringCapacity;
+    private int _flushWindowMs;
+
+    /// <summary>
+    /// Server-side temporal flush window (milliseconds) propagated to the
+    /// per-group dispatch loops. 0 (default) disables idle-flush wakeups
+    /// (legacy behavior). Setter is intended for tests / construction-time
+    /// wiring; not safe to mutate after StartAsync.
+    /// </summary>
+    public int FlushWindowMs
+    {
+        get => _flushWindowMs;
+        set
+        {
+            if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+            _flushWindowMs = value;
+        }
+    }
 
     public event Action? AllGroupsReady;
 
@@ -329,6 +346,7 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     {
         var handler = _handlers[groupId];
         const int spinIterations = 64;
+        int flushWindowMs = _flushWindowMs;
         try
         {
             while (!ct.IsCancellationRequested)
@@ -356,7 +374,23 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
 
                 if (!gotItem)
                 {
-                    try { ring.WaitForItems(ct); }
+                    try
+                    {
+                        if (flushWindowMs > 0)
+                        {
+                            // Bounded wait so deferred conflation buffers can be
+                            // flushed within the configured window even when no
+                            // upstream packet arrives. Waking on timeout invokes
+                            // FlushIfDue which is a no-op when nothing is buffered
+                            // or the window has not yet elapsed.
+                            ring.WaitForItems(flushWindowMs, ct);
+                            handler.FlushIfDue();
+                        }
+                        else
+                        {
+                            ring.WaitForItems(ct);
+                        }
+                    }
                     catch (OperationCanceledException) { break; }
                 }
             }
@@ -373,6 +407,12 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
             // Drain any remaining packets so leases aren't leaked.
             while (ring.TryDequeue(out var packet))
                 packet.Release();
+
+            // Final shutdown drain: flush the last conflation window so
+            // buffered events are not silently lost. Defensive try/catch —
+            // the dispatch thread is exiting; don't propagate.
+            try { handler.FlushNow(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "FlushNow failed during dispatch shutdown for group {GroupId}", groupId); }
         }
     }
 

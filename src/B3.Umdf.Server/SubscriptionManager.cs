@@ -55,6 +55,7 @@ public sealed class SubscriptionManager : IDisposable
 
     private volatile bool _ready;
     private readonly int _maxSnapshotRequestsPerBatch;
+    private readonly int _serverFlushWindowMs;
 
     private readonly long _clientMaxPendingBytes;
     private readonly OutlierSweeper _outlierSweeper;
@@ -68,10 +69,13 @@ public sealed class SubscriptionManager : IDisposable
         double outlierMultiplier = 4.0,
         long outlierMinBytes = 256L * 1024,
         double outlierPressurePct = 0.50,
-        int outlierIntervalMs = 1000)
+        int outlierIntervalMs = 1000,
+        int serverFlushWindowMs = 0)
     {
+        if (serverFlushWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(serverFlushWindowMs));
         _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
+        _serverFlushWindowMs = serverFlushWindowMs;
         _clientMaxPendingBytes = clientMaxPendingBytes;
         _outlierSweeper = new OutlierSweeper(
             _clients,
@@ -109,7 +113,7 @@ public sealed class SubscriptionManager : IDisposable
     /// </summary>
     public GroupConflationHandler CreateGroupHandler()
     {
-        return new GroupConflationHandler(this, maxSnapshotRequestsPerBatch: _maxSnapshotRequestsPerBatch);
+        return new GroupConflationHandler(this, maxSnapshotRequestsPerBatch: _maxSnapshotRequestsPerBatch, flushWindowMs: _serverFlushWindowMs);
     }
 
     public void SetDataSources(

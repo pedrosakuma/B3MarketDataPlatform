@@ -47,4 +47,16 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
         foreach (var handler in _handlers)
             handler.OnSequenceVersionChanged(newVersion);
     }
+
+    public void FlushIfDue()
+    {
+        foreach (var handler in _handlers)
+            handler.FlushIfDue();
+    }
+
+    public void FlushNow()
+    {
+        foreach (var handler in _handlers)
+            handler.FlushNow();
+    }
 }

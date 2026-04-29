@@ -71,4 +71,16 @@ public interface IBookEventHandler
     /// caches) SHOULD use this to invalidate that state.
     /// </summary>
     void OnEpochReset(SnapshotClearReason reason) { }
+
+    /// <summary>
+    /// Optional hook for handlers that defer wire fan-out (server-side temporal
+    /// flush window). Forwarded by the dispatch loop on idle wakeups; default
+    /// no-op preserves legacy behavior.
+    /// </summary>
+    void FlushIfDue() { }
+
+    /// <summary>
+    /// Unconditional shutdown drain. Default no-op preserves legacy behavior.
+    /// </summary>
+    void FlushNow() { }
 }
