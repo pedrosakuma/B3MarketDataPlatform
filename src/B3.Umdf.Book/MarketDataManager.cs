@@ -381,51 +381,49 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.TickSizeDenominator = msg.TickSizeDenominator;
 
         List<UnderlyingInfo>? underlyings = null;
-        List<LegInfo>? legs = null;
-        List<InstrAttribInfo>? attribs = null;
-        string? secDesc = null;
+        foreach (ref readonly var u in reader.NoUnderlyings)
+        {
+            ulong uid = (ulong)u.UnderlyingSecurityID;
+            if (uid == 0) continue; // skip empty entries
+            underlyings ??= new();
+            underlyings.Add(new UnderlyingInfo
+            {
+                SecurityId = uid,
+                Symbol = Encoding.Latin1.GetString(u.UnderlyingSymbol.AsTrimmedSpan()),
+            });
+        }
 
-        reader.ReadGroups(
-            (in SecurityDefinition_12Data.NoUnderlyingsData u) =>
+        List<LegInfo>? legs = null;
+        foreach (ref readonly var leg in reader.NoLegs)
+        {
+            ulong lid = (ulong)leg.LegSecurityID;
+            if (lid == 0) continue; // skip empty entries
+            legs ??= new();
+            legs.Add(new LegInfo
             {
-                ulong uid = (ulong)u.UnderlyingSecurityID;
-                if (uid == 0) return; // skip empty entries
-                underlyings ??= new();
-                underlyings.Add(new UnderlyingInfo
-                {
-                    SecurityId = uid,
-                    Symbol = Encoding.Latin1.GetString(u.UnderlyingSymbol.AsTrimmedSpan()),
-                });
-            },
-            (in SecurityDefinition_12Data.NoLegsData leg) =>
+                SecurityId = lid,
+                Symbol = Encoding.Latin1.GetString(leg.LegSymbol.AsTrimmedSpan()),
+                RatioQty = leg.LegRatioQty.Mantissa,
+                SecurityType = (int)leg.LegSecurityType,
+                Side = (int)leg.LegSide,
+            });
+        }
+
+        List<InstrAttribInfo>? attribs = null;
+        foreach (ref readonly var a in reader.NoInstrAttribs)
+        {
+            attribs ??= new();
+            attribs.Add(new InstrAttribInfo
             {
-                ulong lid = (ulong)leg.LegSecurityID;
-                if (lid == 0) return; // skip empty entries
-                legs ??= new();
-                legs.Add(new LegInfo
-                {
-                    SecurityId = lid,
-                    Symbol = Encoding.Latin1.GetString(leg.LegSymbol.AsTrimmedSpan()),
-                    RatioQty = leg.LegRatioQty.Mantissa,
-                    SecurityType = (int)leg.LegSecurityType,
-                    Side = (int)leg.LegSide,
-                });
-            },
-            (in SecurityDefinition_12Data.NoInstrAttribsData a) =>
-            {
-                attribs ??= new();
-                attribs.Add(new InstrAttribInfo
-                {
-                    Type = (int)a.InstrAttribType,
-                    Value = (int)a.InstrAttribValue,
-                });
-            },
-            (TextEncoding desc) =>
-            {
-                if (desc.Length > 0)
-                    secDesc = Encoding.UTF8.GetString(desc.VarData);
-            }
-        );
+                Type = (int)a.InstrAttribType,
+                Value = (int)a.InstrAttribValue,
+            });
+        }
+
+        string? secDesc = null;
+        var descField = reader.SecurityDesc;
+        if (descField.Length > 0)
+            secDesc = Encoding.UTF8.GetString(descField.VarData);
 
         info.Underlyings = underlyings;
         info.Legs = legs;
