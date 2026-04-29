@@ -393,6 +393,7 @@ function getFlags() {
   if ($('flagBook').checked) f |= DATA_FLAGS.BOOK;
   if ($('flagInfo').checked) f |= DATA_FLAGS.INFO;
   if ($('flagMbp').checked) f |= DATA_FLAGS.MBP;
+  if ($('flagTrades').checked) f |= DATA_FLAGS.TRADES;
   return f || DATA_FLAGS.MBP;
 }
 

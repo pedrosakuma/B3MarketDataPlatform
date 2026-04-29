@@ -120,11 +120,18 @@ public enum DataFlags : byte
     /// since the wire is conflated per (secId, side, price) instead of per
     /// orderId, dramatically reducing bandwidth on hot levels.</summary>
     Mbp = 0x08,
+    /// <summary>Trade prints (live <see cref="MessageType.Trade"/>) and corrections
+    /// (<see cref="MessageType.TradeBust"/>), plus the per-symbol recent-trades
+    /// history sent on subscribe. Opt-in (default OFF): clients that only want
+    /// quotes (Book and/or Mbp) avoid trade-stream bandwidth entirely. Note that
+    /// <c>LastTradePrice</c> in <see cref="MessageType.InfoSnapshot"/> is part of
+    /// <see cref="Info"/> and is not gated by this flag.</summary>
+    Trades = 0x10,
     /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News or MBP.</summary>
+    /// does NOT include News, MBP, or Trades.</summary>
     All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP.</summary>
-    Everything = Book | Info | News | Mbp,
+    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades.</summary>
+    Everything = Book | Info | News | Mbp | Trades,
 }
 
 /// <summary>

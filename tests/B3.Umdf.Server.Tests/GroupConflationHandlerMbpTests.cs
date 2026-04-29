@@ -186,7 +186,8 @@ public class GroupConflationHandlerMbpTests
             var rec = new RecordingWebSocket();
             var session = new ClientSession(rec, channelCapacity: 64);
             w.Manager.RegisterClient(session); _ = Task.Run(() => session.RunWriteLoopAsync());
-            w.Manager.HandleSubscribe(session.Id, Symbol, DataFlags.Mbp,
+            // Mbp + Trades: Mbp-only excludes order frames, Trades opts in to live prints.
+            w.Manager.HandleSubscribe(session.Id, Symbol, DataFlags.Mbp | DataFlags.Trades,
                 w.BookManager, w.Group, bookBatchCutoffSequence: 0);
             await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
 
@@ -195,7 +196,7 @@ public class GroupConflationHandlerMbpTests
             var entry = NewEntry(orderId: 10, price: 1000, qty: 5);
             w.Group.OnOrderAdded(book, in entry);
 
-            // Shared frame (Trade) MUST reach the MBP-only subscriber.
+            // Trade frame MUST reach the subscriber because they opted in via DataFlags.Trades.
             w.Group.OnTrade(SecurityId, price: 1000, quantity: 1, tradeId: 42, sendingTimeNs: 0);
             w.Group.OnBatchComplete();
 

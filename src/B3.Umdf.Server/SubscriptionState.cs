@@ -67,4 +67,15 @@ internal sealed class SubscriptionState
     public bool WantsInfo => (Flags & DataFlags.Info) != 0;
 
     public bool WantsNews => (Flags & DataFlags.News) != 0;
+
+    /// <summary>True iff this subscription opted in to the live trade stream
+    /// (<see cref="MessageType.Trade"/> + <see cref="MessageType.TradeBust"/>) and
+    /// the per-symbol recent-trade history snapshot. Default-OFF flag, so legacy
+    /// clients without this bit do not receive any trade frames.</summary>
+    public bool WantsTrades => (Flags & DataFlags.Trades) != 0;
+
+    /// <summary>True iff this subscription wants live trades and the given batch is
+    /// past the snapshot cutoff. Trades share the same broadcast cutoff as Book/Mbp.</summary>
+    public bool WantsTradesBatch(long batchSequence) =>
+        (Flags & DataFlags.Trades) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
 }

@@ -310,6 +310,16 @@ public sealed class SubscriptionManager : IDisposable
         return false;
     }
 
+    /// <summary>Lock-free quick check used by the dispatch thread to skip serializing
+    /// trade frames (Trade, TradeBust) for securities with no Trades-flag subscriber.</summary>
+    internal bool HasAnyTradesSubscriber(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        foreach (var (_, state) in clients)
+            if ((state.Flags & DataFlags.Trades) != 0) return true;
+        return false;
+    }
+
     /// <summary>
     /// Invoked from the dispatch thread when a broadcast batch had to be dropped
     /// (broadcaster ring full). Schedules a fresh snapshot (Get) request for every
@@ -468,13 +478,6 @@ public sealed class SubscriptionManager : IDisposable
                     return false;
             }
 
-            // Send recent trade history from the owning group's ring buffer
-            if (group.RecentTrades.TryGetValue(securityId, out var trades))
-            {
-                if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
-                    return false;
-            }
-
             // Send candle history from the owning group's aggregator.
             // Always send a CandleSnapshot (even empty) so the frontend knows the snapshot phase is complete.
             if (group.Candles.TryGetValue(securityId, out var agg))
@@ -502,18 +505,10 @@ public sealed class SubscriptionManager : IDisposable
                     return false;
             }
 
-            // MBP subscribers that don't also have Book still need trade history and
-            // candles for the UI's last-trade and chart panels — both panels are
-            // semantically part of the L2 view, not the per-order ladder. Send them
-            // when MBP is requested without Book.
+            // MBP-only subscribers (no Book flag) still need candles for the chart
+            // panel which is part of the L2 view.
             if (!flags.HasFlag(DataFlags.Book))
             {
-                if (group.RecentTrades.TryGetValue(securityId, out var trades))
-                {
-                    if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
-                        return false;
-                }
-
                 if (group.Candles.TryGetValue(securityId, out var agg))
                 {
                     if (!SnapshotEmitter.SendCandleHistory(session, securityId, agg))
@@ -524,6 +519,19 @@ public sealed class SubscriptionManager : IDisposable
                     if (!SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId))
                         return false;
                 }
+            }
+        }
+
+        if (flags.HasFlag(DataFlags.Trades))
+        {
+            // Trade history snapshot is gated on the opt-in Trades flag. Sent
+            // independently of Book/Mbp so a client requesting only Trades still
+            // gets recent prints. The ring may be empty for cold symbols
+            // (Phase C optimization) — that's fine, no frame is emitted.
+            if (group.RecentTrades.TryGetValue(securityId, out var trades))
+            {
+                if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
+                    return false;
             }
         }
 

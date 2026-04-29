@@ -34,12 +34,17 @@ internal sealed class BroadcastWorkBatch
         /// <see cref="EventRecord.SecId"/> that have <c>DataFlags.Mbp</c>.
         /// Honors the same broadcast-sequence cutoff as Book.</summary>
         MbpSubscribers = 3,
-        /// <summary>Shared book-context frames (Trade, BookCleared, StaleStatus,
-        /// MarketTier, TradeBust, CandleUpdate): route to subscribers of
+        /// <summary>Shared book-context frames (BookCleared, StaleStatus,
+        /// MarketTier, CandleUpdate): route to subscribers of
         /// <see cref="EventRecord.SecId"/> that have either <c>DataFlags.Book</c>
         /// or <c>DataFlags.Mbp</c>. Both views need these signals; only the
         /// per-order vs per-level deltas are stream-specific.</summary>
         BookOrMbpSubscribers = 4,
+        /// <summary>Trade prints and corrections (<see cref="MessageType.Trade"/>,
+        /// <see cref="MessageType.TradeBust"/>): route only to subscribers of
+        /// <see cref="EventRecord.SecId"/> that have <c>DataFlags.Trades</c>.
+        /// Honors the same broadcast-sequence cutoff as Book/Mbp.</summary>
+        TradeSubscribers = 5,
     }
 
     public struct EventRecord

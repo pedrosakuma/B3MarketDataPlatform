@@ -20,7 +20,7 @@ export const MSG = {
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
 
-export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, NEWS: 0x04, MBP: 0x08, ALL: 0x03 };
+export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, NEWS: 0x04, MBP: 0x08, TRADES: 0x10, ALL: 0x03 };
 export const CANDLE_FLAGS = { FIRST: 0x01, LAST: 0x02 };
 
 export const INFO_FIELDS = [
@@ -57,6 +57,7 @@ export function flagsStr(f) {
   if (f & DATA_FLAGS.INFO) parts.push('Info');
   if (f & DATA_FLAGS.NEWS) parts.push('News');
   if (f & DATA_FLAGS.MBP) parts.push('Mbp');
+  if (f & DATA_FLAGS.TRADES) parts.push('Trades');
   return parts.join('+') || 'None';
 }
 

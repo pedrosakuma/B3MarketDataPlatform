@@ -65,16 +65,24 @@ Get               0x0003        Unsubscribed        0x0012
 | Value | Name | Meaning |
 |-------|------|---------|
 | `0x00` | None | Treated as `All` |
-| `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `Trade`, `BookCleared`) |
+| `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `BookCleared`). **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
-| `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News) |
+| `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News, MBP, or Trades) |
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
-| `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`Trade`, `BookCleared`, `MarketTierUpdate`, `TradeBust`, `CandleUpdate`) are also delivered. |
-| `0x0F` | Everything | `Book` + `Info` + `News` + `Mbp` |
+| `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
+| `0x10` | Trades | Trade prints (`Trade`) + corrections (`TradeBust`) + per-symbol recent-trades history snapshot on subscribe. Independent of `Book`/`Mbp` — opt in to receive live tape. Note: `LastTradePrice`/`LastTradeSize` in `InfoSnapshot` belong to `Info`, not this flag. |
+| `0x1F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` |
 
-> **News is opt-in.** Existing clients that send `0x03` (or `0x00`) keep
-> the legacy behaviour and never receive news frames. Set the `News` bit
-> explicitly to enable.
+> **News and Trades are opt-in.** Existing clients that send `0x03` (or
+> `0x00`) keep the legacy behaviour and never receive news or trade frames.
+> Set the `News` / `Trades` bits explicitly to enable.
+>
+> ⚠️ **Breaking change (Trades opt-in)**: prior to this version, `Book` and
+> `Mbp` subscribers automatically received `Trade`/`TradeBust` as "shared"
+> frames. They no longer do. Clients that want the trade tape must set the
+> `Trades` (`0x10`) bit. Combine freely: e.g. `Book|Trades` (`0x11`),
+> `Mbp|Trades` (`0x18`), `Book|Mbp|Trades` (`0x19`), or `Trades` alone
+> (`0x10`) for a tape-only client.
 
 Behavior:
 

@@ -33,6 +33,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     // when the level no longer exists). Last-write-wins natural coalescing: a level
     // touched 100× in a packet emits exactly one frame.
     private readonly Dictionary<(ulong SecurityId, byte Side, long Price), bool> _levelBuffer = new();
+    // Reused scratch set for FlushTradeBuffer to dedupe securities needing candle
+    // broadcast. Cleared each flush — keeps the trade flush path zero-alloc.
+    private readonly HashSet<ulong> _scratchCandleSecIds = new();
     private byte[] _flushBuf = new byte[4096];
 
     // Per-packet work batch. Dispatch thread rents on first event in a packet, appends
@@ -85,6 +88,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     private long _eventsReceived;
     private long _eventsFlushed;
+
+    // Trade conflation telemetry. Received counts every OnTrade/OnForwardTrade call that
+    // reached BufferTrade (i.e., security is subscribed). Emitted counts the wire frames
+    // produced by FlushTradeBuffer. Hit rate = 1 - Emitted/Received; if it stays near 0
+    // in production, the (secId,price) coalescing dict isn't earning its keep.
+    private long _tradesReceivedTotal;
+    private long _tradesEmittedTotal;
+    public long TradesReceivedTotal => Volatile.Read(ref _tradesReceivedTotal);
+    public long TradesEmittedTotal => Volatile.Read(ref _tradesEmittedTotal);
 
     // Recent trades per security.
     // ConcurrentDictionary because HandleSubscribe may read from another group's thread
@@ -217,7 +229,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
-        // Always capture trades (regardless of subscription)
+        // Phase C gate: skip ring + candle hydration when no client is subscribed
+        // to this security in the entire fleet. Trade-off: a future subscriber to
+        // a previously cold symbol sees an empty trade history (BookSnapshot still
+        // gives them an immediate price). Cheap O(1) ConcurrentDictionary check;
+        // pays for itself on EQT-feeds with thousands of unsubscribed symbols.
+        if (!_parent.IsSubscribed(securityId)) return;
+
+        // Capture trade in the per-security ring (used to seed snapshot history
+        // for future subscribers).
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
@@ -233,7 +253,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
 
-        if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
         _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
@@ -251,6 +270,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
+        // Same gate as OnTrade — skip hydration for cold (unsubscribed) symbols.
+        if (!_parent.IsSubscribed(securityId)) return;
+
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
         ring.Add(price, quantity, tradeId);
@@ -265,7 +287,6 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
 
-        if (!_parent.IsSubscribed(securityId)) return;
         _eventsReceived++;
         _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
@@ -286,7 +307,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (!_parent.IsSubscribed(securityId)) return;
         Span<byte> tmp = stackalloc byte[20];
         int len = WireProtocol.WriteTradeBust(tmp, securityId, tradeId);
-        AppendSharedEventToBatch(securityId, tmp[..len], logicalCount: 1);
+        AppendTradeEventToBatch(securityId, tmp[..len], logicalCount: 1);
         _eventsReceived++;
     }
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
@@ -657,6 +678,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     private void BufferTrade(ulong securityId, long price, long quantity, long tradeId)
     {
+        _tradesReceivedTotal++;
         ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_tradeBuffer, (securityId, price), out bool existed);
         if (existed)
             slot = (slot.Qty + quantity, tradeId);
@@ -897,27 +919,26 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         // Collect securities that need candle broadcasts (deduplicated). All entries
         // already came in via subscribed callers so no additional filter is needed.
-        HashSet<ulong>? candleSecIds = null;
+        // Reuse the field-level scratch set to keep this path zero-alloc.
+        _scratchCandleSecIds.Clear();
         foreach (var ((secId, _), _) in _tradeBuffer)
-        {
-            candleSecIds ??= new();
-            candleSecIds.Add(secId);
-        }
+            _scratchCandleSecIds.Add(secId);
 
-        // Flush trades
+        // Flush trades (Trades-flag opt-in routing)
         foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
             int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
-            AppendSharedEventToBatch(secId, tmp[..len], logicalCount: 1);
+            AppendTradeEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
+        _tradesEmittedTotal += _tradeBuffer.Count;
         _tradeBuffer.Clear();
 
         // Broadcast candle updates (one per security, after all trades)
-        if (candleSecIds is not null)
+        if (_scratchCandleSecIds.Count > 0)
         {
             Span<byte> cbuf = stackalloc byte[WireProtocol.CandleUpdateMessageSize];
-            foreach (var secId in candleSecIds)
+            foreach (var secId in _scratchCandleSecIds)
             {
                 if (!Candles.TryGetValue(secId, out var agg)) continue;
                 var latest = agg.GetLatest();
@@ -965,10 +986,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     }
 
     /// <summary>
-    /// Append a frame that is relevant to BOTH Book and Mbp subscribers (Trade,
-    /// BookCleared, MarketTier, StaleStatus, TradeBust, CandleUpdate). Tagged with
+    /// Append a frame that is relevant to BOTH Book and Mbp subscribers (BookCleared,
+    /// MarketTier, StaleStatus, CandleUpdate). Tagged with
     /// <see cref="BroadcastWorkBatch.EventKind.BookOrMbpSubscribers"/> so the
     /// broadcaster fanout iterates clients that have either flag set.
+    /// Note: Trade/TradeBust are NOT routed here — they go through
+    /// <see cref="AppendTradeEventToBatch"/> which honors the opt-in
+    /// <see cref="DataFlags.Trades"/> flag.
     /// </summary>
     private void AppendSharedEventToBatch(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
     {
@@ -976,6 +1000,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (!_parent.HasAnyBookSubscriber(securityId) && !_parent.HasAnyMbpSubscriber(securityId)) return;
         _currentBatch ??= BroadcastWorkBatch.Rent();
         _currentBatch.Append(securityId, bytes, logicalCount, BroadcastWorkBatch.EventKind.BookOrMbpSubscribers);
+    }
+
+    /// <summary>
+    /// Append a Trade or TradeBust frame to the broadcast batch tagged for the
+    /// opt-in <see cref="DataFlags.Trades"/> fanout. Skipped when no subscriber
+    /// for this security has the Trades flag set, so trade bytes never enter
+    /// the ring for quote-only consumers.
+    /// </summary>
+    private void AppendTradeEventToBatch(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        if (bytes.Length == 0) return;
+        if (!_parent.HasAnyTradesSubscriber(securityId)) return;
+        _currentBatch ??= BroadcastWorkBatch.Rent();
+        _currentBatch.Append(securityId, bytes, logicalCount, BroadcastWorkBatch.EventKind.TradeSubscribers);
     }
 
     /// <summary>
@@ -1101,6 +1139,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                     break;
                 case BroadcastWorkBatch.EventKind.BookOrMbpSubscribers:
                     AppendForBookOrMbpSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    break;
+                case BroadcastWorkBatch.EventKind.TradeSubscribers:
+                    AppendForTradeSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
                     break;
             }
         }
@@ -1232,6 +1273,23 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var (clientId, state) in subs)
         {
             if (!state.WantsBookBatch(batchSequence) && !state.WantsMbpBatch(batchSequence)) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+            AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    /// <summary>Trade-flag opt-in fan-out for <see cref="MessageType.Trade"/> and
+    /// <see cref="MessageType.TradeBust"/>. Honors the per-batch broadcast cutoff so
+    /// freshly-subscribed clients don't see trades that predate their snapshot.</summary>
+    private void AppendForTradeSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
+    {
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+
+        foreach (var (clientId, state) in subs)
+        {
+            if (!state.WantsTradesBatch(batchSequence)) continue;
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
             AppendToClient(session, bytes, logicalCount);
