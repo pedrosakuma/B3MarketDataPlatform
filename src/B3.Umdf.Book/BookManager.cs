@@ -19,6 +19,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _deleteNotFound;
     private long _nullPriceChangeDeletes;
     private long _tradesFilteredNonReportable;
+    private long _tradeSbeEntries;
+    private long _tradeRouteRejected;
+    private long _executionSummaryEntries;
+    private long _bookOnPacketCalls;
+    private long _bookSbeDispatched;
     private long _marketOrderAdds;
     private long _marketOrderUpdates;
     private long _marketOrderDeletes;
@@ -78,6 +83,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// price) is gated.
     /// </summary>
     public long TradesFilteredNonReportable => Volatile.Read(ref _tradesFilteredNonReportable);
+    /// <summary>Number of Trade_53 SBE messages observed by HandleTrade entry (pre-routing/filter).</summary>
+    public long TradeSbeEntries => Volatile.Read(ref _tradeSbeEntries);
+    /// <summary>Trade_53 messages rejected by RouteMbo (gap/stale path).</summary>
+    public long TradeRouteRejected => Volatile.Read(ref _tradeRouteRejected);
+    /// <summary>ExecutionSummary_55 SBE messages observed by HandleExecutionSummary entry (pre-routing).</summary>
+    public long ExecutionSummaryEntries => Volatile.Read(ref _executionSummaryEntries);
+    public long BookOnPacketCalls => Volatile.Read(ref _bookOnPacketCalls);
+    public long BookSbeDispatched => Volatile.Read(ref _bookSbeDispatched);
 
     private long _endOfEventCount;
     private long _recoveryMsgCount;
@@ -472,6 +485,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
+        Interlocked.Increment(ref _bookOnPacketCalls);
         // Extract packet-level SendingTime for use in HandleTrade/HandleForwardTrade
         if (packet.TryGetHeader(out var pktHeader))
             _currentSendingTimeNs = pktHeader.SendingTime;
@@ -479,7 +493,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         try
         {
             var handler = new BookSbeHandler { Owner = this };
-            SbeDispatcher.Dispatch(sbePayload, ref handler);
+            if (SbeDispatcher.Dispatch(sbePayload, ref handler))
+                Interlocked.Increment(ref _bookSbeDispatched);
         }
         catch (Exception ex)
         {
@@ -806,12 +821,16 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     private void HandleTrade(in Trade_53DataReader reader)
     {
+        Interlocked.Increment(ref _tradeSbeEntries);
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
         if (!RouteMbo(securityId, Trade_53Data.MESSAGE_ID,
                 msg.RptSeq is { } trRs ? (uint)trRs : null, reader.Block, reader.BlockLength))
+        {
+            Interlocked.Increment(ref _tradeRouteRejected);
             return;
+        }
 
         long price = msg.MDEntryPx.Mantissa;
         long quantity = (long)msg.MDEntrySize;
@@ -895,6 +914,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     private void HandleExecutionSummary(in ExecutionSummary_55DataReader reader)
     {
+        Interlocked.Increment(ref _executionSummaryEntries);
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 

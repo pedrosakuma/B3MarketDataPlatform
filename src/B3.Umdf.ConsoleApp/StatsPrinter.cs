@@ -99,6 +99,24 @@ internal sealed class StatsPrinter
         Console.WriteLine($"   Packets: {packets:N0} ({pktRate:N0}/s)  |  Events: {totalEvents:N0} ({evtRate:N0}/s)  |  Books: {_bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {_marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {_symbolRegistry.Count:N0}");
         Console.WriteLine($"   MOA/MOC: snap={_bookManagers.Sum(bm => bm.SnapshotMarketOrderAdds):N0} add={_bookManagers.Sum(bm => bm.MarketOrderAdds):N0} upd={_bookManagers.Sum(bm => bm.MarketOrderUpdates):N0} del={_bookManagers.Sum(bm => bm.MarketOrderDeletes):N0} toPx={_bookManagers.Sum(bm => bm.MarketOrderTransitionsToPriced):N0}");
 
+        if (_groupHandlers is not null && _groupHandlers.Count > 0)
+        {
+            long tradesRecv = _groupHandlers.Sum(g => g.TradesReceivedTotal);
+            long tradesEmit = _groupHandlers.Sum(g => g.TradesEmittedTotal);
+            long tradesFilt = _bookManagers.Sum(bm => bm.TradesFilteredNonReportable);
+            long tradeSbe = _bookManagers.Sum(bm => bm.TradeSbeEntries);
+            long tradeRej = _bookManagers.Sum(bm => bm.TradeRouteRejected);
+            long execSum = _bookManagers.Sum(bm => bm.ExecutionSummaryEntries);
+            Console.WriteLine($"   trades: sbe={tradeSbe:N0} routeRej={tradeRej:N0} filtNonRep={tradesFilt:N0} recv={tradesRecv:N0} emit={tradesEmit:N0}  execSummary={execSum:N0}");
+            long ordAdd = _bookManagers.Sum(bm => bm.OrderAdds);
+            long ordUpd = _bookManagers.Sum(bm => bm.OrderUpdates);
+            long ordDel = _bookManagers.Sum(bm => bm.OrderDeletes);
+            Console.WriteLine($"   orders: add={ordAdd:N0} upd={ordUpd:N0} del={ordDel:N0}");
+            long bmOnPkt = _bookManagers.Sum(bm => bm.BookOnPacketCalls);
+            long bmSbe = _bookManagers.Sum(bm => bm.BookSbeDispatched);
+            Console.WriteLine($"   bookMgr: onPacket={bmOnPkt:N0} sbeDispatched={bmSbe:N0}");
+        }
+
         // Per-group dispatch ring stats — surfaced unconditionally so producer/consumer
         // pressure (queue depth, total drops, per-channel attribution) is visible at
         // every print, not only on heal events. Helps spot bursts that overwhelm the
