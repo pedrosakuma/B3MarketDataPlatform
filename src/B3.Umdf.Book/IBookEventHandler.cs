@@ -13,6 +13,18 @@ public interface IBookEventHandler
     void OnOrderAdded(OrderBook book, in OrderBookEntry entry);
     void OnOrderUpdated(OrderBook book, in OrderBookEntry entry);
     void OnOrderDeleted(OrderBook book, ulong orderId, BookSideType side);
+
+    /// <summary>
+    /// Per-price-level dirty notification. Fired by <c>BookManager</c> after every
+    /// mutation that touches a level (Add, Update same-price, Update moved — twice
+    /// for old+new — and Delete). Consumers MAY consult
+    /// <see cref="BookSide.TryGetLevelAggregate"/> at flush time to read the
+    /// post-mutation aggregate (TotalQty/Count) and emit MBP frames; if the level
+    /// no longer exists, the level was drained and consumers should emit a delete.
+    /// Default implementation is a no-op so MBO-only handlers stay unchanged.
+    /// </summary>
+    void OnPriceLevelChanged(OrderBook book, BookSideType side, long price) { }
+
     void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount) { }
     void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs);
     void OnBookCleared(ulong securityId, BookClearSide side);

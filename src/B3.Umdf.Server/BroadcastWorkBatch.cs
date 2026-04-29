@@ -30,6 +30,16 @@ internal sealed class BroadcastWorkBatch
         /// every connected client with <c>DataFlags.News</c>, regardless of
         /// per-symbol subscriptions.</summary>
         NewsGlobal = 2,
+        /// <summary>MBP (price-level) frames: route to subscribers of
+        /// <see cref="EventRecord.SecId"/> that have <c>DataFlags.Mbp</c>.
+        /// Honors the same broadcast-sequence cutoff as Book.</summary>
+        MbpSubscribers = 3,
+        /// <summary>Shared book-context frames (Trade, BookCleared, StaleStatus,
+        /// MarketTier, TradeBust, CandleUpdate): route to subscribers of
+        /// <see cref="EventRecord.SecId"/> that have either <c>DataFlags.Book</c>
+        /// or <c>DataFlags.Mbp</c>. Both views need these signals; only the
+        /// per-order vs per-level deltas are stream-specific.</summary>
+        BookOrMbpSubscribers = 4,
     }
 
     public struct EventRecord

@@ -34,12 +34,15 @@ Unsubscribe       0x0002        SubscribeError      0x0011
 Get               0x0003        Unsubscribed        0x0012
                                 BookSnapshot        0x0020
                                 InfoSnapshot        0x0021
+                                LevelSnapshot       0x0022
                                 OrderAdded          0x0030
                                 OrderUpdated        0x0031
                                  OrderDeleted        0x0032
                                  Trade               0x0033
                                  BookCleared         0x0034
                                  MarketTierUpdate    0x0036
+                                 LevelUpdate         0x0037
+                                 LevelDeleted        0x0038
                                  RankingsUpdate      0x0040
                                 ServerStatus        0x0050
                                 CandleSnapshot      0x0060
@@ -66,7 +69,8 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
 | `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News) |
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
-| `0x07` | Everything | `Book` + `Info` + `News` |
+| `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`Trade`, `BookCleared`, `MarketTierUpdate`, `TradeBust`, `CandleUpdate`) are also delivered. |
+| `0x0F` | Everything | `Book` + `Info` + `News` + `Mbp` |
 
 > **News is opt-in.** Existing clients that send `0x03` (or `0x00`) keep
 > the legacy behaviour and never receive news frames. Set the `News` bit
@@ -118,6 +122,7 @@ do not consume incrementals" and re-subscribe on the rising edge.
 |---------|------|---------|
 | **BookSnapshot** | `0x0020` | `[secId u64][rptSeq u32][bidCount u16][askCount u16][level × N]` |
 | **InfoSnapshot** | `0x0021` | `[secId u64][fieldMask u32][value i64 × popcount(mask)]` |
+| **LevelSnapshot** | `0x0022` | `[secId u64][bidCount u16][askCount u16][bid × bidCount][ask × askCount]` — each level is `[price i64][totalQty i64][orderCount u32]` (20 bytes). Sent only when `DataFlags.Mbp` is set. |
 
 Each price level is **18 bytes**: `[price i64][totalQty i64][orderCount u16]`.
 The current server uses `BookSnapshot` as a reset marker (`bidCount=0`,
@@ -156,6 +161,8 @@ bit order). Max `InfoSnapshot` body: 192 bytes.
 | **Trade**        | `0x0033` | `[secId u64][price i64][qty i64][tradeId i64]` |
 | **BookCleared**  | `0x0034` | `[secId u64][clearSide u8]` |
 | **MarketTierUpdate** | `0x0036` | `[secId u64][side u8][totalQty i64][orderCount u32]` |
+| **LevelUpdate**  | `0x0037` | `[secId u64][side u8][price i64][totalQty i64][orderCount u32]` |
+| **LevelDeleted** | `0x0038` | `[secId u64][side u8][price i64]` |
 
 For order events and `MarketTierUpdate`, `side` = `0` (Bid) or `1` (Ask).
 For `BookCleared`, `clearSide` = `0` (Both), `1` (Bid), or `2` (Ask).

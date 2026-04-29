@@ -300,10 +300,20 @@ public sealed class SubscriptionManager : IDisposable
         return false;
     }
 
+    /// <summary>Lock-free quick check used by the dispatch thread to skip MBP buffering
+    /// for securities with no MBP-flag subscriber.</summary>
+    internal bool HasAnyMbpSubscriber(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        foreach (var (_, state) in clients)
+            if ((state.Flags & DataFlags.Mbp) != 0) return true;
+        return false;
+    }
+
     /// <summary>
     /// Invoked from the dispatch thread when a broadcast batch had to be dropped
     /// (broadcaster ring full). Schedules a fresh snapshot (Get) request for every
-    /// current Book-flag subscriber of <paramref name="securityId"/> so they can
+    /// current Book- or Mbp-flag subscriber of <paramref name="securityId"/> so they can
     /// recover the state they missed. Returns true if at least one resync request
     /// was enqueued.
     /// </summary>
@@ -318,8 +328,9 @@ public sealed class SubscriptionManager : IDisposable
         if (group is null) return false;
         foreach (var (clientId, state) in clients)
         {
-            if ((state.Flags & DataFlags.Book) == 0) continue;
-            group.EnqueueRequest(clientId, symbol, DataFlags.Book, isGet: true);
+            var resyncFlags = state.Flags & (DataFlags.Book | DataFlags.Mbp);
+            if (resyncFlags == 0) continue;
+            group.EnqueueRequest(clientId, symbol, resyncFlags, isGet: true);
             any = true;
         }
         return any;
@@ -410,7 +421,7 @@ public sealed class SubscriptionManager : IDisposable
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
 
-        if (flags.HasFlag(DataFlags.Book))
+        if (flags.HasFlag(DataFlags.Book) || flags.HasFlag(DataFlags.Mbp))
             UpdateBookCutoffIfSubscribed(clientId, securityId, bookBatchCutoffSequence);
 
         SendSnapshots(session, securityId, flags, bookManager, group);
@@ -475,6 +486,44 @@ public sealed class SubscriptionManager : IDisposable
             {
                 if (!SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId))
                     return false;
+            }
+        }
+
+        if (flags.HasFlag(DataFlags.Mbp))
+        {
+            if (bookManager.Books.TryGetValue(securityId, out var mbpBook))
+            {
+                if (!SnapshotEmitter.SendMbpSnapshot(session, mbpBook))
+                    return false;
+            }
+            else
+            {
+                if (!SnapshotEmitter.SendEmptyMbpSnapshot(session, securityId))
+                    return false;
+            }
+
+            // MBP subscribers that don't also have Book still need trade history and
+            // candles for the UI's last-trade and chart panels — both panels are
+            // semantically part of the L2 view, not the per-order ladder. Send them
+            // when MBP is requested without Book.
+            if (!flags.HasFlag(DataFlags.Book))
+            {
+                if (group.RecentTrades.TryGetValue(securityId, out var trades))
+                {
+                    if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
+                        return false;
+                }
+
+                if (group.Candles.TryGetValue(securityId, out var agg))
+                {
+                    if (!SnapshotEmitter.SendCandleHistory(session, securityId, agg))
+                        return false;
+                }
+                else
+                {
+                    if (!SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId))
+                        return false;
+                }
             }
         }
 

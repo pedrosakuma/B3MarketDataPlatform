@@ -1,5 +1,9 @@
 # UMDF Traffic Characterization (Phase 0)
 
+> See also: [`mbp-stream.md`](mbp-stream.md) — MBP wire stream design,
+> protocol additions, and bandwidth measurements vs MBO on the hot-symbol
+> trace (45–98% reduction depending on the conflation window).
+
 Ground-truth per-channel statistics extracted from recorded B3 UMDF
 PCAPs, used to design realistic dispatcher / ring benchmarks instead
 of guessing synthetic rates.

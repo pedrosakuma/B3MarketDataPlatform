@@ -229,7 +229,8 @@
   <div class="group">
     <input id="symbolInput" type="text" placeholder="Symbol (e.g. PETR4)" list="symbolSuggestions" class="input-symbol" onkeydown="if(event.key==='Enter') doSubscribe()" oninput="this.value=this.value.toUpperCase(); symbolAutocomplete(this.value)" autocomplete="off">
     <datalist id="symbolSuggestions"></datalist>
-    <label><input id="flagBook" type="checkbox" checked> Book</label>
+    <label><input id="flagMbp" type="checkbox" checked> MBP</label>
+    <label><input id="flagBook" type="checkbox"> MBO</label>
     <label><input id="flagInfo" type="checkbox" checked> Info</label>
     <button id="btnSubscribe" onclick="doSubscribe()" disabled>Subscribe</button>
     <button id="btnGet" onclick="doGet()" disabled>Get</button>

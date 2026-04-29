@@ -61,12 +61,49 @@ public sealed class BookSide
     }
 
     /// <summary>
+    /// Iterates aggregated price-level state (price, totalQty, count) in best→worst
+    /// order. Reads cached aggregates — no per-order summation. Intended for the MBP
+    /// snapshot path.
+    /// </summary>
+    public IEnumerable<(long Price, long TotalQty, int Count)> PriceLevelAggregates
+    {
+        get
+        {
+            for (int i = _levels.Count - 1; i >= 0; i--)
+            {
+                var lvl = _levels[i];
+                yield return (lvl.Price, lvl.TotalQty, lvl.Count);
+            }
+        }
+    }
+
+    /// <summary>
     /// Direct access to orders at a given price level. O(1) amortized for top-of-book.
     /// </summary>
     public List<OrderBookEntry>? GetOrdersAtPrice(long price)
     {
         int idx = FindPriceLevel(price);
         return idx >= 0 ? _levels[idx].Orders : null;
+    }
+
+    /// <summary>
+    /// O(1)-amortized lookup of cached aggregates for a single price level.
+    /// Returns false when the level does not exist (e.g. fully drained), in which
+    /// case MBP publishers should emit a "level deleted" frame.
+    /// </summary>
+    public bool TryGetLevelAggregate(long price, out long totalQty, out int count)
+    {
+        int idx = FindPriceLevel(price);
+        if (idx < 0)
+        {
+            totalQty = 0;
+            count = 0;
+            return false;
+        }
+        ref var lvl = ref CollectionsMarshal.AsSpan(_levels)[idx];
+        totalQty = lvl.TotalQty;
+        count = lvl.Count;
+        return true;
     }
 
     public bool TryGetOrder(ulong orderId, out OrderBookEntry entry)

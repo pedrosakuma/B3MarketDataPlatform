@@ -76,6 +76,48 @@ internal static class SnapshotEmitter
         return session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
     }
 
+    /// <summary>
+    /// Serialize the current MBP (price-level) snapshot for both sides of an
+    /// <see cref="OrderBook"/>. One <see cref="MessageType.LevelSnapshot"/> frame is
+    /// produced per security — the wire payload is bid-then-ask price levels, each
+    /// 20 bytes (price/totalQty/orderCount). Pooled buffer ownership transfers to
+    /// the session on success.
+    /// </summary>
+    public static bool SendMbpSnapshot(ClientSession session, OrderBook book)
+    {
+        ulong securityId = book.SecurityId;
+        var bids = book.Bids;
+        var asks = book.Asks;
+        int bidCount = bids.LevelCount;
+        int askCount = asks.LevelCount;
+
+        int total = WireProtocol.LevelSnapshotSize(bidCount, askCount);
+        var buf = BroadcastBufferPool.Shared.Rent(total);
+
+        int offset = WireProtocol.WriteLevelSnapshotHeader(buf, securityId,
+            checked((ushort)bidCount), checked((ushort)askCount));
+
+        // PriceLevels iterates best→worst; for the snapshot we just need every
+        // level and the order doesn't carry semantics (frontend keys by price).
+        foreach (var lvl in bids.PriceLevelAggregates)
+            offset = WireProtocol.WriteLevelSnapshotEntry(buf, offset, lvl.Price, lvl.TotalQty, lvl.Count);
+        foreach (var lvl in asks.PriceLevelAggregates)
+            offset = WireProtocol.WriteLevelSnapshotEntry(buf, offset, lvl.Price, lvl.TotalQty, lvl.Count);
+
+        return session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
+    }
+
+    /// <summary>
+    /// Send an empty MBP snapshot (header only) so the frontend can drop any
+    /// "loading" placeholder when the security has no live book yet.
+    /// </summary>
+    public static bool SendEmptyMbpSnapshot(ClientSession session, ulong securityId)
+    {
+        var emptyBuf = new byte[WireProtocol.LevelSnapshotSize(0, 0)];
+        WireProtocol.WriteLevelSnapshotHeader(emptyBuf, securityId, 0, 0);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
+    }
+
     private static bool SendMarketTierSnapshot(ClientSession session, OrderBook book)
     {
         Span<byte> buf = stackalloc byte[32];

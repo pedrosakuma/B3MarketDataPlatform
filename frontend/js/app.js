@@ -392,7 +392,8 @@ function getFlags() {
   let f = 0;
   if ($('flagBook').checked) f |= DATA_FLAGS.BOOK;
   if ($('flagInfo').checked) f |= DATA_FLAGS.INFO;
-  return f || DATA_FLAGS.ALL;
+  if ($('flagMbp').checked) f |= DATA_FLAGS.MBP;
+  return f || DATA_FLAGS.MBP;
 }
 
 // ── Health polling (fetch stays on main thread) ──

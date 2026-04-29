@@ -5,9 +5,11 @@ export const MSG = {
   SUBSCRIBE: 0x0001, UNSUBSCRIBE: 0x0002, GET: 0x0003,
   SUBSCRIBE_OK: 0x0010, SUBSCRIBE_ERROR: 0x0011, UNSUBSCRIBED: 0x0012,
   BOOK_SNAPSHOT: 0x0020, INFO_SNAPSHOT: 0x0021,
+  LEVEL_SNAPSHOT: 0x0022,
   ORDER_ADDED: 0x0030, ORDER_UPDATED: 0x0031, ORDER_DELETED: 0x0032,
   TRADE: 0x0033, BOOK_CLEARED: 0x0034,
   TRADE_BUST: 0x0035, MARKET_TIER_UPDATE: 0x0036,
+  LEVEL_UPDATE: 0x0037, LEVEL_DELETED: 0x0038,
   RANKINGS_UPDATE: 0x0040,
   SERVER_STATUS: 0x0050,
   CANDLE_SNAPSHOT: 0x0060,
@@ -18,7 +20,7 @@ export const MSG = {
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
 
-export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, ALL: 0x03 };
+export const DATA_FLAGS = { BOOK: 0x01, INFO: 0x02, NEWS: 0x04, MBP: 0x08, ALL: 0x03 };
 export const CANDLE_FLAGS = { FIRST: 0x01, LAST: 0x02 };
 
 export const INFO_FIELDS = [
@@ -53,6 +55,8 @@ export function flagsStr(f) {
   const parts = [];
   if (f & DATA_FLAGS.BOOK) parts.push('Book');
   if (f & DATA_FLAGS.INFO) parts.push('Info');
+  if (f & DATA_FLAGS.NEWS) parts.push('News');
+  if (f & DATA_FLAGS.MBP) parts.push('Mbp');
   return parts.join('+') || 'None';
 }
 
@@ -162,6 +166,42 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const qty = Number(v.getBigInt64(o, true)); o += 8;
       const count = v.getUint32(o, true);
       return { type: 'MarketTierUpdate', securityId, side, qty, count };
+    }
+    case MSG.LEVEL_SNAPSHOT: {
+      // Format: securityId(8) + bidCount(2) + askCount(2) + bid entries + ask entries
+      // Each entry: price(8) + totalQty(8) + orderCount(4) = 20 bytes.
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const bidCount = v.getUint16(o, true); o += 2;
+      const askCount = v.getUint16(o, true); o += 2;
+      const bids = new Array(bidCount);
+      for (let i = 0; i < bidCount; i++) {
+        const price = Number(v.getBigInt64(o, true)); o += 8;
+        const qty = Number(v.getBigInt64(o, true)); o += 8;
+        const count = v.getUint32(o, true); o += 4;
+        bids[i] = { price, qty, count };
+      }
+      const asks = new Array(askCount);
+      for (let i = 0; i < askCount; i++) {
+        const price = Number(v.getBigInt64(o, true)); o += 8;
+        const qty = Number(v.getBigInt64(o, true)); o += 8;
+        const count = v.getUint32(o, true); o += 4;
+        asks[i] = { price, qty, count };
+      }
+      return { type: 'LevelSnapshot', securityId, bids, asks };
+    }
+    case MSG.LEVEL_UPDATE: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const side = v.getUint8(o); o += 1;
+      const price = Number(v.getBigInt64(o, true)); o += 8;
+      const qty = Number(v.getBigInt64(o, true)); o += 8;
+      const count = v.getUint32(o, true);
+      return { type: 'LevelUpdate', securityId, side, price, qty, count };
+    }
+    case MSG.LEVEL_DELETED: {
+      const securityId = v.getBigUint64(o, true); o += 8;
+      const side = v.getUint8(o); o += 1;
+      const price = Number(v.getBigInt64(o, true));
+      return { type: 'LevelDeleted', securityId, side, price };
     }
     case MSG.RANKINGS_UPDATE: {
       const categories = [];

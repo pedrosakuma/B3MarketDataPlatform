@@ -24,6 +24,11 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
         foreach (var h in _handlers) h.OnOrderDeleted(book, orderId, side);
     }
 
+    public void OnPriceLevelChanged(OrderBook book, BookSideType side, long price)
+    {
+        foreach (var h in _handlers) h.OnPriceLevelChanged(book, side, price);
+    }
+
     public void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount)
     {
         foreach (var h in _handlers) h.OnMarketTierChanged(book, side, totalQuantity, orderCount);

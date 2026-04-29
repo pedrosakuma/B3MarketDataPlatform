@@ -18,6 +18,11 @@ public enum MessageType : ushort
     Unsubscribed = 0x0012,
     BookSnapshot = 0x0020,
     InfoSnapshot = 0x0021,
+    /// <summary>Server → Client: aggregated price-level snapshot (MBP) for a security.
+    /// Carries every live price level as (price, totalQty, orderCount). Sent on
+    /// initial subscribe when <see cref="DataFlags.Mbp"/> is requested. Paired
+    /// with incremental <see cref="LevelUpdate"/> / <see cref="LevelDeleted"/>.</summary>
+    LevelSnapshot = 0x0022,
     OrderAdded = 0x0030,
     OrderUpdated = 0x0031,
     OrderDeleted = 0x0032,
@@ -32,6 +37,17 @@ public enum MessageType : ushort
     /// Carries total quantity and order count; it is deliberately separate from
     /// OrderAdded/Updated so no sentinel price is needed.</summary>
     MarketTierUpdate = 0x0036,
+    /// <summary>Server → Client: incremental MBP price-level update.
+    /// Carries (securityId, side, price, totalQty, orderCount) for a level whose
+    /// aggregate just changed. Conflated last-write-wins by (secId, side, price)
+    /// in the per-group MBP buffer so a level touched many times in one packet
+    /// still emits at most one frame per packet.</summary>
+    LevelUpdate = 0x0037,
+    /// <summary>Server → Client: incremental MBP level removal.
+    /// Sent when a price level was fully drained (last order deleted/moved away).
+    /// Carries (securityId, side, price). Frontend MUST drop the level from its
+    /// per-symbol map.</summary>
+    LevelDeleted = 0x0038,
     RankingsUpdate = 0x0040,
 
     /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
@@ -97,11 +113,18 @@ public enum DataFlags : byte
     /// bit receive no news, even for symbols they're subscribed to. Both
     /// instrument-scoped and global news flow through this flag.</summary>
     News = 0x04,
+    /// <summary>Aggregated price-level (MBP) stream: <see cref="MessageType.LevelSnapshot"/>
+    /// + incremental <see cref="MessageType.LevelUpdate"/>/<see cref="MessageType.LevelDeleted"/>.
+    /// Independent of <see cref="Book"/>: a client may request only MBP, only
+    /// MBO (Book), or both. MBP is the recommended default for UI consumers
+    /// since the wire is conflated per (secId, side, price) instead of per
+    /// orderId, dramatically reducing bandwidth on hot levels.</summary>
+    Mbp = 0x08,
     /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News.</summary>
+    /// does NOT include News or MBP.</summary>
     All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News.</summary>
-    Everything = Book | Info | News,
+    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP.</summary>
+    Everything = Book | Info | News | Mbp,
 }
 
 /// <summary>
@@ -257,6 +280,76 @@ public static class WireProtocol
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
         BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount));
         return totalLen;
+    }
+
+    /// <summary>
+    /// Write LevelUpdate (MBP incremental). Layout:
+    /// header(4) + securityId(8) + side(1) + price(8) + totalQty(8) + orderCount(4) = 33 bytes.
+    /// </summary>
+    public const int LevelUpdateSize = FramingHeaderSize + 8 + 1 + 8 + 8 + 4;
+    public static int WriteLevelUpdate(Span<byte> dest, ulong securityId, byte side, long price, long totalQty, int orderCount)
+    {
+        const ushort totalLen = LevelUpdateSize;
+        WriteFramingHeader(dest, totalLen, MessageType.LevelUpdate);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        dest[offset++] = side;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount));
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Write LevelDeleted (MBP incremental). Layout:
+    /// header(4) + securityId(8) + side(1) + price(8) = 21 bytes.
+    /// </summary>
+    public const int LevelDeletedSize = FramingHeaderSize + 8 + 1 + 8;
+    public static int WriteLevelDeleted(Span<byte> dest, ulong securityId, byte side, long price)
+    {
+        const ushort totalLen = LevelDeletedSize;
+        WriteFramingHeader(dest, totalLen, MessageType.LevelDeleted);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        dest[offset++] = side;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price);
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Per-level entry size inside <see cref="MessageType.LevelSnapshot"/>:
+    /// price(8) + totalQty(8) + orderCount(4) = 20 bytes.
+    /// </summary>
+    public const int LevelSnapshotEntrySize = 8 + 8 + 4;
+
+    /// <summary>Total bytes a LevelSnapshot occupies for the given level counts.</summary>
+    public static int LevelSnapshotSize(int bidLevels, int askLevels)
+        => FramingHeaderSize + 8 + 2 + 2 + (bidLevels + askLevels) * LevelSnapshotEntrySize;
+
+    /// <summary>
+    /// Write LevelSnapshot header. Layout:
+    /// header(4) + securityId(8) + bidCount(2) + askCount(2) + bid entries + ask entries.
+    /// Each entry is <see cref="LevelSnapshotEntrySize"/> bytes (price, totalQty, orderCount).
+    /// Caller writes entries via <see cref="WriteLevelSnapshotEntry"/>.
+    /// </summary>
+    public static int WriteLevelSnapshotHeader(Span<byte> dest, ulong securityId, ushort bidCount, ushort askCount)
+    {
+        ushort totalLen = (ushort)LevelSnapshotSize(bidCount, askCount);
+        WriteFramingHeader(dest, totalLen, MessageType.LevelSnapshot);
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], bidCount); offset += 2;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], askCount); offset += 2;
+        return offset;
+    }
+
+    /// <summary>Write one MBP snapshot entry (20 bytes). Returns new offset.</summary>
+    public static int WriteLevelSnapshotEntry(Span<byte> dest, int offset, long price, long totalQty, int orderCount)
+    {
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount)); offset += 4;
+        return offset;
     }
 
     /// <summary>Write BookCleared: securityId + clearSide byte.</summary>

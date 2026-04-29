@@ -641,6 +641,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 TrackMboRptSeq(book, (uint)rptSeq);
 
             _eventHandler?.OnOrderUpdated(book, in slot);
+            if (_eventHandler is not null)
+            {
+                if (oldPrice != price)
+                    _eventHandler.OnPriceLevelChanged(book, side, oldPrice);
+                _eventHandler.OnPriceLevelChanged(book, side, price);
+            }
             CheckCrossing(book, "UPDATE", orderId, price, side);
             TrackMatchEvent(securityId, msg.MatchEventIndicator);
         }
@@ -663,6 +669,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 TrackMboRptSeq(book, (uint)rptSeq);
 
             _eventHandler?.OnOrderAdded(book, in entry);
+            _eventHandler?.OnPriceLevelChanged(book, side, price);
             CheckCrossing(book, "ADD", orderId, price, side);
             TrackMatchEvent(securityId, msg.MatchEventIndicator);
         }
@@ -681,12 +688,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         // market. Drop it from the priced side first, fire the delete event so
         // priced-side subscribers see consistent state, then upsert into the
         // market tier.
-        if (pricedSide.TryGetOrder(orderId, out _))
+        if (pricedSide.TryGetOrder(orderId, out var movingEntry))
         {
+            long oldPrice = movingEntry.Price;
             pricedSide.Remove(orderId);
             _nullPriceChangeDeletes++;
             _marketOrderTransitionsToMarket++;
             _eventHandler?.OnOrderDeleted(book, orderId, side);
+            _eventHandler?.OnPriceLevelChanged(book, side, oldPrice);
         }
 
         bool isNew = book.UpsertMarketOrder(orderId, side, quantity, enteringFirm);
@@ -713,7 +722,16 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         var side = msg.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
         ulong orderId = (ulong)msg.SecondaryOrderID;
 
-        var removed = book.GetSide(side).Remove(orderId);
+        // Capture the price BEFORE Remove so we can fire OnPriceLevelChanged for the
+        // (now-mutated) level after the delete. If the order is a market order the
+        // priced-side lookup misses and the per-level callback is skipped (market
+        // tier emits its own MarketTierChanged signal).
+        var bookSide = book.GetSide(side);
+        long deletedPrice = 0;
+        bool hadPrice = bookSide.TryGetOrder(orderId, out var existingOrder);
+        if (hadPrice) deletedPrice = existingOrder.Price;
+
+        var removed = bookSide.Remove(orderId);
         if (removed)
         {
             _orderDeletes++;
@@ -735,7 +753,11 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             TrackMboRptSeq(book, (uint)rptSeq);
 
         if (removed)
+        {
             _eventHandler?.OnOrderDeleted(book, orderId, side);
+            if (hadPrice)
+                _eventHandler?.OnPriceLevelChanged(book, side, deletedPrice);
+        }
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 

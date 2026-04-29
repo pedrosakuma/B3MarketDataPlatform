@@ -26,6 +26,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     // Per-symbol stale-status flips. Coalesced per security:
     // multiple flips in the same batch collapse to the latest value.
     private readonly Dictionary<ulong, bool> _staleStatusBuffer = new();
+    // MBP (price-level) dirty set. Marked by IBookEventHandler.OnPriceLevelChanged
+    // for every BookManager mutation that touches a level. Flushed at packet
+    // boundary by reading the post-mutation aggregate from BookSide via
+    // TryGetLevelAggregate — emits one LevelUpdate per dirty level (or LevelDeleted
+    // when the level no longer exists). Last-write-wins natural coalescing: a level
+    // touched 100× in a packet emits exactly one frame.
+    private readonly Dictionary<(ulong SecurityId, byte Side, long Price), bool> _levelBuffer = new();
     private byte[] _flushBuf = new byte[4096];
 
     // Per-packet work batch. Dispatch thread rents on first event in a packet, appends
@@ -188,6 +195,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         BufferOrderDelete(book.SecurityId, orderId, (byte)side);
     }
 
+    public void OnPriceLevelChanged(OrderBook book, BookSideType side, long price)
+    {
+        // Cheap subscribed-anywhere check first; the per-flag MBP filter happens
+        // at HasAnyMbpSubscriber to avoid buffering for symbols where nobody
+        // wants the price-level stream.
+        if (!_parent.HasAnyMbpSubscriber(book.SecurityId)) return;
+        // Last-write-wins: presence of the key marks the level dirty. The actual
+        // qty/count/exists state is read from BookSide at flush time so all
+        // mutations within the packet collapse to a single emitted frame.
+        _levelBuffer[(book.SecurityId, (byte)side, price)] = true;
+        _eventsReceived++;
+    }
+
     public void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount)
     {
         if (!_parent.IsSubscribed(book.SecurityId)) return;
@@ -225,6 +245,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _eventsReceived++;
         PurgeBufferedOrders(securityId, (byte)side);
         PurgeBufferedMarketTiers(securityId, side);
+        PurgeBufferedLevels(securityId, side);
         _clearBuffer.Add((securityId, (byte)side));
     }
 
@@ -265,7 +286,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (!_parent.IsSubscribed(securityId)) return;
         Span<byte> tmp = stackalloc byte[20];
         int len = WireProtocol.WriteTradeBust(tmp, securityId, tradeId);
-        AppendEventToBatch(securityId, tmp[..len], logicalCount: 1);
+        AppendSharedEventToBatch(securityId, tmp[..len], logicalCount: 1);
         _eventsReceived++;
     }
     public void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
@@ -485,7 +506,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         // 3. Flush conflation buffers into _currentBatch (dispatch-side work only —
         //    no subscriber fan-out, no ArrayPool rentals for client buffers).
-        if (_orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0)
+        if (_orderBuffer.Count != 0 || _marketTierBuffer.Count != 0 || _clearBuffer.Count != 0 || _tradeBuffer.Count != 0 || _staleStatusBuffer.Count != 0 || _levelBuffer.Count != 0)
             FlushBuffers();
 
         // 4. Process routed subscribe/get requests after current-packet events have
@@ -538,12 +559,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         // Equivalent of FlushBuffers without producing wire bytes — keep the upstream
         // event counter accurate so UpstreamConflated reflects discarded work too.
-        int discarded = _orderBuffer.Count + _marketTierBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count + _staleStatusBuffer.Count;
+        int discarded = _orderBuffer.Count + _marketTierBuffer.Count + _clearBuffer.Count + _tradeBuffer.Count + _staleStatusBuffer.Count + _levelBuffer.Count;
         _orderBuffer.Clear();
         _marketTierBuffer.Clear();
         _clearBuffer.Clear();
         _tradeBuffer.Clear();
         _staleStatusBuffer.Clear();
+        _levelBuffer.Clear();
         if (_currentBatch is not null)
         {
             discarded += _currentBatch.EventCount;
@@ -670,6 +692,23 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _marketTierBuffer.Remove((securityId, (byte)side));
     }
 
+    private void PurgeBufferedLevels(ulong securityId, BookClearSide clearSide)
+    {
+        if (_levelBuffer.Count == 0) return;
+        List<(ulong, byte, long)>? toRemove = null;
+        foreach (var key in _levelBuffer.Keys)
+        {
+            if (key.SecurityId != securityId) continue;
+            if (clearSide == BookClearSide.Bid && key.Side != (byte)BookSideType.Bid) continue;
+            if (clearSide == BookClearSide.Ask && key.Side != (byte)BookSideType.Ask) continue;
+            toRemove ??= new();
+            toRemove.Add(key);
+        }
+        if (toRemove is not null)
+            foreach (var k in toRemove)
+                _levelBuffer.Remove(k);
+    }
+
     // ── Buffer flushing (dispatch thread) ──────────────────────────────────────
     //
     // These methods now only *append events to the current broadcast batch*. They do
@@ -686,7 +725,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var (secId, side) in _clearBuffer)
         {
             int len = WireProtocol.WriteBookCleared(tmp, secId, side);
-            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
+            AppendSharedEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _clearBuffer.Clear();
@@ -706,13 +745,49 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             foreach (var (secId, isStale) in _staleStatusBuffer)
             {
                 int len = WireProtocol.WriteSymbolStaleStatus(staleTmp, secId, isStale);
-                AppendEventToBatch(secId, staleTmp[..len], logicalCount: 1);
+                AppendSharedEventToBatch(secId, staleTmp[..len], logicalCount: 1);
                 flushed++;
             }
             _staleStatusBuffer.Clear();
         }
 
+        if (_levelBuffer.Count > 0)
+            flushed += FlushLevelBuffer();
+
         _eventsFlushed += flushed;
+    }
+
+    /// <summary>
+    /// Flush the MBP dirty-level set: for each (secId, side, price) marked dirty
+    /// during this packet, read the post-mutation aggregate from
+    /// <see cref="BookSide.TryGetLevelAggregate"/>. Levels that still exist emit
+    /// a <see cref="MessageType.LevelUpdate"/>; drained levels emit a
+    /// <see cref="MessageType.LevelDeleted"/>. One frame per dirty level — multiple
+    /// mutations against the same level within a packet collapse to one wire frame.
+    /// </summary>
+    private int FlushLevelBuffer()
+    {
+        int flushed = 0;
+        Span<byte> tmp = stackalloc byte[WireProtocol.LevelUpdateSize];
+        foreach (var (secId, sideByte, price) in _levelBuffer.Keys)
+        {
+            if (!BookManager.Books.TryGetValue(secId, out var book))
+                continue;
+            var bookSide = book.GetSide((BookSideType)sideByte);
+            int len;
+            if (bookSide.TryGetLevelAggregate(price, out var totalQty, out var count))
+            {
+                len = WireProtocol.WriteLevelUpdate(tmp, secId, sideByte, price, totalQty, count);
+            }
+            else
+            {
+                len = WireProtocol.WriteLevelDeleted(tmp, secId, sideByte, price);
+            }
+            AppendMbpEventToBatch(secId, tmp[..len], logicalCount: 1);
+            flushed++;
+        }
+        _levelBuffer.Clear();
+        return flushed;
     }
 
     private int FlushOrderBuffer()
@@ -808,7 +883,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var ((secId, side), (totalQty, orderCount)) in _marketTierBuffer)
         {
             int len = WireProtocol.WriteMarketTierUpdate(tmp, secId, side, totalQty, orderCount);
-            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
+            AppendSharedEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _marketTierBuffer.Clear();
@@ -833,7 +908,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
         {
             int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
-            AppendEventToBatch(secId, tmp[..len], logicalCount: 1);
+            AppendSharedEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }
         _tradeBuffer.Clear();
@@ -849,7 +924,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 if (latest is { } c)
                 {
                     int clen = WireProtocol.WriteCandleUpdate(cbuf, secId, agg.Resolution, c);
-                    AppendEventToBatch(secId, cbuf[..clen], logicalCount: 1);
+                    AppendSharedEventToBatch(secId, cbuf[..clen], logicalCount: 1);
                 }
             }
         }
@@ -874,6 +949,33 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         _currentBatch ??= BroadcastWorkBatch.Rent();
         _currentBatch.Append(securityId, bytes, logicalCount);
+    }
+
+    /// <summary>
+    /// Append an MBP frame to the broadcast batch tagged for MBP-flag fanout.
+    /// Skipped when no subscriber wants MBP for this security so dead bytes never
+    /// enter the ring.
+    /// </summary>
+    private void AppendMbpEventToBatch(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        if (bytes.Length == 0) return;
+        if (!_parent.HasAnyMbpSubscriber(securityId)) return;
+        _currentBatch ??= BroadcastWorkBatch.Rent();
+        _currentBatch.Append(securityId, bytes, logicalCount, BroadcastWorkBatch.EventKind.MbpSubscribers);
+    }
+
+    /// <summary>
+    /// Append a frame that is relevant to BOTH Book and Mbp subscribers (Trade,
+    /// BookCleared, MarketTier, StaleStatus, TradeBust, CandleUpdate). Tagged with
+    /// <see cref="BroadcastWorkBatch.EventKind.BookOrMbpSubscribers"/> so the
+    /// broadcaster fanout iterates clients that have either flag set.
+    /// </summary>
+    private void AppendSharedEventToBatch(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount)
+    {
+        if (bytes.Length == 0) return;
+        if (!_parent.HasAnyBookSubscriber(securityId) && !_parent.HasAnyMbpSubscriber(securityId)) return;
+        _currentBatch ??= BroadcastWorkBatch.Rent();
+        _currentBatch.Append(securityId, bytes, logicalCount, BroadcastWorkBatch.EventKind.BookOrMbpSubscribers);
     }
 
     /// <summary>
@@ -994,6 +1096,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                 case BroadcastWorkBatch.EventKind.NewsGlobal:
                     AppendForGlobalNewsSubscribers(bytes, ev.LogicalCount);
                     break;
+                case BroadcastWorkBatch.EventKind.MbpSubscribers:
+                    AppendForMbpSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    break;
+                case BroadcastWorkBatch.EventKind.BookOrMbpSubscribers:
+                    AppendForBookOrMbpSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    break;
             }
         }
         FlushClientBatches();
@@ -1088,6 +1196,42 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         foreach (var (clientId, state) in subs)
         {
             if (!state.WantsBookBatch(batchSequence)) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+            AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    /// <summary>MBP fan-out: clients with <see cref="DataFlags.Mbp"/> set on their
+    /// subscription, gated by the same per-batch broadcast cutoff used for Book so
+    /// in-flight batches at or below the snapshot barrier are skipped.</summary>
+    private void AppendForMbpSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
+    {
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+
+        foreach (var (clientId, state) in subs)
+        {
+            if (!state.WantsMbpBatch(batchSequence)) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+            AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    /// <summary>Shared (Book-or-Mbp) fan-out for frames relevant to both views.
+    /// Each client is appended at most once even if both flags are set — broken by
+    /// <c>WantsBookBatch || WantsMbpBatch</c>. Honors the per-batch broadcast
+    /// cutoff so freshly-subscribed clients don't receive in-flight events
+    /// already covered by their snapshot.</summary>
+    private void AppendForBookOrMbpSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
+    {
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+
+        foreach (var (clientId, state) in subs)
+        {
+            if (!state.WantsBookBatch(batchSequence) && !state.WantsMbpBatch(batchSequence)) continue;
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
             AppendToClient(session, bytes, logicalCount);

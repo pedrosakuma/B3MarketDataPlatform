@@ -56,6 +56,14 @@ internal sealed class SubscriptionState
     public bool WantsBookBatch(long batchSequence) =>
         (Flags & DataFlags.Book) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
 
+    /// <summary>True iff this subscription wants the MBP (price-level) stream and the
+    /// given batch is past the snapshot cutoff. MBP shares the same broadcast cutoff
+    /// as Book — both originate from the same per-packet batch sequence.</summary>
+    public bool WantsMbpBatch(long batchSequence) =>
+        (Flags & DataFlags.Mbp) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
+
+    public bool WantsMbp => (Flags & DataFlags.Mbp) != 0;
+
     public bool WantsInfo => (Flags & DataFlags.Info) != 0;
 
     public bool WantsNews => (Flags & DataFlags.News) != 0;

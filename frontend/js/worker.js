@@ -598,9 +598,11 @@ function handleMessage(msg) {
         existing.symbol = msg.symbol;
         existing.flags = msg.flags;
         existing.securityId = msg.securityId;
+        existing.usesMbp = !!(msg.flags & DATA_FLAGS.MBP);
       } else {
         subscriptions.set(id, {
           symbol: msg.symbol, flags: msg.flags, securityId: msg.securityId,
+          usesMbp: !!(msg.flags & DATA_FLAGS.MBP),
           orders: new Map(),
           // Aggregated price levels — maintained incrementally on each order event
           // so computeBook() avoids a full O(N) scan over all orders every render frame.
@@ -701,9 +703,12 @@ function handleMessage(msg) {
       if (sub) {
         sub.orderCount++;
         const prev = sub.orders.get(msg.orderId);
-        if (prev) levelRemove(sub, prev.side, prev.price, prev.qty);
+        // When MBP is the authoritative source for aggregated levels, skip the
+        // MBO-derived levelAdd/levelRemove path. The orders map is still
+        // maintained for clients that need raw per-order tracking.
+        if (!sub.usesMbp && prev) levelRemove(sub, prev.side, prev.price, prev.qty);
         sub.orders.set(msg.orderId, { side: msg.side, price: msg.price, qty: msg.qty });
-        levelAdd(sub, msg.side, msg.price, msg.qty);
+        if (!sub.usesMbp) levelAdd(sub, msg.side, msg.price, msg.qty);
       }
       if (sel === id) mark(D_BOOK);
       break;
@@ -716,8 +721,66 @@ function handleMessage(msg) {
         sub.orderCount++;
         const prev = sub.orders.get(msg.orderId);
         if (prev) {
-          levelRemove(sub, prev.side, prev.price, prev.qty);
+          if (!sub.usesMbp) levelRemove(sub, prev.side, prev.price, prev.qty);
           sub.orders.delete(msg.orderId);
+        }
+      }
+      if (sel === id) mark(D_BOOK);
+      break;
+    }
+    case 'LevelSnapshot': {
+      // MBP equivalent of BookSnapshot: replaces all aggregated levels in one frame.
+      stats.books++;
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        sub.bidLevels.clear();
+        sub.askLevels.clear();
+        sub.topBids = [];
+        sub.topAsks = [];
+        for (const lvl of msg.bids) {
+          const obj = { price: lvl.price, qty: lvl.qty, count: lvl.count };
+          sub.bidLevels.set(lvl.price, obj);
+          topInsert(sub, 0, obj);
+        }
+        for (const lvl of msg.asks) {
+          const obj = { price: lvl.price, qty: lvl.qty, count: lvl.count };
+          sub.askLevels.set(lvl.price, obj);
+          topInsert(sub, 1, obj);
+        }
+      }
+      if (sel === id) mark(D_BOOK);
+      break;
+    }
+    case 'LevelUpdate': {
+      stats.orders++;
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        const levels = msg.side === 0 ? sub.bidLevels : sub.askLevels;
+        let lvl = levels.get(msg.price);
+        if (lvl) {
+          lvl.qty = msg.qty;
+          lvl.count = msg.count;
+        } else {
+          lvl = { price: msg.price, qty: msg.qty, count: msg.count };
+          levels.set(msg.price, lvl);
+          topInsert(sub, msg.side, lvl);
+        }
+      }
+      if (sel === id) mark(D_BOOK);
+      break;
+    }
+    case 'LevelDeleted': {
+      stats.orders++;
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      if (sub) {
+        const levels = msg.side === 0 ? sub.bidLevels : sub.askLevels;
+        const lvl = levels.get(msg.price);
+        if (lvl) {
+          levels.delete(msg.price);
+          topRemoveAndRefill(sub, msg.side, lvl);
         }
       }
       if (sel === id) mark(D_BOOK);

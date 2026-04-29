@@ -9,6 +9,18 @@ if (args.Length > 0 && args[0] == "alloc-probe")
     return;
 }
 
+if (args.Length > 0 && args[0] == "mbp-bandwidth-probe")
+{
+    foreach (int batch in new[] { 1, 16, 64, 256, 1024 })
+    {
+        var b = new MbpBandwidthBenchmarks { MessageCount = 100_000, BatchSize = batch };
+        b.Setup();
+        b.Run();
+        b.Report();
+    }
+    return;
+}
+
 // Pass the benchmark class name (or `*`) on the CLI to pick which suite to run, e.g.
 //   dotnet run -c Release -- --filter '*BookManagerOnPacketBenchmarks*'
 //   dotnet run -c Release -- --filter '*BookSideBenchmarks*'
