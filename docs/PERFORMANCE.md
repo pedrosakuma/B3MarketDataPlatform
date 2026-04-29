@@ -95,7 +95,7 @@ Events are coalesced into a single WS frame via three complementary windows:
 
 | Layer | Window | Purpose |
 | ----- | ------ | ------- |
-| **Server-side flush** (per group) | `UMDF_SERVER_FLUSH_WINDOW_MS` (default `0` = per packet) | When `> 0`, defers `FlushBuffers` so conflation spans multiple upstream B3 packets — `LEVEL_UPDATE` (last-write-wins per `secId,side,price`), `CANDLE_UPDATE` (one per security per window), `TRADE` (same-price summation), `OrderAdded`+`OrderDeleted` cancellation all extend across the window |
+| **Server-side flush** (per group) | `UMDF_SERVER_FLUSH_WINDOW_MS` (binary default `0` = per packet; **compose default `10`**) | When `> 0`, defers `FlushBuffers` so conflation spans multiple upstream B3 packets — `LEVEL_UPDATE` (last-write-wins per `secId,side,price`), `CANDLE_UPDATE` (one per security per window), `TRADE` (same-price summation), `OrderAdded`+`OrderDeleted` cancellation all extend across the window |
 | **Server-side flush** (per packet) | 1 packet (per `OnBatchComplete`) | Default. Conflation effective only within a single B3 packet |
 | **Per-client write loop** | `UMDF_CLIENT_COALESCE_WINDOW_MS` (default 10 ms) | After the first item, wait *N* ms before draining → larger frames, fewer pipe-lock acquisitions |
 
@@ -119,10 +119,14 @@ Measured impact of `UMDF_SERVER_FLUSH_WINDOW_MS` on WINV25 incremental traffic
 | `25` | 2,380 (3×↓) | 34 (32×↓) | 82 (13×↓) | ~283 kB/s |
 
 > The server window is a **soft latency knob**. `0` = immediate (lowest latency,
-> highest fanout CPU). `10` ms = recommended sweet spot — bounds added latency
-> at the window value while halving incremental bandwidth and collapsing
-> `CANDLE_UPDATE` toward the natural ~10 Hz visualization rate. HFT-style
-> consumers that need every mutation should keep `0`.
+> highest fanout CPU). `10` ms = **recommended and active default in
+> `docker-compose.yml` / `docker-compose.multicast.yml`** — bounds added
+> latency at the window value while halving incremental bandwidth and
+> collapsing `CANDLE_UPDATE` toward the natural ~10 Hz visualization rate.
+> HFT-style consumers that need every mutation should override with
+> `UMDF_SERVER_FLUSH_WINDOW_MS=0` in their environment. The application
+> binary itself defaults to `0` for backward compatibility when run outside
+> compose.
 
 > The per-client window is also a **soft latency knob**. 0 = immediate (lowest
 > latency, highest CPU). 10–20 ms = sweet spot for hundreds of clients. >50 ms
