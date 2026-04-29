@@ -229,20 +229,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
-        // Phase C gate: skip ring + candle hydration when no client is subscribed
-        // to this security in the entire fleet. Trade-off: a future subscriber to
-        // a previously cold symbol sees an empty trade history (BookSnapshot still
-        // gives them an immediate price). Cheap O(1) ConcurrentDictionary check;
-        // pays for itself on EQT-feeds with thousands of unsubscribed symbols.
-        if (!_parent.IsSubscribed(securityId)) return;
-
-        // Capture trade in the per-security ring (used to seed snapshot history
-        // for future subscribers).
-        var ring = RecentTrades.GetOrAdd(securityId,
-            static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
-
-        // Only aggregate trades into candles during Open trading phase
+        // Always-on work — needed by *future* subscribers, so it must run even
+        // when no client is currently subscribed:
+        //   • Candle aggregator: chart history would have gaps otherwise.
+        //   • UpdateLastTradeFromEvent: feeds LastTradePrice/LastTradeSize into
+        //     InfoSnapshot (late subscribers expect a current "last print").
         if (IsOpenPhase(securityId))
         {
             var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
@@ -252,9 +243,22 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             long sessionVwap = _vwapBySecurity.TryGetValue(securityId, out var v) ? v : price;
             candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
+        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
+
+        // Phase C gate (post-aggregation): skip live-tape work when no client
+        // is subscribed in the entire fleet. The trade-print ring is best-effort
+        // history (acceptable to lose for cold symbols — late subscribers still
+        // see candles + InfoSnapshot last-price). BufferTrade fan-out has no
+        // recipient, so it would be wasted work.
+        if (!_parent.IsSubscribed(securityId)) return;
+
+        // Capture trade in the per-security ring (snapshot history for future
+        // subscribers that arrive while the symbol is warm).
+        var ring = RecentTrades.GetOrAdd(securityId,
+            static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
+        ring.Add(price, quantity, tradeId);
 
         _eventsReceived++;
-        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
     }
 
@@ -270,13 +274,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
-        // Same gate as OnTrade — skip hydration for cold (unsubscribed) symbols.
-        if (!_parent.IsSubscribed(securityId)) return;
-
-        var ring = RecentTrades.GetOrAdd(securityId,
-            static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
-
+        // Always-on aggregation (same rationale as OnTrade): candles + InfoSnapshot
+        // last-price must be maintained for late subscribers.
         if (IsOpenPhase(securityId))
         {
             var candle = Candles.GetOrAdd(securityId, static _ => new CandleAggregator());
@@ -286,9 +285,17 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             long sessionVwap = _vwapBySecurity.TryGetValue(securityId, out var v) ? v : price;
             candle.Add(price, quantity, timestampSeconds, sessionVwap);
         }
+        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
+
+        // Same Phase C gate as OnTrade — skip live tape (ring + buffer fan-out)
+        // when nobody is subscribed.
+        if (!_parent.IsSubscribed(securityId)) return;
+
+        var ring = RecentTrades.GetOrAdd(securityId,
+            static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
+        ring.Add(price, quantity, tradeId);
 
         _eventsReceived++;
-        _parent.UpdateLastTradeFromEvent(securityId, price, quantity);
         BufferTrade(securityId, price, quantity, tradeId);
     }
 

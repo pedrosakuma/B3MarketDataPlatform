@@ -125,11 +125,12 @@ public class GroupConflationHandlerTradeTelemetryTests
     }
 
     [Fact]
-    public void OnTrade_ColdSymbol_DoesNotHydrateRingOrCandle()
+    public void OnTrade_ColdSymbol_DoesNotHydrateRing_ButStillAggregatesCandle()
     {
-        // Phase C invariant: when no client is subscribed to the security, OnTrade
-        // must NOT lazily allocate a TradeRingBuffer or CandleAggregator. This is
-        // the win on EQT-feeds with thousands of symbols and a few subscribed.
+        // Phase C invariant (post-revision): when no client is subscribed, OnTrade
+        // skips the live-tape ring + buffer fan-out, but STILL aggregates candles
+        // and updates InfoSnapshot.LastTradePrice. Late subscribers must not see
+        // gaps in chart history nor a stale last-print, even on cold symbols.
         var w = NewWiring();
         try
         {
@@ -137,10 +138,14 @@ public class GroupConflationHandlerTradeTelemetryTests
             w.Group.OnTrade(SecurityId, price: 100, quantity: 5, tradeId: 1, sendingTimeNs: 0);
             w.Group.OnBatchComplete();
 
+            // Live-tape side: skipped.
             Assert.False(w.Group.RecentTrades.ContainsKey(SecurityId));
-            Assert.False(w.Group.Candles.ContainsKey(SecurityId));
             Assert.Equal(0, w.Group.TradesReceivedTotal);
             Assert.Equal(0, w.Group.TradesEmittedTotal);
+
+            // Aggregation side: still happens.
+            Assert.True(w.Group.Candles.ContainsKey(SecurityId),
+                "Candles must aggregate for cold symbols so chart history has no gaps for late subscribers.");
         }
         finally
         {
