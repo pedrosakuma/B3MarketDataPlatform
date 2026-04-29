@@ -12,7 +12,7 @@ services:
       PCAP_PREFIX: "${PCAP_PREFIX:-20250331_MBO_084_EQT,20250929_MBO_072_DRV}"
       WS_PORT: "${WS_PORT:-8080}"
       REPLAY_SPEED: "${REPLAY_SPEED:-2}"
-      UMDF_SERVER_FLUSH_WINDOW_MS: "${UMDF_SERVER_FLUSH_WINDOW_MS:-0}"
+      UMDF_SERVER_FLUSH_WINDOW_MS: "${UMDF_SERVER_FLUSH_WINDOW_MS:-10}"
     restart: unless-stopped
     stop_grace_period: 10s
     deploy:
