@@ -2,6 +2,7 @@ using System.Diagnostics;
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
 using B3.Umdf.Server;
+using B3.Umdf.Transport;
 
 namespace B3.Umdf.ConsoleApp;
 
@@ -97,6 +98,29 @@ internal sealed class StatsPrinter
         Console.WriteLine($"── [{_sw.Elapsed:hh\\:mm\\:ss}] {stateStr} ──");
         Console.WriteLine($"   Packets: {packets:N0} ({pktRate:N0}/s)  |  Events: {totalEvents:N0} ({evtRate:N0}/s)  |  Books: {_bookManagers.Sum(bm => bm.Books.Count):N0}  |  Instruments: {_marketDataManagers.Sum(m => m.InstrumentData.Count):N0}  |  Symbols: {_symbolRegistry.Count:N0}");
         Console.WriteLine($"   MOA/MOC: snap={_bookManagers.Sum(bm => bm.SnapshotMarketOrderAdds):N0} add={_bookManagers.Sum(bm => bm.MarketOrderAdds):N0} upd={_bookManagers.Sum(bm => bm.MarketOrderUpdates):N0} del={_bookManagers.Sum(bm => bm.MarketOrderDeletes):N0} toPx={_bookManagers.Sum(bm => bm.MarketOrderTransitionsToPriced):N0}");
+
+        // Per-group dispatch ring stats — surfaced unconditionally so producer/consumer
+        // pressure (queue depth, total drops, per-channel attribution) is visible at
+        // every print, not only on heal events. Helps spot bursts that overwhelm the
+        // dispatch thread before they cascade into snapshot recovery storms.
+        if (_multiFeed is not null)
+        {
+            var byGroup = _multiFeed.GetChannelStats()
+                .ToDictionary(s => s.GroupId, s => (s.Depth, s.DroppedPackets));
+            var dropParts = new List<string>();
+            foreach (var (gid, _) in _multiFeed.Handlers.OrderBy(h => h.Key))
+            {
+                if (!byGroup.TryGetValue(gid, out var rs)) continue;
+                if (rs.Depth == 0 && rs.DroppedPackets == 0) continue;
+                var perChannel = _multiFeed.GetChannelDropBreakdown()
+                    .Where(b => b.GroupId == gid && b.DroppedPackets > 0)
+                    .Select(b => $"{ChannelTag(b.Channel)}={b.DroppedPackets:N0}");
+                string breakdown = perChannel.Any() ? $" [{string.Join(",", perChannel)}]" : "";
+                dropParts.Add($"G{gid} depth={rs.Depth:N0} drops={rs.DroppedPackets:N0}{breakdown}");
+            }
+            if (dropParts.Count > 0)
+                Console.WriteLine($"   ring: {string.Join("  ", dropParts)}");
+        }
 
         if (_subscriptionManager is not null)
         {
@@ -316,4 +340,13 @@ internal sealed class StatsPrinter
         _stats.OrderCount + _stats.TradeCount + _stats.DeleteCount +
         _stats.MarketDataCount + _stats.StatusChangeCount +
         _stats.ForwardTradeCount + _stats.TradeBustCount + _stats.ExecSummaryCount;
+
+    private static string ChannelTag(ChannelType ch) => ch switch
+    {
+        ChannelType.IncrementalA => "IncA",
+        ChannelType.IncrementalB => "IncB",
+        ChannelType.InstrumentDefinition => "InstrDef",
+        ChannelType.SnapshotRecovery => "Snap",
+        _ => ch.ToString(),
+    };
 }
