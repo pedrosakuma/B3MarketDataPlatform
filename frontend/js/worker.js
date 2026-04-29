@@ -482,7 +482,8 @@ function computeBook() {
   const sub = selectedId ? subscriptions.get(selectedId) : null;
   if (!sub) return null;
   const hasMarketTier = sub.marketBidCount > 0 || sub.marketAskCount > 0;
-  if (sub.orders.size === 0 && !hasMarketTier) return null;
+  const hasMbpLevels = sub.bidLevels.size > 0 || sub.askLevels.size > 0;
+  if (sub.orders.size === 0 && !hasMarketTier && !hasMbpLevels) return null;
 
   const bids = sub.topBids;
   const asks = sub.topAsks;
@@ -493,10 +494,18 @@ function computeBook() {
   if (sub.marketBidQty > maxQty) maxQty = sub.marketBidQty;
   if (sub.marketAskQty > maxQty) maxQty = sub.marketAskQty;
 
+  let totalOrders = sub.orders.size + sub.marketBidCount + sub.marketAskCount;
+  if (sub.orders.size === 0 && hasMbpLevels) {
+    let mbpOrders = 0;
+    for (const l of sub.bidLevels.values()) mbpOrders += l.count;
+    for (const l of sub.askLevels.values()) mbpOrders += l.count;
+    totalOrders += mbpOrders;
+  }
+
   return {
     bids, asks, maxQty,
     totalBids: sub.bidLevels.size, totalAsks: sub.askLevels.size,
-    totalOrders: sub.orders.size + sub.marketBidCount + sub.marketAskCount, orderCount: sub.orderCount,
+    totalOrders, orderCount: sub.orderCount,
     marketBid: { qty: sub.marketBidQty, count: sub.marketBidCount },
     marketAsk: { qty: sub.marketAskQty, count: sub.marketAskCount },
   };
@@ -989,7 +998,7 @@ self.onmessage = (evt) => {
     }
     case 'rankingSubscribe':
       if (ws && ws.readyState === WebSocket.OPEN)
-        ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, msg.symbol, DATA_FLAGS.ALL));
+        ws.send(buildSubscribeOrGet(MSG.SUBSCRIBE, msg.symbol, msg.flags));
       break;
     case 'setAutoReconnect':
       autoReconnect = msg.value;

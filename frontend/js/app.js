@@ -510,7 +510,7 @@ function rankingClick(symbol) {
   if (existing) {
     selectSubscription(existing.id);
   } else {
-    worker.postMessage({ cmd: 'rankingSubscribe', symbol });
+    worker.postMessage({ cmd: 'rankingSubscribe', symbol, flags: getFlags() });
   }
   closeSidebarIfMobile();
 }
