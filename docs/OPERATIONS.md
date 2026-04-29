@@ -8,6 +8,22 @@ production-like environments.
 ### Prerequisites
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
+- **For multicast deployments (production / `docker-compose.multicast.yml`):**
+  raise the host kernel UDP receive buffer ceiling — the Linux default
+  (`net.core.rmem_max ≈ 208 KiB`) silently clamps the consumer's requested
+  16 MiB sockets and causes packet loss under burst (snapshot recovery,
+  market open, instrument-definition cycle). The consumer logs an explicit
+  warning at startup when this happens. Apply once on the host:
+
+  ```bash
+  sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=33554432
+  # persist across reboots:
+  echo 'net.core.rmem_max=33554432'      | sudo tee /etc/sysctl.d/99-umdf.conf
+  echo 'net.core.rmem_default=33554432'  | sudo tee -a /etc/sysctl.d/99-umdf.conf
+  ```
+
+  See [`docs/CONFIGURATION.md`](CONFIGURATION.md#required-host-kernel-tuning-linux--wsl2--docker)
+  for full details (per-channel buffer sizing, WSL2 persistence, container caveats).
 
 ### Build & test
 
