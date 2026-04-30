@@ -1,7 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <RootNamespace>B3.Exchange.Instruments</RootNamespace>
-  </PropertyGroup>
-
-</Project>
