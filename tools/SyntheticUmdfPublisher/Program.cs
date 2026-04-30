@@ -7,6 +7,7 @@ using System.Text;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Mbo.Sbe.V16.V6;
 using B3.Umdf.Transport;
+using B3.Umdf.WireEncoder;
 
 // Synthetic UMDF publisher: emits a stateless full-bootstrap stream over multicast.
 //
@@ -231,68 +232,6 @@ internal enum PriceMode
     Spread,
 }
 
-internal static class WireOffsets
-{
-    public const int PacketHeaderSize = 16;
-    public const int FramingHeaderSize = 4;
-    public const int SbeMessageHeaderSize = 8;
-
-    // PacketHeader (Pack=1): byte channel, byte reserved, ushort seqVersion, uint sequenceNumber@4, ulong sendingTime@8
-    public const int PacketHeaderSequenceNumberOffset = 4;
-    public const int PacketHeaderSendingTimeOffset = 8;
-
-    // Order_MBO_50V6 body offsets (FieldOffsets in generated code)
-    public const int OrderBlockLength = 56;
-    public const int OrderBodySecurityIdOffset = 0;        // long
-    public const int OrderBodyMdInsertTimestampOffset = 36; // ulong nanos
-    public const int OrderBodySecondaryOrderIdOffset = 44;  // long
-    public const int OrderBodyRptSeqOffset = 52;           // uint
-
-    // DeleteOrder_MBO_51 V16 body offsets (FieldOffsets in generated code).
-    // V16 is what the consumer's SbeDispatcher uses (B3.Umdf.Mbo.Sbe.V16
-    // namespace). The reader struct has FieldOffset(40) for RptSeq with
-    // BLOCK_LENGTH=52 — V15 added TransactTime@32 and MDEntryPx@44. If we
-    // wrote the V6 layout (BLOCK_LENGTH=36, RptSeq@32) the consumer's
-    // V16 reader would read RptSeq from outside our published body, producing
-    // garbage values that the gap detector interprets as a massive jump
-    // (forcing every symbol Stale on the first DEL).
-    public const int DeleteOrderBlockLength = 52;
-    public const int DeleteOrderBodySecurityIdOffset = 0;          // long
-    public const int DeleteOrderBodyMdEntryTypeOffset = 10;        // byte (BID)
-    public const int DeleteOrderBodyMdEntrySizeOffset = 16;        // long
-    public const int DeleteOrderBodySecondaryOrderIdOffset = 24;   // long
-    public const int DeleteOrderBodyTransactTimeOffset = 32;       // ulong nanos (V15+)
-    public const int DeleteOrderBodyRptSeqOffset = 40;             // uint
-    public const int DeleteOrderBodyMdEntryPxOffset = 44;          // PriceOptional (V15+, leave NULL)
-
-    // SnapshotFullRefresh_Header_30V6 body offsets
-    public const int SnapBlockLength = 32;
-    public const int SnapBodySecurityIdOffset = 0;          // long
-    public const int SnapBodyTotNumReportsOffset = 12;      // uint
-    public const int SnapBodyTotNumBidsOffset = 16;         // uint (= OrdersExpected/2 — leave 0)
-    public const int SnapBodyTotNumOffersOffset = 20;       // uint
-    public const int SnapBodyTotNumStatsOffset = 24;        // ushort
-    public const int SnapBodyLastRptSeqOffset = 28;         // uint (0 = NULL → empty illiquid)
-
-    // SecurityDefinition_12V6 body offsets — see SecurityDefinition_12V6.cs
-    public const int SecDefBlockLength = 230;
-    public const int SecDefSecurityIdOffset = 0;            // long
-    public const int SecDefSecurityExchangeOffset = 8;      // SecurityExchange (4 ASCII bytes)
-    public const int SecDefSymbolOffset = 16;               // Symbol (20 ASCII bytes)
-    public const int SecDefSecurityTypeOffset = 37;         // SecurityType (1 byte enum)
-    public const int SecDefTotNoRelatedSymOffset = 40;      // uint
-    public const int SecDefSecurityValidityTimestampOffset = 76; // long (UTCTimestampSeconds.time)
-    public const int SecDefMaturityDateOffset = 140;        // int (LocalMktDate, 0 = null sentinel)
-    public const int SecDefIsinNumberOffset = 164;          // ISINNumber (12 ASCII bytes)
-
-    // We append three empty repeating-group headers (NoUnderlyings, NoLegs,
-    // NoInstrAttribs) so any future consumer path that calls ReadGroups stays
-    // safe; HandleSecurityDefinition's foreach enumerators don't strictly
-    // require them, but the cost is 9 bytes per packet.
-    public const int GroupSizeEncodingSize = 3;
-    public const int SecDefBodyTotal = SecDefBlockLength + GroupSizeEncodingSize * 3;
-}
-
 internal sealed class Worker
 {
     private readonly MulticastPublishChannelConfig _config;
@@ -346,7 +285,7 @@ internal sealed class Worker
                 break;
             case WorkerMode.Snapshot:
                 _msgsPerPacket = 1;
-                _perMessageWireLen = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapBlockLength;
+                _perMessageWireLen = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
                 break;
             case WorkerMode.InstrumentDefinition:
                 _msgsPerPacket = 1;
@@ -383,7 +322,7 @@ internal sealed class Worker
                     break;
                 case WorkerMode.Snapshot:
                     B3.Umdf.Mbo.Sbe.V16.V6.SnapshotFullRefresh_Header_30Data.WriteHeader(_buffer.AsSpan(mhOff, WireOffsets.SbeMessageHeaderSize));
-                    InitSnapBody(_buffer.AsSpan(bodyOff, WireOffsets.SnapBlockLength));
+                    InitSnapBody(_buffer.AsSpan(bodyOff, WireOffsets.SnapHeaderBlockLength));
                     break;
                 case WorkerMode.InstrumentDefinition:
                     B3.Umdf.Mbo.Sbe.V16.V6.SecurityDefinition_12Data.WriteHeader(_buffer.AsSpan(mhOff, WireOffsets.SbeMessageHeaderSize));
@@ -397,7 +336,7 @@ internal sealed class Worker
         if (_mode == WorkerMode.Snapshot && _opts.RotationWindow > 0)
         {
             int K = _opts.RotationWindow;
-            int headerFrame = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapBlockLength;
+            int headerFrame = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
             int ordersFrame = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize
                               + 8 /*SecurityID*/ + 3 /*GroupSizeEncoding*/ + K * 42 /*entries*/;
             int total = WireOffsets.PacketHeaderSize + headerFrame + ordersFrame;
@@ -750,7 +689,7 @@ internal sealed class Worker
                         }
                         else
                         {
-                            MemoryMarshal.Write(bufferSpan.Slice(bodyOff_ + WireOffsets.SnapBodySecurityIdOffset, 8), in secId);
+                            MemoryMarshal.Write(bufferSpan.Slice(bodyOff_ + WireOffsets.SnapHeaderBodySecurityIdOffset, 8), in secId);
                             // OrdersExpected stays 0; LastRptSeq stays 0 (=null).
                             if (snapBootstrapOnly)
                             {
@@ -834,7 +773,7 @@ internal sealed class Worker
 
         // --- Header_30 frame ---
         ref var hdrFraming = ref MemoryMarshal.AsRef<FramingHeader>(buf.Slice(cursor, WireOffsets.FramingHeaderSize));
-        int headerWireLen = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapBlockLength;
+        int headerWireLen = WireOffsets.FramingHeaderSize + WireOffsets.SbeMessageHeaderSize + WireOffsets.SnapHeaderBlockLength;
         hdrFraming.MessageLength = (ushort)headerWireLen;
         hdrFraming.EncodingType = 0;
         cursor += WireOffsets.FramingHeaderSize;
@@ -843,9 +782,9 @@ internal sealed class Worker
         cursor += WireOffsets.SbeMessageHeaderSize;
 
         // Header_30 body: SecurityID + SecurityExchange("BVMF") + counts + LastRptSeq.
-        Span<byte> headerBody = buf.Slice(cursor, WireOffsets.SnapBlockLength);
+        Span<byte> headerBody = buf.Slice(cursor, WireOffsets.SnapHeaderBlockLength);
         headerBody.Clear();
-        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapBodySecurityIdOffset, 8), in secId);
+        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapHeaderBodySecurityIdOffset, 8), in secId);
         Encoding.ASCII.GetBytes("BVMF", headerBody.Slice(8, 4));
 
         // Compute active orderIds and split bid/ask counts.
@@ -856,11 +795,11 @@ internal sealed class Worker
 
         uint totBids = (uint)activeCount;
         uint totOffers = 0u;
-        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapBodyTotNumBidsOffset, 4), in totBids);
-        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapBodyTotNumOffersOffset, 4), in totOffers);
+        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapHeaderBodyTotNumBidsOffset, 4), in totBids);
+        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapHeaderBodyTotNumOffersOffset, 4), in totOffers);
         // LastRptSeq = rs (non-null, non-zero → HasRptSeq=true → CompleteNormalSnapshot path on heal).
-        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapBodyLastRptSeqOffset, 4), in rs);
-        cursor += WireOffsets.SnapBlockLength;
+        MemoryMarshal.Write(headerBody.Slice(WireOffsets.SnapHeaderBodyLastRptSeqOffset, 4), in rs);
+        cursor += WireOffsets.SnapHeaderBlockLength;
 
         // --- Orders_71 frame ---
         // Body: SecurityID(8) + GroupSizeEncoding(3) + N entries × 42.

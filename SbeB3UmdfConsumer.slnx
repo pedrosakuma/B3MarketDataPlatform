@@ -11,6 +11,7 @@
     <Project Path="src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj" />
     <Project Path="src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj" />
     <Project Path="src/B3.Exchange.Instruments/B3.Exchange.Instruments.csproj" />
+    <Project Path="src/B3.Umdf.WireEncoder/B3.Umdf.WireEncoder.csproj" />
     <Project Path="src/B3.Umdf.Transport/B3.Umdf.Transport.csproj" />
     <Project Path="src/B3.Umdf.Server/B3.Umdf.Server.csproj" />
   </Folder>
@@ -28,5 +29,6 @@
     <Project Path="tests/B3.Umdf.PcapReplay.Tests/B3.Umdf.PcapReplay.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Server.Tests/B3.Umdf.Server.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Transport.Tests/B3.Umdf.Transport.Tests.csproj" />
+    <Project Path="tests/B3.Umdf.WireEncoder.Tests/B3.Umdf.WireEncoder.Tests.csproj" />
   </Folder>
 </Solution>

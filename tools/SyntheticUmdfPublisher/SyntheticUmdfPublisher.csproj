@@ -15,5 +15,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\B3.Umdf.Sbe\B3.Umdf.Sbe.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.Transport\B3.Umdf.Transport.csproj" />
+    <ProjectReference Include="..\..\src\B3.Umdf.WireEncoder\B3.Umdf.WireEncoder.csproj" />
   </ItemGroup>
 </Project>
