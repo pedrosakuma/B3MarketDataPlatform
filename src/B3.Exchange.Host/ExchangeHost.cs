@@ -21,15 +21,18 @@ public sealed class ExchangeHost : IAsyncDisposable
 {
     private readonly HostConfig _config;
     private readonly Action<string>? _log;
+    private readonly Func<ChannelConfig, IUmdfPacketSink>? _packetSinkFactory;
     private readonly List<ChannelDispatcher> _dispatchers = new();
-    private readonly List<MulticastUdpPacketSink> _packetSinks = new();
+    private readonly List<IDisposable> _ownedSinks = new();
     private EntryPointListener? _listener;
     private HostRouter? _router;
 
-    public ExchangeHost(HostConfig config, Action<string>? log = null)
+    public ExchangeHost(HostConfig config, Action<string>? log = null,
+        Func<ChannelConfig, IUmdfPacketSink>? packetSinkFactory = null)
     {
         _config = config;
         _log = log;
+        _packetSinkFactory = packetSinkFactory;
     }
 
     public IPEndPoint? TcpEndpoint => _listener?.LocalEndpoint;
@@ -40,9 +43,17 @@ public sealed class ExchangeHost : IAsyncDisposable
         foreach (var ch in _config.Channels)
         {
             var instruments = InstrumentLoader.LoadFromFile(ch.InstrumentsFile);
-            var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
-            var sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
-            _packetSinks.Add(sink);
+            IUmdfPacketSink sink;
+            if (_packetSinkFactory != null)
+            {
+                sink = _packetSinkFactory(ch);
+            }
+            else
+            {
+                var local = ch.LocalInterface != null ? IPAddress.Parse(ch.LocalInterface) : null;
+                sink = new MulticastUdpPacketSink(IPAddress.Parse(ch.IncrementalGroup), ch.IncrementalPort, local, ch.Ttl);
+            }
+            if (sink is IDisposable d) _ownedSinks.Add(d);
             var disp = new ChannelDispatcher(
                 channelNumber: ch.ChannelNumber,
                 engineFactory: s => new MatchingEngine(instruments, s),
@@ -87,6 +98,6 @@ public sealed class ExchangeHost : IAsyncDisposable
     {
         if (_listener != null) await _listener.DisposeAsync().ConfigureAwait(false);
         foreach (var d in _dispatchers) await d.DisposeAsync().ConfigureAwait(false);
-        foreach (var s in _packetSinks) s.Dispose();
+        foreach (var s in _ownedSinks) s.Dispose();
     }
 }

@@ -143,7 +143,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
                     Close();
                     return;
                 }
-                ArrayPool<byte>.Shared.Return(frame);
+                // Frames enqueued here are plain `new byte[]` (see TryEnqueueExact),
+                // never pool-owned, so we do not return them to ArrayPool.
             }
         }
         catch (OperationCanceledException) { }
@@ -169,9 +170,8 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     private bool TryEnqueue(byte[] frame)
     {
-        if (!IsOpen) { ArrayPool<byte>.Shared.Return(frame); return false; }
+        if (!IsOpen) return false;
         if (_sendQueue.Writer.TryWrite(frame)) return true;
-        ArrayPool<byte>.Shared.Return(frame);
         Close();
         return false;
     }
@@ -249,18 +249,13 @@ public sealed class EntryPointSession : IEntryPointResponseChannel, IAsyncDispos
 
     private bool TryEnqueueExact(byte[] frame, int written)
     {
-        // ReadOnlyMemory ignores trailing slack, but our send loop writes the entire array.
-        // Trim by allocating a tight buffer from the pool.
-        if (written == frame.Length) return TryEnqueue(frame);
-        var tight = ArrayPool<byte>.Shared.Rent(written);
-        Buffer.BlockCopy(frame, 0, tight, 0, written);
-        ArrayPool<byte>.Shared.Return(frame);
-        if (tight.Length == written) return TryEnqueue(tight);
-        // Pool returned a larger buffer; we need to send exactly `written` bytes.
-        // Since the send loop writes the whole array, fall back to a precise allocation.
+        // Send loop writes the entire array, so we must hand it a tight buffer.
+        // The encoder buffer (`frame`) was rented from ArrayPool and may be
+        // larger than `written`. Copy out exactly `written` bytes into a fresh
+        // non-pool array and return the rented buffer to the pool.
         var exact = new byte[written];
-        Buffer.BlockCopy(tight, 0, exact, 0, written);
-        ArrayPool<byte>.Shared.Return(tight);
+        Buffer.BlockCopy(frame, 0, exact, 0, written);
+        ArrayPool<byte>.Shared.Return(frame);
         return TryEnqueue(exact);
     }
 
