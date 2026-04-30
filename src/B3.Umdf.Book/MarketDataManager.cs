@@ -837,52 +837,48 @@ public sealed class MarketDataManager : IFeedEventHandler
 
     /// <summary>
     /// P13: parse a News_5 message and route to the multi-part reassembler.
-    /// VarData (Headline, Text, URLLink) is read directly from the underlying
-    /// buffer (no allocation, no closures) since the SBE-generated
-    /// <c>ReadGroups</c> requires delegate callbacks. Layout after the 36-byte
-    /// block: [u16 hLen][headline bytes][u16 tLen][text bytes][u16 uLen][url bytes].
+    /// Headline / Text / URLLink are read via the SbeSourceGenerator v1.6.0
+    /// direct varData properties on <c>News_5DataReader</c> — zero allocation,
+    /// no closure capture. Each access recomputes the segment offset
+    /// statelessly from the buffer (chained <c>SkipData*</c> helpers).
     /// </summary>
     private void HandleNews(in News_5DataReader reader)
     {
         ref readonly var msg = ref reader.Data;
-        var buf = reader.Buffer;
-        int o = News_5Data.MESSAGE_SIZE;
 
         ReadOnlySpan<byte> headline = ReadOnlySpan<byte>.Empty;
         ReadOnlySpan<byte> text = ReadOnlySpan<byte>.Empty;
         ReadOnlySpan<byte> url = ReadOnlySpan<byte>.Empty;
 
-        // Defensive: each var-data segment requires 2 bytes for length prefix
-        // plus its declared payload. Truncated buffers fail open (drop fragment,
-        // pass empty) rather than throw — same posture as other Handle* methods.
-        if (buf.Length >= o + 2)
+        // Fail-open on a truncated wire buffer: TryParse guarantees the fixed
+        // 36-byte block fits, but the varData length prefixes that follow are
+        // not bounds-checked by the generator's first direct property
+        // (`Headline`); chained `Text` / `URLLink` propagate any truncation as
+        // a slice exception. Catch and drop the fragment with whatever spans
+        // were successfully captured before the throw — same posture as the
+        // previous hand-rolled bounds checks. Each assignment is atomic
+        // (struct copy after a successful read), so partial captures are safe.
+        try
         {
-            ushort hLen = (ushort)(buf[o] | (buf[o + 1] << 8));
-            o += 2;
-            if (buf.Length >= o + hLen) { headline = buf.Slice(o, hLen); o += hLen; } else o = buf.Length;
+            headline = reader.Headline.VarData;
+            text = reader.Text.VarData;
+            url = reader.URLLink.VarData;
         }
-        if (buf.Length >= o + 2)
+        catch (Exception)
         {
-            ushort tLen = (ushort)(buf[o] | (buf[o + 1] << 8));
-            o += 2;
-            if (buf.Length >= o + tLen) { text = buf.Slice(o, tLen); o += tLen; } else o = buf.Length;
-        }
-        if (buf.Length >= o + 2)
-        {
-            ushort uLen = (ushort)(buf[o] | (buf[o + 1] << 8));
-            o += 2;
-            if (buf.Length >= o + uLen) { url = buf.Slice(o, uLen); }
+            // Truncated / malformed varData on the wire — submit with the
+            // spans captured so far (remaining stay empty).
         }
 
         ulong securityId = msg.SecurityID ?? 0UL;
         ulong newsId = msg.NewsID ?? 0UL;
         long origTime = (long)(msg.OrigTime.Time ?? 0UL);
         // LanguageCode is a 2-byte ISO-639-1 InlineArray at offset 10 of the
-        // SBE block. Read raw bytes as ushort (little-endian on this wire);
-        // wire layer treats it as opaque ushort.
-        ushort language = buf.Length >= 12
-            ? (ushort)(buf[10] | (buf[11] << 8))
-            : (ushort)0;
+        // SBE block. TryParse already guaranteed the block fits, so the read
+        // is unconditional. Wire layer treats it as opaque little-endian
+        // ushort (downstream maps to ISO-639-1 / pt-BR fallback).
+        var buf = reader.Buffer;
+        ushort language = (ushort)(buf[10] | (buf[11] << 8));
 
         _newsReassembler.Submit(
             securityId, newsId,
