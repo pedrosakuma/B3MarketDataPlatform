@@ -16,7 +16,6 @@
     <Project Path="tools/PcapRptSeqAnalyzer/PcapRptSeqAnalyzer.csproj" />
     <Project Path="tools/PcapTrafficCharacterizer/PcapTrafficCharacterizer.csproj" />
     <Project Path="tools/InboundLatencyProbe/InboundLatencyProbe.csproj" />
-    <Project Path="tools/SyntheticUmdfPublisher/SyntheticUmdfPublisher.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
