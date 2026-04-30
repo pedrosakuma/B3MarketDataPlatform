@@ -244,7 +244,7 @@ History
 			<validValue name="UNCOVERED_QTY">U</validValue>
 			<validValue name="COVERED_QTY">C</validValue>
 		</enum>
-		<enum name="MassActionScope" encodingType="uint8" semanticType="Int" description="Specifies the scope of the action. All Day and MOC orders will be canceled. GTC, GTD and MOA orders will not be canceled.">
+		<enum name="MassActionScope" encodingType="uint8EnumEncoding" semanticType="Int" description="Specifies the scope of the action. All Day and MOC orders will be canceled. GTC, GTD and MOA orders will not be canceled.">
 			<validValue name="ALL_ORDERS_FOR_A_TRADING_SESSION">6</validValue>
 		</enum>
 		<enum name="MassActionType" encodingType="uint8" semanticType="Int" description="Specifies the type of action requested.">
@@ -454,7 +454,7 @@ History
 			<validValue name="MARKET">1</validValue>
 			<validValue name="LIMIT">2</validValue>
 		</enum>
-		<enum name="RoutingInstruction" encodingType="uint8" semanticType="Int" description="Indicates additional order instruction.">
+		<enum name="RoutingInstruction" encodingType="uint8EnumEncoding" semanticType="Int" description="Indicates additional order instruction.">
 			<validValue name="RETAIL_LIQUIDITY_TAKER">1</validValue>
 			<validValue name="WAIVED_PRIORITY">2</validValue>
 			<validValue name="BROKER_ONLY">3</validValue>
@@ -475,14 +475,14 @@ History
 			<validValue name="RESTATED">R</validValue>
 			<validValue name="PREVIOUS_FINAL_STATE">Z</validValue>
 		</enum>
-		<enum name="ExecRestatementReasonValidForSingleCancel" encodingType="uint8" semanticType="Int" description="Used to communicate a reason for a solicited cancel.">
+		<enum name="ExecRestatementReasonValidForSingleCancel" encodingType="uint8EnumEncoding" semanticType="Int" description="Used to communicate a reason for a solicited cancel.">
 			<validValue name="CANCEL_ORDER_DUE_TO_OPERATIONAL_ERROR">203</validValue>
 		</enum>
-		<enum name="ExecRestatementReasonValidForMassCancel" encodingType="uint8" semanticType="Int" description="Used to communicate event type which triggers mass cancellation.">
+		<enum name="ExecRestatementReasonValidForMassCancel" encodingType="uint8EnumEncoding" semanticType="Int" description="Used to communicate event type which triggers mass cancellation.">
 			<validValue name="ORDER_MASS_ACTION_FROM_CLIENT_REQUEST">202</validValue>
 			<validValue name="MASS_CANCEL_ORDER_DUE_TO_OPERATIONAL_ERROR_REQUEST">207</validValue>
 		</enum>
-		<enum name="ExecRestatementReason" encodingType="uint8" semanticType="Int" description="Indicates reason for restatement/cancellation, if available.">
+		<enum name="ExecRestatementReason" encodingType="uint8EnumEncoding" semanticType="Int" description="Indicates reason for restatement/cancellation, if available.">
 			<validValue name="GT_RESTATEMENT" sinceVersion="6">1</validValue>
 			<validValue name="MARKET_OPTION">8</validValue>
 			<validValue name="CANCEL_ON_HARD_DISCONNECTION">100</validValue>
@@ -521,7 +521,7 @@ History
 			<validValue name="RESULT_OF_TRADE_AT_AVERAGE">H</validValue>
 			<validValue name="IMPLIED_ORDER" sinceVersion="4">7</validValue>
 		</enum>
-		<enum name="AccountType" encodingType="uint8" semanticType="Int" description="Type of Account associated with an order.">
+		<enum name="AccountType" encodingType="uint8EnumEncoding" semanticType="Int" description="Type of Account associated with an order.">
 			<validValue name="REMOVE_ACCOUNT_INFORMATION">38</validValue>
 			<validValue name="REGULAR_ACCOUNT">39</validValue>
 		</enum>
@@ -538,16 +538,16 @@ History
 			<validValue name="ISIN">4</validValue>
 			<validValue name="EXCHANGE_SYMBOL">8</validValue>
 		</enum>
-		<enum name="CrossedIndicator" encodingType="uint16" semanticType="Int" description="Indicates cross order purpose.">
+		<enum name="CrossedIndicator" encodingType="uint16EnumEncoding" semanticType="Int" description="Indicates cross order purpose.">
 			<validValue name="STRUCTURED_TRANSACTION">1001</validValue>
 			<validValue name="OPERATIONAL_ERROR">1002</validValue>
 			<validValue name="TWAP_VWAP">1003</validValue>
 		</enum>
-		<enum name="TradingSessionID" encodingType="uint8" description="Identifier for Trading Session." sinceVersion="3">
+		<enum name="TradingSessionID" encodingType="uint8EnumEncoding" description="Identifier for Trading Session." sinceVersion="3">
 			<validValue name="REGULAR_DAY_SESSION">1</validValue>
 			<validValue name="NON_REGULAR_SESSION">6</validValue>
 		</enum>
-		<enum name="TradingSessionSubID" encodingType="uint8" description="Identifier for the instrument group phase." sinceVersion="3">
+		<enum name="TradingSessionSubID" encodingType="uint8EnumEncoding" description="Identifier for the instrument group phase." sinceVersion="3">
 			<validValue name="PAUSE">2</validValue>
 			<validValue name="CLOSE">4</validValue>
 			<validValue name="OPEN">17</validValue>
@@ -555,7 +555,7 @@ History
 			<validValue name="PRE_OPEN">21</validValue>
 			<validValue name="FINAL_CLOSING_CALL">101</validValue>
 		</enum>
-		<enum name="SecurityTradingStatus" encodingType="uint8" description="Identifier for the instrument status." sinceVersion="3">
+		<enum name="SecurityTradingStatus" encodingType="uint8EnumEncoding" description="Identifier for the instrument status." sinceVersion="3">
 			<validValue name="TRADING_HALT">2</validValue>
 			<validValue name="NO_OPEN">4</validValue>
 			<validValue name="READY_TO_TRADE">17</validValue>
@@ -565,7 +565,7 @@ History
 			<validValue name="FINAL_CLOSING_CALL">101</validValue>
 			<validValue name="RESERVED">110</validValue>
 		</enum>
-		<enum name="CrossType" encodingType="uint8" description="Type of cross being submitted to a market." sinceVersion="3">
+		<enum name="CrossType" encodingType="uint8EnumEncoding" description="Type of cross being submitted to a market." sinceVersion="3">
 			<validValue name="ALL_OR_NONE_CROSS">1</validValue>
 			<validValue name="CROSS_EXECUTED_AGAINST_BOOK_FROM_CLIENT">4</validValue>
 			<validValue name="VWAP_CROSS" sinceVersion="6">7</validValue>
