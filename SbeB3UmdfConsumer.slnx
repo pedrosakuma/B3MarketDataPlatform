@@ -10,6 +10,7 @@
     <Project Path="src/B3.Umdf.PcapReplay/B3.Umdf.PcapReplay.csproj" />
     <Project Path="src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj" />
     <Project Path="src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj" />
+    <Project Path="src/B3.Exchange.Instruments/B3.Exchange.Instruments.csproj" />
     <Project Path="src/B3.Umdf.Transport/B3.Umdf.Transport.csproj" />
     <Project Path="src/B3.Umdf.Server/B3.Umdf.Server.csproj" />
   </Folder>
@@ -21,6 +22,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
+    <Project Path="tests/B3.Exchange.Instruments.Tests/B3.Exchange.Instruments.Tests.csproj" />
     <Project Path="tests/B3.Umdf.ConsoleApp.Tests/B3.Umdf.ConsoleApp.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Feed.Tests/B3.Umdf.Feed.Tests.csproj" />
     <Project Path="tests/B3.Umdf.PcapReplay.Tests/B3.Umdf.PcapReplay.Tests.csproj" />
