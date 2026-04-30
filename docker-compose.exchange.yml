@@ -1,0 +1,58 @@
+# Stateful B3 exchange simulator stack:
+#  - exchange: matching engine + EntryPoint TCP listener + UMDF multicast publisher
+#  - consumer: existing UMDF consumer (subscribes to the multicast feed published
+#    by the exchange) and exposes the WebSocket book API
+#  - frontend: web UI (same as docker-compose.multicast.yml)
+#
+# Difference from docker-compose.multicast.yml: that compose file replays
+# captured PCAPs as the multicast source. Here, the source is a live matching
+# engine fed by inbound TCP orders. The publisher service is replaced by the
+# `exchange` service.
+services:
+  exchange:
+    build:
+      context: .
+      dockerfile: Dockerfile.exchange
+    network_mode: "service:consumer"
+    volumes:
+      - ./config:/app/config:ro
+    command: ["/app/config/exchange-simulator.json"]
+    depends_on:
+      consumer:
+        condition: service_healthy
+    restart: "no"
+    stop_grace_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1"
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${WS_PORT:-8080}:${WS_PORT:-8080}"
+      - "${EXCHANGE_TCP_PORT:-9876}:${EXCHANGE_TCP_PORT:-9876}"
+    volumes:
+      - ./config:/app/config:ro
+    environment:
+      UMDF_MULTICAST_CONFIG: "/app/config/${MULTICAST_CONFIG_FILE:-multicast-compose.json}"
+      UMDF_WS_PORT: "${WS_PORT:-8080}"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2"
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - consumer
+    restart: unless-stopped

@@ -182,6 +182,7 @@ the only modification to the original B3 schema.
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook |
 | [docs/NOISY-NEIGHBOUR.md](docs/NOISY-NEIGHBOUR.md) | Behaviour under host-level resource contention, scheduler jitter probe, deployment hardening (cpuset, k8s static CPU manager, NIC IRQ pinning, sysctls) |
+| [docs/EXCHANGE-SIMULATOR.md](docs/EXCHANGE-SIMULATOR.md) | Stateful B3 exchange simulator — TCP EntryPoint listener, matching engine, UMDF multicast publisher, sample order client |
 
 ## References
 
