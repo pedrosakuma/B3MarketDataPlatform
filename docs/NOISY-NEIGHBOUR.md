@@ -1,6 +1,6 @@
 # Noisy Neighbour Hardening
 
-How `SbeB3UmdfConsumer` behaves under host-level resource contention, and the
+How `B3MarketDataPlatform` behaves under host-level resource contention, and the
 deployment knobs that preserve QoS when other workloads share the box.
 
 For application-level fault tolerance see [RESILIENCE.md](./RESILIENCE.md).

@@ -1,6 +1,6 @@
 # Resilience Strategy
 
-This document describes the fault-tolerance design of `SbeB3UmdfConsumer`:
+This document describes the fault-tolerance design of `B3MarketDataPlatform`:
 the failure modes it explicitly handles, and the layered defenses in place.
 
 For raw throughput design see [PERFORMANCE.md](./PERFORMANCE.md).

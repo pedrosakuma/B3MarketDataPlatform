@@ -1,4 +1,4 @@
-# SbeB3UmdfConsumer
+# B3MarketDataPlatform
 
 Open-source C# consumer for [B3](https://www.b3.com.br/) market data over
 the **Binary UMDF** (Unified Market Data Feed) protocol, encoded with

@@ -1,6 +1,6 @@
 # Performance Strategy
 
-This document describes the performance design of `SbeB3UmdfConsumer`: which
+This document describes the performance design of `B3MarketDataPlatform`: which
 hot paths matter, what they look like in code, and the engineering choices
 that keep them fast.
 

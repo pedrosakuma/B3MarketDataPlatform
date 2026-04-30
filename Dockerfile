@@ -12,7 +12,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 
 WORKDIR /src
 
-COPY Directory.Build.props global.json SbeB3UmdfConsumer.slnx ./
+COPY Directory.Build.props global.json B3MarketDataPlatform.slnx ./
 COPY schemas/ schemas/
 COPY src/ src/
 
