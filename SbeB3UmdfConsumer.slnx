@@ -9,6 +9,7 @@
     <Project Path="src/B3.Umdf.Feed/B3.Umdf.Feed.csproj" />
     <Project Path="src/B3.Umdf.PcapReplay/B3.Umdf.PcapReplay.csproj" />
     <Project Path="src/B3.Umdf.Sbe/B3.Umdf.Sbe.csproj" />
+    <Project Path="src/B3.EntryPoint.Sbe/B3.EntryPoint.Sbe.csproj" />
     <Project Path="src/B3.Umdf.Transport/B3.Umdf.Transport.csproj" />
     <Project Path="src/B3.Umdf.Server/B3.Umdf.Server.csproj" />
   </Folder>
