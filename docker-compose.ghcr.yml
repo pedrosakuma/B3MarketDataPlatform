@@ -1,0 +1,16 @@
+# Override that swaps the local backend build for the pre-built GHCR image.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up
+#
+# Pin a specific tag (recommended for reproducibility) by setting MARKETDATA_TAG:
+#   MARKETDATA_TAG=v1.2.3 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up
+#
+# The frontend service is intentionally not overridden — it is a dev-only demo
+# UI and is not published to GHCR. It will continue to build locally from
+# ./frontend in this compose stack.
+
+services:
+  backend:
+    image: ghcr.io/pedrosakuma/b3-marketdata:${MARKETDATA_TAG:-latest}
+    build: !reset null

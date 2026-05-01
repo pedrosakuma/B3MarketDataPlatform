@@ -165,6 +165,38 @@ path, the full CLI / env-var reference, and the multicast JSON format,
 see [docs/OPERATIONS.md](docs/OPERATIONS.md) and
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+### Pre-built backend image (GHCR)
+
+The backend is published to GitHub Container Registry on every push to
+`main` and on every `vX.Y.Z` git tag. Pull it directly instead of
+building from source:
+
+```bash
+docker pull ghcr.io/pedrosakuma/b3-marketdata:latest
+# or pin a release:
+docker pull ghcr.io/pedrosakuma/b3-marketdata:v1.0.0
+```
+
+Tags published per build:
+
+- `latest` — tip of `main`.
+- `vX.Y.Z`, `vX.Y` — semver tags (on git tag pushes).
+- `sha-<short>` — exact commit (immutable, recommended for production pins).
+- `<branch>` — tip of any pushed branch.
+
+Use the GHCR image with the existing compose stack via the override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up
+# pin a specific tag:
+MARKETDATA_TAG=v1.0.0 docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up
+```
+
+The frontend is a dev-only demo UI and is **not** published to GHCR; it
+continues to build locally from `./frontend` in both modes. Downstream
+services (e.g. `B3TradingPlatform`) consume the backend's WebSocket
+directly — see [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md).
+
 ## B3 schema
 
 This project uses the [B3 Market Data Messages v2.2.0](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/)
@@ -178,6 +210,7 @@ the only modification to the original B3 schema.
 |----------|---------------|
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running locally and in Docker, web viewer screenshots, health endpoints, metrics, backpressure summary, graceful shutdown, TLS, profiling |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | CLI options, full `UMDF_*` environment variable reference, multicast JSON config, host kernel tuning, replay-speed range |
+| [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md) | **Consumer-facing landing for the WebSocket distribution layer**: stability label, breaking-change policy, "reference price" quickstart for downstream apps (e.g. risk modules) |
 | [docs/WEBSOCKET-PROTOCOL.md](docs/WEBSOCKET-PROTOCOL.md) | Wire framing, message catalog, hex examples, subscription / reconnect / slow-consumer flows, candle chunking |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook |
