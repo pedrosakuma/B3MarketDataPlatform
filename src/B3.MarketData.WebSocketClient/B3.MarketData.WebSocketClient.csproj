@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.MarketData.WebSocketClient</RootNamespace>
+    <AssemblyName>B3.MarketData.WebSocketClient</AssemblyName>
+
+    <!-- Packaging -->
+    <IsPackable>true</IsPackable>
+    <PackageId>B3.MarketData.WebSocketClient</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>pedrosakuma</Authors>
+    <Description>Typed C# subscriber SDK for the B3MarketDataPlatform WebSocket distribution layer (v1: trades, info snapshots, server status). Built-in reconnect with transparent re-subscribe and bounded back-pressure.</Description>
+    <PackageTags>b3;marketdata;websocket;sdk;trades;reference-price</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/pedrosakuma/B3MarketDataPlatform</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/pedrosakuma/B3MarketDataPlatform</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- SourceLink + deterministic build (matches the rest of the family's NuGets) -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <DebugType>portable</DebugType>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.0" />
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.MarketData.WebSocketClient.Tests" />
+  </ItemGroup>
+
+</Project>

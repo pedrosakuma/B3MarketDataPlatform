@@ -4,6 +4,7 @@
     <Project Path="benchmarks/B3.Umdf.Feed.Benchmarks/B3.Umdf.Feed.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj" />
     <Project Path="src/B3.Umdf.Book/B3.Umdf.Book.csproj" />
     <Project Path="src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj" />
     <Project Path="src/B3.Umdf.Feed/B3.Umdf.Feed.csproj" />
@@ -18,6 +19,7 @@
     <Project Path="tools/InboundLatencyProbe/InboundLatencyProbe.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/B3.MarketData.WebSocketClient.Tests/B3.MarketData.WebSocketClient.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
     <Project Path="tests/B3.Umdf.ConsoleApp.Tests/B3.Umdf.ConsoleApp.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Feed.Tests/B3.Umdf.Feed.Tests.csproj" />
