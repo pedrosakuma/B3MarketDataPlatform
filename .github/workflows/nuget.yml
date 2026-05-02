@@ -1,0 +1,80 @@
+name: Publish NuGet — B3.MarketData.WebSocketClient
+
+# Publishes the SDK to nuget.org when a tag matching `v*` is pushed
+# (e.g. `v0.1.0`, `v0.2.0-preview.1`). The tag itself drives the
+# package version so we don't have to bump the csproj for every release.
+#
+# Required repo secret: `NUGET_API_KEY` — a nuget.org API key with
+# "Push new packages and package versions" scope for the
+# `B3.MarketData.WebSocketClient` package id.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override package version (e.g. 0.1.0). Leave empty to use the tag.'
+        required: false
+        default: ''
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve package version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            ver="${{ inputs.version }}"
+          else
+            tag="${GITHUB_REF##*/}"
+            ver="${tag#v}"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Resolved package version: $ver"
+
+      - name: Restore
+        run: dotnet restore src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj
+
+      - name: Build
+        run: dotnet build src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj -c Release --no-restore -p:PackageVersion=${{ steps.ver.outputs.version }}
+
+      - name: Test (full suite)
+        run: dotnet test B3MarketDataPlatform.slnx -c Release --verbosity minimal
+
+      - name: Pack
+        run: dotnet pack src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj -c Release --no-build -o ./artifacts -p:PackageVersion=${{ steps.ver.outputs.version }}
+
+      - name: List artifacts
+        run: ls -la ./artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkgs
+          path: ./artifacts/*.*nupkg
+
+      - name: Push to nuget.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NUGET_API_KEY secret is not configured."
+            exit 1
+          fi
+          dotnet nuget push "./artifacts/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate

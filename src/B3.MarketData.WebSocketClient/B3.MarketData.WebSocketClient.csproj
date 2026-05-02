@@ -7,7 +7,7 @@
     <!-- Packaging -->
     <IsPackable>true</IsPackable>
     <PackageId>B3.MarketData.WebSocketClient</PackageId>
-    <Version>0.1.0</Version>
+    <Version Condition="'$(PackageVersion)' == ''">0.1.0</Version>
     <Authors>pedrosakuma</Authors>
     <Description>Typed C# subscriber SDK for the B3MarketDataPlatform WebSocket distribution layer (v1: trades, info snapshots, server status). Built-in reconnect with transparent re-subscribe and bounded back-pressure.</Description>
     <PackageTags>b3;marketdata;websocket;sdk;trades;reference-price</PackageTags>
