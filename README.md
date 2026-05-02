@@ -211,6 +211,7 @@ the only modification to the original B3 schema.
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running locally and in Docker, web viewer screenshots, health endpoints, metrics, backpressure summary, graceful shutdown, TLS, profiling |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | CLI options, full `UMDF_*` environment variable reference, multicast JSON config, host kernel tuning, replay-speed range |
 | [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md) | **Consumer-facing landing for the WebSocket distribution layer**: stability label, breaking-change policy, "reference price" quickstart for downstream apps (e.g. risk modules) |
+| [docs/CLIENT-SDK.md](docs/CLIENT-SDK.md) | **Typed C# SDK** (`B3.MarketData.WebSocketClient` NuGet): API, DI extension, reconnect+replay, back-pressure policies |
 | [docs/WEBSOCKET-PROTOCOL.md](docs/WEBSOCKET-PROTOCOL.md) | Wire framing, message catalog, hex examples, subscription / reconnect / slow-consumer flows, candle chunking |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook |

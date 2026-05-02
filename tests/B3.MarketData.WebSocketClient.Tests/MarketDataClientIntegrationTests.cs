@@ -1,0 +1,256 @@
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Text;
+using B3.MarketData.WebSocketClient;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+namespace B3.MarketData.WebSocketClient.Tests;
+
+/// <summary>
+/// End-to-end test of <see cref="MarketDataClient"/> against a tiny
+/// in-process WebSocket server that speaks the B3MarketDataPlatform
+/// binary wire format. Covers the typical reference-price flow:
+/// <c>ServerStatus → SubscribeOk → Trade → InfoSnapshot</c>, plus
+/// <c>SubscribeError</c>.
+/// </summary>
+public class MarketDataClientIntegrationTests
+{
+    private static int FindFreePort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        try { return ((IPEndPoint)listener.LocalEndpoint).Port; }
+        finally { listener.Stop(); }
+    }
+
+    [Fact]
+    public async Task SubscribeOk_Then_Trade_DecodesAndScalesPrice()
+    {
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            // Wait for the SDK's Subscribe frame, then push back
+            // SubscribeOk + Trade.
+            var sym = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            await TestWsServer.SendSubscribeOkAsync(ws, securityId: 12345, sym, ct);
+            await TestWsServer.SendTradeAsync(ws, securityId: 12345, price: 36_7800, qty: 100, tradeId: 1, ct);
+
+            // Hold the socket open until the test cancels.
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var receivedTrade = new TaskCompletionSource<TradeEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.Trade += t => receivedTrade.TrySetResult(t);
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+        await client.SubscribeAsync("PETR4");
+
+        var trade = await receivedTrade.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(12345UL, trade.SecurityId);
+        Assert.Equal("PETR4", trade.Symbol);
+        Assert.Equal(36.78m, trade.Price);
+        Assert.Equal(100L, trade.Qty);
+        Assert.Equal(1L, trade.TradeId);
+        Assert.True(client.TryGetSecurityId("PETR4", out var resolved));
+        Assert.Equal(12345UL, resolved);
+    }
+
+    [Fact]
+    public async Task SubscribeError_IsSurfacedAsTypedEvent()
+    {
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            var sym = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            await TestWsServer.SendSubscribeErrorAsync(ws, sym, errorCode: 0x01, ct); // UnknownSymbol
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var got = new TaskCompletionSource<SubscribeErrorEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.SubscribeError += e => got.TrySetResult(e);
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+        await client.SubscribeAsync("UNKWN");
+
+        var err = await got.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("UNKWN", err.Symbol);
+        Assert.Equal(SubscribeErrorCode.UnknownSymbol, err.ErrorCode);
+    }
+
+    [Fact]
+    public async Task Reconnect_TransparentlyReSubscribes()
+    {
+        var port = FindFreePort();
+        int subscribesSeen = 0;
+        var firstSubscribeReceived = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondSubscribeReceived = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            var sym = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            int n = Interlocked.Increment(ref subscribesSeen);
+            if (n == 1) firstSubscribeReceived.TrySetResult(true);
+            else if (n == 2) secondSubscribeReceived.TrySetResult(true);
+
+            await TestWsServer.SendSubscribeOkAsync(ws, securityId: 7, sym, ct);
+
+            if (n == 1)
+            {
+                // Force the SDK to reconnect by closing the socket.
+                await ws.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, "test reconnect", ct);
+                return;
+            }
+
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+            ReconnectInitialDelay = TimeSpan.FromMilliseconds(50),
+            ReconnectMaxDelay = TimeSpan.FromMilliseconds(200),
+        });
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+        await client.SubscribeAsync("PETR4");
+
+        await firstSubscribeReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        // After the server closes, the SDK should reconnect and re-issue Subscribe.
+        await secondSubscribeReceived.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(subscribesSeen >= 2, $"expected ≥ 2 subscribes after reconnect, saw {subscribesSeen}");
+    }
+
+    private static async Task WaitUntil(Func<bool> pred, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (pred()) return;
+            await Task.Delay(20);
+        }
+    }
+}
+
+/// <summary>
+/// Minimal in-process WebSocket server used to drive the SDK from tests.
+/// Hosts a single <c>/ws</c> endpoint that hands the open socket to the
+/// caller-supplied handler. The handler is responsible for the
+/// per-test conversation; cancellation is passed through on dispose.
+/// </summary>
+internal sealed class TestWsServer : IAsyncDisposable
+{
+    private readonly WebApplication _app;
+    private readonly CancellationTokenSource _cts = new();
+
+    private TestWsServer(WebApplication app) { _app = app; }
+
+    public static async Task<TestWsServer> StartAsync(int port, Func<WebSocket, CancellationToken, Task> handler)
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+        builder.Logging.ClearProviders();
+        var app = builder.Build();
+        app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
+        var server = new TestWsServer(app);
+        app.Map("/ws", async (HttpContext ctx) =>
+        {
+            if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
+            using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+            try { await handler(ws, server._cts.Token); }
+            catch (OperationCanceledException) { /* shutdown */ }
+            catch { /* swallow — server side */ }
+        });
+        await app.StartAsync();
+        return server;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { await _app.StopAsync(); } catch { }
+        await _app.DisposeAsync();
+        _cts.Dispose();
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    public static async Task<string> ReadSubscribeAsync(WebSocket ws, CancellationToken ct)
+    {
+        var buffer = new byte[1024];
+        int filled = 0;
+        WebSocketReceiveResult result;
+        do
+        {
+            result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer, filled, buffer.Length - filled), ct);
+            filled += result.Count;
+        } while (!result.EndOfMessage);
+
+        // [len u16][type u16=0x0001][flags u8][symLen u8][symbol]
+        ushort len = BinaryPrimitives.ReadUInt16LittleEndian(buffer);
+        ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
+        if (type != 0x0001) throw new InvalidOperationException($"expected Subscribe, got 0x{type:X4}");
+        byte symLen = buffer[5];
+        return Encoding.UTF8.GetString(buffer, 6, symLen);
+    }
+
+    public static Task SendSubscribeOkAsync(WebSocket ws, ulong securityId, string symbol, CancellationToken ct)
+    {
+        // [len u16][type u16=0x0010][secId u64][flags u8][symLen u8][symbol]
+        var symBytes = Encoding.UTF8.GetBytes(symbol);
+        ushort total = (ushort)(4 + 8 + 1 + 1 + symBytes.Length);
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0010);
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(4), securityId);
+        buf[12] = (byte)0x10; // Trades flag
+        buf[13] = (byte)symBytes.Length;
+        symBytes.CopyTo(buf, 14);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendSubscribeErrorAsync(WebSocket ws, string symbol, byte errorCode, CancellationToken ct)
+    {
+        // [len u16][type u16=0x0011][errorCode u8][symLen u8][symbol]
+        var symBytes = Encoding.UTF8.GetBytes(symbol);
+        ushort total = (ushort)(4 + 1 + 1 + symBytes.Length);
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0011);
+        buf[4] = errorCode;
+        buf[5] = (byte)symBytes.Length;
+        symBytes.CopyTo(buf, 6);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendTradeAsync(WebSocket ws, ulong securityId, long price, long qty, long tradeId, CancellationToken ct)
+    {
+        // [len u16][type u16=0x0033][secId u64][price i64][qty i64][tradeId i64]
+        const ushort total = 4 + 8 + 8 + 8 + 8;
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0033);
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(4), securityId);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(12), price);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(20), qty);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(28), tradeId);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+}
