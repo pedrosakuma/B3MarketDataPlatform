@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using OpenTelemetry.Metrics;
 
 namespace B3.Umdf.Server;
 
@@ -44,6 +45,17 @@ public sealed class WebSocketHost : IAsyncDisposable
 
     /// <summary>Optional accessor for total events recorded since process start (for the audit-trail endpoint).</summary>
     public Func<long>? RecoveryEventTotalProvider { get; set; }
+
+    /// <summary>
+    /// Additional <c>System.Diagnostics.Metrics.Meter</c> names to expose via
+    /// the Prometheus <c>/metrics</c> endpoint. The host always exposes the
+    /// <c>"B3.Umdf"</c> meter (defined by <see cref="MetricsRegistry"/>);
+    /// callers may add others (e.g. <c>"B3.Umdf.Consumer"</c> registered by
+    /// the ConsoleApp's <c>MetricsBinder</c>) to surface them on the same
+    /// scrape endpoint. Set before <see cref="StartAsync"/>; mutations after
+    /// the host has started are ignored.
+    /// </summary>
+    public IReadOnlyList<string> AdditionalMeterNames { get; set; } = Array.Empty<string>();
 
     public WebSocketHost(
         SubscriptionManager subscriptionManager,
@@ -84,6 +96,19 @@ public sealed class WebSocketHost : IAsyncDisposable
         builder.Services.ConfigureHttpJsonOptions(options =>
             options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
 
+        builder.Services
+            .AddOpenTelemetry()
+            .WithMetrics(metrics =>
+            {
+                metrics.AddMeter(MetricsRegistry.Meter.Name);
+                foreach (var name in AdditionalMeterNames)
+                {
+                    if (!string.IsNullOrWhiteSpace(name))
+                        metrics.AddMeter(name);
+                }
+                metrics.AddPrometheusExporter();
+            });
+
         _app = builder.Build();
         _app.UseWebSockets(new WebSocketOptions
         {
@@ -92,6 +117,7 @@ public sealed class WebSocketHost : IAsyncDisposable
 
         UseCorsHeaders(_app);
         MapHealthEndpoints(_app);
+        MapMetricsEndpoint(_app);
         MapSymbolEndpoints(_app);
         MapInstrumentEndpoint(_app);
         MapRecoveryEndpoint(_app);
@@ -147,6 +173,14 @@ public sealed class WebSocketHost : IAsyncDisposable
             _subscriptionManager.IsReady ? Results.Ok("ready") : Results.StatusCode(503));
 
         app.MapGet("/live", () => Results.Ok("alive"));
+    }
+
+    private static void MapMetricsEndpoint(WebApplication app)
+    {
+        // Prometheus scrape endpoint. Exposes every meter registered in the
+        // OpenTelemetry pipeline (always B3.Umdf, plus AdditionalMeterNames).
+        // Lives on the same port as /health for ops-stack convenience.
+        app.MapPrometheusScrapingEndpoint();
     }
 
     private void MapSymbolEndpoints(WebApplication app)
