@@ -194,9 +194,25 @@ curl http://localhost:8080/health | jq
 ## Metrics
 
 OTEL-compatible metrics via `System.Diagnostics.Metrics` (zero NuGet
-dependencies, fully AOT-safe).
+dependencies on the producer side, fully AOT-safe).
 
-**Meter name:** `B3.Umdf.Consumer`
+**Meter names:** `B3.Umdf.Consumer` (ConsoleApp / `MetricsBinder`) and
+`B3.Umdf` (Server / `MetricsRegistry`).
+
+### Prometheus `/metrics`
+
+The host exposes a Prometheus scrape endpoint on the same port as
+`/health` (default `8080`):
+
+```bash
+curl -s http://localhost:8080/metrics | head
+```
+
+Both meters above are wired into the scrape automatically. See
+[OBSERVABILITY.md](OBSERVABILITY.md) for the full metric catalogue,
+labels, and cardinality rules.
+
+### Local development with `dotnet-counters`
 
 ```bash
 # one time
@@ -276,8 +292,9 @@ automatically.
 | `b3.umdf.server.events_received` | Counter | `group` | Events received into conflation |
 | `b3.umdf.server.events_flushed` | Counter | `group` | Events flushed from conflation to clients |
 
-Adding a Prometheus `/metrics` endpoint or an OTLP exporter requires only
-the corresponding NuGet package — no instrumentation changes.
+Adding an OTLP push exporter requires only the corresponding NuGet
+package — no instrumentation changes; the pull `/metrics` endpoint
+remains available in parallel.
 
 ## Backpressure & slow clients
 

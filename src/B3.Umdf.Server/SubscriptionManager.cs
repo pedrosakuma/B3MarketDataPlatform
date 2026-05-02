@@ -236,6 +236,12 @@ public sealed class SubscriptionManager : IDisposable
     /// <summary>Lock-free check whether any client is subscribed to a security.</summary>
     internal bool IsSubscribed(ulong securityId) => _subscriptions.ContainsKey(securityId);
 
+    /// <summary>
+    /// Count of distinct securities with at least one active subscriber.
+    /// Lock-free; intended for observability gauges (low-cardinality, scrape-time only).
+    /// </summary>
+    public int ActiveSymbolCount => _subscriptions.Count;
+
     /// <summary>Broadcast pre-serialized bytes to all Book subscribers for a security.</summary>
     internal void BroadcastToSubscribers(ulong securityId, ReadOnlyMemory<byte> payload)
     {

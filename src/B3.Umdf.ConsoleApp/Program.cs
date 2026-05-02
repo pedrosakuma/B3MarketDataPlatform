@@ -549,6 +549,15 @@ if (subscriptionManager is not null)
     wsHost.RecoveryEventProvider = max => recoveryEventLog.Snapshot(max);
     wsHost.RecoveryEventTotalProvider = () => recoveryEventLog.TotalRecorded;
 
+    // Expose the ConsoleApp's MetricsBinder meter through the host's
+    // /metrics endpoint alongside the Server's own "B3.Umdf" meter.
+    wsHost.AdditionalMeterNames = new[] { MetricsBinder.Meter.Name };
+
+    // Wire the active-symbol gauge to SubscriptionManager. Captured once;
+    // SubscriptionManager outlives the host.
+    var sm = subscriptionManager;
+    MetricsRegistry.ActiveSubscribedSymbolsProvider = () => sm.ActiveSymbolCount;
+
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
 }
 
