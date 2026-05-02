@@ -195,7 +195,11 @@ MARKETDATA_TAG=v1.0.0 docker compose -f docker-compose.yml -f docker-compose.ghc
 The frontend is a dev-only demo UI and is **not** published to GHCR; it
 continues to build locally from `./frontend` in both modes. Downstream
 services (e.g. `B3TradingPlatform`) consume the backend's WebSocket
-directly — see [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md).
+directly — see [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md). For .NET
+consumers, the typed SDK is published on NuGet:
+[`B3.MarketData.WebSocketClient`](https://www.nuget.org/packages/B3.MarketData.WebSocketClient)
+(`dotnet add package B3.MarketData.WebSocketClient`) — see
+[docs/CLIENT-SDK.md](docs/CLIENT-SDK.md).
 
 ## B3 schema
 

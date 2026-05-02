@@ -10,6 +10,12 @@ info snapshots, server status) — the same surface documented in
 exposed as typed events with the SBE 4-decimal price exponent already
 applied so consumers never see the raw `i64` mantissa.
 
+## Install
+
+```sh
+dotnet add package B3.MarketData.WebSocketClient
+```
+
 ```csharp
 using B3.MarketData.WebSocketClient;
 
