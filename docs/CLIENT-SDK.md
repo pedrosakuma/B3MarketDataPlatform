@@ -1,5 +1,7 @@
 # Client SDK — `B3.MarketData.WebSocketClient`
 
+[![NuGet](https://img.shields.io/nuget/v/B3.MarketData.WebSocketClient.svg)](https://www.nuget.org/packages/B3.MarketData.WebSocketClient)
+
 A typed, allocation-aware C# SDK for consuming the
 B3MarketDataPlatform WebSocket distribution layer. The package wraps
 the binary wire protocol described in
@@ -10,11 +12,23 @@ reconnect + replay transparently.
 
 | Item | Value |
 |------|-------|
-| Package id | `B3.MarketData.WebSocketClient` |
+| Package id | [`B3.MarketData.WebSocketClient`](https://www.nuget.org/packages/B3.MarketData.WebSocketClient) |
 | Target | `net10.0` |
 | License | MIT |
 | Public surface | `MarketDataClient`, `MarketDataClientOptions`, event records, `SubscribeFlags` |
 | Source | `src/B3.MarketData.WebSocketClient/` |
+
+## Install
+
+```sh
+dotnet add package B3.MarketData.WebSocketClient
+```
+
+Or pin a specific version in your `csproj`:
+
+```xml
+<PackageReference Include="B3.MarketData.WebSocketClient" Version="0.1.0" />
+```
 
 ## Quickstart
 
