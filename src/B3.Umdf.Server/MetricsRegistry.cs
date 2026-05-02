@@ -35,4 +35,24 @@ public sealed class MetricsRegistry
     public static readonly Counter<long> BroadcastBufferRentMisses = Meter.CreateCounter<long>("umdf.broadcast_pool.rent_misses");
     public static readonly Counter<long> BroadcastBufferReturnDrops = Meter.CreateCounter<long>("umdf.broadcast_pool.return_drops");
     public static readonly Counter<long> BroadcastBufferOversizeRents = Meter.CreateCounter<long>("umdf.broadcast_pool.oversize_rents");
+
+    // ── Observable gauges (read at scrape time only — zero hot-path cost) ──
+    //
+    // These are lazily wired from a callback so the Server library has no
+    // direct dependency on SubscriptionManager construction order. Set the
+    // provider before starting the host; null (default) disables emission.
+
+    /// <summary>
+    /// Provider for <c>umdf.ws.subscribed_symbols</c> — distinct securities with
+    /// at least one active subscriber. Set once at startup.
+    /// </summary>
+    public static Func<int>? ActiveSubscribedSymbolsProvider { get; set; }
+
+    static MetricsRegistry()
+    {
+        Meter.CreateObservableGauge(
+            "umdf.ws.subscribed_symbols",
+            static () => ActiveSubscribedSymbolsProvider?.Invoke() ?? 0,
+            description: "Distinct securities with at least one active WebSocket subscriber.");
+    }
 }
