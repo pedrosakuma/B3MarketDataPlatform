@@ -61,6 +61,16 @@ public sealed class FeedHandler : IDisposable
     public long InstrDefMismatchedTotalCount => Volatile.Read(ref _instrDefMismatchedTotalCount);
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
+    private long _handlerExceptionCount;
+    private long _lastLoggedHandlerExceptionMilestone;
+    /// <summary>
+    /// Number of exceptions thrown by the downstream <see cref="IFeedEventHandler"/>
+    /// while processing a packet inside <see cref="ProcessOwnedPacket"/>. The
+    /// owned-source consumer loop swallows the exception and continues so a
+    /// misbehaving handler cannot kill the feed thread.
+    /// </summary>
+    public long HandlerExceptionCount => Volatile.Read(ref _handlerExceptionCount);
+
     /// <summary>Fires after the state machine transitions. Args are (oldState, newState). Invoked synchronously on the worker thread.</summary>
     public event Action<FeedState, FeedState>? StateChanged;
 
@@ -197,12 +207,50 @@ public sealed class FeedHandler : IDisposable
     {
         try
         {
-            HandlePacket(in packet);
+            try
+            {
+                HandlePacket(in packet);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation must propagate so the owned-source loop exits cleanly.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Per-packet exception isolation: a downstream IFeedEventHandler
+                // throwing must NOT kill the consumer loop. Increment the counter
+                // first so even logging failures don't mask the metric, then log
+                // rate-limited so a sustained pathology doesn't flood the sink.
+                Interlocked.Increment(ref _handlerExceptionCount);
+                LogHandlerExceptionRateLimited(ex);
+            }
         }
         finally
         {
             packet.Release();
         }
+    }
+
+    private void LogHandlerExceptionRateLimited(Exception ex)
+    {
+        // Power-of-two milestone cadence (1, 2, 4, 8, 16, ...) to mirror
+        // MultiFeedManager.LogDropRateLimited. Single-threaded read/write is
+        // safe here because ProcessOwnedPacket runs on the owned consumer
+        // thread or under a single-producer FeedPacket caller; worst case is
+        // a duplicated log line, never a missed escalation.
+        long current = Volatile.Read(ref _handlerExceptionCount);
+        long last = Volatile.Read(ref _lastLoggedHandlerExceptionMilestone);
+        if (current <= last)
+            return;
+        long milestone = 1L << (63 - System.Numerics.BitOperations.LeadingZeroCount((ulong)current));
+        if (milestone <= last)
+            return;
+        Volatile.Write(ref _lastLoggedHandlerExceptionMilestone, milestone);
+        _logger.LogWarning(
+            ex,
+            "FeedHandler downstream handler threw {Count} exception(s); packet skipped, consumer loop continuing",
+            current);
     }
 
     private void HandlePacket(in UmdfPacket packet)

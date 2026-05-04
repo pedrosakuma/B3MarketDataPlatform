@@ -12,51 +12,102 @@ namespace B3.Umdf.Feed;
 public sealed class CompositeFeedHandler : IFeedEventHandler
 {
     private readonly IFeedEventHandler[] _handlers;
+    private long _delegateExceptionCount;
 
     public CompositeFeedHandler(params IFeedEventHandler[] handlers)
     {
         _handlers = handlers;
     }
 
+    /// <summary>
+    /// Total number of exceptions thrown by any delegate handler across all
+    /// fan-out methods. A misbehaving delegate must NOT prevent its peers from
+    /// observing the same event, so each invocation is isolated in try/catch.
+    /// </summary>
+    public long DelegateExceptionCount => Volatile.Read(ref _delegateExceptionCount);
+
+    private void RecordFailure(Exception ex, string method, ref bool firstReported)
+    {
+        Interlocked.Increment(ref _delegateExceptionCount);
+        if (!firstReported)
+        {
+            firstReported = true;
+            // First failure per fan-out cycle is surfaced via Trace so a host
+            // that wires console redirection sees it; downstream consumers that
+            // care attach to the counter for monitoring. Avoid pulling in ILogger
+            // here to keep this lower-layer composite dependency-free.
+            System.Diagnostics.Trace.TraceWarning(
+                "CompositeFeedHandler delegate threw in {0}: {1}", method, ex);
+        }
+    }
+
     public void OnPacket(in UmdfPacket packet, ReadOnlySpan<byte> sbePayload, ushort templateId)
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.OnPacket(in packet, sbePayload, templateId);
+        {
+            try { handler.OnPacket(in packet, sbePayload, templateId); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnPacket), ref reported); }
+        }
     }
 
     public void OnSequenceReset()
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.OnSequenceReset();
+        {
+            try { handler.OnSequenceReset(); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnSequenceReset), ref reported); }
+        }
     }
 
     public void OnInstrumentDefinitionsComplete(int instrumentCount)
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.OnInstrumentDefinitionsComplete(instrumentCount);
+        {
+            try { handler.OnInstrumentDefinitionsComplete(instrumentCount); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnInstrumentDefinitionsComplete), ref reported); }
+        }
     }
 
     public void OnPacketProcessed()
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.OnPacketProcessed();
+        {
+            try { handler.OnPacketProcessed(); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnPacketProcessed), ref reported); }
+        }
     }
 
     public void OnSequenceVersionChanged(ushort newVersion)
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.OnSequenceVersionChanged(newVersion);
+        {
+            try { handler.OnSequenceVersionChanged(newVersion); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnSequenceVersionChanged), ref reported); }
+        }
     }
 
     public void FlushIfDue()
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.FlushIfDue();
+        {
+            try { handler.FlushIfDue(); }
+            catch (Exception ex) { RecordFailure(ex, nameof(FlushIfDue), ref reported); }
+        }
     }
 
     public void FlushNow()
     {
+        bool reported = false;
         foreach (var handler in _handlers)
-            handler.FlushNow();
+        {
+            try { handler.FlushNow(); }
+            catch (Exception ex) { RecordFailure(ex, nameof(FlushNow), ref reported); }
+        }
     }
 }
