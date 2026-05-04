@@ -418,10 +418,38 @@ public sealed class WebSocketHost : IAsyncDisposable
         });
     }
 
-    public async Task StopAsync()
+    /// <summary>
+    /// Gracefully stop the host. Before tearing down Kestrel we send a clean
+    /// WebSocket close frame (1001 / EndpointUnavailable) to every active client
+    /// so they observe an orderly shutdown rather than a connection reset. The
+    /// per-client close handshake is bounded by <paramref name="closeHandshakeBudget"/>
+    /// (defaults to 5 seconds when unset) so a misbehaving peer cannot hold the
+    /// shutdown open indefinitely.
+    /// </summary>
+    public async Task StopAsync(TimeSpan closeHandshakeBudget = default)
     {
-        if (_app is not null)
-            await _app.StopAsync();
+        if (_app is null) return;
+
+        if (closeHandshakeBudget <= TimeSpan.Zero)
+            closeHandshakeBudget = TimeSpan.FromSeconds(5);
+
+        var sessions = _subscriptionManager.EnumerateAllClients()
+            .Select(kv => kv.Value)
+            .ToList();
+        if (sessions.Count > 0)
+        {
+            using var cts = new CancellationTokenSource(closeHandshakeBudget);
+            var tasks = new Task[sessions.Count];
+            for (int i = 0; i < sessions.Count; i++)
+                tasks[i] = sessions[i].RequestGracefulCloseAsync("server shutting down", cts.Token);
+            try { await Task.WhenAll(tasks).ConfigureAwait(false); }
+            catch { /* per-client failures already logged inside RequestGracefulCloseAsync */ }
+            _logger.LogInformation(
+                "Sent WebSocket close (1001) to {Count} active client(s) before stopping Kestrel",
+                sessions.Count);
+        }
+
+        await _app.StopAsync();
     }
 
     public async ValueTask DisposeAsync()

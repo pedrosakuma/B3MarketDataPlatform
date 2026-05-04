@@ -189,6 +189,46 @@ public class WebSocketHostIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task StopAsync_SendsCloseFrameWith1001ToActiveClients()
+    {
+        var (host, sm, port, cts) = await StartHostAsync();
+        var ws = new ClientWebSocket();
+        try
+        {
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
+            await WaitUntil(() => sm.ClientCount == 1, TimeSpan.FromSeconds(3));
+
+            // Trigger graceful shutdown — should send WebSocket Close (1001) to active clients
+            // before tearing down Kestrel. Kicked off in the background so we can drain frames.
+            var stopTask = host.StopAsync(TimeSpan.FromSeconds(5));
+
+            // Drain frames until we observe the Close frame. The server may emit a
+            // ServerStatus message on connect, so skip non-Close frames.
+            var buffer = new byte[1024];
+            WebSocketReceiveResult? result = null;
+            using var receiveCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            while (!receiveCts.IsCancellationRequested)
+            {
+                result = await ws.ReceiveAsync(buffer, receiveCts.Token);
+                if (result.MessageType == WebSocketMessageType.Close) break;
+            }
+
+            Assert.NotNull(result);
+            Assert.Equal(WebSocketMessageType.Close, result!.MessageType);
+            Assert.Equal(WebSocketCloseStatus.EndpointUnavailable, ws.CloseStatus);
+
+            await stopTask;
+        }
+        finally
+        {
+            cts.Cancel();
+            await host.DisposeAsync();
+            sm.Dispose();
+            ws.Dispose();
+        }
+    }
+
     private static async Task WaitUntil(Func<bool> predicate, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
