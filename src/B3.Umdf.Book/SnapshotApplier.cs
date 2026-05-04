@@ -353,9 +353,6 @@ internal sealed class SnapshotApplier
             return;
         }
 
-        // Snapshot lifecycle is ending — release the per-symbol stale-buffer floor pin.
-        _staleBuffer.ClearProtectedFloor(securityId);
-
         if (!pending.HasRptSeq)
             CompleteIlliquidSnapshot(securityId, book, pending);
         else
@@ -383,6 +380,9 @@ internal sealed class SnapshotApplier
     {
         if (pending.OrdersExpected != 0)
         {
+            // Malformed: snapshot is now rejected — release the floor pin
+            // (no Clear() will fire on this path to do it for us).
+            _staleBuffer.ClearProtectedFloor(securityId);
             Interlocked.Increment(ref _snapshotsMissingRptSeq);
             return;
         }
@@ -409,6 +409,9 @@ internal sealed class SnapshotApplier
 
         if (!heal.Accepted)
         {
+            // Snapshot rejected as too-old — release the floor pin (no Clear()
+            // fires on the rejected path; live book is left untouched).
+            _staleBuffer.ClearProtectedFloor(securityId);
             Interlocked.Increment(ref _snapshotsRejectedTooOld);
             return;
         }

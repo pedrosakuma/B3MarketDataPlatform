@@ -299,7 +299,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     internal int ReplayDeferredMbo(ulong securityId, uint drainFrom, uint drainTo)
     {
-        return _staleBuffer.Drain(securityId, drainFrom, drainTo, m =>
+        // P1: use transactional drain primitive — atomic restore of buffer
+        // state AND protected floor on apply throw.
+        using var tx = _staleBuffer.BeginDrain(securityId, drainFrom, drainTo);
+        int applied = tx.Apply(m =>
         {
             _currentSendingTimeNs = m.SendingTimeNs;
             switch (m.TemplateId)
@@ -335,6 +338,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             }
             Interlocked.Increment(ref _replayedMboMessages);
         });
+        tx.Commit();
+        return applied;
     }
 
     // ── IMarketDataEventHandler ──
