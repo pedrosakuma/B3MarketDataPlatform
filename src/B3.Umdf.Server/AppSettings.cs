@@ -9,7 +9,7 @@ namespace B3.Umdf.Server;
 /// Application settings that can be loaded from appsettings.json, 
 /// environment variables, or overridden via CLI arguments.
 /// </summary>
-public sealed class AppSettings
+public sealed partial class AppSettings
 {
     /// <summary>WebSocket server port. CLI: --ws-port</summary>
     public int? WsPort { get; set; }
