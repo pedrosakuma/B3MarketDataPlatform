@@ -27,6 +27,15 @@ public sealed class MetricsRegistry
     public static readonly Counter<long> WsSubscriptions = Meter.CreateCounter<long>("umdf.ws.subscriptions");
     public static readonly Counter<long> WsMessagesConflated = Meter.CreateCounter<long>("umdf.ws.messages.conflated");
 
+    /// <summary>
+    /// Per-publisher counter of broadcast payloads dropped because a client's outbound
+    /// ring was full. Tagged with <c>publisher</c> = <c>"rankings"</c> | <c>"recovery"</c>.
+    /// Each increment also bumps the per-session <see cref="ClientSession.BroadcastDropCount"/>
+    /// so operators can identify chronically slow clients via that property + outlier
+    /// sweeper logs.
+    /// </summary>
+    public static readonly Counter<long> BroadcastDrops = Meter.CreateCounter<long>("umdf.ws.broadcast.drops");
+
     // BroadcastBufferPool metrics — retention/efficiency of the pool that
     // backs the broadcast → write-loop ownership transfer (replaces
     // ArrayPool<byte>.Shared on that path to avoid per-bucket Monitor

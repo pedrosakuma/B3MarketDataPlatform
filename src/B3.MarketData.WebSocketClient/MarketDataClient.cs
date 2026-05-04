@@ -76,6 +76,36 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<ConnectionStateChangedEvent>? ConnectionStateChanged;
 
     /// <summary>
+    /// Raised on the dispatch thread whenever a frame with an unrecognised
+    /// <c>MessageType</c> opcode is received. The event payload is the raw opcode.
+    /// Useful for forward-compat: the SDK silently skips unknown frames (so newer
+    /// servers can add additive message types without breaking older clients) and
+    /// surfaces them here so applications can log/alarm.
+    /// </summary>
+    public event Action<ushort>? UnknownMessageReceived;
+
+    /// <summary>
+    /// Cumulative number of frames received whose <c>MessageType</c> opcode the SDK
+    /// did not recognise. Mirrors <see cref="UnknownMessageReceived"/> for callers
+    /// that prefer polling over event subscription.
+    /// </summary>
+    public long UnknownMessageCount => Interlocked.Read(ref _unknownMessageCount);
+
+    private long _unknownMessageCount;
+
+    /// <summary>
+    /// Protocol version negotiated with the server, taken from the most recent
+    /// <c>ServerHello</c>. <c>null</c> until the handshake completes (or after a
+    /// reconnect, before the new handshake arrives). Convenience accessor that
+    /// mirrors <see cref="LastServerHello"/>.<c>ProtocolVersion</c>.
+    /// </summary>
+    public uint? NegotiatedProtocolVersion
+    {
+        get { lock (_stateLock) return _lastServerHello?.ProtocolVersion; }
+    }
+
+
+    /// <summary>
     /// Most recently received <c>ServerHello</c> (if any). Cached on the dispatch
     /// thread and snapshotted under <c>_stateLock</c> so callers that connect after
     /// the handshake event has already fired can still read the negotiated values.
@@ -213,6 +243,10 @@ public sealed class MarketDataClient : IAsyncDisposable
                 _socket = socket;
                 ChangeState(ConnectionState.Connected, error: null);
                 delay = _options.ReconnectInitialDelay;
+
+                // Send ClientHello first so the server can reject incompatible
+                // versions before we send Subscribe/Get frames.
+                await SendClientHelloAsync(socket, ct).ConfigureAwait(false);
 
                 if (_options.AutoResubscribeOnReconnect)
                     await ResubscribeAllAsync(ct).ConfigureAwait(false);
@@ -391,8 +425,32 @@ public sealed class MarketDataClient : IAsyncDisposable
             // already knows it called UnsubscribeAsync. Other message
             // types (Book, Mbp, News, …) are out of scope for v1 and
             // simply ignored.
-            default:
+            case WireFormat.MessageType.Unsubscribed:
                 break;
+            default:
+            {
+                // Forward-compat: surface unknown opcodes so applications can
+                // log/alarm but keep parsing the next frame.
+                Interlocked.Increment(ref _unknownMessageCount);
+                ushort opcode = (ushort)type;
+                Enqueue(() => UnknownMessageReceived?.Invoke(opcode));
+                break;
+            }
+        }
+    }
+
+    private async ValueTask SendClientHelloAsync(ClientWebSocket socket, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(WireFormat.FramingHeaderSize + 4);
+        try
+        {
+            int len = WireFormat.WriteClientHello(buffer, WireFormat.ProtocolVersion);
+            await socket.SendAsync(new ArraySegment<byte>(buffer, 0, len),
+                WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 

@@ -18,6 +18,12 @@ public sealed class ClientSession : IDisposable
     public string Id { get; }
     public WebSocket Socket { get; }
     private readonly MpscOutboundRing _outbound;
+    // ALL mutations and iterations of _subscriptions go through _subscriptionsLock.
+    // Historically this set was treated as feed-thread-owned, but unsubscribe paths
+    // (and Subscriptions / IsSubscribed callers) can run on the WS read thread, so
+    // every read/write is now serialised here. The set is small and writes are rare;
+    // contention is negligible and a single lock makes the invariant local + obvious.
+    private readonly object _subscriptionsLock = new();
     private readonly HashSet<ulong> _subscriptions = new();
     // Owned by RunWriteLoopAsync. Populated/cleared exclusively via OutboundKind.AddInfoSub/
     // RemoveInfoSub deltas drained from _outbound, so no synchronization is needed.
@@ -33,10 +39,23 @@ public sealed class ClientSession : IDisposable
     private long _messagesSent;
     private long _bytesSent;
     private long _pendingBytes;
+    private long _broadcastDropCount;
     private int _disconnectRequested;
     private int _infoWakePending;
 
-    public IReadOnlySet<ulong> Subscriptions => _subscriptions;
+    /// <summary>
+    /// Snapshot of currently subscribed securityIds. Returns a fresh array under
+    /// <see cref="_subscriptionsLock"/> so callers can iterate without observing
+    /// concurrent mutations.
+    /// </summary>
+    public IReadOnlyCollection<ulong> Subscriptions
+    {
+        get
+        {
+            lock (_subscriptionsLock)
+                return _subscriptions.Count == 0 ? Array.Empty<ulong>() : _subscriptions.ToArray();
+        }
+    }
     public CancellationToken CancellationToken => _cts.Token;
 
     /// <summary>Total messages (pre-serialized + info) sent to this client.</summary>
@@ -65,6 +84,25 @@ public sealed class ClientSession : IDisposable
     /// to accumulate more messages into a single WebSocket frame. 0 = drain immediately.
     /// </summary>
     public int CoalesceWindowMs => _coalesceWindowMs;
+
+    /// <summary>
+    /// Cumulative number of global broadcast payloads (rankings / recovery progress / news)
+    /// dropped because this session's outbound ring was full. Incremented by publishers
+    /// that intentionally do NOT auto-disconnect on a single drop; the
+    /// <see cref="OutlierSweeper"/> can later use the counter to act on chronically slow
+    /// clients. Reads/writes via <see cref="Volatile"/> + <see cref="Interlocked"/>.
+    /// </summary>
+    public long BroadcastDropCount => Volatile.Read(ref _broadcastDropCount);
+
+    /// <summary>
+    /// Record a dropped global broadcast for this client. Returns the new total count so
+    /// publishers can rate-limit warnings on power-of-two thresholds (1, 8, 64, 512, …)
+    /// without an extra read.
+    /// </summary>
+    internal long RecordBroadcastDrop()
+    {
+        return Interlocked.Increment(ref _broadcastDropCount);
+    }
 
     public ClientSession(
         WebSocket socket,
@@ -97,7 +135,11 @@ public sealed class ClientSession : IDisposable
         _outbound = new MpscOutboundRing(channelCapacity);
     }
 
-    public bool IsSubscribed(ulong securityId) => _subscriptions.Contains(securityId);
+    public bool IsSubscribed(ulong securityId)
+    {
+        lock (_subscriptionsLock)
+            return _subscriptions.Contains(securityId);
+    }
 
     private int _newsSubscriptionCount;
 
@@ -117,16 +159,22 @@ public sealed class ClientSession : IDisposable
         if (updated < 0) Interlocked.Exchange(ref _newsSubscriptionCount, 0);
     }
 
-    /// <summary>Add a subscription. Called on the feed thread.</summary>
-    public void AddSubscription(ulong securityId) => _subscriptions.Add(securityId);
+    /// <summary>Add a subscription. May be called from any thread; serialised through
+    /// <see cref="_subscriptionsLock"/>.</summary>
+    public void AddSubscription(ulong securityId)
+    {
+        lock (_subscriptionsLock)
+            _subscriptions.Add(securityId);
+    }
 
-    /// <summary>Remove a subscription. Called on the feed thread or WS read thread.
-    /// The HashSet remove stays inline (legacy single-thread access pattern); the
-    /// info-version delete is routed through the outbound ring so the WriteLoop is
-    /// the sole writer to <c>_infoVersions</c>.</summary>
+    /// <summary>Remove a subscription. May be called from the feed thread or WS read
+    /// thread; the HashSet mutation is guarded by <see cref="_subscriptionsLock"/>.
+    /// The info-version delete is routed through the outbound ring so the WriteLoop
+    /// is the sole writer to <c>_infoVersions</c>.</summary>
     public bool RemoveSubscription(ulong securityId)
     {
-        _subscriptions.Remove(securityId);
+        lock (_subscriptionsLock)
+            _subscriptions.Remove(securityId);
         return RemoveInfoSubscription(securityId);
     }
 

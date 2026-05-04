@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Umdf.Server;
 
@@ -19,15 +20,18 @@ internal sealed class RecoveryProgressPublisher : IDisposable
 
     private readonly Func<BookManager[]?> _bookManagers;
     private readonly ConcurrentDictionary<string, ClientSession> _clients;
+    private readonly ILogger _logger;
     private Timer? _timer;
     private bool _lastNonZero;
 
     public RecoveryProgressPublisher(
         Func<BookManager[]?> bookManagers,
-        ConcurrentDictionary<string, ClientSession> clients)
+        ConcurrentDictionary<string, ClientSession> clients,
+        ILogger? logger = null)
     {
         _bookManagers = bookManagers;
         _clients = clients;
+        _logger = (ILogger?)logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
     }
 
     public void Start()
@@ -67,6 +71,20 @@ internal sealed class RecoveryProgressPublisher : IDisposable
         int len = WireProtocol.WriteRecoveryProgress(buf, (uint)totalKnown, (uint)totalStale, perKind);
         var payload = new ReadOnlyMemory<byte>(buf[..len].ToArray());
         foreach (var (_, client) in _clients)
-            client.TryEnqueue(payload);
+        {
+            if (client.TryEnqueue(payload)) continue;
+
+            MetricsRegistry.BroadcastDrops.Add(1,
+                new KeyValuePair<string, object?>("publisher", "recovery"));
+            long total = client.RecordBroadcastDrop();
+            if (IsPowerOfTwo(total))
+            {
+                _logger.LogWarning(
+                    "Dropped recovery-progress broadcast for client {ClientId}; total broadcast drops on this session: {Drops}",
+                    client.Id, total);
+            }
+        }
     }
+
+    private static bool IsPowerOfTwo(long n) => n > 0 && (n & (n - 1)) == 0;
 }

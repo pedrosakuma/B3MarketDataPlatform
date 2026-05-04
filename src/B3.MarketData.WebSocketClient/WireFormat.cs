@@ -30,6 +30,7 @@ internal static class WireFormat
         ServerStatus = 0x0050,
         SymbolDelisted = 0x0071,
         ServerHello = 0x00A0,
+        ClientHello = 0x00A1,
     }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
@@ -75,9 +76,23 @@ internal static class WireFormat
     }
 
     /// <summary>
-    /// Encode a <c>Subscribe</c> frame: <c>[flags u8][symLen u8][symbol UTF-8…]</c>.
-    /// Returns the total frame length written.
+    /// Wire-protocol version this SDK speaks. Sent in <see cref="MessageType.ClientHello"/>
+    /// on every (re)connect; servers that do not understand the version close the
+    /// connection with WS code 1003.
     /// </summary>
+    public const uint ProtocolVersion = 1;
+
+    /// <summary>Encode a <c>ClientHello</c> frame: <c>[u32 protocolVersion]</c>.</summary>
+    public static int WriteClientHello(Span<byte> dest, uint protocolVersion)
+    {
+        const ushort totalLen = FramingHeaderSize + 4;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLen);
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)MessageType.ClientHello);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[FramingHeaderSize..], protocolVersion);
+        return totalLen;
+    }
+
+    /// <summary>Encode a <c>Subscribe</c> frame: <c>[flags u8][symLen u8][symbol UTF-8…]</c>.</summary>
     public static int WriteSubscribe(Span<byte> dest, SubscribeFlags flags, string symbol)
     {
         int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(FramingHeaderSize + 2)..]);

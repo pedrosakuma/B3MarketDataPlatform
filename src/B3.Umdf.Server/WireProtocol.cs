@@ -107,6 +107,15 @@ public enum MessageType : ushort
     /// The MessageType is purely additive — older clients that don't recognise it MUST
     /// skip the frame (length-prefixed) and continue parsing the next message.</summary>
     ServerHello = 0x00A0,
+
+    /// <summary>Client → Server: optional version-negotiation handshake. If sent it MUST
+    /// arrive before any <see cref="Subscribe"/> / <see cref="Get"/> / <see cref="Unsubscribe"/>
+    /// frame. Payload: <c>[u32 protocolVersion]</c> — the version the client intends to
+    /// speak. Servers reject (WS close 1003 "protocol_version_unsupported") any value
+    /// outside <see cref="WireProtocol.SupportedProtocolVersionMin"/>..<see cref="WireProtocol.SupportedProtocolVersionMax"/>.
+    /// Backwards compatible: clients that never send ClientHello are assumed to speak
+    /// the current <see cref="WireProtocol.ProtocolVersion"/>.</summary>
+    ClientHello = 0x00A1,
 }
 
 /// <summary>
@@ -411,6 +420,48 @@ public static class WireProtocol
     /// Additive new MessageTypes do NOT bump this field.
     /// </summary>
     public const uint ProtocolVersion = 1;
+
+    /// <summary>
+    /// Minimum protocol version the server can speak with a client. A
+    /// <see cref="MessageType.ClientHello"/> payload below this value triggers a
+    /// WS close (1003 "protocol_version_unsupported"). Today identical to
+    /// <see cref="ProtocolVersion"/> (no historic versions supported); kept as a
+    /// distinct constant so the negotiation path is shaped correctly for the day
+    /// the server bumps <see cref="SupportedProtocolVersionMax"/>.
+    /// </summary>
+    public const uint SupportedProtocolVersionMin = 1;
+
+    /// <summary>
+    /// Maximum protocol version the server can speak with a client. Mirrors
+    /// <see cref="ProtocolVersion"/> today; future server releases that gain a new
+    /// wire format should bump <see cref="ProtocolVersion"/> + this constant.
+    /// </summary>
+    public const uint SupportedProtocolVersionMax = ProtocolVersion;
+
+    /// <summary>
+    /// Total bytes of a <see cref="MessageType.ClientHello"/> frame: header(4) + version(4).
+    /// </summary>
+    public const int ClientHelloSize = FramingHeaderSize + 4;
+
+    /// <summary>
+    /// Write a <see cref="MessageType.ClientHello"/> frame: <c>[u32 protocolVersion]</c>.
+    /// Used by the C# SDK (and tests) to advertise the version the client intends to speak.
+    /// </summary>
+    public static int WriteClientHello(Span<byte> dest, uint protocolVersion)
+    {
+        const ushort totalLen = ClientHelloSize;
+        WriteFramingHeader(dest, totalLen, MessageType.ClientHello);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[FramingHeaderSize..], protocolVersion);
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Parse a <see cref="MessageType.ClientHello"/> payload (everything after the 4-byte
+    /// framing header). Returns the version the client claims to support.
+    /// </summary>
+    public static uint ReadClientHello(ReadOnlySpan<byte> payload)
+        => BinaryPrimitives.ReadUInt32LittleEndian(payload);
+
 
     /// <summary>
     /// Maximum buffer needed for a <see cref="MessageType.ServerHello"/> frame:
