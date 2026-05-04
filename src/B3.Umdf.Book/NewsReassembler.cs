@@ -31,9 +31,13 @@ namespace B3.Umdf.Book;
 /// </summary>
 internal sealed class NewsReassembler
 {
+    /// <summary>Default value of <see cref="NewsReassemblerOptions.MaxParts"/>; preserved as a const for back-compat with existing callers/tests.</summary>
     public const int MaxPartCount = 64;
+    /// <summary>Maximum number of simultaneously in-flight news IDs (assemblies). Not currently surfaced via options — fixed for back-compat.</summary>
     public const int MaxInflight = 1024;
+    /// <summary>Default value of <see cref="NewsReassemblerOptions.MaxInflightBytes"/>; preserved as a const for back-compat with existing callers/tests.</summary>
     public const long MaxInflightBytes = 16L * 1024 * 1024;
+    /// <summary>Default value of <see cref="NewsReassemblerOptions.Ttl"/> in <see cref="System.Diagnostics.Stopwatch"/> ticks; preserved as a static for back-compat with existing callers/tests.</summary>
     public static readonly long TtlTicks = TimeSpan.FromSeconds(5).Ticks;
 
     /// <summary>Receiver of completed news. Spans are valid only during the call.</summary>
@@ -49,6 +53,10 @@ internal sealed class NewsReassembler
 
     private readonly NewsCompletedCallback _onComplete;
     private readonly Func<long> _monotonicTicks;
+    private readonly long _ttlTicks;
+    private readonly long _maxInflightBytes;
+    private readonly long _maxPartBytes;
+    private readonly int _maxParts;
     private readonly Dictionary<ulong, Assembly> _inflight = new(MaxInflight);
     // LinkedList tracks LRU order — most recently used at the tail.
     private readonly LinkedList<ulong> _lru = new();
@@ -66,9 +74,22 @@ internal sealed class NewsReassembler
     public long InflightBytes => _inflightBytes;
 
     public NewsReassembler(NewsCompletedCallback onComplete, Func<long>? monotonicTicks = null)
+        : this(onComplete, NewsReassemblerOptions.Default, monotonicTicks) { }
+
+    public NewsReassembler(NewsCompletedCallback onComplete, NewsReassemblerOptions options, Func<long>? monotonicTicks = null)
     {
         _onComplete = onComplete ?? throw new ArgumentNullException(nameof(onComplete));
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        options.Validate();
         _monotonicTicks = monotonicTicks ?? (() => Stopwatch.GetTimestamp());
+        // Convert TTL TimeSpan to ticks; matches the units of TtlTicks (TimeSpan.Ticks)
+        // and the legacy default. Custom monotonicTicks callbacks must produce values in
+        // the same unit (callers in tests typically use a synthetic counter incremented
+        // by `NewsReassembler.TtlTicks` deltas).
+        _ttlTicks = options.Ttl.Ticks;
+        _maxInflightBytes = options.MaxInflightBytes;
+        _maxPartBytes = options.MaxPartBytes;
+        _maxParts = options.MaxParts;
     }
 
     /// <summary>Submit one News_5 part. Spans are consumed synchronously; safe
@@ -89,7 +110,7 @@ internal sealed class NewsReassembler
         PartsReceived++;
 
         // Validate part bookkeeping.
-        if (partCount == 0 || partCount > MaxPartCount)
+        if (partCount == 0 || partCount > _maxParts)
         {
             DroppedInvalidPart++;
             return;
@@ -97,6 +118,19 @@ internal sealed class NewsReassembler
         if (partNumber == 0 || partNumber > partCount)
         {
             DroppedInvalidPart++;
+            return;
+        }
+
+        // Per-part byte cap. Sum of headline + text + url for this single part must
+        // fit MaxPartBytes (default 16 MiB — same as MaxInflightBytes, so legacy
+        // behavior is preserved). Drops any in-flight assembly for the same newsId
+        // since the part is unusable.
+        long partBytes = (long)headline.Length + text.Length + url.Length;
+        if (partBytes > _maxPartBytes)
+        {
+            DroppedInvalidPart++;
+            if (newsId != 0 && _inflight.TryGetValue(newsId, out var existing))
+                Remove(newsId, existing);
             return;
         }
 
@@ -112,6 +146,17 @@ internal sealed class NewsReassembler
         if (newsId == 0)
         {
             DroppedNoId++;
+            return;
+        }
+
+        // Defensive cap on the SBE-declared total text length: an oversized claim
+        // (e.g. malformed/hostile producer) would cause unbounded buffering as
+        // parts arrive. Reject up front so we never start the assembly.
+        if (totalTextLength > _maxInflightBytes)
+        {
+            DroppedInvalidPart++;
+            if (_inflight.TryGetValue(newsId, out var existing2))
+                Remove(newsId, existing2);
             return;
         }
 
@@ -216,7 +261,7 @@ internal sealed class NewsReassembler
                 node = next;
                 continue;
             }
-            if (now - asm.CreatedTicks <= TtlTicks) break;
+            if (now - asm.CreatedTicks <= _ttlTicks) break;
             DroppedTtl++;
             Remove(node.Value, asm);
             node = next;
@@ -225,7 +270,7 @@ internal sealed class NewsReassembler
 
     private void EvictIfNeeded()
     {
-        while (_inflight.Count >= MaxInflight || _inflightBytes >= MaxInflightBytes)
+        while (_inflight.Count >= MaxInflight || _inflightBytes >= _maxInflightBytes)
         {
             var oldest = _lru.First;
             if (oldest == null) break;
