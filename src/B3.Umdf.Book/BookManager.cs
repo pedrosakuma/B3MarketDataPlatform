@@ -30,6 +30,34 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     private long _marketOrderTransitionsToPriced;
     private long _marketOrderTransitionsToMarket;
 
+    // ── Trade-bust reversal state (P1 — TradeBust_57 §10) ────────────────────
+
+    /// <summary>
+    /// Capacity of the per-symbol recent-trade index used for bust reversal.
+    /// Mirrors the ring buffer used downstream by the server (50 entries) but
+    /// gives a little extra headroom for late busts.
+    /// </summary>
+    internal const int TradeBustRingCapacity = 64;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, SymbolTradeState> _tradeStates = new();
+    private long _tradeBustsReceived;
+    private long _tradeBustsApplied;
+    private long _unknownTradeBusts;
+    private long _outOfRetentionTradeBusts;
+
+    /// <summary>Total <c>TradeBust_57</c> messages dispatched to <see cref="HandleTradeBust"/>.</summary>
+    public long TradeBustsReceived => Volatile.Read(ref _tradeBustsReceived);
+    /// <summary>Trade busts that resulted in real internal-state mutation (ring + candle).</summary>
+    public long TradeBustsApplied => Volatile.Read(ref _tradeBustsApplied);
+    /// <summary>Busts whose tradeId was not found in the per-symbol recent-trade index.</summary>
+    public long UnknownTradeBusts => Volatile.Read(ref _unknownTradeBusts);
+    /// <summary>Busts whose original trade fell outside the candle retention window — counted, not reversed.</summary>
+    public long OutOfRetentionTradeBusts => Volatile.Read(ref _outOfRetentionTradeBusts);
+
+    /// <summary>Per-symbol trade-state lookup. Used by tests to inspect ring/candles after a bust.</summary>
+    internal bool TryGetTradeState(ulong securityId, out SymbolTradeState? state)
+        => _tradeStates.TryGetValue(securityId, out state);
+
     /// <summary>
     /// Packet-level SendingTime (nanoseconds since epoch) for the message currently being processed.
     /// Set at the start of OnPacket, consumed by Handle* methods.
@@ -866,6 +894,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
 
         _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        RecordTrade(securityId, price, quantity, tradeId, tradeTimeNs);
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
@@ -922,6 +951,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         }
 
         _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        RecordTrade(securityId, price, quantity, tradeId, tradeTimeNs);
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
 
@@ -949,6 +979,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     private void HandleTradeBust(in TradeBust_57DataReader reader)
     {
+        Interlocked.Increment(ref _tradeBustsReceived);
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
@@ -966,8 +997,144 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 TrackMboRptSeq(book, (uint)rptSeq);
         }
 
-        _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
+        DispatchTradeBust(securityId, price, quantity, tradeId);
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
+    }
+
+    /// <summary>
+    /// Apply a TradeBust_57 to per-symbol state and fan out
+    /// <see cref="IBookEventHandler.OnTradeBust"/>. Single source of truth
+    /// for the post-routing bust path — invoked by both the SBE wire
+    /// handler and tests that drive the contract directly.
+    /// </summary>
+    internal void DispatchTradeBust(ulong securityId, long price, long quantity, long tradeId)
+    {
+        ApplyTradeBustToState(securityId, tradeId);
+        _eventHandler?.OnTradeBust(securityId, price, quantity, tradeId);
+    }
+
+    /// <summary>
+    /// Append a trade to the per-symbol bust-reversal state (recent-trades ring,
+    /// 1-second candle aggregator, id→record index). Called from
+    /// <see cref="HandleTrade"/> / <see cref="HandleForwardTrade"/> after the
+    /// reportable-trade filter.
+    /// </summary>
+    internal void RecordTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
+    {
+        long ts = sendingTimeNs > 0 ? sendingTimeNs / 1_000_000_000 : 0;
+        var state = _tradeStates.GetOrAdd(securityId,
+            static _ => new SymbolTradeState(TradeBustRingCapacity));
+        state.AddTrade(price, quantity, tradeId, ts);
+    }
+
+    /// <summary>
+    /// Apply a TradeBust_57 to the per-symbol state: mark the ring slot
+    /// busted, recompute (or remove) the affected 1-second candle bucket,
+    /// and refresh the cached last-trade price. Returns silently and
+    /// counts <see cref="UnknownTradeBusts"/> when the trade id isn't in
+    /// the recent-trade index, or <see cref="OutOfRetentionTradeBusts"/>
+    /// when the trade pre-dates the candle retention window. Successful
+    /// reversals increment <see cref="TradeBustsApplied"/>.
+    /// </summary>
+    internal void ApplyTradeBustToState(ulong securityId, long tradeId)
+    {
+        if (!_tradeStates.TryGetValue(securityId, out var state))
+        {
+            Interlocked.Increment(ref _unknownTradeBusts);
+            return;
+        }
+
+        if (!state.TryGetTrade(tradeId, out var rec))
+        {
+            // Trade id evicted from the bounded id-index. Best-effort:
+            // mark the ring (so snapshot history skips it) and count
+            // out-of-retention; OHLCV cannot be exactly recomputed.
+            if (!state.Ring.MarkBust(tradeId))
+            {
+                Interlocked.Increment(ref _unknownTradeBusts);
+                return;
+            }
+            Interlocked.Increment(ref _outOfRetentionTradeBusts);
+            state.RefreshLastTradeFromRing();
+            Interlocked.Increment(ref _tradeBustsApplied);
+            return;
+        }
+
+        state.Ring.MarkBust(tradeId);
+        state.RemoveTradeFromIndex(tradeId);
+
+        int bucketIdx = state.Candles.FindBucketIndex(rec.TimestampSeconds);
+        if (bucketIdx < 0)
+        {
+            // Bucket has rolled out of the 10-hour retention window. Ring
+            // entry is still flagged so future snapshots skip the busted
+            // print, but candles cannot be recomputed.
+            Interlocked.Increment(ref _outOfRetentionTradeBusts);
+            state.RefreshLastTradeFromRing();
+            Interlocked.Increment(ref _tradeBustsApplied);
+            return;
+        }
+
+        RecomputeBucket(state, bucketIdx, rec);
+        state.RefreshLastTradeFromRing();
+        Interlocked.Increment(ref _tradeBustsApplied);
+    }
+
+    /// <summary>
+    /// Rebuild the OHLCV at <paramref name="bucketIdx"/> after the trade
+    /// described by <paramref name="busted"/> is removed from contention.
+    /// Strategy:
+    /// <list type="bullet">
+    /// <item>If sibling trades from the same bucket are still in the
+    /// id-index, recompute Open (= prior bucket's close, or first remaining
+    /// price for the very first bucket), High, Low, Close, Volume from
+    /// them — exact reversal.</item>
+    /// <item>If no sibling trades remain AND the bucket is the most recent,
+    /// pop it (<see cref="CandleAggregator.RemoveLast"/>) so the next trade
+    /// starts a fresh bucket.</item>
+    /// <item>If no sibling trades remain but the bucket isn't the most
+    /// recent (i.e., gap-fill or follow-on candles came after), collapse
+    /// the bucket to a flat candle at the prior bucket's close (volume = 0)
+    /// and bump <see cref="CandleAggregator.IncrementBustedCount"/>.</item>
+    /// </list>
+    /// </summary>
+    private static void RecomputeBucket(SymbolTradeState state, int bucketIdx, in SymbolTradeState.TradeRecord busted)
+    {
+        var agg = state.Candles;
+        var original = agg.GetAt(bucketIdx);
+        long ts = original.Time;
+        var siblings = state.GetTradesInBucket(ts);
+
+        long priorClose = bucketIdx > 0 ? agg.GetAt(bucketIdx - 1).Close : 0;
+
+        if (siblings.Count > 0)
+        {
+            long open = bucketIdx > 0 ? priorClose : siblings[0].Price;
+            long high = open;
+            long low = open;
+            long volume = 0;
+            long close = open;
+            foreach (var t in siblings)
+            {
+                if (t.Price > high) high = t.Price;
+                if (t.Price < low) low = t.Price;
+                volume += t.Qty;
+                close = t.Price;
+            }
+            agg.ReplaceAt(bucketIdx, new Candle(ts, open, high, low, close, volume, original.Avg));
+            return;
+        }
+
+        bool isLast = bucketIdx == agg.Count - 1;
+        if (isLast)
+        {
+            agg.RemoveLast();
+            return;
+        }
+
+        long flat = priorClose != 0 ? priorClose : original.Close;
+        agg.ReplaceAt(bucketIdx, new Candle(ts, flat, flat, flat, flat, 0, original.Avg));
+        agg.IncrementBustedCount(ts);
     }
 
     // ── Snapshot lifecycle (delegated to SnapshotApplier) ────────────────────

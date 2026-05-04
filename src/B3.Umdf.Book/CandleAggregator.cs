@@ -39,6 +39,13 @@ internal sealed class CandleAggregator
     private volatile int _count;
     private volatile int _version; // bumped on every mutation
 
+    // Per-bucket count of busted trades that fell outside the candle-reversal
+    // window (e.g. the bucket's contributing trades were already evicted from
+    // the ring, so OHLCV cannot be exactly recomputed). Exposed via
+    // <see cref="GetBustedCount"/> so dashboards can flag the affected candle
+    // as "stat-quality-degraded" without distorting OHLC.
+    private Dictionary<long, int>? _bustedCounts;
+
     /// <summary>Resolution is always 1 second.</summary>
     public int Resolution => 1;
 
@@ -47,6 +54,96 @@ internal sealed class CandleAggregator
 
     /// <summary>Version counter — incremented on every Add.</summary>
     public int Version => _version;
+
+    /// <summary>Most recent close price written to the aggregator, or 0 if empty.</summary>
+    public long LastClose => _lastClose;
+
+    /// <summary>
+    /// Locate the candle whose <see cref="Candle.Time"/> equals
+    /// <paramref name="timestampSeconds"/>. Returns the logical index
+    /// (0 = oldest retained) or -1 if no such candle exists in the
+    /// retention window. Buckets are 1-second contiguous (gap-fill
+    /// inserts placeholder candles) so the lookup is O(1).
+    /// </summary>
+    public int FindBucketIndex(long timestampSeconds)
+    {
+        int count = _count;
+        if (count == 0) return -1;
+        int oldestPos = _head;
+        var oldestChunk = _chunks[oldestPos / ChunkSize];
+        if (oldestChunk is null) return -1;
+        long oldestTime = oldestChunk[oldestPos % ChunkSize].Time;
+        long delta = timestampSeconds - oldestTime;
+        if (delta < 0 || delta >= count) return -1;
+        return (int)delta;
+    }
+
+    /// <summary>Read the candle at logical index <paramref name="logicalIndex"/>.</summary>
+    public Candle GetAt(int logicalIndex)
+    {
+        if ((uint)logicalIndex >= (uint)_count)
+            throw new ArgumentOutOfRangeException(nameof(logicalIndex));
+        int pos = (_head + logicalIndex) % MaxRetainedCandles;
+        return _chunks[pos / ChunkSize]![pos % ChunkSize];
+    }
+
+    /// <summary>
+    /// Overwrite the candle at <paramref name="logicalIndex"/>. Used by the
+    /// trade-bust reversal path to swap a recomputed OHLCV in for a
+    /// busted bucket. If the replaced candle is the most recent one,
+    /// <see cref="LastClose"/> is updated to the new close.
+    /// </summary>
+    public void ReplaceAt(int logicalIndex, in Candle candle)
+    {
+        if ((uint)logicalIndex >= (uint)_count)
+            throw new ArgumentOutOfRangeException(nameof(logicalIndex));
+        int pos = (_head + logicalIndex) % MaxRetainedCandles;
+        _chunks[pos / ChunkSize]![pos % ChunkSize] = candle;
+        if (logicalIndex == _count - 1)
+            _lastClose = candle.Close;
+        _version++;
+    }
+
+    /// <summary>
+    /// Drop the most recent candle. Used by trade-bust reversal when the
+    /// busted trade was the only contributor to the latest bucket. Falls
+    /// back <see cref="LastClose"/> to the now-last bucket's close (or 0
+    /// if the aggregator is empty).
+    /// </summary>
+    public bool RemoveLast()
+    {
+        if (_count == 0) return false;
+        _count--;
+        if (_count > 0)
+        {
+            int pos = (_head + _count - 1) % MaxRetainedCandles;
+            _lastClose = _chunks[pos / ChunkSize]![pos % ChunkSize].Close;
+        }
+        else
+        {
+            _lastClose = 0;
+        }
+        _version++;
+        return true;
+    }
+
+    /// <summary>
+    /// Annotate a candle bucket as containing a busted trade we could not
+    /// fully reverse (typically because its sibling trades fell out of the
+    /// recent-trades retention window). OHLCV is left untouched — the
+    /// counter is purely advisory and surfaces via <see cref="GetBustedCount"/>.
+    /// </summary>
+    public void IncrementBustedCount(long timestampSeconds)
+    {
+        _bustedCounts ??= new Dictionary<long, int>();
+        _bustedCounts.TryGetValue(timestampSeconds, out var c);
+        _bustedCounts[timestampSeconds] = c + 1;
+        _version++;
+    }
+
+    /// <summary>How many busted trades fall in the bucket at <paramref name="timestampSeconds"/>.</summary>
+    public int GetBustedCount(long timestampSeconds)
+        => _bustedCounts is { } b && b.TryGetValue(timestampSeconds, out var c) ? c : 0;
 
     /// <summary>Convenience overload for tests/callers that don't have a session VWAP.
     /// Stamps the trade price as Avg (best-effort fallback).</summary>
