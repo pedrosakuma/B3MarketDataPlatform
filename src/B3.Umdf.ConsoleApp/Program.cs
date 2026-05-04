@@ -693,7 +693,7 @@ subscriptionManager?.StopRankingsTimer();
 if (wsHost is not null)
 {
     await Task.Delay(TimeSpan.FromSeconds(shutdownDrainSeconds));
-    await wsHost.StopAsync();
+    await wsHost.StopAsync(TimeSpan.FromSeconds(shutdownDrainSeconds));
     await wsHost.DisposeAsync();
 }
 
