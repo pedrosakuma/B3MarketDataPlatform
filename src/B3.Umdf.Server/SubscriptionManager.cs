@@ -88,10 +88,12 @@ public sealed class SubscriptionManager : IDisposable
         _rankingsPublisher = new RankingsPublisher(
             () => _marketDataManagers,
             () => _symbolRegistry,
-            _clients);
+            _clients,
+            _logger);
         _recoveryProgressPublisher = new RecoveryProgressPublisher(
             () => _bookManagers,
-            _clients);
+            _clients,
+            _logger);
     }
 
     public bool IsReady => _ready;

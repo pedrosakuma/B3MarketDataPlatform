@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using B3.Umdf.Book;
+using Microsoft.Extensions.Logging;
 
 namespace B3.Umdf.Server;
 
@@ -23,17 +24,20 @@ internal sealed class RankingsPublisher : IDisposable
     private readonly Func<MarketDataManager[]?> _marketDataManagers;
     private readonly Func<SymbolRegistry?> _symbolRegistry;
     private readonly ConcurrentDictionary<string, ClientSession> _clients;
+    private readonly ILogger _logger;
     private Timer? _timer;
     private int _tick;
 
     public RankingsPublisher(
         Func<MarketDataManager[]?> marketDataManagers,
         Func<SymbolRegistry?> symbolRegistry,
-        ConcurrentDictionary<string, ClientSession> clients)
+        ConcurrentDictionary<string, ClientSession> clients,
+        ILogger? logger = null)
     {
         _marketDataManagers = marketDataManagers;
         _symbolRegistry = symbolRegistry;
         _clients = clients;
+        _logger = (ILogger?)logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
     }
 
     public void Start()
@@ -93,8 +97,25 @@ internal sealed class RankingsPublisher : IDisposable
         var payload = new ReadOnlyMemory<byte>(buf, 0, len);
 
         foreach (var (_, client) in _clients)
-            client.TryEnqueue(payload);
+        {
+            if (client.TryEnqueue(payload)) continue;
+
+            // Drop: increment global counter (tagged by publisher), per-session
+            // counter, and warn at power-of-two thresholds so logs don't get
+            // spammed by a chronically slow client.
+            MetricsRegistry.BroadcastDrops.Add(1,
+                new KeyValuePair<string, object?>("publisher", "rankings"));
+            long total = client.RecordBroadcastDrop();
+            if (IsPowerOfTwo(total))
+            {
+                _logger.LogWarning(
+                    "Dropped rankings broadcast for client {ClientId}; total broadcast drops on this session: {Drops}",
+                    client.Id, total);
+            }
+        }
     }
+
+    private static bool IsPowerOfTwo(long n) => n > 0 && (n & (n - 1)) == 0;
 
     private static RankingEntry[] TakeTopN(List<RankingEntry> sorted, int n)
         => sorted.Count > n ? sorted.GetRange(0, n).ToArray() : sorted.ToArray();
