@@ -72,6 +72,19 @@ public sealed class MulticastPacketSource : IPacketSource
     // Dispose drops the references for prompt GC.
     internal bool BatchStateAllocatedForTests => _batchBufferPool is not null;
 
+    // Test seam — see RecvmmsgEdgeCaseTests. Wraps the recvmmsg(2) syscall behind a
+    // delegate so tests can inject deterministic returns for 0-result, partial-batch,
+    // and EINTR retry without provoking a real kernel race. Default points at the
+    // real libc binding; tests swap it via the internal field.
+    internal delegate int RecvmmsgInvoker(int sockfd, IntPtr msgvec, uint vlen, int flags, out int errno);
+    internal RecvmmsgInvoker _recvmmsgInvoker = DefaultRecvmmsgInvoker;
+    private static int DefaultRecvmmsgInvoker(int sockfd, IntPtr msgvec, uint vlen, int flags, out int errno)
+    {
+        int r = LinuxNative.recvmmsg(sockfd, msgvec, vlen, flags, IntPtr.Zero);
+        errno = r < 0 ? Marshal.GetLastPInvokeError() : 0;
+        return r;
+    }
+
     public MulticastPacketSource(ChannelConfig config, ILogger<MulticastPacketSource>? logger = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(config.ReceiveBufferBytes, 1);
@@ -396,15 +409,15 @@ public sealed class MulticastPacketSource : IPacketSource
         int n;
         while (true)
         {
+            int err;
             unsafe
             {
                 fixed (LinuxNative.Mmsghdr* hdrPtr = mmsghdrs)
                 {
-                    n = LinuxNative.recvmmsg((int)fd, (IntPtr)hdrPtr, (uint)batchSize, LinuxNative.MSG_WAITFORONE, IntPtr.Zero);
+                    n = _recvmmsgInvoker((int)fd, (IntPtr)hdrPtr, (uint)batchSize, LinuxNative.MSG_WAITFORONE, out err);
                 }
             }
             if (n >= 0) break;
-            int err = Marshal.GetLastPInvokeError();
             if (err == LinuxNative.EINTR) continue;
             throw new SocketException(err);
         }
