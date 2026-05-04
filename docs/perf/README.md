@@ -1,8 +1,19 @@
 # UMDF Traffic Characterization (Phase 0)
 
-> See also: [`mbp-stream.md`](mbp-stream.md) — MBP wire stream design,
-> protocol additions, and bandwidth measurements vs MBO on the hot-symbol
-> trace (45–98% reduction depending on the conflation window).
+> See also:
+> - [`mbp-stream.md`](mbp-stream.md) — MBP wire stream design,
+>   protocol additions, and bandwidth measurements vs MBO on the
+>   hot-symbol trace (45–98% reduction depending on the conflation
+>   window).
+> - [`baselines/`](baselines/) — machine-readable BenchmarkDotNet
+>   baselines used by the opt-in `perf-smoke` workflow
+>   (`.github/workflows/perf-smoke.yml`). To run that workflow on a
+>   PR, add the `run-perf` label; otherwise it only runs on manual
+>   `workflow_dispatch`. Treat regressions as advisory until they
+>   reproduce on stable hardware. See
+>   [`baselines/README.md`](baselines/README.md) for the file format,
+>   refresh procedure, and the rule that perf-affecting PRs must
+>   update the affected baseline JSON in the same PR.
 
 Ground-truth per-channel statistics extracted from recorded B3 UMDF
 PCAPs, used to design realistic dispatcher / ring benchmarks instead

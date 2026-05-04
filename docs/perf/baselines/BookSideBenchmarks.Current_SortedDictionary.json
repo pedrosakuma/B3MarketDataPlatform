@@ -1,0 +1,11 @@
+{
+  "benchmark": "BookSideBenchmarks",
+  "method": "Current_SortedDictionary",
+  "params": { "OperationCount": 100000 },
+  "captured_at": null,
+  "captured_on": "not yet captured on stable hardware",
+  "runtime": "net10.0 Release",
+  "metrics": {},
+  "tolerance": { "mean_pct": 15, "alloc_pct": 25 },
+  "notes": "Schema-only placeholder. The committed prose docs do not record a single number for the baseline BookSide implementation in isolation, so we deliberately omit metrics rather than fabricate them. The perf-smoke workflow will surface this row as MISSING until the metrics are populated from a real capture (see docs/perf/baselines/README.md). Tracked under issue #19."
+}

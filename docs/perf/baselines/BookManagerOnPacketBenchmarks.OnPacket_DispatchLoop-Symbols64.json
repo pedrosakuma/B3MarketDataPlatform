@@ -1,0 +1,15 @@
+{
+  "benchmark": "BookManagerOnPacketBenchmarks",
+  "method": "OnPacket_DispatchLoop",
+  "params": { "MessageCount": 10000, "SymbolCount": 64 },
+  "ops_per_invocation": 10000,
+  "captured_at": "2026-04-27",
+  "captured_on": "AMD EPYC 7763 (per docs/perf/onpacket-profiling.md table)",
+  "runtime": "net10.0 Release",
+  "metrics": {
+    "mean_ns_per_op": 53.0,
+    "alloc_b_per_op": 32.0
+  },
+  "tolerance": { "mean_pct": 15, "alloc_pct": 25 },
+  "notes": "Doc-sourced from docs/perf/onpacket-profiling.md (Throughput baseline + Allocation findings). Replace with a fresh capture on stable hardware before treating as a hard CI gate; tolerances are intentionally loose because GitHub-hosted runners are noisy."
+}

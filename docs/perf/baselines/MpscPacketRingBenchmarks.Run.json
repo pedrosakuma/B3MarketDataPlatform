@@ -1,0 +1,11 @@
+{
+  "benchmark": "MpscPacketRingBenchmarks",
+  "method": "Run",
+  "params": { "ProducerCount": 1, "PacketsPerProducer": 100000 },
+  "captured_at": null,
+  "captured_on": "not yet captured on stable hardware",
+  "runtime": "net10.0 Release",
+  "metrics": {},
+  "tolerance": { "mean_pct": 20, "alloc_pct": 25 },
+  "notes": "Schema-only placeholder. No prose baseline number was committed for MpscPacketRing; metrics are omitted on purpose. Will be populated once the perf-smoke workflow is run on a stable runner. Tracked under issue #19."
+}
