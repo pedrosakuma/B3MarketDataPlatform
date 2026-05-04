@@ -544,6 +544,32 @@ public sealed class ClientSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Send a clean WebSocket close frame (1001 Going Away by default; here we use
+    /// <see cref="WebSocketCloseStatus.EndpointUnavailable"/> which maps to status
+    /// code 1001) so the peer learns the server is shutting down rather than seeing
+    /// a TCP RST. Idempotent: no-op once the socket has left the Open state.
+    /// Bounded by the supplied <paramref name="cancellationToken"/> so the host's
+    /// shutdown drain budget remains in control.
+    /// </summary>
+    public async Task RequestGracefulCloseAsync(string statusDescription, CancellationToken cancellationToken)
+    {
+        if (Socket.State != WebSocketState.Open) return;
+        try
+        {
+            await Socket.CloseOutputAsync(
+                WebSocketCloseStatus.EndpointUnavailable,
+                statusDescription,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning("Graceful close failed for {ClientId}: {Error}", Id, ex.Message);
+        }
+    }
+
     public void Cancel()
     {
         if (_cts.IsCancellationRequested)
