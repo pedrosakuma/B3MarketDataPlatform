@@ -1,0 +1,25 @@
+{
+  "Title": "sample",
+  "Benchmarks": [
+    { "Type": "B3.Umdf.Book.Benchmarks.BookManagerOnPacketBenchmarks",
+      "Method": "OnPacket_DispatchLoop",
+      "Parameters": "MessageCount=10000, SymbolCount=64",
+      "Statistics": { "Mean": 530000.0 },
+      "Memory": { "BytesAllocatedPerOperation": 320000 } },
+    { "Type": "B3.Umdf.Book.Benchmarks.BookManagerOnPacketBenchmarks",
+      "Method": "OnPacket_DispatchLoop",
+      "Parameters": "MessageCount=10000, SymbolCount=512",
+      "Statistics": { "Mean": 620000.0 },
+      "Memory": { "BytesAllocatedPerOperation": 320000 } },
+    { "Type": "B3.Umdf.Book.Benchmarks.BookSideBenchmarks",
+      "Method": "Current_SortedDictionary",
+      "Parameters": "OperationCount=100000",
+      "Statistics": { "Mean": 5000000.0 },
+      "Memory": { "BytesAllocatedPerOperation": 1234 } },
+    { "Type": "B3.Umdf.Feed.Benchmarks.MpscPacketRingBenchmarks",
+      "Method": "Run",
+      "Parameters": "ProducerCount=1, PacketsPerProducer=100000",
+      "Statistics": { "Mean": 12345678.0 },
+      "Memory": { "BytesAllocatedPerOperation": 99 } }
+  ]
+}

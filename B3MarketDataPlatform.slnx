@@ -17,6 +17,8 @@
     <Project Path="tools/PcapRptSeqAnalyzer/PcapRptSeqAnalyzer.csproj" />
     <Project Path="tools/PcapTrafficCharacterizer/PcapTrafficCharacterizer.csproj" />
     <Project Path="tools/InboundLatencyProbe/InboundLatencyProbe.csproj" />
+    <Project Path="tools/PerfBaselineCompare/PerfBaselineCompare.csproj" />
+    <Project Path="tools/PerfBaselineCompare.Tests/PerfBaselineCompare.Tests.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/B3.MarketData.WebSocketClient.Tests/B3.MarketData.WebSocketClient.Tests.csproj" />

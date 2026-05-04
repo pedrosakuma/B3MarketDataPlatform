@@ -1,0 +1,78 @@
+# Perf-smoke: runs the three representative microbenchmarks and compares
+# results against committed baselines under docs/perf/baselines/.
+#
+# WHY OPT-IN: BenchmarkDotNet on shared GitHub-hosted runners is high-noise
+# (variable host load, no CPU pinning, no fixed governor). Treat any
+# regression reported here as ADVISORY unless it reproduces on stable
+# hardware. To opt a PR into this workflow, add the `run-perf` label.
+#
+# This workflow is deliberately NOT in the required-checks set.
+# See docs/perf/baselines/README.md and issue #19.
+
+name: perf-smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+jobs:
+  perf-smoke:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-perf')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build (Release)
+        run: dotnet build -c Release --no-restore
+
+      - name: Run Book benchmarks (BookManagerOnPacket + BookSide)
+        working-directory: benchmarks/B3.Umdf.Book.Benchmarks
+        run: |
+          dotnet run -c Release --no-build -- \
+            --filter '*BookManagerOnPacketBenchmarks*|*BookSideBenchmarks*' \
+            --exporters json
+
+      - name: Run Feed benchmarks (MpscPacketRing)
+        working-directory: benchmarks/B3.Umdf.Feed.Benchmarks
+        run: |
+          dotnet run -c Release --no-build -- \
+            --filter '*MpscPacketRingBenchmarks*' \
+            --exporters json
+
+      - name: Upload BDN artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdn-artifacts
+          path: |
+            benchmarks/B3.Umdf.Book.Benchmarks/BenchmarkDotNet.Artifacts/
+            benchmarks/B3.Umdf.Feed.Benchmarks/BenchmarkDotNet.Artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Compare against baselines
+        run: |
+          shopt -s nullglob
+          reports=()
+          for f in benchmarks/B3.Umdf.Book.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full.json \
+                  benchmarks/B3.Umdf.Feed.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full.json; do
+            reports+=(--report "$f")
+          done
+          if [ ${#reports[@]} -eq 0 ]; then
+            echo "No BenchmarkDotNet -report-full.json files found." >&2
+            exit 1
+          fi
+          dotnet run -c Release --no-build --project tools/PerfBaselineCompare -- \
+            --baselines docs/perf/baselines \
+            "${reports[@]}"
