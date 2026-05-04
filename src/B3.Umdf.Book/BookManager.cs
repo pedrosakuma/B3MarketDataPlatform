@@ -995,6 +995,18 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// <see cref="SnapshotApplier.SnapshotsAbortedByEpoch"/>.
     /// </summary>
     public long SnapshotsAbortedByEpoch => _snapshotApplier.SnapshotsAbortedByEpoch;
+    /// <summary>Successful snapshot atomic-swap operations. See <see cref="SnapshotApplier.SnapshotsCompleted"/>.</summary>
+    public long SnapshotsCompleted => _snapshotApplier.SnapshotsCompleted;
+    /// <summary>Subset of completions: header-only (illiquid empty). See <see cref="SnapshotApplier.SnapshotsHeaderOnly"/>.</summary>
+    public long SnapshotsHeaderOnly => _snapshotApplier.SnapshotsHeaderOnly;
+    /// <summary>Subset of completions: zero-order with concrete LastRptSeq. See <see cref="SnapshotApplier.SnapshotsZeroOrder"/>.</summary>
+    public long SnapshotsZeroOrder => _snapshotApplier.SnapshotsZeroOrder;
+    /// <summary>Anomaly counter: chunks observed without a preceding header. See <see cref="SnapshotApplier.SnapshotsOrphanChunk"/>.</summary>
+    public long SnapshotsOrphanChunk => _snapshotApplier.SnapshotsOrphanChunk;
+    /// <summary>Anomaly counter: header replaced an in-flight assembly. See <see cref="SnapshotApplier.SnapshotsReplacedHeader"/>.</summary>
+    public long SnapshotsReplacedHeader => _snapshotApplier.SnapshotsReplacedHeader;
+    /// <summary>Mid-assembly aborts (chunk apply threw). See <see cref="SnapshotApplier.SnapshotsAborted"/>.</summary>
+    public long SnapshotsAborted => _snapshotApplier.SnapshotsAborted;
 
     private void HandleSnapshotHeader(in SnapshotFullRefresh_Header_30DataReader reader) => _snapshotApplier.OnHeader(in reader);
     private void HandleSnapshotOrders(in SnapshotFullRefresh_Orders_MBO_71DataReader reader) => _snapshotApplier.OnOrdersChunk(in reader);
@@ -1019,6 +1031,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         => _snapshotApplier.RecordSnapshotHeader(securityId, lastRptSeq);
     internal void HealAfterSnapshotForTest(ulong securityId)
         => _snapshotApplier.HealAfterSnapshotForTest(securityId);
+    internal bool AbortPendingSnapshotForTest(ulong securityId)
+        => _snapshotApplier.AbortPendingSnapshotForTest(securityId);
     internal void HandleEmptyBookForTest(ReadOnlySpan<byte> body)
     {
         if (EmptyBook_9Data.TryParse(body, out var reader))
