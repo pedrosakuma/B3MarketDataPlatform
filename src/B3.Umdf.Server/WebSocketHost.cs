@@ -47,6 +47,25 @@ public sealed class WebSocketHost : IAsyncDisposable
     public Func<long>? RecoveryEventTotalProvider { get; set; }
 
     /// <summary>
+    /// Threshold (seconds) beyond which a feed group reported in a non-Streaming
+    /// state by <see cref="FeedStateProvider"/> causes <c>GET /health</c> to
+    /// return HTTP 503. Staleness is measured from the group's last observed
+    /// packet (via <see cref="LastPacketTimestampProvider"/>); for groups that
+    /// have never received a packet, process uptime is used so cold starts
+    /// don't fail readiness gates until the threshold elapses. Defaults to
+    /// 60 s. Mirrors <c>AppSettings.HealthMaxStaleSeconds</c>.
+    /// </summary>
+    public int HealthMaxStaleSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Master switch for the <c>/health</c> stale-recovery → 503 behavior.
+    /// When false, the endpoint preserves its legacy always-200 contract
+    /// (status + per-group state in body) regardless of staleness. Defaults
+    /// to true. Mirrors <c>AppSettings.HealthFailOnRecovery</c>.
+    /// </summary>
+    public bool HealthFailOnRecovery { get; set; } = true;
+
+    /// <summary>
     /// Additional <c>System.Diagnostics.Metrics.Meter</c> names to expose via
     /// the Prometheus <c>/metrics</c> endpoint. The host always exposes the
     /// <c>"B3.Umdf"</c> meter (defined by <see cref="MetricsRegistry"/>);
@@ -155,17 +174,56 @@ public sealed class WebSocketHost : IAsyncDisposable
                 Status = _subscriptionManager.IsReady ? "ready" : "initializing",
                 Uptime = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
             };
+            IReadOnlyDictionary<string, string>? states = null;
             if (FeedStateProvider is not null)
-                result.FeedGroups = new Dictionary<string, string>(FeedStateProvider());
+            {
+                states = FeedStateProvider();
+                result.FeedGroups = new Dictionary<string, string>(states);
+            }
+            IReadOnlyDictionary<string, long>? lastPackets = null;
             if (LastPacketTimestampProvider is not null)
             {
-                var timestamps = LastPacketTimestampProvider();
-                var seconds = new Dictionary<string, double>(timestamps.Count);
+                lastPackets = LastPacketTimestampProvider();
+                var seconds = new Dictionary<string, double>(lastPackets.Count);
                 long now = Environment.TickCount64;
-                foreach (var (k, v) in timestamps)
+                foreach (var (k, v) in lastPackets)
                     seconds[k] = v > 0 ? (now - v) / 1000.0 : -1.0;
                 result.SecondsSinceLastPacket = seconds;
             }
+
+            // Stale-recovery gate: a group reported as non-Streaming for longer
+            // than HealthMaxStaleSeconds flips the response to 503 so that
+            // orchestrators can fail readiness on stuck groups. Cold-start
+            // semantics: when no packet has yet been seen for a group we
+            // measure staleness against process uptime, so /health stays 200
+            // until the threshold elapses (matches existing /ready behavior).
+            if (HealthFailOnRecovery && states is not null && HealthMaxStaleSeconds >= 0)
+            {
+                long now = Environment.TickCount64;
+                double uptimeSec = _uptime.Elapsed.TotalSeconds;
+                List<string>? unhealthy = null;
+                foreach (var (group, state) in states)
+                {
+                    if (string.Equals(state, nameof(FeedState.Streaming), StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    double staleSec;
+                    if (lastPackets is not null && lastPackets.TryGetValue(group, out var ticks) && ticks > 0)
+                        staleSec = (now - ticks) / 1000.0;
+                    else
+                        staleSec = uptimeSec;
+                    if (staleSec > HealthMaxStaleSeconds)
+                    {
+                        unhealthy ??= new List<string>();
+                        unhealthy.Add($"{group}={state} for {staleSec:F0}s");
+                    }
+                }
+                if (unhealthy is not null)
+                {
+                    result.Reason = "Stale recovery: " + string.Join(", ", unhealthy);
+                    return Results.Json(result, AppJsonContext.Default.HealthResponse, statusCode: 503);
+                }
+            }
+
             return Results.Json(result, AppJsonContext.Default.HealthResponse);
         });
 

@@ -526,7 +526,11 @@ if (subscriptionManager is not null)
         slowClientThreshold: slowClientThreshold,
         slowClientMaxTicks: slowClientMaxTicks,
         clientMaxPendingBytes: clientMaxPendingBytes,
-        clientCoalesceWindowMs: clientCoalesceWindowMs);
+        clientCoalesceWindowMs: clientCoalesceWindowMs)
+    {
+        HealthMaxStaleSeconds = settings.HealthMaxStaleSeconds,
+        HealthFailOnRecovery = settings.HealthFailOnRecovery,
+    };
 
     // Wire up feed state and last-packet providers for /health endpoint
     if (multiFeed is not null)

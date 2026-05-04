@@ -116,14 +116,23 @@ internal static class HealthCheckCommand
 {
     public static async Task<int?> TryRunAsync(string[] args)
     {
-        if (args.Length != 1 || args[0] != "--health-check") return null;
+        if (args.Length != 1) return null;
+        string mode;
+        if (args[0] == "--health-check") mode = "live";
+        else if (args[0] == "--health-check=full" || args[0] == "--health-check=health") mode = "health";
+        else if (args[0] == "--health-check=live") mode = "live";
+        else return null;
         try
         {
             using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
             var port = Environment.GetEnvironmentVariable("UMDF_WS_PORT")
                 ?? Environment.GetEnvironmentVariable("WS_PORT")
                 ?? "8080";
-            var resp = await http.GetAsync($"http://localhost:{port}/live");
+            // "live" probes /live (liveness, always 200 unless the process is dead).
+            // "full"/"health" probes /health which returns 503 when feed groups
+            // are stuck in non-Streaming state past UMDF_HEALTH_MAX_STALE_SECONDS.
+            var path = mode == "health" ? "/health" : "/live";
+            var resp = await http.GetAsync($"http://localhost:{port}{path}");
             return resp.IsSuccessStatusCode ? 0 : 1;
         }
         catch { return 1; }

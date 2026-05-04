@@ -239,6 +239,27 @@ public sealed class AppSettings
     /// </summary>
     public long StaleEscapeTimeoutMs { get; set; } = 60_000;
 
+    /// <summary>
+    /// Threshold (seconds) beyond which a feed group still in a non-Streaming
+    /// state (the channel-level <see cref="B3.Umdf.Feed.FeedState.WaitInstrumentDefinition"/>
+    /// "stuck in bootstrap/recovery" condition) causes <c>GET /health</c> to
+    /// return HTTP 503. Until the threshold elapses (measured from the last
+    /// observed packet for the group, or from process start when no packet
+    /// has yet been received), the endpoint stays 200/initializing so cold
+    /// starts don't fail readiness gates. Default 60 s. CLI: env
+    /// <c>UMDF_HEALTH_MAX_STALE_SECONDS</c>.
+    /// </summary>
+    public int HealthMaxStaleSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Master switch for the <c>/health</c> stale-recovery → 503 behavior.
+    /// When false, the endpoint preserves its legacy always-200 contract
+    /// (status + per-group state in body) regardless of staleness. Defaults
+    /// to true so orchestrators can gate readiness on stale state out of the
+    /// box. CLI: env <c>UMDF_HEALTH_FAIL_ON_RECOVERY</c>.
+    /// </summary>
+    public bool HealthFailOnRecovery { get; set; } = true;
+
     /// <summary>Load settings from a JSON file.</summary>
     public static AppSettings LoadFromFile(string path)
     {
@@ -346,6 +367,10 @@ public sealed class AppSettings
             PerSymbolFanoutSuppressLowPct = psLow;
         if (long.TryParse(Environment.GetEnvironmentVariable("UMDF_STALE_ESCAPE_TIMEOUT_MS"), out var staleEscapeMs))
             StaleEscapeTimeoutMs = staleEscapeMs;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_HEALTH_MAX_STALE_SECONDS"), out var healthStaleSec) && healthStaleSec >= 0)
+            HealthMaxStaleSeconds = healthStaleSec;
+        if (TryParseBoolean(Environment.GetEnvironmentVariable("UMDF_HEALTH_FAIL_ON_RECOVERY"), out var healthFail))
+            HealthFailOnRecovery = healthFail;
 
         // ── Legacy environment variable fallbacks ──
         // Pre-UMDF_* naming, retained for the shell-less Docker image (compose files

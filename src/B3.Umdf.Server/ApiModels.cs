@@ -8,6 +8,13 @@ public sealed class HealthResponse
     public string Uptime { get; set; } = "";
     public Dictionary<string, string>? FeedGroups { get; set; }
     public Dictionary<string, double>? SecondsSinceLastPacket { get; set; }
+    /// <summary>
+    /// Populated only when the endpoint is reporting an unhealthy condition
+    /// (HTTP 503). Lists the feed groups that exceeded the configured
+    /// stale-recovery threshold. Absent on healthy responses to keep the
+    /// legacy JSON shape unchanged for existing consumers.
+    /// </summary>
+    public string? Reason { get; set; }
 }
 
 public sealed class SymbolsResponse
