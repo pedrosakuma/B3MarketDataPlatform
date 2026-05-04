@@ -40,6 +40,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="B3.MarketData.WebSocketClient.Tests" />
+    <InternalsVisibleTo Include="B3.Umdf.Fuzz.Tests" />
   </ItemGroup>
 
 </Project>

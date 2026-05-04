@@ -14,6 +14,8 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\B3.Umdf.Sbe\B3.Umdf.Sbe.csproj" />
     <ProjectReference Include="..\..\src\B3.Umdf.Book\B3.Umdf.Book.csproj" />
+    <ProjectReference Include="..\..\src\B3.Umdf.Server\B3.Umdf.Server.csproj" />
+    <ProjectReference Include="..\..\src\B3.MarketData.WebSocketClient\B3.MarketData.WebSocketClient.csproj" />
   </ItemGroup>
 
   <ItemGroup>
