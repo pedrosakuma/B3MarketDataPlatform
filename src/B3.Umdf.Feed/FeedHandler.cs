@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
@@ -362,7 +361,7 @@ public sealed class FeedHandler : IDisposable
             _instrDefFirstSeenTicks = packet.ReceivedTimestampTicks;
 
         int offset = PacketHeader.MESSAGE_SIZE;
-        while (TryReadNextSbe(span, ref offset, out var sbeSlice, out var templateId))
+        while (SbeFrameWalker.TryReadNext(span, ref offset, out var sbeSlice, out var templateId))
         {
             _eventHandler.OnPacket(in packet, sbeSlice, templateId);
             if (templateId == SecurityDefinition_12Data.MESSAGE_ID)
@@ -439,7 +438,7 @@ public sealed class FeedHandler : IDisposable
         bool snapshotStarted = false;
         ulong lastSecurityId = 0;
         int channelGroupId = packet.ChannelGroup;
-        while (TryReadNextSbe(span, ref offset, out var sbeSlice, out var templateId))
+        while (SbeFrameWalker.TryReadNext(span, ref offset, out var sbeSlice, out var templateId))
         {
             if (templateId == SnapshotFullRefresh_Header_30Data.MESSAGE_ID
                 && TryReadSnapshotHeaderSecurityId(sbeSlice[MessageDispatcher.SbeHeaderSize..], out var securityId))
@@ -462,35 +461,6 @@ public sealed class FeedHandler : IDisposable
         if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader))
             return false;
         securityId = reader.Data.SecurityID.Value;
-        return true;
-    }
-
-    /// <summary>
-    /// Advance <paramref name="offset"/> past one framed SBE message. Centralizes
-    /// the framing validation (length checks + bounds) shared by the snapshot and
-    /// instrument-definition dispatch loops. Returns false at end-of-packet or on
-    /// any malformed frame (matching the pre-existing "best-effort, never throw"
-    /// contract — partial packets are silently truncated).
-    /// </summary>
-    private static bool TryReadNextSbe(
-        ReadOnlySpan<byte> packetSpan, ref int offset,
-        out ReadOnlySpan<byte> sbeSlice, out ushort templateId)
-    {
-        sbeSlice = default;
-        templateId = 0;
-        if (offset + FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize > packetSpan.Length)
-            return false;
-        var framingSlice = packetSpan[offset..];
-        if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
-            return false;
-        if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + MessageDispatcher.SbeHeaderSize)
-            return false;
-        if (offset + framing.MessageLength > packetSpan.Length)
-            return false;
-
-        sbeSlice = packetSpan[(offset + FramingHeader.MESSAGE_SIZE)..];
-        templateId = MemoryMarshal.Read<ushort>(sbeSlice[2..]);
-        offset += framing.MessageLength;
         return true;
     }
 
