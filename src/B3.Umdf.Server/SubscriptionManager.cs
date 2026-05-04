@@ -198,20 +198,49 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     /// <summary>
+    /// Centralised copy-on-write writer for <see cref="_subscriptions"/>. Acquires
+    /// <see cref="_subLock"/>, snapshots the current per-security inner map, hands it
+    /// to <paramref name="mutator"/>, and atomically publishes the result (removes the
+    /// outer entry if the mutator returns null or an empty map).
+    ///
+    /// ALL writes that bump the per-security snapshot MUST go through this helper so
+    /// the COW invariant ("readers always see a frozen Dictionary, writers always
+    /// build a fresh one") is impossible to violate from a future contributor.
+    /// The mutator receives <c>null</c> when the security is not currently tracked;
+    /// it MUST NOT mutate the existing dictionary in place — return a new instance.
+    /// The lock is reentrant so callers already inside <c>lock (_subLock)</c> for a
+    /// broader sequence (e.g. <see cref="ActivateSubscription"/>) can still use it.
+    /// </summary>
+    private void UpdateSubscriptionSnapshot(
+        ulong securityId,
+        Func<Dictionary<string, SubscriptionState>?, Dictionary<string, SubscriptionState>?> mutator)
+    {
+        lock (_subLock)
+        {
+            _subscriptions.TryGetValue(securityId, out var existing);
+            var next = mutator(existing);
+            if (next is null || next.Count == 0)
+                _subscriptions.TryRemove(securityId, out _);
+            else if (!ReferenceEquals(next, existing))
+                _subscriptions[securityId] = next;
+        }
+    }
+
+    /// <summary>
     /// Test-only seam: register a synthetic subscription without going through the
     /// full snapshot/registry pipeline. Used by <c>SubscriptionManagerTests</c> to
     /// exercise <see cref="NotifyDelisted"/> in isolation.
     /// </summary>
     internal void AddSubscriptionForTest(string clientId, ulong securityId, DataFlags flags)
     {
-        lock (_subLock)
+        UpdateSubscriptionSnapshot(securityId, existing =>
         {
-            var newClients = _subscriptions.TryGetValue(securityId, out var existing)
+            var next = existing is not null
                 ? new Dictionary<string, SubscriptionState>(existing)
                 : new Dictionary<string, SubscriptionState>();
-            newClients[clientId] = new SubscriptionState(flags, 0);
-            _subscriptions[securityId] = newClients;
-        }
+            next[clientId] = new SubscriptionState(flags, 0);
+            return next;
+        });
     }
 
     /// <summary>Unregister a client and remove all its subscriptions.</summary>
@@ -665,10 +694,15 @@ public sealed class SubscriptionManager : IDisposable
             if (wantsNews && !hadNews) session.IncrementNewsSubscriptions();
             else if (!wantsNews && hadNews) session.DecrementNewsSubscriptions();
 
-            // Copy-on-write: create new inner dict to avoid mutating a dict being iterated.
-            var newClients = existing is not null ? new Dictionary<string, SubscriptionState>(existing) : new();
-            newClients[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
-            _subscriptions[securityId] = newClients;
+            // Copy-on-write through the centralised helper (reentrant on _subLock).
+            UpdateSubscriptionSnapshot(securityId, current =>
+            {
+                var next = current is not null
+                    ? new Dictionary<string, SubscriptionState>(current)
+                    : new Dictionary<string, SubscriptionState>();
+                next[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
+                return next;
+            });
             activation = new SubscriptionActivation(
                 !hadPrevious,
                 hadPrevious,
@@ -697,20 +731,16 @@ public sealed class SubscriptionManager : IDisposable
         ulong securityId,
         SubscriptionActivation activation)
     {
-        lock (_subLock)
+        UpdateSubscriptionSnapshot(securityId, existing =>
         {
-            if (!_subscriptions.TryGetValue(securityId, out var existing)) return;
-            var newClients = new Dictionary<string, SubscriptionState>(existing);
+            if (existing is null) return null;
+            var next = new Dictionary<string, SubscriptionState>(existing);
             if (activation.HadPrevious)
-                newClients[clientId] = activation.PreviousState!;
+                next[clientId] = activation.PreviousState!;
             else
-                newClients.Remove(clientId);
-
-            if (newClients.Count == 0)
-                _subscriptions.TryRemove(securityId, out _);
-            else
-                _subscriptions[securityId] = newClients;
-        }
+                next.Remove(clientId);
+            return next;
+        });
 
         if (activation.IsNew)
             session.RemoveSubscription(securityId);
@@ -747,21 +777,22 @@ public sealed class SubscriptionManager : IDisposable
 
         session.RemoveSubscription(securityId);
 
-        // Copy-on-write
-        if (_subscriptions.TryGetValue(securityId, out var existing))
+        bool removed = false;
+        bool removedHadNews = false;
+        UpdateSubscriptionSnapshot(securityId, existing =>
         {
-            bool removedHadNews = existing.TryGetValue(clientId, out var prev) && prev.WantsNews;
-            var newClients = new Dictionary<string, SubscriptionState>(existing);
-            if (newClients.Remove(clientId))
-            {
-                if (adjustMetric)
-                    MetricsRegistry.WsSubscriptions.Add(-1);
-                if (removedHadNews) session.DecrementNewsSubscriptions();
-                if (newClients.Count == 0)
-                    _subscriptions.TryRemove(securityId, out _);
-                else
-                    _subscriptions[securityId] = newClients;
-            }
+            if (existing is null) return null;
+            removedHadNews = existing.TryGetValue(clientId, out var prev) && prev.WantsNews;
+            var next = new Dictionary<string, SubscriptionState>(existing);
+            removed = next.Remove(clientId);
+            return next;
+        });
+
+        if (removed)
+        {
+            if (adjustMetric)
+                MetricsRegistry.WsSubscriptions.Add(-1);
+            if (removedHadNews) session.DecrementNewsSubscriptions();
         }
 
         if (!enqueueAck) return;
@@ -773,45 +804,33 @@ public sealed class SubscriptionManager : IDisposable
     private void HandleUnsubscribeAll(string clientId)
     {
         // Must be called under _subLock.
-        // Copy-on-write: build list of security IDs that need updating.
-        List<ulong>? toRemove = null;
-        List<ulong>? toUpdate = null;
-        int removedSubscriptions = 0;
-
+        // Two-phase to avoid mutating _subscriptions while iterating it: first
+        // collect the set of securities the client touches, then fan out per-security
+        // COW writes through the centralised helper.
+        List<ulong>? affected = null;
         foreach (var (secId, clients) in _subscriptions)
         {
-            if (!clients.TryGetValue(clientId, out var prev)) continue;
-            removedSubscriptions++;
-            if (prev.WantsNews && _clients.TryGetValue(clientId, out var s))
-                s.DecrementNewsSubscriptions();
-
-            if (clients.Count == 1)
-            {
-                toRemove ??= new();
-                toRemove.Add(secId);
-            }
-            else
-            {
-                toUpdate ??= new();
-                toUpdate.Add(secId);
-            }
+            if (!clients.ContainsKey(clientId)) continue;
+            (affected ??= new()).Add(secId);
         }
 
-        if (toRemove is not null)
-        {
-            foreach (var key in toRemove)
-                _subscriptions.TryRemove(key, out _);
-        }
+        if (affected is null) return;
 
-        if (toUpdate is not null)
+        int removedSubscriptions = 0;
+        foreach (var secId in affected)
         {
-            foreach (var secId in toUpdate)
+            UpdateSubscriptionSnapshot(secId, existing =>
             {
-                if (!_subscriptions.TryGetValue(secId, out var existing)) continue;
-                var newClients = new Dictionary<string, SubscriptionState>(existing);
-                newClients.Remove(clientId);
-                _subscriptions[secId] = newClients;
-            }
+                if (existing is null || !existing.TryGetValue(clientId, out var prev))
+                    return existing;
+                removedSubscriptions++;
+                if (prev.WantsNews && _clients.TryGetValue(clientId, out var session) && session is not null)
+                    session.DecrementNewsSubscriptions();
+                if (existing.Count == 1) return null;
+                var next = new Dictionary<string, SubscriptionState>(existing);
+                next.Remove(clientId);
+                return next;
+            });
         }
 
         if (removedSubscriptions > 0)
