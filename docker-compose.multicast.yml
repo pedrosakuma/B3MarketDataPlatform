@@ -67,5 +67,6 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:80"
     depends_on:
-      - consumer
+      consumer:
+        condition: service_healthy
     restart: unless-stopped
