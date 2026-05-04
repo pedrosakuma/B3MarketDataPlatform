@@ -18,8 +18,31 @@ namespace B3.Umdf.Book;
 /// </summary>
 internal sealed class SnapshotApplier
 {
+    /// <summary>
+    /// Explicit per-assembly state. The terminal events
+    /// (Complete / Replaced / Orphaned / Aborted) are NOT states an in-flight
+    /// <see cref="PendingSnapshot"/> dwells in — they are transitions out of
+    /// <see cref="ReceivingChunks"/> (or <see cref="Skipped"/>) accounted via
+    /// the matching counters. Only <see cref="ReceivingChunks"/> is eligible
+    /// for the atomic swap into the live book.
+    /// </summary>
+    internal enum SnapshotAssemblyState : byte
+    {
+        /// <summary>No header observed for this SecurityID — chunks would be orphaned.</summary>
+        AwaitingHeader = 0,
+        /// <summary>Header observed; staging buffers accumulating chunk payloads.</summary>
+        ReceivingChunks = 1,
+        /// <summary>
+        /// Header observed but the snapshot is being silently absorbed
+        /// (symbol Healthy ahead, or stale-version per spec §7.2). Chunks
+        /// tick OrdersReceived but never reach the live book.
+        /// </summary>
+        Skipped = 2,
+    }
+
     private sealed class PendingSnapshot
     {
+        public SnapshotAssemblyState State;
         public uint LastRptSeq;        // 0 if no usable rptSeq baseline
         public uint OrdersExpected;    // TotNumBids + TotNumOffers from Header_30
         public uint OrdersReceived;    // accumulated across Orders_71 chunks
@@ -50,6 +73,12 @@ internal sealed class SnapshotApplier
     private long _snapshotMarketOrderAdds;
     private long _snapshotsAbandoned;
     private long _snapshotsAbortedByEpoch;
+    private long _snapshotsCompleted;
+    private long _snapshotsHeaderOnly;
+    private long _snapshotsZeroOrder;
+    private long _snapshotsOrphanChunk;
+    private long _snapshotsReplacedHeader;
+    private long _snapshotsAborted;
 
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
@@ -85,6 +114,57 @@ internal sealed class SnapshotApplier
     /// orphan counter.
     /// </summary>
     public long SnapshotsRejectedStaleVersion => Volatile.Read(ref _snapshotsRejectedStaleVersion);
+
+    /// <summary>
+    /// Successful snapshot atomic-swap operations: a header was observed,
+    /// staging completed, the heal was accepted, and the live
+    /// <see cref="OrderBook"/> was atomically replaced. Sum of the three
+    /// success-case sub-counters (<see cref="SnapshotsHeaderOnly"/>,
+    /// <see cref="SnapshotsZeroOrder"/>, and the implicit
+    /// "non-empty completion" remainder).
+    /// </summary>
+    public long SnapshotsCompleted => Volatile.Read(ref _snapshotsCompleted);
+
+    /// <summary>
+    /// Subset of <see cref="SnapshotsCompleted"/>: header observed for an
+    /// illiquid instrument (no <c>LastRptSeq</c>) declaring zero orders, and
+    /// the completion happened immediately at <c>Header_30</c> time with no
+    /// <c>Orders_71</c> chunks following. Authoritative "instrument is empty"
+    /// signal per spec §7.4.
+    /// </summary>
+    public long SnapshotsHeaderOnly => Volatile.Read(ref _snapshotsHeaderOnly);
+
+    /// <summary>
+    /// Subset of <see cref="SnapshotsCompleted"/>: header observed with a
+    /// concrete <c>LastRptSeq</c> declaring zero orders. Empty book swap with
+    /// the rptSeq baseline acting as the heal anchor.
+    /// </summary>
+    public long SnapshotsZeroOrder => Volatile.Read(ref _snapshotsZeroOrder);
+
+    /// <summary>
+    /// Anomaly counter — <c>Orders_71</c> chunks observed without a preceding
+    /// <c>Header_30</c> for the same SecurityID. Increments alongside the
+    /// legacy <see cref="SnapshotChunksOrphaned"/> counter; both reflect the
+    /// same event under explicit-state-machine accounting.
+    /// </summary>
+    public long SnapshotsOrphanChunk => Volatile.Read(ref _snapshotsOrphanChunk);
+
+    /// <summary>
+    /// Anomaly counter — a new <c>Header_30</c> arrived for an in-flight
+    /// (non-Skipped, non-completed) assembly, discarding the old staging.
+    /// The new header path still proceeds normally (success counter
+    /// increments on its later completion). Increments alongside the legacy
+    /// <see cref="SnapshotsAbandoned"/> counter.
+    /// </summary>
+    public long SnapshotsReplacedHeader => Volatile.Read(ref _snapshotsReplacedHeader);
+
+    /// <summary>
+    /// Mid-assembly aborts — staging was discarded because chunk processing
+    /// failed (e.g., a parser/staging exception). The live
+    /// <see cref="OrderBook"/> was NOT mutated; the symbol stays in its
+    /// pre-snapshot state until the next snapshot rotation.
+    /// </summary>
+    public long SnapshotsAborted => Volatile.Read(ref _snapshotsAborted);
 
     public SnapshotApplier(
         BookStore bookStore,
@@ -125,6 +205,7 @@ internal sealed class SnapshotApplier
         {
             ReplacePendingSnapshot(secId, new PendingSnapshot
             {
+                State = SnapshotAssemblyState.Skipped,
                 OrdersExpected = expected,
                 OrdersReceived = 0,
                 Skipped = true,
@@ -159,6 +240,7 @@ internal sealed class SnapshotApplier
         {
             ReplacePendingSnapshot(secId, new PendingSnapshot
             {
+                State = SnapshotAssemblyState.Skipped,
                 LastRptSeq = lastRptSeq,
                 OrdersExpected = ordersExpected,
                 OrdersReceived = 0,
@@ -174,6 +256,7 @@ internal sealed class SnapshotApplier
         // CompleteSnapshot decides Accept (swap) or Reject (discard staging).
         ReplacePendingSnapshot(secId, new PendingSnapshot
         {
+            State = SnapshotAssemblyState.ReceivingChunks,
             LastRptSeq = lastRptSeq,
             OrdersExpected = ordersExpected,
             OrdersReceived = 0,
@@ -209,6 +292,7 @@ internal sealed class SnapshotApplier
         if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
         {
             Interlocked.Increment(ref _snapshotChunksOrphaned);
+            Interlocked.Increment(ref _snapshotsOrphanChunk);
             return;
         }
 
@@ -295,7 +379,10 @@ internal sealed class SnapshotApplier
             // OrdersReceived >= OrdersExpected. Includes "header arrived, zero
             // chunks delivered" — total loss is at least as important as partial.
             if (!existing.Skipped && existing.OrdersReceived < existing.OrdersExpected)
+            {
                 Interlocked.Increment(ref _snapshotsAbandoned);
+                Interlocked.Increment(ref _snapshotsReplacedHeader);
+            }
             // Always release any protected floor that the predecessor pinned —
             // skipped replacements never call CompleteSnapshot, so without this
             // the floor would leak indefinitely.
@@ -392,6 +479,9 @@ internal sealed class SnapshotApplier
         book.LastRptSeq = heal.SnapshotRptSeq;
         if (heal.TransitionedToHealthy)
             Interlocked.Increment(ref _snapshotsHealed);
+        Interlocked.Increment(ref _snapshotsCompleted);
+        // OrdersExpected == 0 + HasRptSeq == false ⇒ "header-only" success path.
+        Interlocked.Increment(ref _snapshotsHeaderOnly);
         // No drain window — illiquid asserts the book is empty as of the
         // snapshot moment, so any Stale-buffered tail is meaningless.
         _staleBuffer.Clear(securityId);
@@ -420,6 +510,9 @@ internal sealed class SnapshotApplier
         book.LastRptSeq = snapshotRptSeq;
         if (heal.TransitionedToHealthy)
             Interlocked.Increment(ref _snapshotsHealed);
+        Interlocked.Increment(ref _snapshotsCompleted);
+        if (pending.OrdersExpected == 0)
+            Interlocked.Increment(ref _snapshotsZeroOrder);
 
         if (heal.DrainTo >= heal.DrainFrom)
         {
@@ -485,6 +578,7 @@ internal sealed class SnapshotApplier
         {
             ReplacePendingSnapshot(secId, new PendingSnapshot
             {
+                State = SnapshotAssemblyState.Skipped,
                 OrdersExpected = ordersExpected,
                 OrdersReceived = 0,
                 Skipped = true,
@@ -503,6 +597,7 @@ internal sealed class SnapshotApplier
         var book = _bookStore.GetOrCreate(securityId);
         ReplacePendingSnapshot(securityId, new PendingSnapshot
         {
+            State = SnapshotAssemblyState.ReceivingChunks,
             LastRptSeq = lastRptSeq,
             OrdersExpected = ordersExpected,
             OrdersReceived = 0,
@@ -519,6 +614,7 @@ internal sealed class SnapshotApplier
         if (!_pendingSnapshots.TryGetValue(securityId, out var pending))
         {
             Interlocked.Increment(ref _snapshotChunksOrphaned);
+            Interlocked.Increment(ref _snapshotsOrphanChunk);
             return;
         }
         var book = _bookStore.GetOrCreate(securityId);
@@ -581,11 +677,28 @@ internal sealed class SnapshotApplier
         bool hasRpt = lastRptSeq is { } v && v > 0;
         ReplacePendingSnapshot(securityId, new PendingSnapshot
         {
+            State = SnapshotAssemblyState.ReceivingChunks,
             LastRptSeq = hasRpt ? lastRptSeq!.Value : 0u,
             OrdersExpected = 0,
             OrdersReceived = 0,
             HasRptSeq = hasRpt,
         });
+    }
+
+    /// <summary>
+    /// Test helper: simulates a mid-assembly failure (e.g., an exception
+    /// thrown while applying a chunk). Discards staging cleanly without
+    /// touching the live book and increments <see cref="SnapshotsAborted"/>.
+    /// Returns <c>true</c> if a pending assembly was actually aborted.
+    /// </summary>
+    internal bool AbortPendingSnapshotForTest(ulong securityId)
+    {
+        if (!_pendingSnapshots.Remove(securityId, out var pending))
+            return false;
+        _staleBuffer.ClearProtectedFloor(securityId);
+        if (!pending.Skipped)
+            Interlocked.Increment(ref _snapshotsAborted);
+        return true;
     }
 
     internal void HealAfterSnapshotForTest(ulong securityId)
