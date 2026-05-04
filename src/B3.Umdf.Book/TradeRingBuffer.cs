@@ -63,6 +63,33 @@ internal sealed class TradeRingBuffer
     }
 
     /// <summary>
+    /// Most recent non-busted trade's price (newest → oldest scan). Returns
+    /// false if every retained slot is busted or the ring is empty. Used by
+    /// the bust reversal path on <see cref="BookManager"/> to recompute the
+    /// effective last-trade price after a <c>TradeBust_57</c> wipes the
+    /// most recent print.
+    /// </summary>
+    public bool TryGetLastNonBustedPrice(out long price, out long quantity, out long tradeId)
+    {
+        int count = _count;
+        int head = _head;
+        int len = _buf.Length;
+        for (int i = 1; i <= count; i++)
+        {
+            int pos = (head - i + len) % len;
+            if (_buf[pos].Busted == 0)
+            {
+                price = _buf[pos].Price;
+                quantity = _buf[pos].Qty;
+                tradeId = _buf[pos].TradeId;
+                return true;
+            }
+        }
+        price = 0; quantity = 0; tradeId = 0;
+        return false;
+    }
+
+    /// <summary>
     /// Snapshot oldest → newest. Safe for concurrent reads.
     /// Re-copies the slot array if any mutation (Add or MarkBust) is detected
     /// during the copy via the <see cref="_version"/> stamp — without this, a
