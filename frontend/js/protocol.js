@@ -16,6 +16,16 @@ export const MSG = {
   CANDLE_UPDATE: 0x0061,
   SYMBOL_STALE_STATUS: 0x0070,
   RECOVERY_PROGRESS: 0x0080,
+  SYMBOL_DELISTED: 0x0071,
+  SERVER_HELLO: 0x00A0,
+};
+
+// Bitfield positions for ServerHello.capabilities. Mirror of the server's
+// `ServerCapabilities` enum. Unknown bits MUST be ignored — never gate behaviour
+// on the absence of a known bit (forward compatibility).
+export const SERVER_CAPABILITIES = {
+  SNAPSHOT_ON_SUBSCRIBE: 0x0001,
+  SYMBOL_DELISTED_NOTIFICATION: 0x0002,
 };
 
 export const MSG_NAMES = Object.fromEntries(Object.entries(MSG).map(([k, v]) => [v, k]));
@@ -272,6 +282,17 @@ export function parseMessage(buf, baseOffset, msgLen) {
         staleByKind[kindId] = count;
       }
       return { type: 'RecoveryProgress', totalSymbols, totalStaleSymbols, staleByKind };
+    }
+    case MSG.SERVER_HELLO: {
+      const protocolVersion = v.getUint32(o, true); o += 4;
+      const capabilities = v.getUint32(o, true); o += 4;
+      const buildLen = v.getUint8(o); o += 1;
+      const buildVersion = decoder.decode(new Uint8Array(buf, baseOffset + o, buildLen));
+      return { type: 'ServerHello', protocolVersion, capabilities, buildVersion };
+    }
+    case MSG.SYMBOL_DELISTED: {
+      const securityId = v.getBigUint64(o, true);
+      return { type: 'SymbolDelisted', securityId };
     }
     default:
       return null;

@@ -138,6 +138,46 @@ public class MarketDataClientIntegrationTests
         Assert.True(subscribesSeen >= 2, $"expected ≥ 2 subscribes after reconnect, saw {subscribesSeen}");
     }
 
+    [Fact]
+    public async Task ServerHello_IsParsed_AndExposedOnLastServerHello()
+    {
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            // Push a ServerHello as the first frame, then idle. Mirrors what the
+            // real server's RegisterClient does on connect.
+            await TestWsServer.SendServerHelloAsync(
+                ws,
+                protocolVersion: 1,
+                capabilities: 0x03, // SnapshotOnSubscribe | SymbolDelistedNotification
+                buildVersion: "1.2.3-test",
+                ct);
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var helloReceived = new TaskCompletionSource<ServerHelloEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.ServerHello += h => helloReceived.TrySetResult(h);
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+
+        var hello = await helloReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1U, hello.ProtocolVersion);
+        Assert.Equal(ServerCapabilities.SnapshotOnSubscribe | ServerCapabilities.SymbolDelistedNotification, hello.Capabilities);
+        Assert.Equal("1.2.3-test", hello.BuildVersion);
+
+        // LastServerHello property snapshots the most-recently-received hello so
+        // late subscribers can still inspect the negotiation result.
+        var snap = client.LastServerHello;
+        Assert.NotNull(snap);
+        Assert.Equal(1U, snap!.Value.ProtocolVersion);
+        Assert.Equal("1.2.3-test", snap.Value.BuildVersion);
+    }
+
     private static async Task WaitUntil(Func<bool> pred, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -251,6 +291,21 @@ internal sealed class TestWsServer : IAsyncDisposable
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(12), price);
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(20), qty);
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(28), tradeId);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendServerHelloAsync(WebSocket ws, uint protocolVersion, uint capabilities, string buildVersion, CancellationToken ct)
+    {
+        // [len u16][type u16=0x00A0][protocolVersion u32][capabilities u32][buildVerLen u8][buildVer UTF-8…]
+        var buildBytes = Encoding.UTF8.GetBytes(buildVersion);
+        ushort total = (ushort)(4 + 4 + 4 + 1 + buildBytes.Length);
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x00A0);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), protocolVersion);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(8), capabilities);
+        buf[12] = (byte)buildBytes.Length;
+        buildBytes.CopyTo(buf, 13);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 }

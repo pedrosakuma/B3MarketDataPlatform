@@ -65,6 +65,16 @@ public enum MessageType : ushort
     /// the last value within a packet wins.</summary>
     SymbolStaleStatus = 0x0070,
 
+    /// <summary>Server → Client: terminal notification that a previously-subscribed
+    /// security has been delisted by the venue. Carries only the securityId; clients
+    /// MUST stop expecting further data for that symbol and SHOULD remove it from
+    /// their UI. The server cleans up the per-symbol subscription map after sending,
+    /// so subsequent <c>Subscribe</c> attempts for the same symbol will fail with
+    /// <see cref="SubscribeErrorCode.UnknownSymbol"/>.
+    /// Issued via <c>SubscriptionManager.NotifyDelisted</c>; integration with the
+    /// upstream SBE delisting trigger is intentionally a follow-up.</summary>
+    SymbolDelisted = 0x0071,
+
     /// <summary>Server → Client: aggregate recovery progress.
     /// Periodic broadcast (~250ms) of total stale symbols and per-kind breakdown across
     /// all channel groups. Stops after totalStale=0 has been broadcast once so clients
@@ -89,6 +99,32 @@ public enum MessageType : ushort
     /// Lets clients release per-news buffers and surface the assembled news to
     /// the UI exactly once.</summary>
     NewsEnd = 0x0092,
+
+    /// <summary>Server → Client: protocol/version handshake. Sent as the very first
+    /// frame after a client connects (before <see cref="ServerStatus"/>) so consumers
+    /// can negotiate features and surface the server build to operators.
+    /// Payload: <c>[u32 protocolVersion][u32 capabilities][u8 buildVerLen][buildVer UTF-8]</c>.
+    /// The MessageType is purely additive — older clients that don't recognise it MUST
+    /// skip the frame (length-prefixed) and continue parsing the next message.</summary>
+    ServerHello = 0x00A0,
+}
+
+/// <summary>
+/// Bitfield of optional server-side features advertised in <see cref="MessageType.ServerHello"/>.
+/// Clients MUST treat unknown bits as reserved (ignore + log). New flags are appended
+/// only — bits MUST NOT be reused or repurposed once shipped.
+/// </summary>
+[Flags]
+public enum ServerCapabilities : uint
+{
+    None = 0,
+    /// <summary>Server pushes initial book/info/MBP snapshot frames immediately on
+    /// successful Subscribe. Always set today; documented as a flag so clients can
+    /// branch cleanly once a future server might allow snapshot opt-out.</summary>
+    SnapshotOnSubscribe = 0x0001,
+    /// <summary>Server emits <see cref="MessageType.SymbolDelisted"/> as the terminal
+    /// notification when a subscribed security is delisted mid-session.</summary>
+    SymbolDelistedNotification = 0x0002,
 }
 
 public enum SubscribeErrorCode : byte
@@ -366,6 +402,78 @@ public static class WireProtocol
         WriteFramingHeader(dest, totalLen, MessageType.BookCleared);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
         dest[12] = clearSide;
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Current server-side wire protocol version. Bumped only on a breaking change to
+    /// the framing or to the semantics of an existing <see cref="MessageType"/>.
+    /// Additive new MessageTypes do NOT bump this field.
+    /// </summary>
+    public const uint ProtocolVersion = 1;
+
+    /// <summary>
+    /// Maximum buffer needed for a <see cref="MessageType.ServerHello"/> frame:
+    /// header(4) + protocolVersion(4) + capabilities(4) + buildVerLen(1) + 255 UTF-8 bytes.
+    /// </summary>
+    public const int ServerHelloMaxSize = FramingHeaderSize + 4 + 4 + 1 + 255;
+
+    /// <summary>
+    /// Write a <see cref="MessageType.ServerHello"/> frame. <paramref name="buildVersion"/>
+    /// is truncated to 255 UTF-8 bytes (the on-wire length prefix is a single byte) so
+    /// callers may safely pass an assembly version, semver string, or git SHA without
+    /// pre-validation. Returns the total number of bytes written.
+    /// </summary>
+    public static int WriteServerHello(
+        Span<byte> dest,
+        uint protocolVersion,
+        ServerCapabilities capabilities,
+        string buildVersion)
+    {
+        // UTF-8-encode into a scratch buffer first so we can clamp to 255 bytes
+        // without truncating mid-codepoint awkwardness — buildVersion is short
+        // (assembly version / sha) so the alloc is negligible.
+        var encoded = Encoding.UTF8.GetBytes(buildVersion ?? string.Empty);
+        if (encoded.Length > 255)
+        {
+            // Defensive: drop trailing bytes; build strings should never exceed 255.
+            var trimmed = new byte[255];
+            Array.Copy(encoded, trimmed, 255);
+            encoded = trimmed;
+        }
+        ushort totalLen = (ushort)(FramingHeaderSize + 4 + 4 + 1 + encoded.Length);
+        WriteFramingHeader(dest, totalLen, MessageType.ServerHello);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[4..], protocolVersion);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[8..], (uint)capabilities);
+        dest[12] = (byte)encoded.Length;
+        encoded.CopyTo(dest[13..]);
+        return totalLen;
+    }
+
+    /// <summary>
+    /// Parse a <see cref="MessageType.ServerHello"/> payload (everything after the
+    /// 4-byte framing header). Returns the negotiated tuple. Used by the C# client
+    /// SDK and useful to round-trip in tests.
+    /// </summary>
+    public static (uint ProtocolVersion, ServerCapabilities Capabilities, string BuildVersion) ReadServerHello(
+        ReadOnlySpan<byte> payload)
+    {
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        var caps = (ServerCapabilities)BinaryPrimitives.ReadUInt32LittleEndian(payload[4..]);
+        byte buildLen = payload[8];
+        string build = Encoding.UTF8.GetString(payload.Slice(9, buildLen));
+        return (version, caps, build);
+    }
+
+    /// <summary>
+    /// Write a <see cref="MessageType.SymbolDelisted"/> frame: <c>[securityId u64]</c>.
+    /// Total: 12 bytes. Sent once per subscriber when a security is delisted.
+    /// </summary>
+    public static int WriteSymbolDelisted(Span<byte> dest, ulong securityId)
+    {
+        const ushort totalLen = FramingHeaderSize + 8; // 12
+        WriteFramingHeader(dest, totalLen, MessageType.SymbolDelisted);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
         return totalLen;
     }
 

@@ -145,8 +145,73 @@ public sealed class SubscriptionManager : IDisposable
             session.SetMarketDataManagers(managers);
         MetricsRegistry.WsConnectionsActive.Add(1);
 
+        // ServerHello MUST be the first server-initiated frame so clients can negotiate
+        // protocol version + capabilities before interpreting any other message.
+        SnapshotEmitter.SendServerHello(session);
+
         // Immediately tell the client whether the server is ready
         SnapshotEmitter.SendServerStatus(session, _ready);
+    }
+
+    /// <summary>
+    /// Terminal notification hook: deliver a <see cref="MessageType.SymbolDelisted"/>
+    /// frame to every current subscriber of <paramref name="securityId"/> and tear
+    /// down the per-symbol subscription map so the symbol stops fanning out.
+    /// <para>Today this hook has no built-in upstream trigger — integration with the
+    /// real SBE delisting code path (e.g. <c>SecurityStatus_3</c> in a terminal state)
+    /// is a follow-up. The hook is exercised by the unit test in
+    /// <c>SubscriptionManagerTests.NotifyDelisted_NotifiesOnlySubscribers</c>.</para>
+    /// <para>Thread-safety: the snapshot of subscriber ids is taken under
+    /// <c>_subLock</c>; per-subscriber <c>TryEnqueue</c> is multi-writer-safe.
+    /// Cleanup runs under the same lock to avoid racing a fresh subscribe.</para>
+    /// </summary>
+    public void NotifyDelisted(ulong securityId)
+    {
+        string[] clientIds;
+        lock (_subLock)
+        {
+            if (!_subscriptions.TryGetValue(securityId, out var subs) || subs.Count == 0)
+                return;
+            clientIds = new string[subs.Count];
+            int i = 0;
+            foreach (var k in subs.Keys) clientIds[i++] = k;
+        }
+
+        var buf = new byte[12];
+        int len = WireProtocol.WriteSymbolDelisted(buf, securityId);
+        var payload = new ReadOnlyMemory<byte>(buf, 0, len);
+
+        foreach (var clientId in clientIds)
+        {
+            if (_clients.TryGetValue(clientId, out var session))
+                session.TryEnqueue(payload);
+        }
+
+        // Tear down the per-symbol subscription map last so any concurrent
+        // broadcast that has already snapshotted the inner dict still gets
+        // through, but no future broadcast will find subscribers for it.
+        lock (_subLock)
+        {
+            foreach (var clientId in clientIds)
+                RemoveSubscriptionCore(clientId, securityId, enqueueAck: false, adjustMetric: true);
+        }
+    }
+
+    /// <summary>
+    /// Test-only seam: register a synthetic subscription without going through the
+    /// full snapshot/registry pipeline. Used by <c>SubscriptionManagerTests</c> to
+    /// exercise <see cref="NotifyDelisted"/> in isolation.
+    /// </summary>
+    internal void AddSubscriptionForTest(string clientId, ulong securityId, DataFlags flags)
+    {
+        lock (_subLock)
+        {
+            var newClients = _subscriptions.TryGetValue(securityId, out var existing)
+                ? new Dictionary<string, SubscriptionState>(existing)
+                : new Dictionary<string, SubscriptionState>();
+            newClients[clientId] = new SubscriptionState(flags, 0);
+            _subscriptions[securityId] = newClients;
+        }
     }
 
     /// <summary>Unregister a client and remove all its subscriptions.</summary>
