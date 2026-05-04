@@ -44,6 +44,7 @@ public sealed class MulticastPacketSource : IPacketSource
     private long _batchedDatagrams;
     private long _membershipJoins;
     private long _membershipLeaves;
+    private long _truncatedDatagramCount;
 
     /// <summary>Number of recvmmsg(2) calls that returned at least one datagram.</summary>
     public long BatchedSyscalls => Volatile.Read(ref _batchedSyscalls);
@@ -53,6 +54,13 @@ public sealed class MulticastPacketSource : IPacketSource
     public long MembershipJoins => Volatile.Read(ref _membershipJoins);
     /// <summary>Count of successful multicast membership leaves.</summary>
     public long MembershipLeaves => Volatile.Read(ref _membershipLeaves);
+    /// <summary>
+    /// Number of datagrams the kernel reported as truncated to the receive buffer
+    /// (MSG_TRUNC in the recvmmsg path). These are dropped — never delivered downstream —
+    /// so the count is the operator's only visibility into "datagram bigger than
+    /// <see cref="MaxDatagramSize"/>" events.
+    /// </summary>
+    public long TruncatedDatagramCount => Volatile.Read(ref _truncatedDatagramCount);
 
     public ChannelType ChannelType => _channelType;
     public int ChannelGroup => _channelGroup;
@@ -403,12 +411,26 @@ public sealed class MulticastPacketSource : IPacketSource
 
         long ticks = Environment.TickCount64;
         var iovecs = _batchIovecs!;
+        int delivered = 0;
         for (int i = 0; i < n; i++)
         {
             var buf = pending[i]!;
             int received = (int)mmsghdrs[i].msg_len;
+            int msgFlags = mmsghdrs[i].msg_hdr.msg_flags;
+
+            if (IsKernelTruncated(msgFlags, received, MaxDatagramSize))
+            {
+                // Datagram exceeded our receive buffer — kernel truncated it.
+                // Dropping is the only safe option: a partial UMDF SBE message would
+                // mis-parse downstream. Reuse the buffer in-place (no rent/return)
+                // since no lease is created and the iovec is still bound to it.
+                long tn = Interlocked.Increment(ref _truncatedDatagramCount);
+                LogTruncatedRateLimited(tn, received);
+                continue;
+            }
+
             var lease = new PinnedPoolPacketLease(buf, pool);
-            destination[i] = UmdfPacket.CreateOwned(
+            destination[delivered++] = UmdfPacket.CreateOwned(
                 new ReadOnlyMemory<byte>(buf, 0, received),
                 _channelType,
                 _channelGroup,
@@ -432,7 +454,32 @@ public sealed class MulticastPacketSource : IPacketSource
             Interlocked.Increment(ref _batchedSyscalls);
             Interlocked.Add(ref _batchedDatagrams, n);
         }
-        return n;
+        return delivered;
+    }
+
+    /// <summary>
+    /// True if the kernel signalled that the datagram was truncated to the receive buffer.
+    /// Prefers the direct MSG_TRUNC flag (<see cref="LinuxNative.MSG_TRUNC"/>) when set in
+    /// <paramref name="msgFlags"/>; otherwise falls back to a heuristic on older kernels /
+    /// libc combinations that don't propagate per-message flags through recvmmsg: the
+    /// returned length being exactly the buffer cap is suspect for the UMDF workload
+    /// (genuine UMDF datagrams are bounded by Ethernet MTU well below 9 KiB).
+    /// Exposed as internal so the truncation policy can be unit-tested with synthetic flags.
+    /// </summary>
+    internal static bool IsKernelTruncated(int msgFlags, int receivedLen, int bufferCap)
+    {
+        if ((msgFlags & LinuxNative.MSG_TRUNC) != 0) return true;
+        // Heuristic fallback: a datagram exactly filling the cap is treated as suspect.
+        // For UMDF (max payload << 9 KiB) this never triggers in steady state.
+        return receivedLen >= bufferCap;
+    }
+
+    private void LogTruncatedRateLimited(long counter, int receivedLen)
+    {
+        if (counter == 1 || (counter & 63) == 0)
+            _logger.LogWarning(
+                "Dropped truncated UDP datagram on {ChannelType} (group {ChannelGroup}): kernel truncated to {ReceivedLen} bytes (cap {Cap}); upstream sender exceeds the receive buffer (TruncatedDatagramCount={Count}).",
+                _channelType, _channelGroup, receivedLen, MaxDatagramSize, counter);
     }
 
     private void EnsureBatchStateInitialized()

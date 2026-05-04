@@ -9,6 +9,7 @@ namespace B3.Umdf.Transport;
 internal static class LinuxNative
 {
     public const int MSG_WAITFORONE = 0x10000;
+    public const int MSG_TRUNC = 0x20;
     public const int EINTR = 4;
     public const int EAGAIN = 11;
 
