@@ -312,7 +312,12 @@ else if (multicastConfig is not null)
         int g = feedConfig.ChannelGroups.IndexOf(group);
         Console.WriteLine($"  Channel group {g}: {group.Name}");
         foreach (var ch in group.Channels)
-            Console.WriteLine($"    {ch.Type,-25} <- {ch.MulticastGroup}:{ch.Port}");
+        {
+            var transport = MulticastFeedConfig.ParseTransport(ch.Transport);
+            Console.WriteLine(transport == TransportKind.Unicast
+                ? $"    {ch.Type,-25} <- unicast {ch.MulticastGroup}:{ch.Port}"
+                : $"    {ch.Type,-25} <- {ch.MulticastGroup}:{ch.Port}");
+        }
     }
 
     var multicastSources = new List<MulticastPacketSource>();

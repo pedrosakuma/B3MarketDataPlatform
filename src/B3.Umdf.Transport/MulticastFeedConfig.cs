@@ -43,10 +43,27 @@ public sealed class MulticastFeedConfig
                     LocalAddress: ch.LocalAddress is not null ? IPAddress.Parse(ch.LocalAddress) : null,
                     ReceiveBufferBytes: ch.ReceiveBufferBytes ?? DefaultReceiveBufferBytesFor(ch.Type),
                     ChannelGroup: g,
-                    ReceiveSocketCount: Math.Max(1, ch.ReceiveSocketCount ?? 1)));
+                    ReceiveSocketCount: Math.Max(1, ch.ReceiveSocketCount ?? 1),
+                    Transport: ParseTransport(ch.Transport)));
             }
         }
         return configs;
+    }
+
+    /// <summary>
+    /// Parses the optional <c>transport</c> field. Accepts "multicast" and "unicast"
+    /// (case-insensitive). Null/empty → <see cref="TransportKind.Multicast"/> (back-compat).
+    /// </summary>
+    public static TransportKind ParseTransport(string? transport)
+    {
+        if (string.IsNullOrWhiteSpace(transport))
+            return TransportKind.Multicast;
+        if (transport.Equals("multicast", StringComparison.OrdinalIgnoreCase))
+            return TransportKind.Multicast;
+        if (transport.Equals("unicast", StringComparison.OrdinalIgnoreCase))
+            return TransportKind.Unicast;
+        throw new InvalidOperationException(
+            $"Invalid transport '{transport}'. Expected 'multicast' or 'unicast'.");
     }
 
     /// <summary>
@@ -137,6 +154,18 @@ public sealed class ChannelEntryConfig
     /// </summary>
     [JsonPropertyName("receiveSocketCount")]
     public int? ReceiveSocketCount { get; set; }
+
+    /// <summary>
+    /// Wire transport for ingest. Optional; defaults to <c>multicast</c> for
+    /// back-compat. Set to <c>unicast</c> to bind to <see cref="MulticastGroup"/>:<see cref="Port"/>
+    /// without issuing an IGMP join. Required for Docker Compose bridge networks where
+    /// the publisher (e.g. B3MatchingPlatform's exchange-simulator) emits unicast UDP.
+    /// In <c>unicast</c> mode <see cref="MulticastGroup"/> is the bind address (typically
+    /// <c>0.0.0.0</c>) and <see cref="SourceAddress"/>/<see cref="LocalAddress"/> are
+    /// rejected because they are IGMP/SSM-only.
+    /// </summary>
+    [JsonPropertyName("transport")]
+    public string? Transport { get; set; }
 }
 
 [JsonSerializable(typeof(MulticastFeedConfig))]

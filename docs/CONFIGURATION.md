@@ -112,15 +112,35 @@ publisher (`--replay-to-multicast --multicast-config`).
 
 Optional channel fields:
 
+- `transport` — `multicast` (default) or `unicast`. Set to `unicast` for Docker Compose bridge networks where the publisher (e.g. `B3MatchingPlatform`'s `exchange-simulator` in bridge mode) emits UMDF as plain UDP and IPv4 multicast is not forwarded between sibling containers. In `unicast` mode the consumer binds to `multicastGroup`:`port` (treat `multicastGroup` as the bind address; typically `0.0.0.0`, or a specific NIC IP) and skips the IGMP join entirely. `sourceAddress` and `localAddress` are rejected in `unicast` mode because they are IGMP/SSM-only. See [issue #10](https://github.com/pedrosakuma/B3MarketDataPlatform/issues/10).
 - `sourceAddress` — enables source-specific multicast (SSM), receiving only from the given sender IP.
 - `localAddress` — selects the local NIC/IP used for the multicast membership join (ASM or SSM).
 - `receiveBufferBytes` — per-socket UDP receive buffer size. When omitted, the consumer picks per-channel-type defaults: **16 MiB** for `IncrementalA`/`IncrementalB`, **8 MiB** for `SnapshotRecovery`, **2 MiB** for `InstrumentDefinition`. All values are still capped by `net.core.rmem_max`.
+
+Example — unicast (Docker Compose bridge):
+
+```json
+{
+  "channelGroups": [
+    {
+      "name": "EQT",
+      "channels": [
+        { "channelId": 84, "type": "IncrementalA",        "transport": "unicast", "multicastGroup": "0.0.0.0", "port": 30084 },
+        { "channelId": 84, "type": "IncrementalB",        "transport": "unicast", "multicastGroup": "0.0.0.0", "port": 30085 },
+        { "channelId": 84, "type": "InstrumentDefinition","transport": "unicast", "multicastGroup": "0.0.0.0", "port": 31084 },
+        { "channelId": 84, "type": "SnapshotRecovery",    "transport": "unicast", "multicastGroup": "0.0.0.0", "port": 30184 }
+      ]
+    }
+  ]
+}
+```
 
 When `--replay-to-multicast` is enabled, the same JSON is reused as the publish map:
 
 - `multicastGroup` + `port` become the destination endpoint.
 - `localAddress` becomes the optional local bind/interface for outgoing multicast.
 - `sourceAddress` is ignored in publisher mode.
+- `transport` is ignored in publisher mode (replay-to-multicast only emits multicast; for unicast publishing use `B3MatchingPlatform`'s exchange-simulator).
 - `channelGroups` count/order must match the replay input order so `groupId → multicast route` stays deterministic.
 
 > **Note on `receiveSocketCount`** — exists in `ChannelEntryConfig` to bind multiple sockets per channel via `SO_REUSEPORT`. On **Linux multicast** every bound socket receives a *copy* of each datagram (REUSEPORT only load-balances unicast). Replicating sockets multiplies CPU cost without enlarging the effective kernel buffer. Leave at `1` for multicast and rely on `rmem_max` instead.
