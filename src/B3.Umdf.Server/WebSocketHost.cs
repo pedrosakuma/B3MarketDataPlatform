@@ -444,6 +444,36 @@ public sealed class WebSocketHost : IAsyncDisposable
                 {
                     switch (type)
                     {
+                        case MessageType.ClientHello:
+                        {
+                            // Optional negotiation: clients that never send ClientHello are
+                            // assumed to speak the current ProtocolVersion. If sent and
+                            // incompatible, close with WS 1003 (unsupported data).
+                            if (payload.Length < 4) break;
+                            uint clientVer = WireProtocol.ReadClientHello(payload.Span);
+                            if (clientVer < WireProtocol.SupportedProtocolVersionMin ||
+                                clientVer > WireProtocol.SupportedProtocolVersionMax)
+                            {
+                                var reason =
+                                    $"protocol_version_unsupported: client {clientVer}, " +
+                                    $"server min {WireProtocol.SupportedProtocolVersionMin} " +
+                                    $"max {WireProtocol.SupportedProtocolVersionMax}";
+                                _logger.LogWarning(
+                                    "Client {ClientId} sent unsupported ClientHello version {Version}; closing",
+                                    session.Id, clientVer);
+                                try
+                                {
+                                    await ws.CloseAsync(
+                                        System.Net.WebSockets.WebSocketCloseStatus.InvalidMessageType,
+                                        reason,
+                                        CancellationToken.None).ConfigureAwait(false);
+                                }
+                                catch { /* best effort */ }
+                                return;
+                            }
+                            break;
+                        }
+
                         case MessageType.Subscribe:
                         {
                             var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);

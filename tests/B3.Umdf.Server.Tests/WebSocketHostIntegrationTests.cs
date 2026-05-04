@@ -277,6 +277,94 @@ public class WebSocketHostIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task WebSocket_ClientHello_AcceptedForCurrentProtocolVersion()
+    {
+        var (host, sm, port, cts) = await StartHostAsync();
+        using var ws = new ClientWebSocket();
+        try
+        {
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
+
+            // Send ClientHello at v=ProtocolVersion. Server must NOT close.
+            var helloBuf = new byte[WireProtocol.ClientHelloSize];
+            int helloLen = WireProtocol.WriteClientHello(helloBuf, WireProtocol.ProtocolVersion);
+            await ws.SendAsync(new ArraySegment<byte>(helloBuf, 0, helloLen),
+                WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
+
+            // Drain server frames briefly. We don't expect a Close frame.
+            var buf = new byte[1024];
+            using var rcvCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            bool sawClose = false;
+            try
+            {
+                while (!rcvCts.IsCancellationRequested)
+                {
+                    var r = await ws.ReceiveAsync(buf, rcvCts.Token);
+                    if (r.MessageType == WebSocketMessageType.Close)
+                    {
+                        sawClose = true;
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* expected: server kept the socket open */ }
+
+            Assert.False(sawClose,
+                $"Server unexpectedly closed: {ws.CloseStatus} {ws.CloseStatusDescription}");
+        }
+        finally
+        {
+            cts.Cancel();
+            await host.StopAsync();
+            await host.DisposeAsync();
+            sm.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task WebSocket_ClientHello_RejectsUnsupportedVersion_With1003()
+    {
+        var (host, sm, port, cts) = await StartHostAsync();
+        using var ws = new ClientWebSocket();
+        try
+        {
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
+
+            // ClientHello with a version far above SupportedProtocolVersionMax.
+            uint badVersion = WireProtocol.SupportedProtocolVersionMax + 999u;
+            var helloBuf = new byte[WireProtocol.ClientHelloSize];
+            int helloLen = WireProtocol.WriteClientHello(helloBuf, badVersion);
+            await ws.SendAsync(new ArraySegment<byte>(helloBuf, 0, helloLen),
+                WebSocketMessageType.Binary, endOfMessage: true, CancellationToken.None);
+
+            // Drain frames until we observe Close. ServerHello/ServerStatus may arrive first.
+            var buf = new byte[1024];
+            using var rcvCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            WebSocketReceiveResult? r = null;
+            while (!rcvCts.IsCancellationRequested)
+            {
+                r = await ws.ReceiveAsync(buf, rcvCts.Token);
+                if (r.MessageType == WebSocketMessageType.Close) break;
+            }
+
+            Assert.NotNull(r);
+            Assert.Equal(WebSocketMessageType.Close, r!.MessageType);
+            // WS code 1003 => InvalidMessageType in System.Net.WebSockets.
+            Assert.Equal(WebSocketCloseStatus.InvalidMessageType, ws.CloseStatus);
+            Assert.NotNull(ws.CloseStatusDescription);
+            Assert.Contains("protocol_version_unsupported", ws.CloseStatusDescription!);
+            Assert.Contains($"client {badVersion}", ws.CloseStatusDescription!);
+        }
+        finally
+        {
+            cts.Cancel();
+            await host.StopAsync();
+            await host.DisposeAsync();
+            sm.Dispose();
+        }
+    }
+
     private static async Task WaitUntil(Func<bool> predicate, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

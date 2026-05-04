@@ -176,6 +176,54 @@ public class MarketDataClientIntegrationTests
         Assert.NotNull(snap);
         Assert.Equal(1U, snap!.Value.ProtocolVersion);
         Assert.Equal("1.2.3-test", snap.Value.BuildVersion);
+
+        // NegotiatedProtocolVersion convenience accessor mirrors LastServerHello.
+        Assert.Equal(1U, client.NegotiatedProtocolVersion);
+    }
+
+    [Fact]
+    public async Task UnknownMessageType_IsCounted_AndRaisesEvent_AndSubsequentFramesStillDecode()
+    {
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            // First read+discard the SDK's ClientHello so the in-process server doesn't
+            // confuse it with anything else.
+            var buf = new byte[1024];
+            try { _ = await ws.ReceiveAsync(buf, ct); } catch { }
+
+            // Send an unknown opcode (0xFFFE) — payload is 4 trailing bytes — then a
+            // valid Trade frame to assert the decoder kept going.
+            const ushort unknownTotal = 4 + 4;
+            var unknown = new byte[unknownTotal];
+            BinaryPrimitives.WriteUInt16LittleEndian(unknown, unknownTotal);
+            BinaryPrimitives.WriteUInt16LittleEndian(unknown.AsSpan(2), 0xFFFE);
+            BinaryPrimitives.WriteUInt32LittleEndian(unknown.AsSpan(4), 0xDEADBEEF);
+            await ws.SendAsync(unknown, WebSocketMessageType.Binary, true, ct);
+
+            await TestWsServer.SendTradeAsync(ws, securityId: 42, price: 12345, qty: 100, tradeId: 1, ct);
+
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var unknownTcs = new TaskCompletionSource<ushort>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tradeTcs = new TaskCompletionSource<TradeEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.UnknownMessageReceived += op => unknownTcs.TrySetResult(op);
+        client.Trade += t => tradeTcs.TrySetResult(t);
+
+        await client.ConnectAsync();
+
+        var op = await unknownTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal((ushort)0xFFFE, op);
+
+        var trade = await tradeTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(42UL, trade.SecurityId);
+
+        Assert.True(client.UnknownMessageCount >= 1);
     }
 
     private static async Task WaitUntil(Func<bool> pred, TimeSpan timeout)
@@ -234,21 +282,27 @@ internal sealed class TestWsServer : IAsyncDisposable
 
     public static async Task<string> ReadSubscribeAsync(WebSocket ws, CancellationToken ct)
     {
-        var buffer = new byte[1024];
-        int filled = 0;
-        WebSocketReceiveResult result;
-        do
+        // The SDK sends a ClientHello (0x00A1) as its first frame. Skip any
+        // non-Subscribe frames so existing tests need no changes.
+        while (true)
         {
-            result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer, filled, buffer.Length - filled), ct);
-            filled += result.Count;
-        } while (!result.EndOfMessage);
+            var buffer = new byte[1024];
+            int filled = 0;
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer, filled, buffer.Length - filled), ct);
+                filled += result.Count;
+            } while (!result.EndOfMessage);
 
-        // [len u16][type u16=0x0001][flags u8][symLen u8][symbol]
-        ushort len = BinaryPrimitives.ReadUInt16LittleEndian(buffer);
-        ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
-        if (type != 0x0001) throw new InvalidOperationException($"expected Subscribe, got 0x{type:X4}");
-        byte symLen = buffer[5];
-        return Encoding.UTF8.GetString(buffer, 6, symLen);
+            // [len u16][type u16=0x0001][flags u8][symLen u8][symbol]
+            ushort len = BinaryPrimitives.ReadUInt16LittleEndian(buffer);
+            ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
+            if (type == 0x00A1) continue; // ClientHello — ignore
+            if (type != 0x0001) throw new InvalidOperationException($"expected Subscribe, got 0x{type:X4}");
+            byte symLen = buffer[5];
+            return Encoding.UTF8.GetString(buffer, 6, symLen);
+        }
     }
 
     public static Task SendSubscribeOkAsync(WebSocket ws, ulong securityId, string symbol, CancellationToken ct)
