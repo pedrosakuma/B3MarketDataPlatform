@@ -61,6 +61,16 @@ public sealed class FeedHandler : IDisposable
     public long InstrDefMismatchedTotalCount => Volatile.Read(ref _instrDefMismatchedTotalCount);
     public ChannelHandler IncrementalHandler => _incrementalHandler;
 
+    private long _handlerExceptionCount;
+    private long _lastLoggedHandlerExceptionMilestone;
+    /// <summary>
+    /// Number of exceptions thrown by the downstream <see cref="IFeedEventHandler"/>
+    /// while processing a packet inside <see cref="ProcessOwnedPacket"/>. The
+    /// owned-source consumer loop swallows the exception and continues so a
+    /// misbehaving handler cannot kill the feed thread.
+    /// </summary>
+    public long HandlerExceptionCount => Volatile.Read(ref _handlerExceptionCount);
+
     /// <summary>Fires after the state machine transitions. Args are (oldState, newState). Invoked synchronously on the worker thread.</summary>
     public event Action<FeedState, FeedState>? StateChanged;
 
@@ -197,12 +207,50 @@ public sealed class FeedHandler : IDisposable
     {
         try
         {
-            HandlePacket(in packet);
+            try
+            {
+                HandlePacket(in packet);
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation must propagate so the owned-source loop exits cleanly.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Per-packet exception isolation: a downstream IFeedEventHandler
+                // throwing must NOT kill the consumer loop. Increment the counter
+                // first so even logging failures don't mask the metric, then log
+                // rate-limited so a sustained pathology doesn't flood the sink.
+                Interlocked.Increment(ref _handlerExceptionCount);
+                LogHandlerExceptionRateLimited(ex);
+            }
         }
         finally
         {
             packet.Release();
         }
+    }
+
+    private void LogHandlerExceptionRateLimited(Exception ex)
+    {
+        // Power-of-two milestone cadence (1, 2, 4, 8, 16, ...) to mirror
+        // MultiFeedManager.LogDropRateLimited. Single-threaded read/write is
+        // safe here because ProcessOwnedPacket runs on the owned consumer
+        // thread or under a single-producer FeedPacket caller; worst case is
+        // a duplicated log line, never a missed escalation.
+        long current = Volatile.Read(ref _handlerExceptionCount);
+        long last = Volatile.Read(ref _lastLoggedHandlerExceptionMilestone);
+        if (current <= last)
+            return;
+        long milestone = 1L << (63 - System.Numerics.BitOperations.LeadingZeroCount((ulong)current));
+        if (milestone <= last)
+            return;
+        Volatile.Write(ref _lastLoggedHandlerExceptionMilestone, milestone);
+        _logger.LogWarning(
+            ex,
+            "FeedHandler downstream handler threw {Count} exception(s); packet skipped, consumer loop continuing",
+            current);
     }
 
     private void HandlePacket(in UmdfPacket packet)
@@ -248,7 +296,7 @@ public sealed class FeedHandler : IDisposable
                 packet.ReceivedTimestampTicks - _instrDefFirstSeenTicks,
                 _instrDefReceived,
                 _instrDefTotalExpected);
-            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefReceived);
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefReceived, wasAborted: true);
             TransitionTo(FeedState.Streaming);
         }
     }
@@ -363,7 +411,7 @@ public sealed class FeedHandler : IDisposable
             // FreezeData (universe metadata is now stable). After this transition
             // the feed is fully Streaming; per-symbol heal drives all bootstrap
             // and gap-recovery work.
-            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected);
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected, wasAborted: false);
             TransitionTo(FeedState.Streaming);
         }
     }
@@ -373,6 +421,13 @@ public sealed class FeedHandler : IDisposable
     /// handler. Per-symbol heal does not depend on cycle boundaries — each
     /// (Header_30, Orders_71) pair is self-contained and applies independently
     /// to one instrument at a time.
+    ///
+    /// Fires <see cref="IFeedEventHandler.OnSnapshotStart"/> on every
+    /// <c>Header_30</c> observed and <see cref="IFeedEventHandler.OnSnapshotComplete"/>
+    /// after the packet's last message has been dispatched, with the most
+    /// recently observed SecurityID. This gives downstream consumers a per-
+    /// security snapshot lifecycle hook for packets that carry a single
+    /// snapshot (the common B3 case).
     /// </summary>
     private void DispatchSnapshotMessages(in UmdfPacket packet)
     {
@@ -381,8 +436,33 @@ public sealed class FeedHandler : IDisposable
             return;
 
         int offset = PacketHeader.MESSAGE_SIZE;
+        bool snapshotStarted = false;
+        ulong lastSecurityId = 0;
+        int channelGroupId = packet.ChannelGroup;
         while (TryReadNextSbe(span, ref offset, out var sbeSlice, out var templateId))
+        {
+            if (templateId == SnapshotFullRefresh_Header_30Data.MESSAGE_ID
+                && TryReadSnapshotHeaderSecurityId(sbeSlice[MessageDispatcher.SbeHeaderSize..], out var securityId))
+            {
+                if (snapshotStarted)
+                    _eventHandler.OnSnapshotComplete(channelGroupId, lastSecurityId);
+                lastSecurityId = securityId;
+                snapshotStarted = true;
+                _eventHandler.OnSnapshotStart(channelGroupId, securityId);
+            }
             _eventHandler.OnPacket(in packet, sbeSlice, templateId);
+        }
+        if (snapshotStarted)
+            _eventHandler.OnSnapshotComplete(channelGroupId, lastSecurityId);
+    }
+
+    private static bool TryReadSnapshotHeaderSecurityId(ReadOnlySpan<byte> body, out ulong securityId)
+    {
+        securityId = 0;
+        if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader))
+            return false;
+        securityId = reader.Data.SecurityID.Value;
+        return true;
     }
 
     /// <summary>
@@ -429,6 +509,17 @@ public sealed class FeedHandler : IDisposable
 
     /// <summary>For testing: invoke the real state transition (with all side effects).</summary>
     internal void TransitionToForTesting(FeedState state) => TransitionTo(state);
+
+    /// <summary>
+    /// Test/operator hook: synthetically forward a SequenceReset to the wired
+    /// event handler with the supplied reason. Production wiring is in
+    /// <see cref="MessageDispatcher"/> on decode of <c>SequenceReset_1</c> /
+    /// <c>ChannelReset_11</c>; this entry point exists for unit tests and for
+    /// future callers (e.g. an out-of-band failover signal) that need to drive
+    /// the same fan-out without a wire packet.
+    /// </summary>
+    public void RaiseSequenceReset(SequenceResetReason reason, int channelGroupId = 0)
+        => _eventHandler.OnSequenceReset(channelGroupId, reason);
 
     public void Dispose()
     {

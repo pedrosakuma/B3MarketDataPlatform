@@ -1,5 +1,7 @@
 using B3.Umdf.Mbo.Sbe.V16;
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Feed;
 
@@ -38,6 +40,7 @@ public sealed class ChannelHandler : IDisposable
     private readonly IFeedEventHandler _eventHandler;
     private readonly int _maxReorderDistance;
     private readonly Dictionary<uint, UmdfPacket> _reorderBuffer;
+    private readonly ILogger _logger;
 
     private uint _expectedSeqNum = 1;
 
@@ -54,6 +57,7 @@ public sealed class ChannelHandler : IDisposable
     private long _gapsDetected;
     private long _reorderHits;
     private long _sequenceVersionResets;
+    private long _sequenceResetHandlerExceptionCount;
     private int _maxObservedReorderDepth;
     private volatile uint _lastGapExpected;
     private volatile uint _lastGapReceived;
@@ -69,6 +73,13 @@ public sealed class ChannelHandler : IDisposable
     /// in the PacketHeader (B3 spec §6.5.5.1).
     /// </summary>
     public long SequenceVersionResets => Volatile.Read(ref _sequenceVersionResets);
+    /// <summary>
+    /// Number of exceptions thrown by the downstream <see cref="IFeedEventHandler.OnSequenceVersionChanged"/>
+    /// callback during a SequenceVersion change. Previously these were silently
+    /// swallowed; now we surface a counter and log so a misbehaving handler can
+    /// be diagnosed without destabilising the channel.
+    /// </summary>
+    public long SequenceResetHandlerExceptionCount => Volatile.Read(ref _sequenceResetHandlerExceptionCount);
     /// <summary>
     /// Count of packets that arrived out-of-order and were later drained from the
     /// reorder buffer (i.e. saved a recovery cycle thanks to A/B arbitration).
@@ -89,15 +100,19 @@ public sealed class ChannelHandler : IDisposable
     public uint LastGapReceived => _lastGapReceived;
 
     public ChannelHandler(IFeedEventHandler eventHandler)
-        : this(eventHandler, MaxReorderDistance) { }
+        : this(eventHandler, MaxReorderDistance, NullLogger.Instance) { }
 
     public ChannelHandler(IFeedEventHandler eventHandler, int maxReorderDistance)
+        : this(eventHandler, maxReorderDistance, NullLogger.Instance) { }
+
+    public ChannelHandler(IFeedEventHandler eventHandler, int maxReorderDistance, ILogger logger)
     {
         if (maxReorderDistance < 1)
             throw new ArgumentOutOfRangeException(nameof(maxReorderDistance), "Must be ≥ 1.");
         _eventHandler = eventHandler;
         _maxReorderDistance = maxReorderDistance;
         _reorderBuffer = new Dictionary<uint, UmdfPacket>(maxReorderDistance);
+        _logger = logger ?? NullLogger.Instance;
     }
 
     public GapResult HandlePacket(in UmdfPacket packet)
@@ -267,7 +282,16 @@ public sealed class ChannelHandler : IDisposable
         _expectedSeqNum = firstSeqOfNewVersion;
         Interlocked.Increment(ref _sequenceVersionResets);
         try { _eventHandler.OnSequenceVersionChanged(newVersion); }
-        catch { /* event handler exceptions must not destabilize the channel; counters still reflect the reset */ }
+        catch (Exception ex)
+        {
+            // Event handler exceptions must not destabilize the channel; counters
+            // still reflect the reset. Track the failure so a misbehaving handler
+            // is observable instead of silently masked.
+            Interlocked.Increment(ref _sequenceResetHandlerExceptionCount);
+            _logger.LogWarning(ex,
+                "Downstream handler threw in OnSequenceVersionChanged(newVersion={NewVersion}); channel state advanced normally",
+                newVersion);
+        }
     }
 
     private void ProcessAndAdvance(in UmdfPacket packet, ReadOnlySpan<byte> span)

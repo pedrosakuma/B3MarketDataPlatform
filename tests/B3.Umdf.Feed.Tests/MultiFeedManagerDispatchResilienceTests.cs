@@ -44,7 +44,13 @@ public class MultiFeedManagerDispatchResilienceTests
         }
 
         Assert.Equal(3, handler.AttemptedPackets);
-        Assert.Equal(3, manager.DispatchHandlerExceptionCount(0));
+        // FeedHandler.ProcessOwnedPacket now isolates handler exceptions before
+        // they bubble to the MultiFeedManager dispatch loop, so the exception is
+        // counted on the per-FeedHandler counter instead of the per-group MFM
+        // counter. The contract under test — handler throws don't kill the
+        // dispatch thread and every failure is observable — is still pinned.
+        Assert.Equal(3, manager.Handlers[0].HandlerExceptionCount);
+        Assert.Equal(0, manager.DispatchHandlerExceptionCount(0));
     }
 
     [Fact]
