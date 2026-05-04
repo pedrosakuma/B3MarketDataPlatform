@@ -66,7 +66,7 @@ public enum LiveResyncPolicy : byte
 /// <see cref="LiveResyncPolicy.SnapshotOnly"/> because the book is stateful.
 /// Stats use <see cref="BootstrapPolicy.AcceptFirst"/> +
 /// <see cref="LiveResyncPolicy.NextMessage"/> because each message fully
-/// replaces the field. Defaults are encoded in <see cref="DefaultPolicies"/>.</para>
+/// replaces the field. Defaults are encoded in <see cref="SymbolStatePolicy.Default"/>.</para>
 ///
 /// <para><b>Concurrency.</b> One <see cref="SymbolEntry"/> per security; the
 /// outer <see cref="ConcurrentDictionary{TKey,TValue}"/> handles concurrent
@@ -83,22 +83,10 @@ public sealed class SymbolStateRegistry
 {
     private const int KindCount = (int)SymbolGapKind.SecurityStatus + 1;
 
-    private static readonly (BootstrapPolicy Boot, LiveResyncPolicy Live)[] DefaultPolicies = BuildDefaultPolicies();
-
-    private static (BootstrapPolicy, LiveResyncPolicy)[] BuildDefaultPolicies()
-    {
-        var p = new (BootstrapPolicy, LiveResyncPolicy)[KindCount];
-        // Default for stats: self-contained, accept first, resync on next message.
-        for (int i = 0; i < KindCount; i++)
-            p[i] = (BootstrapPolicy.AcceptFirst, LiveResyncPolicy.NextMessage);
-        // MBO is the one stateful kind that requires snapshot for both bootstrap and recovery.
-        p[(int)SymbolGapKind.Mbo] = (BootstrapPolicy.RequireSnapshot, LiveResyncPolicy.SnapshotOnly);
-        return p;
-    }
-
     private readonly ConcurrentDictionary<ulong, SymbolEntry> _entries = new();
     private readonly ILogger _logger;
     private readonly IClock _clock;
+    private readonly SymbolStatePolicy _policy;
     private Action<ulong, bool>? _onMboStaleStatusChanged;
 
     /// <summary>
@@ -136,12 +124,24 @@ public sealed class SymbolStateRegistry
     private int _staleSymbolCount;
 
     public SymbolStateRegistry(ILogger logger)
-        : this(logger, SystemClock.Instance) { }
+        : this(logger, SystemClock.Instance, SymbolStatePolicy.Default) { }
 
     public SymbolStateRegistry(ILogger logger, IClock clock)
+        : this(logger, clock, SymbolStatePolicy.Default) { }
+
+    /// <summary>
+    /// Primary constructor. The <paramref name="policy"/> bundles every tunable
+    /// knob (per-kind bootstrap/live-resync, <see cref="SymbolStatePolicy.StaleEscapeTimeoutMs"/>)
+    /// so the registry's state-machine core only reads configuration. The
+    /// <see cref="StaleEscapeTimeoutMs"/> property is initialized from the policy
+    /// but remains settable for tests / hot-reconfig paths.
+    /// </summary>
+    public SymbolStateRegistry(ILogger logger, IClock clock, SymbolStatePolicy policy)
     {
         _logger = logger;
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        _policy = policy ?? throw new ArgumentNullException(nameof(policy));
+        StaleEscapeTimeoutMs = policy.StaleEscapeTimeoutMs;
     }
 
     /// <summary>
@@ -247,7 +247,7 @@ public sealed class SymbolStateRegistry
 
         var entry = GetOrAddEntry(securityId);
         int idx = (int)kind;
-        var (bootPolicy, _) = DefaultPolicies[idx];
+        var bootPolicy = _policy.GetBootstrap(kind);
 
         ObserveResult result;
         bool fireMboStaleCallback;
