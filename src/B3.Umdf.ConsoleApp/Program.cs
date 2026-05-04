@@ -472,8 +472,13 @@ FeedHandler? singleFeed = null;
 
 var feedLogger = loggerFactory.CreateLogger<FeedHandler>();
 
-if (groupIds.Count > 1)
+if (groupIds.Count > 1 || packetSource is null)
 {
+    // Live push-mode (multicast/unicast, packetSource == null): receive threads call
+    // PushPacket/PushPacketBatch directly — works for any group count, including 1
+    // (e.g. matching-platform's single-EQT bridge deployment, see issue #13).
+    // Source-driven mode (packetSource != null) keeps the multi-group MultiFeedManager
+    // it always used.
     multiFeed = packetSource is null
         ? new MultiFeedManager(
             groupFeedHandlers,
@@ -496,8 +501,8 @@ if (groupIds.Count > 1)
 }
 else
 {
-    if (packetSource is null)
-        throw new InvalidOperationException("Single-group live multicast mode is not supported; use multiple groups.");
+    // Source-driven single-group: replay path. FeedHandler avoids the per-group
+    // dispatcher overhead since there's exactly one source feeding one group.
     singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]]);
 }
 
