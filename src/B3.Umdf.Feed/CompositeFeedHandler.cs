@@ -61,6 +61,16 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
         }
     }
 
+    public void OnSequenceReset(int channelGroupId, SequenceResetReason reason)
+    {
+        bool reported = false;
+        foreach (var handler in _handlers)
+        {
+            try { handler.OnSequenceReset(channelGroupId, reason); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnSequenceReset), ref reported); }
+        }
+    }
+
     public void OnInstrumentDefinitionsComplete(int instrumentCount)
     {
         bool reported = false;

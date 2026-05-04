@@ -14,6 +14,19 @@ public interface IFeedEventHandler
     void OnSequenceReset();
 
     /// <summary>
+    /// Variant of <see cref="OnSequenceReset()"/> that surfaces the originating
+    /// <paramref name="channelGroupId"/> and <paramref name="reason"/> so
+    /// downstream consumers can tag metrics / dashboards by reset source. The
+    /// default implementation forwards to the legacy zero-arg overload to keep
+    /// existing implementers source-compatible. Wired by
+    /// <see cref="MessageDispatcher"/> when an SBE template id matching one of
+    /// the UMDF reset templates (SequenceReset_1, ChannelReset_11) is decoded
+    /// on any channel.
+    /// </summary>
+    void OnSequenceReset(int channelGroupId, SequenceResetReason reason)
+        => OnSequenceReset();
+
+    /// <summary>
     /// Fired once when all instrument definitions have been received and the
     /// channel transitions to Streaming. Used by managers to freeze metadata
     /// dictionaries (FreezeBooks / FreezeData).

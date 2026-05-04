@@ -510,6 +510,17 @@ public sealed class FeedHandler : IDisposable
     /// <summary>For testing: invoke the real state transition (with all side effects).</summary>
     internal void TransitionToForTesting(FeedState state) => TransitionTo(state);
 
+    /// <summary>
+    /// Test/operator hook: synthetically forward a SequenceReset to the wired
+    /// event handler with the supplied reason. Production wiring is in
+    /// <see cref="MessageDispatcher"/> on decode of <c>SequenceReset_1</c> /
+    /// <c>ChannelReset_11</c>; this entry point exists for unit tests and for
+    /// future callers (e.g. an out-of-band failover signal) that need to drive
+    /// the same fan-out without a wire packet.
+    /// </summary>
+    public void RaiseSequenceReset(SequenceResetReason reason, int channelGroupId = 0)
+        => _eventHandler.OnSequenceReset(channelGroupId, reason);
+
     public void Dispose()
     {
         _incrementalHandler.Dispose();

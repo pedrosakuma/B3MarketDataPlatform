@@ -14,6 +14,10 @@ public static class MessageDispatcher
 
     /// <summary>
     /// Dispatches SBE messages from a pre-computed span, avoiding redundant .Data.Span calls.
+    /// Additionally fires <see cref="IFeedEventHandler.OnSequenceReset(int, SequenceResetReason)"/>
+    /// when the decoded template is one of the UMDF reset templates
+    /// (<c>SequenceReset_1</c>, <c>ChannelReset_11</c>) so downstream consumers
+    /// can react to mid-session resets without re-decoding the SBE body.
     /// </summary>
     public static void Dispatch(in UmdfPacket packet, ReadOnlySpan<byte> span, IFeedEventHandler handler)
     {
@@ -40,6 +44,16 @@ public static class MessageDispatcher
                 break;
 
             handler.OnPacket(in packet, sbeSlice, templateId);
+
+            // SequenceReset fan-out: SBE template ids 1 and 11 are mid-session
+            // reset signals on the B3 UMDF wire. Surface them via the typed
+            // OnSequenceReset overload so downstream policy (epoch resets,
+            // pending-snapshot drops, dashboards) can run without the consumer
+            // having to re-decode SBE bodies.
+            if (templateId == SequenceReset_1Data.MESSAGE_ID)
+                handler.OnSequenceReset(packet.ChannelGroup, SequenceResetReason.SequenceReset);
+            else if (templateId == ChannelReset_11Data.MESSAGE_ID)
+                handler.OnSequenceReset(packet.ChannelGroup, SequenceResetReason.ChannelReset);
 
             offset += framing.MessageLength;
         }
