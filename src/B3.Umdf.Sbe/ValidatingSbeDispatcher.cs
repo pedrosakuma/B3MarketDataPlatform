@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
 using B3.Umdf.Mbo.Sbe.V16;
 
 namespace B3.Umdf.Sbe;
@@ -15,6 +17,10 @@ public enum SbeHeaderRejectReason
     VersionUnsupported,
     /// <summary>Header <c>BlockLength</c> exceeded the bytes remaining in the buffer.</summary>
     BlockLengthImplausible,
+    /// <summary>Header <c>TemplateId</c> is not present in <see cref="ValidatingSbeDispatcher.KnownTemplateIds"/>.</summary>
+    UnknownTemplateId,
+    /// <summary>The generated <c>TryParse</c> for a known template rejected the payload (truncated/malformed varData).</summary>
+    MalformedKnownTemplate,
 }
 
 /// <summary>
@@ -47,6 +53,28 @@ public sealed class ValidatingSbeDispatcher
     /// <summary>Highest <c>sinceVersion</c> that the bundled <c>SbeSourceGenerator</c> generates code for.</summary>
     public const ushort DefaultMaxSupportedVersion = 16;
 
+    /// <summary>
+    /// Curated set of template ids the bundled SBE source generator emits decoders for in
+    /// <c>b3-market-data-messages-2.2.0.xml</c>. Mirrors the cases in the generated
+    /// <c>SbeDispatcher.Dispatch</c> switch — kept here as data so we can detect
+    /// "unsupported template" BEFORE handing the buffer off and bump the
+    /// <see cref="SbeValidationMetrics.UnsupportedTemplateCount"/> counter exactly once per packet.
+    /// If you regenerate the schema and add new templates, append them here too.
+    /// </summary>
+    public static readonly FrozenSet<ushort> KnownTemplateIds = new ushort[]
+    {
+        0, 1, 2, 3, 5, 9, 10, 11, 12, 15, 16, 17, 19, 21, 22, 24, 25, 27, 28, 29, 30,
+        50, 51, 52, 53, 54, 55, 56, 57, 71,
+    }.ToFrozenSet();
+
+    /// <summary>
+    /// Maximum number of distinct unknown template ids the dispatcher will surface through
+    /// <see cref="OnUnsupportedTemplate"/>. After this many distinct ids have been seen the
+    /// callback is suppressed (the metric still increments). Bounds memory growth from a
+    /// hostile feed that injects every <see cref="ushort"/> value.
+    /// </summary>
+    public const int UnsupportedTemplateSampleCap = 32;
+
     /// <summary>Expected <c>SchemaId</c>. Headers carrying any other value are rejected.</summary>
     public ushort ExpectedSchemaId { get; }
     /// <summary>Inclusive upper bound on accepted header <c>Version</c>.</summary>
@@ -59,18 +87,30 @@ public sealed class ValidatingSbeDispatcher
     /// <summary>Optional callback invoked once per rejection — useful for logging or test assertions.</summary>
     public Action<SbeHeaderRejection>? OnHeaderMismatch { get; }
 
+    /// <summary>
+    /// Optional callback invoked the first time each distinct unknown <c>TemplateId</c> is seen
+    /// (capped at <see cref="UnsupportedTemplateSampleCap"/> distinct ids — beyond that the metric
+    /// still increments but the callback is suppressed). Use this to emit a sampled warning log
+    /// without flooding the logger when a hostile/buggy feed sprays unknown ids.
+    /// </summary>
+    public Action<ushort>? OnUnsupportedTemplate { get; }
+
+    private readonly ConcurrentDictionary<ushort, byte> _seenUnsupportedTemplates = new();
+
     public ValidatingSbeDispatcher(
         ushort expectedSchemaId = DefaultSchemaId,
         ushort maxSupportedVersion = DefaultMaxSupportedVersion,
         bool skipOnMismatch = true,
         bool validateBlockLength = true,
-        Action<SbeHeaderRejection>? onHeaderMismatch = null)
+        Action<SbeHeaderRejection>? onHeaderMismatch = null,
+        Action<ushort>? onUnsupportedTemplate = null)
     {
         ExpectedSchemaId = expectedSchemaId;
         MaxSupportedVersion = maxSupportedVersion;
         SkipOnMismatch = skipOnMismatch;
         ValidateBlockLength = validateBlockLength;
         OnHeaderMismatch = onHeaderMismatch;
+        OnUnsupportedTemplate = onUnsupportedTemplate;
     }
 
     /// <summary>
@@ -111,7 +151,37 @@ public sealed class ValidatingSbeDispatcher
             }
         }
 
-        return SbeDispatcher.Dispatch(buffer, ref handler);
+        if (!KnownTemplateIds.Contains(templateId))
+        {
+            SbeValidationMetrics.UnsupportedTemplateCount.Add(1);
+            // Sampled callback: only fire on first occurrence of each id, capped to avoid
+            // unbounded dictionary growth under a hostile feed.
+            if (OnUnsupportedTemplate is { } cb &&
+                _seenUnsupportedTemplates.Count < UnsupportedTemplateSampleCap &&
+                _seenUnsupportedTemplates.TryAdd(templateId, 0))
+            {
+                cb(templateId);
+            }
+            OnHeaderMismatch?.Invoke(new SbeHeaderRejection(
+                SbeHeaderRejectReason.UnknownTemplateId, schemaId, version, templateId, blockLength, buffer.Length));
+            if (SkipOnMismatch) return false;
+            // Fall through so the generated dispatcher's default arm can call
+            // handler.OnUnknownMessage if the caller opted out of skipping.
+            return SbeDispatcher.Dispatch(buffer, ref handler);
+        }
+
+        bool dispatched = SbeDispatcher.Dispatch(buffer, ref handler);
+        if (!dispatched)
+        {
+            // We already validated header + blockLength + templateId, so a `false` here means the
+            // generated TryParse rejected the payload (varData length claim exceeds frame, truncated
+            // composite, zero-length where required, etc.) — bump the per-template malformed counter.
+            SbeValidationMetrics.MalformedKnownTemplate.Add(1,
+                new KeyValuePair<string, object?>("template_id", templateId));
+            OnHeaderMismatch?.Invoke(new SbeHeaderRejection(
+                SbeHeaderRejectReason.MalformedKnownTemplate, schemaId, version, templateId, blockLength, buffer.Length));
+        }
+        return dispatched;
     }
 
     private bool Reject<T>(
