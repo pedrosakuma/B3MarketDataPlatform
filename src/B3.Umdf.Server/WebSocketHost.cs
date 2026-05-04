@@ -1,12 +1,12 @@
 using System.Diagnostics;
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
+using B3.Umdf.Server.Hosting;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
-using OpenTelemetry.Metrics;
 
 namespace B3.Umdf.Server;
 
@@ -14,21 +14,23 @@ namespace B3.Umdf.Server;
 /// Kestrel-based WebSocket server for market data subscriptions.
 /// Includes health/readiness endpoints for orchestration compatibility.
 /// AOT-compatible: uses CreateSlimBuilder and source-generated JSON.
+///
+/// This type orchestrates the host lifecycle and owns the providers wired
+/// in by the ConsoleApp. The actual endpoint logic, CORS, health staleness
+/// evaluation, WebSocket connection handling, and shutdown drain live in
+/// dedicated classes under <see cref="Hosting"/> so each concern is
+/// independently testable.
 /// </summary>
 public sealed class WebSocketHost : IAsyncDisposable
 {
     private readonly SubscriptionManager _subscriptionManager;
     private readonly ILogger<WebSocketHost> _logger;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
+    private readonly ClientSessionOptions _sessionOptions;
+    private readonly int _maxConnections;
     private WebApplication? _app;
     private volatile bool _isShuttingDown;
     private CancellationTokenRegistration _shutdownRegistration;
-    private readonly int _maxConnections;
-    private readonly int _clientChannelCapacity;
-    private readonly double _slowClientThreshold;
-    private readonly int _slowClientMaxTicks;
-    private readonly long _clientMaxPendingBytes;
-    private readonly int _clientCoalesceWindowMs;
 
     /// <summary>Optional provider for feed group states (set before StartAsync).</summary>
     public Func<IReadOnlyDictionary<string, string>>? FeedStateProvider { get; set; }
@@ -89,11 +91,12 @@ public sealed class WebSocketHost : IAsyncDisposable
         _subscriptionManager = subscriptionManager;
         _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<WebSocketHost>.Instance;
         _maxConnections = maxConnections;
-        _clientChannelCapacity = clientChannelCapacity;
-        _slowClientThreshold = slowClientThreshold;
-        _slowClientMaxTicks = slowClientMaxTicks;
-        _clientMaxPendingBytes = clientMaxPendingBytes;
-        _clientCoalesceWindowMs = clientCoalesceWindowMs;
+        _sessionOptions = new ClientSessionOptions(
+            ChannelCapacity: clientChannelCapacity,
+            SlowClientThreshold: slowClientThreshold,
+            SlowClientMaxTicks: slowClientMaxTicks,
+            MaxPendingBytes: clientMaxPendingBytes,
+            CoalesceWindowMs: clientCoalesceWindowMs);
     }
 
     public async Task StartAsync(int port, CancellationToken ct = default)
@@ -115,18 +118,7 @@ public sealed class WebSocketHost : IAsyncDisposable
         builder.Services.ConfigureHttpJsonOptions(options =>
             options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
 
-        builder.Services
-            .AddOpenTelemetry()
-            .WithMetrics(metrics =>
-            {
-                metrics.AddMeter(MetricsRegistry.Meter.Name);
-                foreach (var name in AdditionalMeterNames)
-                {
-                    if (!string.IsNullOrWhiteSpace(name))
-                        metrics.AddMeter(name);
-                }
-                metrics.AddPrometheusExporter();
-            });
+        MetricsEndpointMapper.AddOpenTelemetryWithMeters(builder.Services, AdditionalMeterNames);
 
         _app = builder.Build();
         _app.UseWebSockets(new WebSocketOptions
@@ -134,376 +126,35 @@ public sealed class WebSocketHost : IAsyncDisposable
             KeepAliveInterval = TimeSpan.FromSeconds(30),
         });
 
-        UseCorsHeaders(_app);
-        MapHealthEndpoints(_app);
-        MapMetricsEndpoint(_app);
-        MapSymbolEndpoints(_app);
-        MapInstrumentEndpoint(_app);
-        MapRecoveryEndpoint(_app);
-        MapWebSocketEndpoint(_app, ct);
+        _app.UsePermissiveCors();
+
+        var healthMapper = new HealthEndpointMapper(
+            _subscriptionManager,
+            _uptime,
+            () => HealthMaxStaleSeconds,
+            () => HealthFailOnRecovery,
+            () => FeedStateProvider,
+            () => LastPacketTimestampProvider);
+        healthMapper.Map(_app);
+
+        MetricsEndpointMapper.MapPrometheus(_app);
+
+        new SymbolEndpointMapper(_subscriptionManager).Map(_app);
+        new InstrumentEndpointMapper(_subscriptionManager).Map(_app);
+        new RecoveryEndpointMapper(
+            () => RecoveryEventProvider,
+            () => RecoveryEventTotalProvider).Map(_app);
+
+        var wsHandler = new WebSocketConnectionHandler(
+            _subscriptionManager,
+            _logger,
+            _sessionOptions,
+            _maxConnections,
+            () => _isShuttingDown);
+        wsHandler.Map(_app, ct);
 
         await _app.StartAsync(ct);
         _logger.LogInformation("WebSocket server listening on port {Port}", port);
-    }
-
-    private static void UseCorsHeaders(WebApplication app)
-    {
-        // CORS for cross-origin frontend access. Permissive by design — this
-        // service is intentionally read-only / public-by-default for the
-        // dashboard. Tighten via reverse proxy if exposed externally.
-        app.Use(async (context, next) =>
-        {
-            context.Response.Headers["Access-Control-Allow-Origin"] = "*";
-            context.Response.Headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
-            context.Response.Headers["Access-Control-Allow-Headers"] = "Content-Type";
-            if (context.Request.Method == "OPTIONS")
-            {
-                context.Response.StatusCode = 204;
-                return;
-            }
-            await next();
-        });
-    }
-
-    private void MapHealthEndpoints(WebApplication app)
-    {
-        app.MapGet("/health", () =>
-        {
-            var result = new HealthResponse
-            {
-                Status = _subscriptionManager.IsReady ? "ready" : "initializing",
-                Uptime = _uptime.Elapsed.ToString(@"hh\:mm\:ss"),
-            };
-            IReadOnlyDictionary<string, string>? states = null;
-            if (FeedStateProvider is not null)
-            {
-                states = FeedStateProvider();
-                result.FeedGroups = new Dictionary<string, string>(states);
-            }
-            IReadOnlyDictionary<string, long>? lastPackets = null;
-            if (LastPacketTimestampProvider is not null)
-            {
-                lastPackets = LastPacketTimestampProvider();
-                var seconds = new Dictionary<string, double>(lastPackets.Count);
-                long now = Environment.TickCount64;
-                foreach (var (k, v) in lastPackets)
-                    seconds[k] = v > 0 ? (now - v) / 1000.0 : -1.0;
-                result.SecondsSinceLastPacket = seconds;
-            }
-
-            // Stale-recovery gate: a group reported as non-Streaming for longer
-            // than HealthMaxStaleSeconds flips the response to 503 so that
-            // orchestrators can fail readiness on stuck groups. Cold-start
-            // semantics: when no packet has yet been seen for a group we
-            // measure staleness against process uptime, so /health stays 200
-            // until the threshold elapses (matches existing /ready behavior).
-            if (HealthFailOnRecovery && states is not null && HealthMaxStaleSeconds >= 0)
-            {
-                long now = Environment.TickCount64;
-                double uptimeSec = _uptime.Elapsed.TotalSeconds;
-                List<string>? unhealthy = null;
-                foreach (var (group, state) in states)
-                {
-                    if (string.Equals(state, nameof(FeedState.Streaming), StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    double staleSec;
-                    if (lastPackets is not null && lastPackets.TryGetValue(group, out var ticks) && ticks > 0)
-                        staleSec = (now - ticks) / 1000.0;
-                    else
-                        staleSec = uptimeSec;
-                    if (staleSec > HealthMaxStaleSeconds)
-                    {
-                        unhealthy ??= new List<string>();
-                        unhealthy.Add($"{group}={state} for {staleSec:F0}s");
-                    }
-                }
-                if (unhealthy is not null)
-                {
-                    result.Reason = "Stale recovery: " + string.Join(", ", unhealthy);
-                    return Results.Json(result, AppJsonContext.Default.HealthResponse, statusCode: 503);
-                }
-            }
-
-            return Results.Json(result, AppJsonContext.Default.HealthResponse);
-        });
-
-        app.MapGet("/ready", () =>
-            _subscriptionManager.IsReady ? Results.Ok("ready") : Results.StatusCode(503));
-
-        app.MapGet("/live", () => Results.Ok("alive"));
-    }
-
-    private static void MapMetricsEndpoint(WebApplication app)
-    {
-        // Prometheus scrape endpoint. Exposes every meter registered in the
-        // OpenTelemetry pipeline (always B3.Umdf, plus AdditionalMeterNames).
-        // Lives on the same port as /health for ops-stack convenience.
-        app.MapPrometheusScrapingEndpoint();
-    }
-
-    private void MapSymbolEndpoints(WebApplication app)
-    {
-        app.MapGet("/symbols", (string? q, int? limit) =>
-        {
-            var registry = _subscriptionManager.SymbolRegistry;
-            if (registry is null)
-                return Results.Json(new SymbolsResponse(), AppJsonContext.Default.SymbolsResponse);
-            IEnumerable<string> symbols = registry.BySymbol.Keys.Order();
-            if (!string.IsNullOrEmpty(q))
-                symbols = symbols.Where(s => s.Contains(q, StringComparison.OrdinalIgnoreCase));
-            var max = Math.Clamp(limit ?? 20, 1, 100);
-            var list = symbols.Take(max).ToArray();
-            return Results.Json(new SymbolsResponse { Count = registry.Count, Matched = list.Length, Symbols = list },
-                AppJsonContext.Default.SymbolsResponse);
-        });
-    }
-
-    private void MapRecoveryEndpoint(WebApplication app)
-    {
-        // /api/recovery/recent surfaces the in-memory ring buffer of recent
-        // recovery audit events for ops triage. When no provider is wired
-        // (tests, embedded scenarios) the endpoint returns an empty list
-        // rather than 404 so the contract stays stable.
-        app.MapGet("/api/recovery/recent", (int? limit) =>
-        {
-            var capped = Math.Clamp(limit ?? 50, 1, 1000);
-            var events = RecoveryEventProvider?.Invoke(capped) ?? Array.Empty<RecoveryEvent>();
-            var dto = new RecoveryEventLogResponse
-            {
-                TotalRecorded = RecoveryEventTotalProvider?.Invoke() ?? 0,
-                Returned = events.Count,
-                Events = new RecoveryEventDto[events.Count],
-            };
-            for (int i = 0; i < events.Count; i++)
-            {
-                var e = events[i];
-                dto.Events[i] = new RecoveryEventDto
-                {
-                    TimestampUnixMs = e.TimestampUnixMs,
-                    Kind = (int)e.Kind,
-                    KindName = e.Kind.ToString(),
-                    GroupId = e.GroupId,
-                    SecurityId = e.SecurityId,
-                    SnapshotRptSeq = e.SnapshotRptSeq,
-                    PriorRptSeq = e.PriorRptSeq,
-                    Detail = e.Detail,
-                };
-            }
-            return Results.Json(dto, AppJsonContext.Default.RecoveryEventLogResponse);
-        });
-    }
-
-    private void MapInstrumentEndpoint(WebApplication app)
-    {
-        app.MapGet("/instrument/{symbol}", (string symbol) =>
-        {
-            var registry = _subscriptionManager.SymbolRegistry;
-            if (registry is null)
-                return Results.StatusCode(503);
-
-            symbol = symbol.Trim().ToUpperInvariant();
-            if (!registry.TryResolve(symbol, out var securityId))
-                return Results.NotFound();
-            var info = _subscriptionManager.FindInstrumentInfo(securityId);
-            if (info is null)
-                return Results.NotFound();
-
-            var resp = BuildInstrumentInfoResponse(securityId, info);
-            return Results.Json(resp, AppJsonContext.Default.InstrumentInfoResponse);
-        });
-    }
-
-    /// <summary>
-    /// Pure mapping helper: copy every field from the internal <see cref="InstrumentInfo"/>
-    /// snapshot into the public DTO. Mechanical and large by necessity (~50 fields covering
-    /// reference data + statistics + collections); kept separate so the endpoint registration
-    /// stays scannable.
-    /// </summary>
-    private static InstrumentInfoResponse BuildInstrumentInfoResponse(ulong securityId, InstrumentInfo info)
-    {
-        return new InstrumentInfoResponse
-        {
-            SecurityId = securityId,
-            Symbol = info.Symbol,
-            Asset = info.Asset,
-            IsinNumber = info.IsinNumber,
-            Currency = info.Currency,
-            CfiCode = info.CfiCode,
-            SecurityGroup = info.SecurityGroup,
-            SecurityDescription = info.SecurityDescription,
-            SecurityType = info.SecurityType,
-            SecuritySubType = info.SecuritySubType,
-            Product = info.Product,
-            MinPriceIncrement = info.MinPriceIncrement,
-            PriceDivisor = info.PriceDivisor,
-            ContractMultiplier = info.ContractMultiplier,
-            StrikePrice = info.StrikePrice,
-            MaturityDate = info.MaturityDate,
-            PutOrCall = info.PutOrCall,
-            ExerciseStyle = info.ExerciseStyle,
-            MarketSegmentID = info.MarketSegmentID,
-            TickSizeDenominator = info.TickSizeDenominator,
-            TradingStatus = info.TradingStatus,
-            TradingEvent = info.TradingEvent,
-            OpeningPrice = info.OpeningPrice,
-            ClosingPrice = info.ClosingPrice,
-            HighPrice = info.HighPrice,
-            LowPrice = info.LowPrice,
-            LastTradePrice = info.LastTradePrice,
-            LastTradeSize = info.LastTradeSize,
-            SettlementPrice = info.SettlementPrice,
-            TheoreticalOpeningPrice = info.TheoreticalOpeningPrice,
-            TheoreticalOpeningSize = info.TheoreticalOpeningSize,
-            AuctionImbalanceSize = info.AuctionImbalanceSize,
-            PriceBandLow = info.PriceBandLow,
-            PriceBandHigh = info.PriceBandHigh,
-            PriceLimitType = info.PriceLimitType,
-            TradingReferencePrice = info.TradingReferencePrice,
-            AvgDailyTradedQty = info.AvgDailyTradedQty,
-            MaxTradeVol = info.MaxTradeVol,
-            TradeVolume = info.TradeVolume,
-            VwapPrice = info.VwapPrice,
-            NetChangeFromPrevDay = info.NetChangeFromPrevDay,
-            NumberOfTrades = info.NumberOfTrades,
-            OpenInterest = info.OpenInterest,
-            LastUpdateTimestamp = info.LastUpdateTimestamp,
-            Underlyings = info.Underlyings?.Select(u => new UnderlyingResponse
-            {
-                SecurityId = u.SecurityId,
-                Symbol = u.Symbol,
-            }).ToList(),
-            Legs = info.Legs?.Select(l => new LegResponse
-            {
-                SecurityId = l.SecurityId,
-                Symbol = l.Symbol,
-                RatioQty = l.RatioQty,
-                SecurityType = l.SecurityType,
-                Side = l.Side,
-            }).ToList(),
-            InstrAttribs = info.InstrAttribs?.Select(a => new InstrAttribResponse
-            {
-                Type = a.Type,
-                Value = a.Value,
-            }).ToList(),
-        };
-    }
-
-    private void MapWebSocketEndpoint(WebApplication app, CancellationToken ct)
-    {
-        app.Map("/ws", async context =>
-        {
-            // Once shutdown has been signaled, refuse new connections immediately so the
-            // drain phase does not have to wait on freshly-accepted clients (and so we
-            // don't keep logging the connect/disconnect churn from clients that retry).
-            if (_isShuttingDown || ct.IsCancellationRequested)
-            {
-                _logger.LogInformation("Connection rejected: server is shutting down");
-                context.Response.StatusCode = 503;
-                context.Response.Headers["Connection"] = "close";
-                return;
-            }
-
-            if (!context.WebSockets.IsWebSocketRequest)
-            {
-                context.Response.StatusCode = 400;
-                return;
-            }
-
-            // Soft connection limit: this check is intentionally racy (TOCTOU vs
-            // RegisterClient below) — under heavy concurrent connect bursts we may
-            // briefly exceed _maxConnections by a handful, which is acceptable.
-            // Tightening would require a CAS-counter in SubscriptionManager and is
-            // not worth the contention for a soft cap.
-            if (_maxConnections > 0 && _subscriptionManager.ClientCount >= _maxConnections)
-            {
-                _logger.LogWarning("Connection rejected: limit {Max} reached", _maxConnections);
-                context.Response.StatusCode = 503;
-                return;
-            }
-
-            var ws = await context.WebSockets.AcceptWebSocketAsync();
-            var session = new ClientSession(
-                ws,
-                channelCapacity: _clientChannelCapacity,
-                slowClientThreshold: _slowClientThreshold,
-                slowClientMaxTicks: _slowClientMaxTicks,
-                maxPendingBytes: _clientMaxPendingBytes,
-                coalesceWindowMs: _clientCoalesceWindowMs,
-                logger: _logger);
-            _subscriptionManager.RegisterClient(session);
-
-            _logger.LogInformation("Client {ClientId} connected", session.Id);
-
-            // Start write loop
-            var writeTask = Task.Run(() => session.RunWriteLoopAsync());
-
-            // Read loop
-            try
-            {
-                await foreach (var (type, payload) in session.ReadMessagesAsync(ct))
-                {
-                    switch (type)
-                    {
-                        case MessageType.ClientHello:
-                        {
-                            // Optional negotiation: clients that never send ClientHello are
-                            // assumed to speak the current ProtocolVersion. If sent and
-                            // incompatible, close with WS 1003 (unsupported data).
-                            if (payload.Length < 4) break;
-                            uint clientVer = WireProtocol.ReadClientHello(payload.Span);
-                            if (clientVer < WireProtocol.SupportedProtocolVersionMin ||
-                                clientVer > WireProtocol.SupportedProtocolVersionMax)
-                            {
-                                var reason =
-                                    $"protocol_version_unsupported: client {clientVer}, " +
-                                    $"server min {WireProtocol.SupportedProtocolVersionMin} " +
-                                    $"max {WireProtocol.SupportedProtocolVersionMax}";
-                                _logger.LogWarning(
-                                    "Client {ClientId} sent unsupported ClientHello version {Version}; closing",
-                                    session.Id, clientVer);
-                                try
-                                {
-                                    await ws.CloseAsync(
-                                        System.Net.WebSockets.WebSocketCloseStatus.InvalidMessageType,
-                                        reason,
-                                        CancellationToken.None).ConfigureAwait(false);
-                                }
-                                catch { /* best effort */ }
-                                return;
-                            }
-                            break;
-                        }
-
-                        case MessageType.Subscribe:
-                        {
-                            var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
-                            _subscriptionManager.RequestSubscribe(session.Id, symbol, flags);
-                            break;
-                        }
-
-                        case MessageType.Get:
-                        {
-                            var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
-                            _subscriptionManager.RequestGet(session.Id, symbol, flags);
-                            break;
-                        }
-
-                        case MessageType.Unsubscribe:
-                            var securityId = WireProtocol.ReadUnsubscribe(payload.Span);
-                            _subscriptionManager.RequestUnsubscribe(session.Id, securityId);
-                            break;
-                    }
-                }
-            }
-            finally
-            {
-                _logger.LogInformation("Client {ClientId} disconnected", session.Id);
-                _subscriptionManager.UnregisterClient(session.Id);
-                session.Cancel();   // signal write loop to stop before awaiting
-                await writeTask;    // wait for clean exit before disposing CTS
-                session.Dispose();
-            }
-        });
     }
 
     /// <summary>
@@ -518,24 +169,8 @@ public sealed class WebSocketHost : IAsyncDisposable
     {
         if (_app is null) return;
 
-        if (closeHandshakeBudget <= TimeSpan.Zero)
-            closeHandshakeBudget = TimeSpan.FromSeconds(5);
-
-        var sessions = _subscriptionManager.EnumerateAllClients()
-            .Select(kv => kv.Value)
-            .ToList();
-        if (sessions.Count > 0)
-        {
-            using var cts = new CancellationTokenSource(closeHandshakeBudget);
-            var tasks = new Task[sessions.Count];
-            for (int i = 0; i < sessions.Count; i++)
-                tasks[i] = sessions[i].RequestGracefulCloseAsync("server shutting down", cts.Token);
-            try { await Task.WhenAll(tasks).ConfigureAwait(false); }
-            catch { /* per-client failures already logged inside RequestGracefulCloseAsync */ }
-            _logger.LogInformation(
-                "Sent WebSocket close (1001) to {Count} active client(s) before stopping Kestrel",
-                sessions.Count);
-        }
+        var coordinator = new ShutdownCoordinator(_subscriptionManager, _logger);
+        await coordinator.DrainClientsAsync(closeHandshakeBudget);
 
         await _app.StopAsync();
     }
