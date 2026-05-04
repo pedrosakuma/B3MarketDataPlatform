@@ -21,6 +21,35 @@ public interface IFeedEventHandler
     void OnInstrumentDefinitionsComplete(int instrumentCount);
 
     /// <summary>
+    /// Variant of <see cref="OnInstrumentDefinitionsComplete(int)"/> that
+    /// distinguishes a normal end-of-replay completion (<paramref name="wasAborted"/>=false)
+    /// from a forced bootstrap-abort fallback (<paramref name="wasAborted"/>=true,
+    /// fired when <c>InstrDefStuckTimeoutMs</c> elapses without a real completion
+    /// message). The default implementation forwards to the legacy single-arg
+    /// overload so existing implementers remain source-compatible; handlers that
+    /// need to flag aborted-bootstrap state to operators or downstream metrics
+    /// should override this method instead.
+    /// </summary>
+    void OnInstrumentDefinitionsComplete(int instrumentCount, bool wasAborted)
+        => OnInstrumentDefinitionsComplete(instrumentCount);
+
+    /// <summary>
+    /// Fired when a snapshot recovery batch begins for a single security on the
+    /// snapshot channel (i.e. when a <c>SnapshotFullRefresh_Header_30</c> is
+    /// observed). Default no-op preserves legacy behaviour for handlers that do
+    /// not care about per-symbol snapshot lifecycle.
+    /// </summary>
+    void OnSnapshotStart(int channelGroupId, ulong securityId) { }
+
+    /// <summary>
+    /// Fired when the snapshot recovery batch for a single security finishes.
+    /// The current implementation emits this once per snapshot packet that
+    /// contained a <c>Header_30</c>, with the last observed securityId. Default
+    /// no-op preserves legacy behaviour.
+    /// </summary>
+    void OnSnapshotComplete(int channelGroupId, ulong securityId) { }
+
+    /// <summary>
     /// Called after all SBE messages in a UMDF packet have been dispatched.
     /// Used as a batch boundary for upstream conflation.
     /// </summary>

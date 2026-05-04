@@ -71,6 +71,36 @@ public sealed class CompositeFeedHandler : IFeedEventHandler
         }
     }
 
+    public void OnInstrumentDefinitionsComplete(int instrumentCount, bool wasAborted)
+    {
+        bool reported = false;
+        foreach (var handler in _handlers)
+        {
+            try { handler.OnInstrumentDefinitionsComplete(instrumentCount, wasAborted); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnInstrumentDefinitionsComplete), ref reported); }
+        }
+    }
+
+    public void OnSnapshotStart(int channelGroupId, ulong securityId)
+    {
+        bool reported = false;
+        foreach (var handler in _handlers)
+        {
+            try { handler.OnSnapshotStart(channelGroupId, securityId); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnSnapshotStart), ref reported); }
+        }
+    }
+
+    public void OnSnapshotComplete(int channelGroupId, ulong securityId)
+    {
+        bool reported = false;
+        foreach (var handler in _handlers)
+        {
+            try { handler.OnSnapshotComplete(channelGroupId, securityId); }
+            catch (Exception ex) { RecordFailure(ex, nameof(OnSnapshotComplete), ref reported); }
+        }
+    }
+
     public void OnPacketProcessed()
     {
         bool reported = false;

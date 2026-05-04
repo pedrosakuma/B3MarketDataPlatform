@@ -296,7 +296,7 @@ public sealed class FeedHandler : IDisposable
                 packet.ReceivedTimestampTicks - _instrDefFirstSeenTicks,
                 _instrDefReceived,
                 _instrDefTotalExpected);
-            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefReceived);
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefReceived, wasAborted: true);
             TransitionTo(FeedState.Streaming);
         }
     }
@@ -411,7 +411,7 @@ public sealed class FeedHandler : IDisposable
             // FreezeData (universe metadata is now stable). After this transition
             // the feed is fully Streaming; per-symbol heal drives all bootstrap
             // and gap-recovery work.
-            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected);
+            _eventHandler.OnInstrumentDefinitionsComplete((int)_instrDefTotalExpected, wasAborted: false);
             TransitionTo(FeedState.Streaming);
         }
     }
@@ -421,6 +421,13 @@ public sealed class FeedHandler : IDisposable
     /// handler. Per-symbol heal does not depend on cycle boundaries — each
     /// (Header_30, Orders_71) pair is self-contained and applies independently
     /// to one instrument at a time.
+    ///
+    /// Fires <see cref="IFeedEventHandler.OnSnapshotStart"/> on every
+    /// <c>Header_30</c> observed and <see cref="IFeedEventHandler.OnSnapshotComplete"/>
+    /// after the packet's last message has been dispatched, with the most
+    /// recently observed SecurityID. This gives downstream consumers a per-
+    /// security snapshot lifecycle hook for packets that carry a single
+    /// snapshot (the common B3 case).
     /// </summary>
     private void DispatchSnapshotMessages(in UmdfPacket packet)
     {
@@ -429,8 +436,33 @@ public sealed class FeedHandler : IDisposable
             return;
 
         int offset = PacketHeader.MESSAGE_SIZE;
+        bool snapshotStarted = false;
+        ulong lastSecurityId = 0;
+        int channelGroupId = packet.ChannelGroup;
         while (TryReadNextSbe(span, ref offset, out var sbeSlice, out var templateId))
+        {
+            if (templateId == SnapshotFullRefresh_Header_30Data.MESSAGE_ID
+                && TryReadSnapshotHeaderSecurityId(sbeSlice[MessageDispatcher.SbeHeaderSize..], out var securityId))
+            {
+                if (snapshotStarted)
+                    _eventHandler.OnSnapshotComplete(channelGroupId, lastSecurityId);
+                lastSecurityId = securityId;
+                snapshotStarted = true;
+                _eventHandler.OnSnapshotStart(channelGroupId, securityId);
+            }
             _eventHandler.OnPacket(in packet, sbeSlice, templateId);
+        }
+        if (snapshotStarted)
+            _eventHandler.OnSnapshotComplete(channelGroupId, lastSecurityId);
+    }
+
+    private static bool TryReadSnapshotHeaderSecurityId(ReadOnlySpan<byte> body, out ulong securityId)
+    {
+        securityId = 0;
+        if (!SnapshotFullRefresh_Header_30Data.TryParse(body, out var reader))
+            return false;
+        securityId = reader.Data.SecurityID.Value;
+        return true;
     }
 
     /// <summary>
