@@ -458,4 +458,200 @@ public sealed class StaleMboBuffer
     /// <summary>Current depth of a symbol's queue (for tests/metrics).</summary>
     public int DepthOf(ulong securityId) =>
         _queues.TryGetValue(securityId, out var q) ? q.Items.Count : 0;
+
+    /// <summary>
+    /// Begin a transactional drain of the per-symbol buffer for
+    /// <paramref name="securityId"/>. The returned <see cref="DrainTransaction"/>
+    /// extracts the matching window (rptSeq ∈ [drainFrom, drainTo]) and the
+    /// future tail from the queue, captures and clears the protected floor
+    /// pin, and gives the caller exclusive ownership of those entries until
+    /// <see cref="DrainTransaction.Commit"/>, <see cref="DrainTransaction.Rollback"/>,
+    /// or <see cref="DrainTransaction.Dispose"/> (which auto-rolls back if neither
+    /// Commit nor Rollback was called).
+    ///
+    /// <para><b>Atomicity guarantee:</b> if the apply callback throws or the
+    /// caller rolls back, the per-symbol queue contents, <see cref="TotalBytes"/>
+    /// accounting, and <see cref="ProtectedFloorOf"/> are restored EXACTLY to
+    /// their pre-<see cref="BeginDrain"/> values. This subsumes (and is stronger
+    /// than) the legacy <see cref="Drain"/> exception-safety contract, which
+    /// only restored the queue/byte state — not the protected floor.</para>
+    ///
+    /// <para><b>Recommended path</b> for new call sites: replaces the
+    /// <c>Drain</c> + <c>ClearProtectedFloor</c> + <c>BumpMinHeal</c>
+    /// coordination dance the caller previously had to choreograph. Old
+    /// <see cref="Drain"/>, <see cref="ClearProtectedFloor"/>, and
+    /// <see cref="SetProtectedFloor"/> remain available for callers that
+    /// have not migrated.</para>
+    ///
+    /// <para><b>Single-thread ownership:</b> per the class-level concurrency
+    /// contract, <c>BeginDrain</c> must be called from the single owner
+    /// (per-group feed) thread, and the returned transaction must not be
+    /// shared across threads.</para>
+    /// </summary>
+    public DrainTransaction BeginDrain(ulong securityId, uint drainFrom, uint drainTo) =>
+        new DrainTransaction(this, securityId, drainFrom, drainTo);
+
+    /// <summary>
+    /// Transactional drain handle returned by <see cref="BeginDrain"/>.
+    /// See that method for the full atomicity / ownership contract.
+    /// Use with <c>using</c> so an unhandled exception in the apply callback
+    /// triggers automatic <see cref="Rollback"/>.
+    /// </summary>
+    public sealed class DrainTransaction : IDisposable
+    {
+        private readonly StaleMboBuffer _buffer;
+        private readonly PerSymbolQueue? _queue;
+        private readonly List<DeferredMboMsg>? _matches;     // rptSeq ∈ [from, to], sorted asc
+        private readonly List<DeferredMboMsg>? _future;      // rptSeq > to
+        private readonly List<DeferredMboMsg>? _belowFloor;  // rptSeq < from
+        private readonly uint _originalFloor;
+        // Single-owner re-entrancy guard: BeginDrain spec is single-threaded
+        // per the class concurrency contract, but a buggy caller could nest
+        // BeginDrain inside an Apply callback. Detect and refuse.
+        private static readonly System.Threading.ThreadLocal<int> _activeTxOnThread =
+            new(() => 0, trackAllValues: false);
+
+        private int _appliedCount;
+        private bool _committed;
+        private bool _rolledBack;
+        private bool _applyThrew;
+
+        internal DrainTransaction(StaleMboBuffer buffer, ulong securityId, uint drainFrom, uint drainTo)
+        {
+            _buffer = buffer;
+            if (_activeTxOnThread.Value > 0)
+                throw new InvalidOperationException(
+                    "StaleMboBuffer.BeginDrain is single-owner: a DrainTransaction is already active on this thread. " +
+                    "Commit or Dispose the outer transaction before starting a new one.");
+            _activeTxOnThread.Value = 1;
+            try
+            {
+                if (drainTo < drainFrom || !buffer._queues.TryGetValue(securityId, out _queue))
+                    return; // empty tx — Commit/Rollback are no-ops
+                _matches = new List<DeferredMboMsg>();
+                _future = new List<DeferredMboMsg>();
+                _belowFloor = new List<DeferredMboMsg>();
+                _originalFloor = _queue.ProtectedFloor;
+                _queue.ProtectedFloor = 0; // capture & clear; restored by Rollback, left cleared by Commit
+                while (_queue.Items.TryDequeue(out var item))
+                {
+                    if (item.RptSeq < drainFrom) _belowFloor.Add(item);
+                    else if (item.RptSeq > drainTo) _future.Add(item);
+                    else _matches.Add(item);
+                }
+                _matches.Sort(static (a, b) => a.RptSeq.CompareTo(b.RptSeq));
+            }
+            catch
+            {
+                _activeTxOnThread.Value = 0;
+                throw;
+            }
+        }
+
+        /// <summary>Number of messages in the drain window that will be applied.</summary>
+        public int MatchCount => _matches?.Count ?? 0;
+
+        /// <summary>True if no messages match the drain window (Commit/Rollback are no-ops).</summary>
+        public bool IsEmpty => MatchCount == 0;
+
+        /// <summary>
+        /// Apply every match in causal (rptSeq) order via <paramref name="apply"/>.
+        /// If the callback throws, the exception propagates; the transaction is
+        /// marked failed and only <see cref="Rollback"/> (or Dispose) is permitted.
+        /// Returns the number of messages successfully applied.
+        /// </summary>
+        public int Apply(Action<DeferredMboMsg> apply)
+        {
+            EnsureNotFinalized();
+            if (_applyThrew)
+                throw new InvalidOperationException("Apply already failed; call Rollback (or Dispose) and start a new transaction.");
+            if (_matches == null) return 0;
+            try
+            {
+                for (int i = _appliedCount; i < _matches.Count; i++)
+                {
+                    apply(_matches[i]);
+                    _appliedCount++;
+                }
+            }
+            catch
+            {
+                _applyThrew = true;
+                throw;
+            }
+            return _appliedCount;
+        }
+
+        /// <summary>
+        /// Commit: release pooled buffers for matched messages, restore
+        /// future-window entries to the queue, drop snapshot-covered (below
+        /// drainFrom) entries, leave the protected floor cleared, and bump
+        /// the drained counter. Forbidden if Apply did not run to completion.
+        /// </summary>
+        public void Commit()
+        {
+            EnsureNotFinalized();
+            if (_applyThrew)
+                throw new InvalidOperationException("Cannot Commit after Apply threw; Rollback (or Dispose) instead.");
+            if (_matches != null && _appliedCount < _matches.Count)
+                throw new InvalidOperationException(
+                    $"Cannot Commit with {_matches.Count - _appliedCount} unapplied matches; call Apply first or Rollback.");
+
+            if (_queue != null && _matches != null && _future != null && _belowFloor != null)
+            {
+                long releasedBytes = 0;
+                for (int i = 0; i < _matches.Count; i++)
+                {
+                    releasedBytes += _matches[i].BodyLength;
+                    _matches[i].Release();
+                }
+                for (int i = 0; i < _belowFloor.Count; i++)
+                {
+                    releasedBytes += _belowFloor[i].BodyLength;
+                    _belowFloor[i].Release();
+                }
+                foreach (var f in _future) _queue.Items.Enqueue(f);
+                Volatile.Write(ref _buffer._totalBytes, Volatile.Read(ref _buffer._totalBytes) - releasedBytes);
+                _buffer._drained += _appliedCount;
+            }
+            _committed = true;
+            _activeTxOnThread.Value = 0;
+        }
+
+        /// <summary>
+        /// Rollback: restore EVERY entry the transaction extracted (matches +
+        /// future + below-floor) to the queue and restore the original
+        /// protected floor. Post-condition: buffer state, TotalBytes, and
+        /// ProtectedFloorOf are byte-identical to pre-<see cref="BeginDrain"/>.
+        /// Idempotent.
+        /// </summary>
+        public void Rollback()
+        {
+            if (_committed || _rolledBack) return;
+            if (_queue != null && _matches != null && _future != null && _belowFloor != null)
+            {
+                // Re-enqueue order is matches → future → below-floor. The next
+                // drain partitions by rptSeq again, so observable behavior is
+                // identical regardless of in-queue order.
+                foreach (var m in _matches) _queue.Items.Enqueue(m);
+                foreach (var f in _future) _queue.Items.Enqueue(f);
+                foreach (var b in _belowFloor) _queue.Items.Enqueue(b);
+                _queue.ProtectedFloor = _originalFloor;
+            }
+            _rolledBack = true;
+            _activeTxOnThread.Value = 0;
+        }
+
+        /// <summary>Auto-Rollback if neither Commit nor Rollback was called.</summary>
+        public void Dispose()
+        {
+            if (!_committed && !_rolledBack) Rollback();
+        }
+
+        private void EnsureNotFinalized()
+        {
+            if (_committed) throw new InvalidOperationException("DrainTransaction already committed.");
+            if (_rolledBack) throw new InvalidOperationException("DrainTransaction already rolled back.");
+        }
+    }
 }
