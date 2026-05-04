@@ -18,6 +18,7 @@ public sealed class MulticastPacketSource : IPacketSource
     private readonly Socket _socket;
     private readonly ChannelType _channelType;
     private readonly int _channelGroup;
+    private readonly TransportKind _transport;
     private readonly ILogger _logger;
 
     // Membership info retained so we can leave and rejoin the multicast group on demand
@@ -55,6 +56,7 @@ public sealed class MulticastPacketSource : IPacketSource
 
     public ChannelType ChannelType => _channelType;
     public int ChannelGroup => _channelGroup;
+    public TransportKind Transport => _transport;
     public bool IsJoined { get { lock (_membershipLock) return _isJoined; } }
 
     // Test-only: exposes whether the recvmmsg batch state (POH buffer pool +
@@ -71,8 +73,24 @@ public sealed class MulticastPacketSource : IPacketSource
         if (config.LocalAddress is not null)
             ValidateIPv4(config.LocalAddress, nameof(config.LocalAddress));
 
+        // Unicast transport: bind only, no IGMP join. SourceAddress/LocalAddress are
+        // IGMP/SSM-only — reject explicitly so misconfigurations fail fast instead of
+        // being silently ignored. See issue #10 (Docker Compose bridge deployments).
+        if (config.Transport == TransportKind.Unicast)
+        {
+            if (config.SourceAddress is not null)
+                throw new ArgumentException(
+                    "sourceAddress is not valid with transport=unicast (it is a source-specific multicast / IGMP-only field).",
+                    nameof(config));
+            if (config.LocalAddress is not null)
+                throw new ArgumentException(
+                    "localAddress is not valid with transport=unicast (it is a multicast membership / IGMP-only field). Use multicastGroup as the bind address (e.g. 0.0.0.0 or a specific NIC IP).",
+                    nameof(config));
+        }
+
         _channelType = config.Type;
         _channelGroup = config.ChannelGroup;
+        _transport = config.Transport;
         _multicastGroup = config.MulticastGroup;
         _port = config.Port;
         _localAddress = config.LocalAddress;
@@ -114,7 +132,15 @@ public sealed class MulticastPacketSource : IPacketSource
 
         socket.ReceiveBufferSize = config.ReceiveBufferBytes;
         int actualReceiveBufferBytes = socket.ReceiveBufferSize;
-        socket.Bind(new IPEndPoint(IPAddress.Any, config.Port));
+
+        // Multicast: bind to wildcard so the kernel delivers any datagram for the joined
+        // group/port regardless of the destination IP carried by the NIC.
+        // Unicast: bind to the configured address (typically 0.0.0.0; can be a NIC IP
+        // to restrict ingress to a single interface).
+        var bindAddress = config.Transport == TransportKind.Unicast
+            ? config.MulticastGroup
+            : IPAddress.Any;
+        socket.Bind(new IPEndPoint(bindAddress, config.Port));
 
         if (actualReceiveBufferBytes < config.ReceiveBufferBytes)
         {
@@ -129,7 +155,16 @@ public sealed class MulticastPacketSource : IPacketSource
                 config.ReceiveBufferBytes);
         }
 
-        if (config.SourceAddress is not null)
+        if (config.Transport == TransportKind.Unicast)
+        {
+            // No IGMP join: the kernel delivers unicast datagrams addressed to (bind, port)
+            // directly. _isJoined is set true so callers treat the source as "ready to receive";
+            // Leave/Rejoin become no-ops (see those methods).
+            _logger.LogInformation(
+                "Listening unicast UDP on {Bind}:{Port} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes})",
+                bindAddress, config.Port, _channelType, _channelGroup, actualReceiveBufferBytes);
+        }
+        else if (config.SourceAddress is not null)
         {
             var localAddress = config.LocalAddress ?? IPAddress.Any;
             socket.SetSocketOption(
@@ -172,6 +207,7 @@ public sealed class MulticastPacketSource : IPacketSource
     /// </summary>
     public void LeaveMulticastGroup()
     {
+        if (_transport == TransportKind.Unicast) return;
         lock (_membershipLock)
         {
             if (!_isJoined) return;
@@ -222,6 +258,7 @@ public sealed class MulticastPacketSource : IPacketSource
     /// </summary>
     public void RejoinMulticastGroup()
     {
+        if (_transport == TransportKind.Unicast) return;
         lock (_membershipLock)
         {
             if (_isJoined) return;
