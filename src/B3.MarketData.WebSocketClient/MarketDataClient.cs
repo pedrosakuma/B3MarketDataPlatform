@@ -70,8 +70,23 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<TradeBustEvent>? TradeBust;
     public event Action<InfoSnapshotEvent>? InfoSnapshot;
     public event Action<ServerStatusEvent>? ServerStatus;
+    public event Action<ServerHelloEvent>? ServerHello;
+    public event Action<SymbolDelistedEvent>? SymbolDelisted;
     public event Action<SubscribeErrorEvent>? SubscribeError;
     public event Action<ConnectionStateChangedEvent>? ConnectionStateChanged;
+
+    /// <summary>
+    /// Most recently received <c>ServerHello</c> (if any). Cached on the dispatch
+    /// thread and snapshotted under <c>_stateLock</c> so callers that connect after
+    /// the handshake event has already fired can still read the negotiated values.
+    /// Reset to <c>null</c> on every reconnect attempt.
+    /// </summary>
+    public ServerHelloEvent? LastServerHello
+    {
+        get { lock (_stateLock) return _lastServerHello; }
+    }
+
+    private ServerHelloEvent? _lastServerHello;
 
     /// <summary>Current connection state. Updated by the run loop.</summary>
     public ConnectionState State
@@ -193,6 +208,7 @@ public sealed class MarketDataClient : IAsyncDisposable
             {
                 ChangeState(ConnectionState.Connecting, error: null);
                 socket = new ClientWebSocket();
+                lock (_stateLock) _lastServerHello = null;
                 await socket.ConnectAsync(_options.Endpoint, ct).ConfigureAwait(false);
                 _socket = socket;
                 ChangeState(ConnectionState.Connected, error: null);
@@ -311,6 +327,21 @@ public sealed class MarketDataClient : IAsyncDisposable
             {
                 bool ready = WireFormat.ReadServerStatus(payload);
                 Enqueue(() => ServerStatus?.Invoke(new ServerStatusEvent(ready, receivedUtc)));
+                break;
+            }
+            case WireFormat.MessageType.ServerHello:
+            {
+                var (ver, caps, build) = WireFormat.ReadServerHello(payload);
+                var ev = new ServerHelloEvent(ver, caps, build, receivedUtc);
+                lock (_stateLock) _lastServerHello = ev;
+                Enqueue(() => ServerHello?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.SymbolDelisted:
+            {
+                ulong secId = WireFormat.ReadSymbolDelisted(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                Enqueue(() => SymbolDelisted?.Invoke(new SymbolDelistedEvent(secId, symbol, receivedUtc)));
                 break;
             }
             case WireFormat.MessageType.SubscribeOk:

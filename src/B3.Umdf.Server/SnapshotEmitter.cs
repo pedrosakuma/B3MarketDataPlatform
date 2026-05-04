@@ -17,6 +17,37 @@ namespace B3.Umdf.Server;
 internal static class SnapshotEmitter
 {
     /// <summary>
+    /// Cached UTF-8 build-version string used in every <see cref="MessageType.ServerHello"/>
+    /// frame. Sourced from the assembly version once at first access — no per-connection
+    /// reflection cost on the hot connect path.
+    /// </summary>
+    private static readonly string s_serverBuildVersion =
+        typeof(SnapshotEmitter).Assembly.GetName().Version?.ToString() ?? "0.0.0.0";
+
+    /// <summary>
+    /// Capabilities advertised in the handshake. Kept as a single source of truth so
+    /// tests can assert against it without re-deriving the bitmask.
+    /// </summary>
+    internal const ServerCapabilities AdvertisedCapabilities =
+        ServerCapabilities.SnapshotOnSubscribe | ServerCapabilities.SymbolDelistedNotification;
+
+    /// <summary>
+    /// Send a <see cref="MessageType.ServerHello"/> as the very first server-initiated
+    /// frame. Carries protocol version + capabilities + server build so clients can
+    /// negotiate features and surface the build version to operators.
+    /// </summary>
+    public static bool SendServerHello(ClientSession session)
+    {
+        var buf = new byte[WireProtocol.ServerHelloMaxSize];
+        int len = WireProtocol.WriteServerHello(
+            buf,
+            WireProtocol.ProtocolVersion,
+            AdvertisedCapabilities,
+            s_serverBuildVersion);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
+    /// <summary>
     /// Send a server-status frame (ready/initializing) directly. Used both for
     /// fresh-client greeting and for broadcast on RealTime entry.
     /// </summary>

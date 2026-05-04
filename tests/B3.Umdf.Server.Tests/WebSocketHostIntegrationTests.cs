@@ -229,6 +229,54 @@ public class WebSocketHostIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task WebSocket_ServerHello_IsFirstFrame_AndCarriesProtocolVersion()
+    {
+        var (host, sm, port, cts) = await StartHostAsync();
+        using var ws = new ClientWebSocket();
+        try
+        {
+            await ws.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/ws"), CancellationToken.None);
+
+            // Read the first WebSocket frame: it MUST be the binary ServerHello,
+            // emitted by RegisterClient before ServerStatus.
+            var buffer = new byte[1024];
+            using var receiveCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            int filled = 0;
+            WebSocketReceiveResult result;
+            do
+            {
+                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer, filled, buffer.Length - filled), receiveCts.Token);
+                filled += result.Count;
+            } while (!result.EndOfMessage);
+
+            Assert.Equal(WebSocketMessageType.Binary, result.MessageType);
+
+            // Frame 0: ServerHello (length-prefixed, type at offset 2).
+            ushort len = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(buffer);
+            ushort type = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
+            Assert.Equal((ushort)MessageType.ServerHello, type);
+            Assert.True(filled >= len, $"frame should be at least {len} bytes (got {filled})");
+
+            var (protocolVersion, capabilities, buildVersion) =
+                WireProtocol.ReadServerHello(buffer.AsSpan(WireProtocol.FramingHeaderSize, len - WireProtocol.FramingHeaderSize));
+
+            Assert.Equal(WireProtocol.ProtocolVersion, protocolVersion);
+            Assert.False(string.IsNullOrEmpty(buildVersion), "ServerHello.buildVersion must be non-empty");
+            Assert.True(capabilities.HasFlag(ServerCapabilities.SnapshotOnSubscribe));
+            Assert.True(capabilities.HasFlag(ServerCapabilities.SymbolDelistedNotification));
+
+            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
+        }
+        finally
+        {
+            cts.Cancel();
+            await host.StopAsync();
+            await host.DisposeAsync();
+            sm.Dispose();
+        }
+    }
+
     private static async Task WaitUntil(Func<bool> predicate, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

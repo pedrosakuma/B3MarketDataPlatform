@@ -217,6 +217,45 @@ public class SubscriptionManagerTests
     }
 
     [Fact]
+    public void NotifyDelisted_NotifiesOnlySubscribers_AndCleansUpSubscriptionMap()
+    {
+        using var sm = new SubscriptionManager();
+
+        var subscriber = new ClientSession(new FakeWebSocket(), channelCapacity: 16);
+        var bystander = new ClientSession(new FakeWebSocket(), channelCapacity: 16);
+        sm.RegisterClient(subscriber);
+        sm.RegisterClient(bystander);
+
+        // Both sessions received ServerHello + ServerStatus on register (2 frames each).
+        Assert.Equal(2, subscriber.QueueDepth);
+        Assert.Equal(2, bystander.QueueDepth);
+
+        const ulong securityId = 9999UL;
+        sm.AddSubscriptionForTest(subscriber.Id, securityId, DataFlags.Book);
+        Assert.Equal(1, sm.ActiveSymbolCount);
+
+        int subscriberBefore = subscriber.QueueDepth;
+        int bystanderBefore = bystander.QueueDepth;
+        sm.NotifyDelisted(securityId);
+
+        // Subscriber gains the SymbolDelisted frame (and any internal cleanup deltas
+        // routed through the outbound ring); bystander's queue is untouched.
+        Assert.True(subscriber.QueueDepth > subscriberBefore,
+            $"subscriber should receive SymbolDelisted (depth {subscriberBefore} -> {subscriber.QueueDepth})");
+        Assert.Equal(bystanderBefore, bystander.QueueDepth);
+
+        // Server-side subscription map for the symbol is cleared so future events
+        // for the same securityId no longer fan out anywhere.
+        Assert.Equal(0, sm.ActiveSymbolCount);
+
+        // Idempotent: re-calling on a symbol with no subscribers is a no-op.
+        int subscriberAfter = subscriber.QueueDepth;
+        sm.NotifyDelisted(securityId);
+        Assert.Equal(subscriberAfter, subscriber.QueueDepth);
+        Assert.Equal(bystanderBefore, bystander.QueueDepth);
+    }
+
+    [Fact]
     public void AppSettings_DefaultValues()
     {
         var settings = new AppSettings();

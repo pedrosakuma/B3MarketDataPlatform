@@ -924,6 +924,28 @@ function handleMessage(msg) {
       if (msg.ready && !wasReady) resubscribeAll();
       break;
     }
+    case 'ServerHello': {
+      // Stash the negotiated protocol version + capabilities + build for diagnostics.
+      // UI surfacing is intentionally minimal: log + post for any future status bar.
+      log(`Server protocol v${msg.protocolVersion} (build ${msg.buildVersion}, caps 0x${msg.capabilities.toString(16)})`, 'log-info');
+      postMessage({
+        type: 'serverHello',
+        protocolVersion: msg.protocolVersion,
+        capabilities: msg.capabilities,
+        buildVersion: msg.buildVersion,
+      });
+      break;
+    }
+    case 'SymbolDelisted': {
+      const id = secIdStr(msg.securityId);
+      const sub = subscriptions.get(id);
+      log(`Symbol ${sub ? sub.symbol : id} delisted by venue`, 'log-info');
+      // Server has already cleaned up its side; drop the local subscription so we
+      // stop trying to render it. No Unsubscribe frame needed.
+      if (sub) subscriptions.delete(id);
+      mark(D_SUBS | D_ALLINFO);
+      break;
+    }
     case 'SymbolStaleStatus': {
       const id = secIdStr(msg.securityId);
       const sub = subscriptions.get(id);

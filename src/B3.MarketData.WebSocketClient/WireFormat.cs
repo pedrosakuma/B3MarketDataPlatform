@@ -28,6 +28,8 @@ internal static class WireFormat
         Trade = 0x0033,
         TradeBust = 0x0035,
         ServerStatus = 0x0050,
+        SymbolDelisted = 0x0071,
+        ServerHello = 0x00A0,
     }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
@@ -115,6 +117,24 @@ internal static class WireFormat
     }
 
     public static bool ReadServerStatus(ReadOnlySpan<byte> payload) => payload[0] != 0;
+
+    /// <summary>
+    /// Decode a <c>ServerHello</c> payload (everything after the 4-byte framing
+    /// header). Layout: <c>[u32 protocolVersion][u32 capabilities][u8 buildVerLen][buildVer UTF-8…]</c>.
+    /// </summary>
+    public static (uint ProtocolVersion, ServerCapabilities Capabilities, string BuildVersion) ReadServerHello(
+        ReadOnlySpan<byte> payload)
+    {
+        uint version = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        var caps = (ServerCapabilities)BinaryPrimitives.ReadUInt32LittleEndian(payload[4..]);
+        byte buildLen = payload[8];
+        string build = Encoding.UTF8.GetString(payload.Slice(9, buildLen));
+        return (version, caps, build);
+    }
+
+    /// <summary>Decode a <c>SymbolDelisted</c> payload: <c>[securityId u64]</c>.</summary>
+    public static ulong ReadSymbolDelisted(ReadOnlySpan<byte> payload)
+        => BinaryPrimitives.ReadUInt64LittleEndian(payload);
 
     public static (ulong SecurityId, long Price, long Qty, long TradeId) ReadTrade(ReadOnlySpan<byte> payload)
     {
