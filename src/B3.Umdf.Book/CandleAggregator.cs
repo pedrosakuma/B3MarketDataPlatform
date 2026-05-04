@@ -19,20 +19,26 @@ namespace B3.Umdf.Book;
 /// </summary>
 internal sealed class CandleAggregator
 {
-    private const int MaxGapFill = 60; // max gap-fill candles per trade gap
+    /// <summary>Default value of <see cref="CandleAggregatorOptions.RetentionWindow"/>; preserved as a const for back-compat with existing callers/tests.</summary>
     internal const int MaxRetainedCandles = 10 * 60 * 60; // 10h @ 1s resolution
     /// <summary>
     /// 512 candles × 56 bytes = 28,672 bytes per chunk — comfortably below the .NET LOH
     /// threshold (85,000 bytes), so chunk allocations stay on the SOH and are cheap to GC.
     /// </summary>
     internal const int ChunkSize = 512;
+    /// <summary>Number of chunk slots required for the default retention. Instance retention may differ; see <see cref="_maxChunks"/>.</summary>
     internal static readonly int MaxChunks = (MaxRetainedCandles + ChunkSize - 1) / ChunkSize;
+
+    private readonly int _maxGapFill;
+    private readonly int _maxRetainedCandles;
+    private readonly int _bucketSize;
+    private readonly int _maxChunks;
 
     /// <summary>
     /// Fixed-length array of chunk references. Allocated once at construction (small: ~MaxChunks
     /// pointers ≈ 568 bytes per security). Individual chunks are allocated lazily on first write.
     /// </summary>
-    private readonly Candle[]?[] _chunks = new Candle[MaxChunks][];
+    private readonly Candle[]?[] _chunks;
     private long _lastClose;
     /// <summary>Logical index of the oldest candle (0..MaxRetainedCandles-1).</summary>
     private volatile int _head;
@@ -46,8 +52,14 @@ internal sealed class CandleAggregator
     // as "stat-quality-degraded" without distorting OHLC.
     private Dictionary<long, int>? _bustedCounts;
 
-    /// <summary>Resolution is always 1 second.</summary>
-    public int Resolution => 1;
+    /// <summary>Resolution in seconds — equals the configured bucket size.</summary>
+    public int Resolution => _bucketSize;
+
+    /// <summary>Maximum number of candles this instance will retain (configurable).</summary>
+    public int RetentionWindow => _maxRetainedCandles;
+
+    /// <summary>Maximum gap-fill candles inserted between consecutive trades (configurable).</summary>
+    public int MaxGapFill => _maxGapFill;
 
     /// <summary>Number of candles stored.</summary>
     public int Count => _count;
@@ -57,6 +69,21 @@ internal sealed class CandleAggregator
 
     /// <summary>Most recent close price written to the aggregator, or 0 if empty.</summary>
     public long LastClose => _lastClose;
+
+    /// <summary>Construct with default options (matches legacy behavior: 60s gap-fill cap, 10h retention, 1s buckets).</summary>
+    public CandleAggregator() : this(CandleAggregatorOptions.Default) { }
+
+    /// <summary>Construct with explicit options.</summary>
+    public CandleAggregator(CandleAggregatorOptions options)
+    {
+        if (options is null) throw new ArgumentNullException(nameof(options));
+        options.Validate();
+        _maxGapFill = options.MaxGapFill;
+        _maxRetainedCandles = options.RetentionWindow;
+        _bucketSize = options.BucketSize;
+        _maxChunks = (_maxRetainedCandles + ChunkSize - 1) / ChunkSize;
+        _chunks = new Candle[_maxChunks][];
+    }
 
     /// <summary>
     /// Locate the candle whose <see cref="Candle.Time"/> equals
@@ -73,9 +100,12 @@ internal sealed class CandleAggregator
         var oldestChunk = _chunks[oldestPos / ChunkSize];
         if (oldestChunk is null) return -1;
         long oldestTime = oldestChunk[oldestPos % ChunkSize].Time;
-        long delta = timestampSeconds - oldestTime;
-        if (delta < 0 || delta >= count) return -1;
-        return (int)delta;
+        long bucket = BucketFloor(timestampSeconds);
+        long delta = bucket - oldestTime;
+        if (delta < 0) return -1;
+        long step = delta / _bucketSize;
+        if (step >= count) return -1;
+        return (int)step;
     }
 
     /// <summary>Read the candle at logical index <paramref name="logicalIndex"/>.</summary>
@@ -83,7 +113,7 @@ internal sealed class CandleAggregator
     {
         if ((uint)logicalIndex >= (uint)_count)
             throw new ArgumentOutOfRangeException(nameof(logicalIndex));
-        int pos = (_head + logicalIndex) % MaxRetainedCandles;
+        int pos = (_head + logicalIndex) % _maxRetainedCandles;
         return _chunks[pos / ChunkSize]![pos % ChunkSize];
     }
 
@@ -97,7 +127,7 @@ internal sealed class CandleAggregator
     {
         if ((uint)logicalIndex >= (uint)_count)
             throw new ArgumentOutOfRangeException(nameof(logicalIndex));
-        int pos = (_head + logicalIndex) % MaxRetainedCandles;
+        int pos = (_head + logicalIndex) % _maxRetainedCandles;
         _chunks[pos / ChunkSize]![pos % ChunkSize] = candle;
         if (logicalIndex == _count - 1)
             _lastClose = candle.Close;
@@ -116,7 +146,7 @@ internal sealed class CandleAggregator
         _count--;
         if (_count > 0)
         {
-            int pos = (_head + _count - 1) % MaxRetainedCandles;
+            int pos = (_head + _count - 1) % _maxRetainedCandles;
             _lastClose = _chunks[pos / ChunkSize]![pos % ChunkSize].Close;
         }
         else
@@ -135,15 +165,16 @@ internal sealed class CandleAggregator
     /// </summary>
     public void IncrementBustedCount(long timestampSeconds)
     {
+        long bucket = BucketFloor(timestampSeconds);
         _bustedCounts ??= new Dictionary<long, int>();
-        _bustedCounts.TryGetValue(timestampSeconds, out var c);
-        _bustedCounts[timestampSeconds] = c + 1;
+        _bustedCounts.TryGetValue(bucket, out var c);
+        _bustedCounts[bucket] = c + 1;
         _version++;
     }
 
     /// <summary>How many busted trades fall in the bucket at <paramref name="timestampSeconds"/>.</summary>
     public int GetBustedCount(long timestampSeconds)
-        => _bustedCounts is { } b && b.TryGetValue(timestampSeconds, out var c) ? c : 0;
+        => _bustedCounts is { } b && b.TryGetValue(BucketFloor(timestampSeconds), out var c) ? c : 0;
 
     /// <summary>Convenience overload for tests/callers that don't have a session VWAP.
     /// Stamps the trade price as Avg (best-effort fallback).</summary>
@@ -159,16 +190,17 @@ internal sealed class CandleAggregator
     /// </summary>
     public bool Add(long price, long quantity, long timestampSeconds, long sessionVwap)
     {
+        long bucket = BucketFloor(timestampSeconds);
         if (_count > 0)
         {
-            int lastPos = (_head + _count - 1) % MaxRetainedCandles;
+            int lastPos = (_head + _count - 1) % _maxRetainedCandles;
             ref var last = ref _chunks[lastPos / ChunkSize]![lastPos % ChunkSize];
-            if (timestampSeconds < last.Time)
+            if (bucket < last.Time)
                 return false; // out-of-order trade — ignore to preserve time ordering
 
-            if (timestampSeconds == last.Time)
+            if (bucket == last.Time)
             {
-                // Same second — update in place
+                // Same bucket — update in place
                 if (price > last.High) last.High = price;
                 if (price < last.Low) last.Low = price;
                 last.Close = price;
@@ -179,29 +211,39 @@ internal sealed class CandleAggregator
                 return false;
             }
 
-            // Gap-fill: insert flat candles for empty seconds between last and current.
+            // Gap-fill: insert flat candles for empty buckets between last and current.
             // Avg = previous bucket's VWAP (no trades happened during the gap, so VWAP is unchanged).
-            long gapStart = last.Time + 1;
+            long gapStart = last.Time + _bucketSize;
             int gaps = 0;
             long gapAvg = last.Avg;
-            while (gapStart < timestampSeconds && gaps < MaxGapFill)
+            while (gapStart < bucket && gaps < _maxGapFill)
             {
                 AppendCandle(new Candle(gapStart, _lastClose, _lastClose, _lastClose, _lastClose, 0, gapAvg));
-                gapStart++;
+                gapStart += _bucketSize;
                 gaps++;
             }
 
-            AppendCandle(new Candle(timestampSeconds, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity, sessionVwap));
+            AppendCandle(new Candle(bucket, _lastClose, Math.Max(price, _lastClose), Math.Min(price, _lastClose), price, quantity, sessionVwap));
         }
         else
         {
             // First candle ever
-            AppendCandle(new Candle(timestampSeconds, price, price, price, price, quantity, sessionVwap));
+            AppendCandle(new Candle(bucket, price, price, price, price, quantity, sessionVwap));
         }
 
         _lastClose = price;
         _version++;
         return true;
+    }
+
+    private long BucketFloor(long timestampSeconds)
+    {
+        if (_bucketSize == 1) return timestampSeconds;
+        // Floor toward negative infinity; trade timestamps are >= 0 in practice but
+        // guard for safety against synthetic test inputs.
+        long b = timestampSeconds / _bucketSize;
+        if (timestampSeconds < 0 && timestampSeconds % _bucketSize != 0) b--;
+        return b * _bucketSize;
     }
 
     /// <summary>
@@ -217,7 +259,7 @@ internal sealed class CandleAggregator
             var snapshot = new Candle[count];
             for (int i = 0; i < count; i++)
             {
-                int pos = (head + i) % MaxRetainedCandles;
+                int pos = (head + i) % _maxRetainedCandles;
                 var chunk = _chunks[pos / ChunkSize];
                 if (chunk is null)
                 {
@@ -244,7 +286,7 @@ internal sealed class CandleAggregator
             int v1 = _version;
             int count = _count;
             if (count == 0) return null;
-            int pos = (_head + count - 1) % MaxRetainedCandles;
+            int pos = (_head + count - 1) % _maxRetainedCandles;
             var chunk = _chunks[pos / ChunkSize];
             if (chunk is null)
             {
@@ -260,16 +302,16 @@ internal sealed class CandleAggregator
     private void AppendCandle(in Candle candle)
     {
         int writePos;
-        if (_count == MaxRetainedCandles)
+        if (_count == _maxRetainedCandles)
         {
             // At the retention cap: ring-buffer write; advance head.
-            writePos = (_head + _count) % MaxRetainedCandles;
+            writePos = (_head + _count) % _maxRetainedCandles;
             _chunks[writePos / ChunkSize]![writePos % ChunkSize] = candle;
-            _head = (_head + 1) % MaxRetainedCandles;
+            _head = (_head + 1) % _maxRetainedCandles;
             return;
         }
 
-        writePos = (_head + _count) % MaxRetainedCandles;
+        writePos = (_head + _count) % _maxRetainedCandles;
         int chunkIdx = writePos / ChunkSize;
         var chunk = _chunks[chunkIdx];
         if (chunk is null)
