@@ -121,4 +121,73 @@ public class CliArgsTests
         Assert.Equal(2.5, settings.Speed);
     }
 
+    [Theory]
+    [InlineData("--ws-port")]
+    [InlineData("--speed")]
+    [InlineData("--pcap-prefix")]
+    [InlineData("--multicast-config")]
+    [InlineData("--loss-targets")]
+    [InlineData("--loss-rate")]
+    [InlineData("--loss-mode")]
+    [InlineData("--loss-burst")]
+    [InlineData("--loss-seed")]
+    public void TryApply_ValueFlagAtEndOfArgs_ReturnsError(string flag)
+    {
+        var settings = new AppSettings();
+        var ok = CliArgs.TryApply(new[] { flag }, settings, new List<string>(), out var error);
+
+        Assert.False(ok);
+        Assert.NotNull(error);
+        Assert.Contains(flag, error);
+        Assert.Contains("requires a value", error);
+        Assert.Contains("<EOF>", error);
+    }
+
+    [Fact]
+    public void TryApply_MulticastConfigFollowedByAnotherFlag_ReturnsError()
+    {
+        var settings = new AppSettings();
+        var ok = CliArgs.TryApply(
+            new[] { "--multicast-config", "--replay-to-multicast" },
+            settings, new List<string>(), out var error);
+
+        Assert.False(ok);
+        Assert.NotNull(error);
+        Assert.Contains("--multicast-config", error);
+        Assert.Contains("requires a value", error);
+        Assert.Contains("--replay-to-multicast", error);
+        // The next flag must NOT have been silently consumed as the value.
+        Assert.Null(settings.MulticastConfig);
+        Assert.False(settings.ReplayToMulticast);
+    }
+
+    [Fact]
+    public void TryApply_SpeedFollowedByAnotherFlag_ReturnsError()
+    {
+        var settings = new AppSettings { Speed = 1.0 };
+        var ok = CliArgs.TryApply(
+            new[] { "--speed", "--multicast-config", "cfg.json" },
+            settings, new List<string>(), out var error);
+
+        Assert.False(ok);
+        Assert.NotNull(error);
+        Assert.Contains("--speed", error);
+        Assert.Contains("requires a value", error);
+        // Speed must remain untouched.
+        Assert.Equal(1.0, settings.Speed);
+    }
+
+    [Fact]
+    public void TryApply_MulticastConfigWithValue_ParsesCorrectly()
+    {
+        var settings = new AppSettings();
+        var ok = CliArgs.TryApply(
+            new[] { "--multicast-config", "/path/to/file.json" },
+            settings, new List<string>(), out var error);
+
+        Assert.True(ok);
+        Assert.Null(error);
+        Assert.Equal("/path/to/file.json", settings.MulticastConfig);
+    }
+
 }

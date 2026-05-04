@@ -23,18 +23,37 @@ internal static class CliArgs
     {
         var cliPrefixes = new List<string>();
 
+        // Flags that take a value as the next token. Used to detect missing
+        // values (flag at end of args, or followed by another --flag) and
+        // surface a clear validation error instead of silently consuming the
+        // next flag as the value.
+        var valueFlags = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "--ws-port", "--speed", "--pcap-prefix", "--multicast-config",
+            "--loss-targets", "--loss-rate", "--loss-mode", "--loss-burst",
+            "--loss-seed",
+        };
+
         for (int i = 0; i < args.Length; i++)
         {
-            switch (args[i])
+            var arg = args[i];
+
+            if (valueFlags.Contains(arg) && !TryReadValue(args, ref i, arg, out var readErr))
             {
-                case "--ws-port" when i + 1 < args.Length:
-                    if (!int.TryParse(args[++i], out var p) || p < 1 || p > 65535)
+                error = readErr;
+                return false;
+            }
+
+            switch (arg)
+            {
+                case "--ws-port":
+                    if (!int.TryParse(args[i], out var p) || p < 1 || p > 65535)
                     { error = "Invalid --ws-port value."; return false; }
                     settings.WsPort = p;
                     break;
 
-                case "--speed" when i + 1 < args.Length:
-                    if (!double.TryParse(args[++i],
+                case "--speed":
+                    if (!double.TryParse(args[i],
                             System.Globalization.NumberStyles.Any,
                             System.Globalization.CultureInfo.InvariantCulture,
                             out var sp) || sp < 0)
@@ -45,24 +64,24 @@ internal static class CliArgs
                     settings.Speed = sp;
                     break;
 
-                case "--pcap-prefix" when i + 1 < args.Length:
-                    cliPrefixes.Add(args[++i]);
+                case "--pcap-prefix":
+                    cliPrefixes.Add(args[i]);
                     break;
 
-                case "--multicast-config" when i + 1 < args.Length:
-                    settings.MulticastConfig = args[++i];
+                case "--multicast-config":
+                    settings.MulticastConfig = args[i];
                     break;
 
                 case "--replay-to-multicast":
                     settings.ReplayToMulticast = true;
                     break;
 
-                case "--loss-targets" when i + 1 < args.Length:
-                    settings.LossTargets = args[++i];
+                case "--loss-targets":
+                    settings.LossTargets = args[i];
                     break;
 
-                case "--loss-rate" when i + 1 < args.Length:
-                    if (!double.TryParse(args[++i],
+                case "--loss-rate":
+                    if (!double.TryParse(args[i],
                             System.Globalization.NumberStyles.Any,
                             System.Globalization.CultureInfo.InvariantCulture,
                             out var lr) || lr < 0 || lr > 1)
@@ -73,12 +92,12 @@ internal static class CliArgs
                     settings.LossRate = lr;
                     break;
 
-                case "--loss-mode" when i + 1 < args.Length:
-                    settings.LossMode = args[++i];
+                case "--loss-mode":
+                    settings.LossMode = args[i];
                     break;
 
-                case "--loss-burst" when i + 1 < args.Length:
-                    if (!int.TryParse(args[++i], out var lb) || lb < 1)
+                case "--loss-burst":
+                    if (!int.TryParse(args[i], out var lb) || lb < 1)
                     { error = "Invalid --loss-burst value. Must be >= 1."; return false; }
                     settings.LossBurstSize = lb;
                     break;
@@ -87,14 +106,14 @@ internal static class CliArgs
                     settings.LossCorrelated = true;
                     break;
 
-                case "--loss-seed" when i + 1 < args.Length:
-                    if (!int.TryParse(args[++i], out var ls))
+                case "--loss-seed":
+                    if (!int.TryParse(args[i], out var ls))
                     { error = "Invalid --loss-seed value."; return false; }
                     settings.LossSeed = ls;
                     break;
 
                 default:
-                    positionalArgs.Add(args[i]);
+                    positionalArgs.Add(arg);
                     break;
             }
         }
@@ -107,6 +126,24 @@ internal static class CliArgs
             settings.PcapPrefixes.AddRange(cliPrefixes);
         }
 
+        error = null;
+        return true;
+    }
+
+    private static bool TryReadValue(string[] args, ref int i, string flag, out string? error)
+    {
+        if (i + 1 >= args.Length)
+        {
+            error = $"{flag} requires a value (got: <EOF>)";
+            return false;
+        }
+        var next = args[i + 1];
+        if (next.StartsWith("--", StringComparison.Ordinal))
+        {
+            error = $"{flag} requires a value (got: {next})";
+            return false;
+        }
+        i++;
         error = null;
         return true;
     }
