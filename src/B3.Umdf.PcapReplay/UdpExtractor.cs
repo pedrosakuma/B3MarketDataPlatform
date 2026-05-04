@@ -19,6 +19,36 @@ public static class UdpExtractor
         return offset + ihl + 8; // IP header + UDP header (8 bytes)
     }
 
+    /// <summary>
+    /// Best-effort, non-throwing variant of <see cref="ComputeUdpPayloadOffset"/>.
+    /// Returns false (and offset = -1) when the frame is too short, the link type is unsupported,
+    /// or the computed offset would land outside the captured frame. Intended for corruption-tolerant
+    /// PCAP readers that need to skip malformed records without aborting the merge.
+    /// </summary>
+    public static bool TryComputeUdpPayloadOffset(ReadOnlySpan<byte> frame, uint linkType, out int offset)
+    {
+        offset = -1;
+        try
+        {
+            if (frame.Length < 28) return false;
+            if (linkType != 1 && linkType != 113) return false;
+
+            int ipOff = GetIpOffset(frame, linkType);
+            if (ipOff < 0 || ipOff >= frame.Length) return false;
+            int ihl = (frame[ipOff] & 0x0F) * 4;
+            if (ihl < 20) return false; // IPv4 minimum header length
+            int payloadStart = ipOff + ihl + 8;
+            if (payloadStart < 0 || payloadStart > frame.Length) return false;
+
+            offset = payloadStart;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static ushort ExtractUdpDstPort(ReadOnlySpan<byte> frame, uint linkType = 1)
     {
         int offset = GetIpOffset(frame, linkType);
@@ -39,17 +69,13 @@ public static class UdpExtractor
 
     private static int GetEthernetIpOffset(ReadOnlySpan<byte> frame)
     {
-        // Standard Ethernet header: 14 bytes (dst[6] + src[6] + ethertype[2])
-        int offset = 12; // skip MACs, point at EtherType
+        int offset = 12;
         ushort etherType = (ushort)((frame[offset] << 8) | frame[offset + 1]);
-
-        // Skip 802.1Q VLAN tags (0x8100) — may be stacked (QinQ)
         while (etherType == 0x8100 || etherType == 0x88A8)
         {
-            offset += 4; // VLAN tag: TPID(2) + TCI(2)
+            offset += 4;
             etherType = (ushort)((frame[offset] << 8) | frame[offset + 1]);
         }
-
-        return offset + 2; // skip the final EtherType field → IP header starts here
+        return offset + 2;
     }
 }

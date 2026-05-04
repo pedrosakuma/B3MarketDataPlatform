@@ -1,4 +1,6 @@
 using B3.Umdf.Transport;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.PcapReplay;
 
@@ -18,22 +20,37 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
     private readonly long[] _groupTimeOffset;
     private readonly ReplayOptions _options;
     private readonly LossInjector? _loss;
+    private readonly ILogger _logger;
     private long? _firstTimestampMicros;
     private readonly System.Diagnostics.Stopwatch _stopwatch = System.Diagnostics.Stopwatch.StartNew();
     private bool _disposed;
     private long _droppedPackets;
+    private long _malformedPcapFrames;
 
     /// <summary>Number of packets suppressed by the loss policy. 0 when no policy.</summary>
     public long DroppedPackets => System.Threading.Volatile.Read(ref _droppedPackets);
 
+    /// <summary>
+    /// Number of PCAP frames dropped because their UDP payload offset could not be computed
+    /// (truncated link-layer header, unsupported link type, or out-of-range slice). The merge
+    /// continues past these — they do not stop the stream.
+    /// </summary>
+    public long MalformedPcapFrames => System.Threading.Volatile.Read(ref _malformedPcapFrames);
+
     public TimestampMergedReplayer(IReadOnlyList<PcapChannelSource> sources, ReplayOptions? options = null)
+        : this(sources, options, logger: null) { }
+
+    public TimestampMergedReplayer(IReadOnlyList<PcapChannelSource> sources, ReplayOptions? options, ILogger<TimestampMergedReplayer>? logger)
     {
         _options = options ?? new ReplayOptions();
         _loss = _options.Loss is { } p ? new LossInjector(p) : null;
+        _logger = logger ?? NullLogger<TimestampMergedReplayer>.Instance;
         _cachedUdpOffset = new int[sources.Count];
         _groupTimeOffset = new long[sources.Count];
 
-        // First pass: read first packet from each reader and find min timestamp per group
+        // First pass: read first packet from each reader and find min timestamp per group.
+        // For each reader, advance past leading malformed frames so the cached offset is
+        // computed against a packet whose link-layer header is intact.
         var firstPackets = new PcapPacket?[sources.Count];
         var groupMinTimestamp = new Dictionary<int, long>();
 
@@ -42,12 +59,27 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             var src = sources[i];
             var reader = new MmapPcapReader(src.FilePath);
             _readers.Add((reader, src.Channel, src.Group));
-            if (reader.TryReadNext(out var pkt))
+
+            PcapPacket? firstValid = null;
+            int validOffset = -1;
+            while (reader.TryReadNext(out var pkt))
             {
-                _cachedUdpOffset[i] = UdpExtractor.ComputeUdpPayloadOffset(pkt.Data.Span, reader.LinkType);
-                firstPackets[i] = pkt;
-                if (!groupMinTimestamp.TryGetValue(src.Group, out var existing) || pkt.TimestampMicros < existing)
-                    groupMinTimestamp[src.Group] = pkt.TimestampMicros;
+                if (UdpExtractor.TryComputeUdpPayloadOffset(pkt.Data.Span, reader.LinkType, out int off))
+                {
+                    firstValid = pkt;
+                    validOffset = off;
+                    break;
+                }
+                long n = System.Threading.Interlocked.Increment(ref _malformedPcapFrames);
+                LogMalformedRateLimited(n, src.FilePath, pkt.Data.Length);
+            }
+
+            if (firstValid is { } v)
+            {
+                _cachedUdpOffset[i] = validOffset;
+                firstPackets[i] = v;
+                if (!groupMinTimestamp.TryGetValue(src.Group, out var existing) || v.TimestampMicros < existing)
+                    groupMinTimestamp[src.Group] = v.TimestampMicros;
             }
         }
 
@@ -61,6 +93,14 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             if (firstPackets[i] is { } pkt)
                 _pq.Enqueue((pkt, i), pkt.TimestampMicros - _groupTimeOffset[i]);
         }
+    }
+
+    private void LogMalformedRateLimited(long counter, string filePath, int frameLen)
+    {
+        if (counter == 1 || (counter & 63) == 0)
+            _logger.LogWarning(
+                "Dropping malformed PCAP frame from {Path} (frameLen={FrameLen}); UDP payload offset could not be computed (MalformedPcapFrames={Count}).",
+                filePath, frameLen, counter);
     }
 
     /// <summary>
@@ -84,10 +124,6 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             {
                 _firstTimestampMicros ??= normalizedTimestamp;
                 // Sub-millisecond pacing: target elapsed time using Stopwatch ticks (typically 100 ns resolution).
-                // Coarse Thread.Sleep is replaced by a 3-tier wait that preserves microbursts of inter-packet gaps:
-                //   - long delay (>= 2 ms): Thread.Sleep((int)(delayMs - 1)) for OS-scheduled wait
-                //   - medium delay (>= 50 us): Thread.SpinWait + Yield to avoid kernel scheduling jitter
-                //   - tiny delay: tight Thread.SpinWait (sub-microsecond)
                 double targetElapsedMicros = (normalizedTimestamp - _firstTimestampMicros.Value) / _options.SpeedMultiplier;
                 long targetElapsedTicks = (long)(targetElapsedMicros * System.Diagnostics.Stopwatch.Frequency / 1_000_000.0);
                 long delayTicks = targetElapsedTicks - _stopwatch.ElapsedTicks;
@@ -111,7 +147,20 @@ public sealed class TimestampMergedReplayer : ISyncPacketSource, IPacketSource
             }
 
             var (reader, channel, group) = _readers[item.ReaderIndex];
-            var payload = item.Packet.Data.Slice(_cachedUdpOffset[item.ReaderIndex]);
+            int udpOffset = _cachedUdpOffset[item.ReaderIndex];
+
+            // Validate the cached offset still fits this packet — a short/malformed frame
+            // would otherwise throw from Memory.Slice. Drop it and continue.
+            if (udpOffset < 0 || udpOffset > item.Packet.Data.Length)
+            {
+                long n = System.Threading.Interlocked.Increment(ref _malformedPcapFrames);
+                LogMalformedRateLimited(n, "<reader index " + item.ReaderIndex + ">", item.Packet.Data.Length);
+                if (reader.TryReadNext(out var nextSkip))
+                    _pq.Enqueue((nextSkip, item.ReaderIndex), nextSkip.TimestampMicros - _groupTimeOffset[item.ReaderIndex]);
+                continue;
+            }
+
+            var payload = item.Packet.Data.Slice(udpOffset);
 
             // Always advance the reader regardless of drop decision so the
             // priority queue stays full and per-reader ordering is preserved.
