@@ -5,7 +5,7 @@ namespace B3.Umdf.Feed;
 
 public static class MessageDispatcher
 {
-    public const int SbeHeaderSize = MessageHeader.MESSAGE_SIZE;
+    public const int SbeHeaderSize = SbeFrameWalker.SbeHeaderSize;
 
     public static void Dispatch(in UmdfPacket packet, IFeedEventHandler handler)
     {
@@ -18,6 +18,10 @@ public static class MessageDispatcher
     /// when the decoded template is one of the UMDF reset templates
     /// (<c>SequenceReset_1</c>, <c>ChannelReset_11</c>) so downstream consumers
     /// can react to mid-session resets without re-decoding the SBE body.
+    ///
+    /// Per-frame walking (framing parse, length validation, SBE slice/template
+    /// extraction) is delegated to <see cref="SbeFrameWalker"/>; this method
+    /// owns only the dispatcher-specific fan-out.
     /// </summary>
     public static void Dispatch(in UmdfPacket packet, ReadOnlySpan<byte> span, IFeedEventHandler handler)
     {
@@ -26,23 +30,8 @@ public static class MessageDispatcher
 
         int offset = UmdfPacketHeader.Size;
 
-        while (offset + FramingHeader.MESSAGE_SIZE + SbeHeaderSize <= span.Length)
+        while (SbeFrameWalker.TryReadNext(span, ref offset, out var sbeSlice, out var templateId))
         {
-            var framingSlice = span[offset..];
-            if (!FramingHeader.TryParse(framingSlice, out var framing, out _))
-                break;
-
-            if (framing.MessageLength < FramingHeader.MESSAGE_SIZE + SbeHeaderSize)
-                break;
-
-            if (offset + framing.MessageLength > span.Length)
-                break;
-
-            // SBE message starts right after the FramingHeader
-            var sbeSlice = span[(offset + FramingHeader.MESSAGE_SIZE)..];
-            if (!MessageHeader.TryReadTemplateId(sbeSlice, out var templateId))
-                break;
-
             handler.OnPacket(in packet, sbeSlice, templateId);
 
             // SequenceReset fan-out: SBE template ids 1 and 11 are mid-session
@@ -54,8 +43,6 @@ public static class MessageDispatcher
                 handler.OnSequenceReset(packet.ChannelGroup, SequenceResetReason.SequenceReset);
             else if (templateId == ChannelReset_11Data.MESSAGE_ID)
                 handler.OnSequenceReset(packet.ChannelGroup, SequenceResetReason.ChannelReset);
-
-            offset += framing.MessageLength;
         }
     }
 }
