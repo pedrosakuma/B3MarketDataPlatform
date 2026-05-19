@@ -133,6 +133,18 @@ public sealed class MarketDataClient : IAsyncDisposable
     private long _unknownMessageCount;
 
     /// <summary>
+    /// Creates an opt-in <see cref="IBookFeed"/> view that materializes an
+    /// in-memory L3 / MBO book for every subscribed symbol and exposes a
+    /// derived top-of-book (<see cref="IBookView"/>) — see issue #43.
+    /// The feed attaches handlers on construction and detaches on disposal;
+    /// it does NOT issue subscriptions itself, so callers must still call
+    /// <c>SubscribeAsync(symbol, SubscribeFlags.Book | …)</c>. Construct at
+    /// most one BookFeed per client (multiple feeds would double-process
+    /// every frame); for DI, prefer <c>AddMarketDataClient(…).WithBookFeed()</c>.
+    /// </summary>
+    public BookFeed CreateBookFeed() => new(this);
+
+    /// <summary>
     /// Per-newsId reassembly buffers for fragmented <c>NewsBegin/Chunk/End</c>
     /// frames. Single-reader (the receive loop) so plain Dictionary is fine.
     /// Entries are removed on NewsEnd; abandoned reassemblies (server reboot,

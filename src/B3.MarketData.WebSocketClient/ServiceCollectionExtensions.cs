@@ -35,4 +35,19 @@ public static class ServiceCollectionExtensions
         });
         return services;
     }
+
+    /// <summary>
+    /// Opt into the materialized <see cref="IBookFeed"/> layer (issue #43).
+    /// Registers a singleton <see cref="BookFeed"/> that attaches to the
+    /// already-registered <see cref="MarketDataClient"/> and exposes both
+    /// <see cref="BookFeed"/> (concrete) and <see cref="IBookFeed"/> (seam).
+    /// MUST be chained after <see cref="AddMarketDataClient"/>.
+    /// </summary>
+    public static IServiceCollection WithBookFeed(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        services.TryAddSingleton(sp => sp.GetRequiredService<MarketDataClient>().CreateBookFeed());
+        services.TryAddSingleton<IBookFeed>(sp => sp.GetRequiredService<BookFeed>());
+        return services;
+    }
 }
