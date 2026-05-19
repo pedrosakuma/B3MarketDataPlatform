@@ -75,6 +75,45 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<SubscribeErrorEvent>? SubscribeError;
     public event Action<ConnectionStateChangedEvent>? ConnectionStateChanged;
 
+    // ── L3 / Order-by-order (MBO) ────────────────────────────────────
+
+    /// <summary>L3 snapshot-phase marker. Consumers SHOULD clear prior book
+    /// state and rebuild from the <see cref="OrderAdded"/> stream that
+    /// follows in the same packet.</summary>
+    public event Action<BookSnapshotEvent>? BookSnapshot;
+    public event Action<OrderAddedEvent>? OrderAdded;
+    public event Action<OrderUpdatedEvent>? OrderUpdated;
+    public event Action<OrderDeletedEvent>? OrderDeleted;
+    public event Action<BookClearedEvent>? BookCleared;
+    public event Action<MarketTierUpdateEvent>? MarketTierUpdate;
+
+    // ── MBP / aggregated levels ──────────────────────────────────────
+
+    public event Action<LevelSnapshotEvent>? LevelSnapshot;
+    public event Action<LevelUpdateEvent>? LevelUpdate;
+    public event Action<LevelDeletedEvent>? LevelDeleted;
+
+    // ── Stale / recovery ─────────────────────────────────────────────
+
+    public event Action<SymbolStaleStatusEvent>? SymbolStaleStatus;
+    public event Action<RecoveryProgressEvent>? RecoveryProgress;
+
+    // ── Candles ──────────────────────────────────────────────────────
+
+    public event Action<CandleSnapshotEvent>? CandleSnapshot;
+    public event Action<CandleUpdateEvent>? CandleUpdate;
+
+    // ── Rankings ─────────────────────────────────────────────────────
+
+    public event Action<RankingsUpdateEvent>? RankingsUpdate;
+
+    // ── News ─────────────────────────────────────────────────────────
+
+    /// <summary>Raised once per fully-reassembled news delivery. The SDK
+    /// buffers <c>NewsBegin/Chunk/End</c> frames internally and surfaces a
+    /// single typed event with the joined Headline/Text/URL payloads.</summary>
+    public event Action<NewsEvent>? News;
+
     /// <summary>
     /// Raised on the dispatch thread whenever a frame with an unrecognised
     /// <c>MessageType</c> opcode is received. The event payload is the raw opcode.
@@ -92,6 +131,16 @@ public sealed class MarketDataClient : IAsyncDisposable
     public long UnknownMessageCount => Interlocked.Read(ref _unknownMessageCount);
 
     private long _unknownMessageCount;
+
+    /// <summary>
+    /// Per-newsId reassembly buffers for fragmented <c>NewsBegin/Chunk/End</c>
+    /// frames. Single-reader (the receive loop) so plain Dictionary is fine.
+    /// Entries are removed on NewsEnd; abandoned reassemblies (server reboot,
+    /// missing End) leak until the next process restart — acceptable given the
+    /// low rate of News and the small per-entry footprint (≤ a few KB total
+    /// length declared in NewsBegin).
+    /// </summary>
+    private readonly Dictionary<ulong, NewsReassembly> _newsReassembly = new();
 
     /// <summary>
     /// Protocol version negotiated with the server, taken from the most recent
@@ -421,10 +470,164 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => InfoSnapshot?.Invoke(ev));
                 break;
             }
+            // ── L3 / order-by-order (MBO) ─────────────────────────
+            case WireFormat.MessageType.BookSnapshot:
+            {
+                ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = WireFormat.ReadBookSnapshot(payload, symbol, receivedUtc);
+                Enqueue(() => BookSnapshot?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.OrderAdded:
+            {
+                var (secId, orderId, sideByte, price, qty) = WireFormat.ReadOrderEvent(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new OrderAddedEvent(secId, symbol, orderId, (BookSide)sideByte,
+                    price / WireFormat.PriceScale, qty, receivedUtc);
+                Enqueue(() => OrderAdded?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.OrderUpdated:
+            {
+                var (secId, orderId, sideByte, price, qty) = WireFormat.ReadOrderEvent(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new OrderUpdatedEvent(secId, symbol, orderId, (BookSide)sideByte,
+                    price / WireFormat.PriceScale, qty, receivedUtc);
+                Enqueue(() => OrderUpdated?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.OrderDeleted:
+            {
+                var (secId, orderId, sideByte) = WireFormat.ReadOrderDeleted(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new OrderDeletedEvent(secId, symbol, orderId, (BookSide)sideByte, receivedUtc);
+                Enqueue(() => OrderDeleted?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.BookCleared:
+            {
+                var (secId, clearByte) = WireFormat.ReadBookCleared(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                // Unknown clear-side bytes fall back to Both (safest: clears full book).
+                var clearSide = Enum.IsDefined(typeof(BookClearSide), clearByte)
+                    ? (BookClearSide)clearByte : BookClearSide.Both;
+                var ev = new BookClearedEvent(secId, symbol, clearSide, receivedUtc);
+                Enqueue(() => BookCleared?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.MarketTierUpdate:
+            {
+                var (secId, sideByte, totalQty, orderCount) = WireFormat.ReadMarketTierUpdate(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new MarketTierUpdateEvent(secId, symbol, (BookSide)sideByte,
+                    totalQty, orderCount, receivedUtc);
+                Enqueue(() => MarketTierUpdate?.Invoke(ev));
+                break;
+            }
+            // ── MBP / aggregated levels ───────────────────────────
+            case WireFormat.MessageType.LevelSnapshot:
+            {
+                ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = WireFormat.ReadLevelSnapshot(payload, symbol, receivedUtc);
+                Enqueue(() => LevelSnapshot?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.LevelUpdate:
+            {
+                var (secId, sideByte, price, totalQty, orderCount) = WireFormat.ReadLevelUpdate(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new LevelUpdateEvent(secId, symbol, (BookSide)sideByte,
+                    price / WireFormat.PriceScale, totalQty, orderCount, receivedUtc);
+                Enqueue(() => LevelUpdate?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.LevelDeleted:
+            {
+                var (secId, sideByte, price) = WireFormat.ReadLevelDeleted(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new LevelDeletedEvent(secId, symbol, (BookSide)sideByte,
+                    price / WireFormat.PriceScale, receivedUtc);
+                Enqueue(() => LevelDeleted?.Invoke(ev));
+                break;
+            }
+            // ── Stale / recovery ──────────────────────────────────
+            case WireFormat.MessageType.SymbolStaleStatus:
+            {
+                var (secId, isStale) = WireFormat.ReadSymbolStaleStatus(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                Enqueue(() => SymbolStaleStatus?.Invoke(new SymbolStaleStatusEvent(secId, symbol, isStale, receivedUtc)));
+                break;
+            }
+            case WireFormat.MessageType.RecoveryProgress:
+            {
+                var ev = WireFormat.ReadRecoveryProgress(payload, receivedUtc);
+                Enqueue(() => RecoveryProgress?.Invoke(ev));
+                break;
+            }
+            // ── Candles ───────────────────────────────────────────
+            case WireFormat.MessageType.CandleSnapshot:
+            {
+                ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = WireFormat.ReadCandleSnapshot(payload, symbol, receivedUtc);
+                Enqueue(() => CandleSnapshot?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.CandleUpdate:
+            {
+                var (secId, resolution, candle) = WireFormat.ReadCandleUpdate(payload);
+                string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
+                var ev = new CandleUpdateEvent(secId, symbol, resolution, candle, receivedUtc);
+                Enqueue(() => CandleUpdate?.Invoke(ev));
+                break;
+            }
+            // ── Rankings ──────────────────────────────────────────
+            case WireFormat.MessageType.RankingsUpdate:
+            {
+                var ev = WireFormat.ReadRankingsUpdate(payload, receivedUtc);
+                Enqueue(() => RankingsUpdate?.Invoke(ev));
+                break;
+            }
+            // ── News (fragmented; reassembled before raising) ─────
+            case WireFormat.MessageType.NewsBegin:
+            {
+                var hdr = WireFormat.ReadNewsBegin(payload);
+                if (hdr.Version != WireFormat.NewsFrameVersion)
+                {
+                    _logger.LogWarning("Unsupported NewsBegin frame version {Version}; dropping.", hdr.Version);
+                    break;
+                }
+                _newsReassembly[hdr.NewsId] = new NewsReassembly(hdr.SecurityIdOrZero, hdr.NewsId,
+                    hdr.Source, hdr.Language, hdr.OrigTimeNanos,
+                    (int)Math.Min(hdr.TotalHeadlineLen, int.MaxValue),
+                    (int)Math.Min(hdr.TotalTextLen, int.MaxValue),
+                    (int)Math.Min(hdr.TotalUrlLen, int.MaxValue));
+                break;
+            }
+            case WireFormat.MessageType.NewsChunk:
+            {
+                var (version, newsId, field) = WireFormat.ReadNewsChunk(payload, out var fragment);
+                if (version != WireFormat.NewsFrameVersion) break;
+                if (_newsReassembly.TryGetValue(newsId, out var ra))
+                    ra.Append(field, fragment);
+                break;
+            }
+            case WireFormat.MessageType.NewsEnd:
+            {
+                var (version, newsId, field) = WireFormat.ReadNewsChunk(payload, out var fragment);
+                if (version != WireFormat.NewsFrameVersion) break;
+                if (!_newsReassembly.Remove(newsId, out var ra))
+                    break; // Begin missed — drop.
+                ra.Append(field, fragment);
+                string symbol = _securityIdToSymbol.TryGetValue(ra.SecurityIdOrZero, out var s) ? s : "";
+                var ev = ra.ToEvent(symbol, receivedUtc);
+                Enqueue(() => News?.Invoke(ev));
+                break;
+            }
             // Unsubscribed (0x0012) is currently silent — the application
-            // already knows it called UnsubscribeAsync. Other message
-            // types (Book, Mbp, News, …) are out of scope for v1 and
-            // simply ignored.
+            // already knows it called UnsubscribeAsync.
             case WireFormat.MessageType.Unsubscribed:
                 break;
             default:
@@ -572,5 +775,79 @@ public sealed class MarketDataClient : IAsyncDisposable
             Symbol = symbol;
             Flags = flags;
         }
+    }
+
+    /// <summary>
+    /// Per-newsId reassembly state. Allocates byte arrays sized from the
+    /// totals declared in <c>NewsBegin</c> (clamped to <see cref="int.MaxValue"/>
+    /// for safety) and copies fragment bytes in order. The server emits
+    /// fragments for any given field contiguously, so the trailing fragment
+    /// is always the one carried in <c>NewsEnd</c>.
+    /// </summary>
+    private sealed class NewsReassembly
+    {
+        public ulong SecurityIdOrZero { get; }
+        public ulong NewsId { get; }
+        public byte Source { get; }
+        public ushort Language { get; }
+        public long OrigTimeNanos { get; }
+
+        private readonly byte[] _headline;
+        private readonly byte[] _text;
+        private readonly byte[] _url;
+        private int _headlineLen;
+        private int _textLen;
+        private int _urlLen;
+
+        public NewsReassembly(ulong securityIdOrZero, ulong newsId, byte source, ushort language,
+            long origTimeNanos, int headlineLen, int textLen, int urlLen)
+        {
+            SecurityIdOrZero = securityIdOrZero;
+            NewsId = newsId;
+            Source = source;
+            Language = language;
+            OrigTimeNanos = origTimeNanos;
+            _headline = headlineLen > 0 ? new byte[headlineLen] : Array.Empty<byte>();
+            _text = textLen > 0 ? new byte[textLen] : Array.Empty<byte>();
+            _url = urlLen > 0 ? new byte[urlLen] : Array.Empty<byte>();
+        }
+
+        public void Append(WireFormat.NewsField field, ReadOnlySpan<byte> fragment)
+        {
+            switch (field)
+            {
+                case WireFormat.NewsField.Headline:
+                    AppendTo(_headline, ref _headlineLen, fragment);
+                    break;
+                case WireFormat.NewsField.Text:
+                    AppendTo(_text, ref _textLen, fragment);
+                    break;
+                case WireFormat.NewsField.Url:
+                    AppendTo(_url, ref _urlLen, fragment);
+                    break;
+            }
+        }
+
+        private static void AppendTo(byte[] buffer, ref int filled, ReadOnlySpan<byte> fragment)
+        {
+            int copy = Math.Min(fragment.Length, buffer.Length - filled);
+            if (copy <= 0) return;
+            fragment[..copy].CopyTo(buffer.AsSpan(filled));
+            filled += copy;
+        }
+
+        public NewsEvent ToEvent(string symbol, DateTime receivedUtc) => new()
+        {
+            SecurityIdOrZero = SecurityIdOrZero,
+            Symbol = symbol,
+            NewsId = NewsId,
+            SourceRaw = Source,
+            LanguageRaw = Language,
+            OrigTimeNanos = OrigTimeNanos,
+            Headline = _headlineLen > 0 ? System.Text.Encoding.UTF8.GetString(_headline, 0, _headlineLen) : "",
+            Text = _textLen > 0 ? System.Text.Encoding.UTF8.GetString(_text, 0, _textLen) : "",
+            Url = _urlLen > 0 ? System.Text.Encoding.UTF8.GetString(_url, 0, _urlLen) : "",
+            ReceivedUtc = receivedUtc,
+        };
     }
 }
