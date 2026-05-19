@@ -43,6 +43,12 @@ Includes:
   `MarketTierUpdate`), MBP (`LevelSnapshot`, `LevelUpdate`,
   `LevelDeleted`), candles (snapshot + update), rankings, per-symbol
   stale status, recovery progress, and reassembled news.
+- **Opt-in materialized book layer (`IBookFeed`/`IBookView`)** —
+  maintains an in-memory L3 book per symbol from the MBO event stream
+  and exposes derived top-of-book. Stale-flag bridged from the
+  server's `SymbolStaleStatus` (no client-side gap detection
+  duplication). Construct via `client.CreateBookFeed()` or
+  `services.AddMarketDataClient(...).WithBookFeed()`.
 
 See [`docs/CLIENT-SDK.md`](https://github.com/pedrosakuma/B3MarketDataPlatform/blob/main/docs/CLIENT-SDK.md)
 for the full guide.
