@@ -145,3 +145,290 @@ public readonly record struct ConnectionStateChangedEvent(
     ConnectionState State,
     Exception? Error,
     DateTime ChangedUtc);
+
+/// <summary>
+/// Order book side. Matches the server's internal <c>BookSideType</c> /
+/// SBE <c>MDEntryType</c> wire byte (0 = Bid, 1 = Ask).
+/// </summary>
+public enum BookSide : byte
+{
+    Bid = 0,
+    Ask = 1,
+}
+
+/// <summary>
+/// Side(s) cleared by a <see cref="BookClearedEvent"/>. Matches the server's
+/// <c>BookClearSide</c> wire byte (0 = Both, 1 = Bid, 2 = Ask).
+/// </summary>
+public enum BookClearSide : byte
+{
+    Both = 0,
+    Bid = 1,
+    Ask = 2,
+}
+
+// ── L3 / Order-by-order book (MBO) ──────────────────────────────────
+
+/// <summary>One MBO order inside a <see cref="BookSnapshotEvent"/>.
+/// Price is scaled with the SBE 4-decimal exponent already applied.</summary>
+public readonly record struct BookSnapshotOrder(
+    ulong OrderId,
+    decimal Price,
+    long Qty);
+
+/// <summary>
+/// L3 / order-by-order snapshot phase boundary. The server currently
+/// emits this as an empty marker frame (zero entries on both sides)
+/// followed by one <see cref="OrderAddedEvent"/> per live order on the
+/// book — so consumers SHOULD clear any prior state for
+/// <see cref="SecurityId"/> when this event fires and then rebuild from
+/// the OrderAdded stream that follows in the same WebSocket packet.
+/// <para>The wire format also allows aggregated price-level entries
+/// inside the snapshot body (price/totalQty/orderCount), which are
+/// surfaced via <see cref="Bids"/> / <see cref="Asks"/> with
+/// <see cref="BookSnapshotOrder.OrderId"/> set to 0 — present for
+/// forward-compatibility but empty in production traffic today.</para>
+/// </summary>
+public sealed class BookSnapshotEvent
+{
+    public ulong SecurityId { get; init; }
+    public string Symbol { get; init; } = "";
+    /// <summary>Per-symbol RptSeq at snapshot publish time; matches the value
+    /// the next incremental will carry on the wire.</summary>
+    public uint RptSeq { get; init; }
+    public IReadOnlyList<BookSnapshotOrder> Bids { get; init; } = Array.Empty<BookSnapshotOrder>();
+    public IReadOnlyList<BookSnapshotOrder> Asks { get; init; } = Array.Empty<BookSnapshotOrder>();
+    public DateTime ReceivedUtc { get; init; }
+}
+
+/// <summary>Per-order Add. Price already scaled. Fires for both
+/// <c>OrderAdded</c> (0x0030) opcodes.</summary>
+public readonly record struct OrderAddedEvent(
+    ulong SecurityId,
+    string Symbol,
+    ulong OrderId,
+    BookSide Side,
+    decimal Price,
+    long Qty,
+    DateTime ReceivedUtc);
+
+/// <summary>Per-order Update (qty / price change). Price already scaled.</summary>
+public readonly record struct OrderUpdatedEvent(
+    ulong SecurityId,
+    string Symbol,
+    ulong OrderId,
+    BookSide Side,
+    decimal Price,
+    long Qty,
+    DateTime ReceivedUtc);
+
+/// <summary>Per-order Delete. Consumers MUST drop the matching
+/// <see cref="OrderId"/> on <see cref="Side"/> from their book.</summary>
+public readonly record struct OrderDeletedEvent(
+    ulong SecurityId,
+    string Symbol,
+    ulong OrderId,
+    BookSide Side,
+    DateTime ReceivedUtc);
+
+/// <summary>Mass-delete of one or both sides of the book. Consumers MUST
+/// drop every order on the affected side(s) — a follow-up
+/// <see cref="BookSnapshotEvent"/> is NOT guaranteed.</summary>
+public readonly record struct BookClearedEvent(
+    ulong SecurityId,
+    string Symbol,
+    BookClearSide ClearSide,
+    DateTime ReceivedUtc);
+
+/// <summary>
+/// Aggregate null-price MOA/MOC market tier for one side. Carries the
+/// total quantity and order count; deliberately separate from
+/// <see cref="OrderAddedEvent"/> so no sentinel price is needed.
+/// </summary>
+public readonly record struct MarketTierUpdateEvent(
+    ulong SecurityId,
+    string Symbol,
+    BookSide Side,
+    long TotalQty,
+    int OrderCount,
+    DateTime ReceivedUtc);
+
+// ── MBP / Aggregated price levels ───────────────────────────────────
+
+/// <summary>One aggregated level inside a <see cref="LevelSnapshotEvent"/>.
+/// Price already scaled.</summary>
+public readonly record struct PriceLevel(
+    decimal Price,
+    long TotalQty,
+    int OrderCount);
+
+/// <summary>
+/// Full MBP price-level snapshot. Emitted on initial
+/// <see cref="SubscribeFlags.Mbp"/> subscribe. Consumers SHOULD replace
+/// any prior per-symbol level map when this fires.
+/// </summary>
+public sealed class LevelSnapshotEvent
+{
+    public ulong SecurityId { get; init; }
+    public string Symbol { get; init; } = "";
+    public IReadOnlyList<PriceLevel> Bids { get; init; } = Array.Empty<PriceLevel>();
+    public IReadOnlyList<PriceLevel> Asks { get; init; } = Array.Empty<PriceLevel>();
+    public DateTime ReceivedUtc { get; init; }
+}
+
+/// <summary>Incremental MBP level (re)write. Conflated server-side per
+/// <c>(secId, side, price)</c> — at most one per packet per level.</summary>
+public readonly record struct LevelUpdateEvent(
+    ulong SecurityId,
+    string Symbol,
+    BookSide Side,
+    decimal Price,
+    long TotalQty,
+    int OrderCount,
+    DateTime ReceivedUtc);
+
+/// <summary>Incremental MBP level removal. Consumers MUST drop the
+/// matching <c>(side, price)</c> from their per-symbol map.</summary>
+public readonly record struct LevelDeletedEvent(
+    ulong SecurityId,
+    string Symbol,
+    BookSide Side,
+    decimal Price,
+    DateTime ReceivedUtc);
+
+// ── Per-symbol stale + recovery aggregate ───────────────────────────
+
+/// <summary>Per-symbol stale-status transition. Coalesced server-side
+/// (last value within a packet wins). UI consumers SHOULD dim rows
+/// when <see cref="IsStale"/> is <c>true</c>.</summary>
+public readonly record struct SymbolStaleStatusEvent(
+    ulong SecurityId,
+    string Symbol,
+    bool IsStale,
+    DateTime ReceivedUtc);
+
+/// <summary>One per-kind stale breakdown row inside
+/// <see cref="RecoveryProgressEvent"/>. <see cref="Kind"/> is the raw
+/// <c>SymbolGapKind</c> byte from the server — kept as a byte so that
+/// new kinds added server-side are forward-compatible.</summary>
+public readonly record struct RecoveryProgressKind(byte Kind, uint StaleCount);
+
+/// <summary>
+/// Aggregate recovery progress (broadcast ~250 ms). Stops after the
+/// final "all healthy" frame (<see cref="TotalStaleSymbols"/> == 0) so
+/// the UI can clear its banner.
+/// </summary>
+public sealed class RecoveryProgressEvent
+{
+    public uint TotalSymbols { get; init; }
+    public uint TotalStaleSymbols { get; init; }
+    public IReadOnlyList<RecoveryProgressKind> StaleByKind { get; init; } = Array.Empty<RecoveryProgressKind>();
+    public DateTime ReceivedUtc { get; init; }
+}
+
+// ── Candles ─────────────────────────────────────────────────────────
+
+/// <summary>
+/// One OHLCV+VWAP candle. Prices already scaled with the SBE 4-decimal
+/// exponent; <see cref="TimeNanos"/> is exchange epoch nanoseconds.
+/// </summary>
+public readonly record struct Candle(
+    long TimeNanos,
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    long Volume,
+    decimal Avg);
+
+/// <summary>
+/// Historical candle batch. The server may send multiple batches per
+/// snapshot (e.g. one per resolution); each frame is self-contained.
+/// </summary>
+public sealed class CandleSnapshotEvent
+{
+    public ulong SecurityId { get; init; }
+    public string Symbol { get; init; } = "";
+    /// <summary>Candle resolution as a raw server-side identifier
+    /// (e.g. seconds-per-bucket). Kept as <c>int</c> to stay
+    /// forward-compatible with new resolutions.</summary>
+    public int Resolution { get; init; }
+    /// <summary>True on the first batch of a snapshot — consumers SHOULD
+    /// replace their cached history for <c>(SecurityId, Resolution)</c>.</summary>
+    public bool IsFirst { get; init; }
+    /// <summary>True on the final batch of a snapshot.</summary>
+    public bool IsLast { get; init; }
+    public IReadOnlyList<Candle> Candles { get; init; } = Array.Empty<Candle>();
+    public DateTime ReceivedUtc { get; init; }
+}
+
+/// <summary>Single candle change (latest candle updated or a new bucket
+/// opened). Consumers SHOULD upsert by <see cref="Candle.TimeNanos"/>.</summary>
+public readonly record struct CandleUpdateEvent(
+    ulong SecurityId,
+    string Symbol,
+    int Resolution,
+    Candle Candle,
+    DateTime ReceivedUtc);
+
+// ── Rankings ────────────────────────────────────────────────────────
+
+/// <summary>One row inside a <see cref="RankingsUpdateEvent"/>. <see cref="Value"/>
+/// is the raw server-side metric (volume in shares, gainers/losers in
+/// basis-point percentage * 100, etc.) — kept as <c>long</c> so the
+/// SDK does not have to interpret category-specific scaling.</summary>
+public readonly record struct RankingEntry(
+    ulong SecurityId,
+    string Symbol,
+    long Value);
+
+/// <summary>
+/// Three top-N rankings tables (most-traded by volume, top gainers,
+/// top losers) emitted periodically by the server. Each list is at
+/// most 10 entries on the current wire.
+/// </summary>
+public sealed class RankingsUpdateEvent
+{
+    public IReadOnlyList<RankingEntry> Volume { get; init; } = Array.Empty<RankingEntry>();
+    public IReadOnlyList<RankingEntry> Gainers { get; init; } = Array.Empty<RankingEntry>();
+    public IReadOnlyList<RankingEntry> Losers { get; init; } = Array.Empty<RankingEntry>();
+    public DateTime ReceivedUtc { get; init; }
+}
+
+// ── News ────────────────────────────────────────────────────────────
+
+/// <summary>Optional source classification for a <see cref="NewsEvent"/>.
+/// Kept as a raw byte so that new sources added server-side are
+/// forward-compatible.</summary>
+public enum NewsSource : byte
+{
+    Unknown = 0,
+}
+
+/// <summary>
+/// A fully-reassembled news delivery. The SDK buffers
+/// <c>NewsBegin/Chunk/End</c> frames internally and raises a single
+/// <see cref="MarketDataClient.News"/> event with the joined payloads.
+/// </summary>
+public sealed class NewsEvent
+{
+    /// <summary>0 = global news (no instrument scope).</summary>
+    public ulong SecurityIdOrZero { get; init; }
+    /// <summary>Resolved symbol when <see cref="SecurityIdOrZero"/> matches
+    /// a previously-subscribed security; empty otherwise.</summary>
+    public string Symbol { get; init; } = "";
+    public ulong NewsId { get; init; }
+    public byte SourceRaw { get; init; }
+    /// <summary>Source classification when known; otherwise
+    /// <see cref="NewsSource.Unknown"/>. Use <see cref="SourceRaw"/>
+    /// for the wire byte.</summary>
+    public NewsSource Source => Enum.IsDefined(typeof(NewsSource), SourceRaw) ? (NewsSource)SourceRaw : NewsSource.Unknown;
+    /// <summary>Raw language code from the wire (ISO-style or vendor-specific).</summary>
+    public ushort LanguageRaw { get; init; }
+    /// <summary>Original publish time in nanoseconds from epoch (exchange time).</summary>
+    public long OrigTimeNanos { get; init; }
+    public string Headline { get; init; } = "";
+    public string Text { get; init; } = "";
+    public string Url { get; init; } = "";
+    public DateTime ReceivedUtc { get; init; }
+}

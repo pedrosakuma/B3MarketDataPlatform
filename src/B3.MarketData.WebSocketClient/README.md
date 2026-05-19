@@ -25,9 +25,10 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 });
 
 client.Trade += t => Console.WriteLine($"{t.Symbol}  {t.Price:F4} x {t.Qty}");
+client.LevelUpdate += l => Console.WriteLine($"{l.Symbol} {l.Side} {l.Price} qty={l.TotalQty}");
 
 await client.ConnectAsync();
-await client.SubscribeAsync("PETR4");
+await client.SubscribeAsync("PETR4", SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Mbp);
 ```
 
 Includes:
@@ -37,8 +38,11 @@ Includes:
 - Bounded back-pressure (`Channel<T>` with a configurable policy:
   `DropOldest` / `Block` / `Throw`).
 - DI extension: `services.AddMarketDataClient(...)`.
-
-Out of scope for v1: full L2/MBO subscription, recovery REST endpoints.
+- Full server parity: trades, info snapshots, server status, L3 / MBO
+  (`BookSnapshot`, `OrderAdded/Updated/Deleted`, `BookCleared`,
+  `MarketTierUpdate`), MBP (`LevelSnapshot`, `LevelUpdate`,
+  `LevelDeleted`), candles (snapshot + update), rankings, per-symbol
+  stale status, recovery progress, and reassembled news.
 
 See [`docs/CLIENT-SDK.md`](https://github.com/pedrosakuma/B3MarketDataPlatform/blob/main/docs/CLIENT-SDK.md)
 for the full guide.

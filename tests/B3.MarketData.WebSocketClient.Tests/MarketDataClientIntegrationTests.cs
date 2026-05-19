@@ -226,6 +226,41 @@ public class MarketDataClientIntegrationTests
         Assert.True(client.UnknownMessageCount >= 1);
     }
 
+    [Fact]
+    public async Task News_BeginChunkEnd_AreReassembledIntoSingleEvent()
+    {
+        var port = FindFreePort();
+        var headline = Encoding.UTF8.GetBytes("Petrobras anuncia dividendos");
+        var body = Encoding.UTF8.GetBytes("Lorem ipsum dolor sit amet, consectetur.");
+        var url = Encoding.UTF8.GetBytes("https://example.com/n/1");
+        const ulong newsId = 9876UL;
+
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            await TestWsServer.SendNewsBeginAsync(ws, securityIdOrZero: 0, newsId: newsId,
+                source: 0, language: 1, origTimeNanos: 1_000,
+                headlineLen: (uint)headline.Length, textLen: (uint)body.Length, urlLen: (uint)url.Length, ct);
+            await TestWsServer.SendNewsChunkAsync(ws, newsId, fieldByte: 0, headline, isFinal: false, ct);
+            await TestWsServer.SendNewsChunkAsync(ws, newsId, fieldByte: 1, body, isFinal: false, ct);
+            await TestWsServer.SendNewsChunkAsync(ws, newsId, fieldByte: 2, url, isFinal: true, ct);
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var got = new TaskCompletionSource<NewsEvent>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.News += n => got.TrySetResult(n);
+
+        await client.ConnectAsync();
+        var ev = await got.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(newsId, ev.NewsId);
+        Assert.Equal("Petrobras anuncia dividendos", ev.Headline);
+        Assert.Equal("Lorem ipsum dolor sit amet, consectetur.", ev.Text);
+        Assert.Equal("https://example.com/n/1", ev.Url);
+    }
+
     private static async Task WaitUntil(Func<bool> pred, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;
@@ -360,6 +395,47 @@ internal sealed class TestWsServer : IAsyncDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(8), capabilities);
         buf[12] = (byte)buildBytes.Length;
         buildBytes.CopyTo(buf, 13);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendNewsBeginAsync(WebSocket ws, ulong securityIdOrZero, ulong newsId,
+        byte source, ushort language, long origTimeNanos,
+        uint headlineLen, uint textLen, uint urlLen, CancellationToken ct)
+    {
+        // [len u16][type u16=0x0090][version u8][secId u64][newsId u64][source u8][lang u16][origTime i64]
+        // [hLen u32][tLen u32][uLen u32]
+        ushort total = (ushort)(4 + 1 + 8 + 8 + 1 + 2 + 8 + 4 + 4 + 4);
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0090);
+        int o = 4;
+        buf[o++] = 1; // version
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), securityIdOrZero); o += 8;
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), newsId); o += 8;
+        buf[o++] = source;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(o), language); o += 2;
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(o), origTimeNanos); o += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o), headlineLen); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o), textLen); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(o), urlLen);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendNewsChunkAsync(WebSocket ws, ulong newsId, byte fieldByte,
+        byte[] fragment, bool isFinal, CancellationToken ct)
+    {
+        // [len u16][type u16][version u8][newsId u64][field u8][fragLen u16][bytes]
+        ushort opcode = isFinal ? (ushort)0x0092 : (ushort)0x0091;
+        ushort total = (ushort)(4 + 1 + 8 + 1 + 2 + fragment.Length);
+        var buf = new byte[total];
+        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), opcode);
+        int o = 4;
+        buf[o++] = 1; // version
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), newsId); o += 8;
+        buf[o++] = fieldByte;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(o), (ushort)fragment.Length); o += 2;
+        fragment.CopyTo(buf, o);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 }
