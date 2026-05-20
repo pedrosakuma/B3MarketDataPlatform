@@ -54,7 +54,7 @@ services:
       UMDF_CLIENT_OUTLIER_PRESSURE_PCT: "${UMDF_CLIENT_OUTLIER_PRESSURE_PCT:-0.50}"
       UMDF_CLIENT_OUTLIER_INTERVAL_MS: "${UMDF_CLIENT_OUTLIER_INTERVAL_MS:-1000}"
     restart: unless-stopped
-    stop_grace_period: 10s
+    stop_grace_period: 30s
     deploy:
       resources:
         limits:

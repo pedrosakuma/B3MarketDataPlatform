@@ -14,7 +14,7 @@ services:
       REPLAY_SPEED: "${REPLAY_SPEED:-2}"
       UMDF_SERVER_FLUSH_WINDOW_MS: "${UMDF_SERVER_FLUSH_WINDOW_MS:-10}"
     restart: unless-stopped
-    stop_grace_period: 10s
+    stop_grace_period: 30s
     deploy:
       resources:
         limits:

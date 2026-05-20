@@ -32,6 +32,6 @@ EXPOSE 8080
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
-    CMD ["/app/B3.Umdf.ConsoleApp", "--health-check"]
+    CMD ["/app/B3.Umdf.ConsoleApp", "--health-check=health"]
 
 ENTRYPOINT ["/app/B3.Umdf.ConsoleApp"]
