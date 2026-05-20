@@ -65,6 +65,38 @@ public interface IBookView
     /// snapshot — safe to keep on the stack while the live state advances.
     /// </summary>
     bool TryGetTop(out L2TopOfBook top);
+
+    /// <summary>
+    /// Last <see cref="BookSnapshotEvent.RptSeq"/> observed for this book.
+    /// Incremental MBO events do not carry an explicit sequence number on the
+    /// current wire, so this advances only on (re)snapshots. Zero before the
+    /// first snapshot is applied.
+    /// </summary>
+    long Sequence { get; }
+
+    /// <summary>
+    /// Copy up to <paramref name="depth"/> price levels of the bid side
+    /// (highest price first) into <paramref name="destination"/>. Returns
+    /// the number of levels actually written, which may be less than
+    /// <paramref name="depth"/> when the side has fewer levels.
+    /// Zero-alloc; safe to call on the hot path with a stack-allocated span.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="depth"/> is negative or greater than
+    /// <paramref name="destination"/>.Length.
+    /// </exception>
+    int CopyBidLevels(Span<L2Level> destination, int depth);
+
+    /// <summary>
+    /// Copy up to <paramref name="depth"/> price levels of the ask side
+    /// (lowest price first) into <paramref name="destination"/>. Returns
+    /// the number of levels actually written. Zero-alloc.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="depth"/> is negative or greater than
+    /// <paramref name="destination"/>.Length.
+    /// </exception>
+    int CopyAskLevels(Span<L2Level> destination, int depth);
 }
 
 /// <summary>
@@ -81,6 +113,17 @@ public readonly record struct L2TopOfBook(
 
 /// <summary>Aggregate of one side at one price level.</summary>
 public readonly record struct L2Side(
+    decimal Price,
+    long TotalQty,
+    int OrderCount);
+
+/// <summary>
+/// One price level inside an L2 ladder — returned by
+/// <see cref="IBookView.CopyBidLevels"/> / <see cref="IBookView.CopyAskLevels"/>.
+/// Structurally identical to <see cref="L2Side"/>; named separately for clarity
+/// at call sites that walk multi-level depth instead of just the top.
+/// </summary>
+public readonly record struct L2Level(
     decimal Price,
     long TotalQty,
     int OrderCount);

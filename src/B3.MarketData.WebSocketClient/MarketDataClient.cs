@@ -75,6 +75,15 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<SubscribeErrorEvent>? SubscribeError;
     public event Action<ConnectionStateChangedEvent>? ConnectionStateChanged;
 
+    /// <summary>
+    /// Raised after <see cref="UnsubscribeAsync"/> drops a symbol from the
+    /// active subscription set. Fires synchronously on the caller's thread
+    /// (before the Unsubscribe frame is sent on the wire) so consumers can
+    /// release any per-symbol state — the materialized
+    /// <see cref="BookFeed"/>, for example, uses this to evict the book.
+    /// </summary>
+    public event Action<UnsubscribedEvent>? Unsubscribed;
+
     // ── L3 / Order-by-order (MBO) ────────────────────────────────────
 
     /// <summary>L3 snapshot-phase marker. Consumers SHOULD clear prior book
@@ -244,6 +253,9 @@ public sealed class MarketDataClient : IAsyncDisposable
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrEmpty(symbol);
         if (!_subscriptions.TryRemove(symbol, out var record)) return default;
+
+        try { Unsubscribed?.Invoke(new UnsubscribedEvent(symbol, record.SecurityId, DateTime.UtcNow)); }
+        catch (Exception ex) { _logger.LogError(ex, "Unsubscribed handler threw for {Symbol}", symbol); }
 
         ulong secId = record.SecurityId;
         if (secId == 0) return default;

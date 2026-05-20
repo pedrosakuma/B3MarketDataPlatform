@@ -145,6 +145,177 @@ public class BookFeedTests
         Assert.False(view.IsStale);
     }
 
+    // ── Phase 2: depth-N + Sequence ─────────────────────────────────
+
+    [Fact]
+    public void CopyBidLevels_returns_levels_in_descending_price_order()
+    {
+        var view = SeedDepth();
+        Span<L2Level> levels = stackalloc L2Level[5];
+        int n = view.CopyBidLevels(levels, 5);
+        Assert.Equal(3, n);
+        Assert.Equal(30.20m, levels[0].Price);
+        Assert.Equal(250, levels[0].TotalQty);
+        Assert.Equal(2, levels[0].OrderCount);
+        Assert.Equal(30.10m, levels[1].Price);
+        Assert.Equal(100, levels[1].TotalQty);
+        Assert.Equal(30.00m, levels[2].Price);
+        Assert.Equal(80, levels[2].TotalQty);
+    }
+
+    [Fact]
+    public void CopyAskLevels_returns_levels_in_ascending_price_order()
+    {
+        var view = SeedDepth();
+        Span<L2Level> levels = stackalloc L2Level[5];
+        int n = view.CopyAskLevels(levels, 5);
+        Assert.Equal(2, n);
+        Assert.Equal(30.40m, levels[0].Price);
+        Assert.Equal(300, levels[0].TotalQty);
+        Assert.Equal(30.50m, levels[1].Price);
+        Assert.Equal(100, levels[1].TotalQty);
+    }
+
+    [Fact]
+    public void CopyLevels_truncates_when_depth_lt_available()
+    {
+        var view = SeedDepth();
+        Span<L2Level> levels = stackalloc L2Level[2];
+        int n = view.CopyBidLevels(levels, 2);
+        Assert.Equal(2, n);
+        Assert.Equal(30.20m, levels[0].Price);
+        Assert.Equal(30.10m, levels[1].Price);
+    }
+
+    [Fact]
+    public void CopyLevels_returns_zero_for_empty_side()
+    {
+        var view = new BookView("PETR4", 4321);
+        Span<L2Level> levels = stackalloc L2Level[5];
+        Assert.Equal(0, view.CopyBidLevels(levels, 5));
+        Assert.Equal(0, view.CopyAskLevels(levels, 5));
+    }
+
+    [Fact]
+    public void CopyLevels_validates_depth_against_destination()
+    {
+        var view = SeedDepth();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            var dst = new L2Level[2];
+            view.CopyBidLevels(dst.AsSpan(), 3);
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            var dst = new L2Level[2];
+            view.CopyAskLevels(dst.AsSpan(), -1);
+        });
+    }
+
+    [Fact]
+    public void Update_with_price_change_moves_order_between_levels()
+    {
+        var view = SeedDepth();
+        // Move order 101 from 30.10 → 30.20 (joining the top level)
+        view.ApplyUpdated(Upd("PETR4", 4321, 101, BookSide.Bid, 30.20m, 100, T0.AddSeconds(1)));
+
+        Span<L2Level> levels = stackalloc L2Level[5];
+        int n = view.CopyBidLevels(levels, 5);
+        Assert.Equal(2, n);
+        Assert.Equal(30.20m, levels[0].Price);
+        Assert.Equal(350, levels[0].TotalQty); // 200 + 50 + 100
+        Assert.Equal(3, levels[0].OrderCount);
+        Assert.Equal(30.00m, levels[1].Price);
+        Assert.Equal(80, levels[1].TotalQty);
+    }
+
+    [Fact]
+    public void Update_same_price_qty_change_adjusts_level_qty_only()
+    {
+        var view = SeedDepth();
+        view.ApplyUpdated(Upd("PETR4", 4321, 103, BookSide.Bid, 30.20m, 150, T0.AddSeconds(1)));
+        Span<L2Level> levels = stackalloc L2Level[5];
+        int n = view.CopyBidLevels(levels, 5);
+        Assert.Equal(3, n);
+        Assert.Equal(30.20m, levels[0].Price);
+        Assert.Equal(350, levels[0].TotalQty); // 200 + 150
+        Assert.Equal(2, levels[0].OrderCount);
+    }
+
+    [Fact]
+    public void Delete_collapses_empty_level()
+    {
+        var view = SeedDepth();
+        view.ApplyDeleted(Del("PETR4", 4321, 100, BookSide.Bid, T0.AddSeconds(1)));
+        var (_, _) = view.GetLevelCounts();
+        Span<L2Level> levels = stackalloc L2Level[5];
+        int n = view.CopyBidLevels(levels, 5);
+        Assert.Equal(2, n); // 30.00 collapsed
+        Assert.Equal(30.20m, levels[0].Price);
+        Assert.Equal(30.10m, levels[1].Price);
+    }
+
+    [Fact]
+    public void Sequence_tracks_last_snapshot_RptSeq()
+    {
+        var view = new BookView("PETR4", 4321);
+        Assert.Equal(0, view.Sequence);
+        view.ApplySnapshot(SnapWithSeq("PETR4", 4321, 42, T0));
+        Assert.Equal(42, view.Sequence);
+        // Incrementals do not bump Sequence on the current wire.
+        view.ApplyAdded(Add("PETR4", 4321, 1, BookSide.Bid, 30m, 10, T0.AddSeconds(1)));
+        Assert.Equal(42, view.Sequence);
+        view.ApplySnapshot(SnapWithSeq("PETR4", 4321, 99, T0.AddSeconds(2)));
+        Assert.Equal(99, view.Sequence);
+    }
+
+    [Fact]
+    public async Task BookFeed_evicts_book_on_UnsubscribeAsync()
+    {
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            var sym = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            await TestWsServer.SendSubscribeOkAsync(ws, securityId: 4321, sym, ct);
+            await SendBookSnapshotEmptyAsync(ws, securityId: 4321, ct);
+            await SendOrderEventAsync(ws, ServerMsg.OrderAdded, secId: 4321, orderId: 1, side: BookSide.Bid, price: 30_0000, qty: 100, ct);
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        using var feed = client.CreateBookFeed();
+        await client.ConnectAsync();
+        await client.SubscribeAsync("PETR4", SubscribeFlags.Book);
+        await WaitUntil(() => feed.GetBook("PETR4") is not null, TimeSpan.FromSeconds(5));
+
+        await client.UnsubscribeAsync("PETR4");
+        await WaitUntil(() => feed.GetBook("PETR4") is null, TimeSpan.FromSeconds(2));
+        Assert.Null(feed.GetBook("PETR4"));
+        // Re-Unsubscribe of an unknown symbol is a no-op (does not throw, does not re-fire eviction)
+        await client.UnsubscribeAsync("PETR4");
+    }
+
+    private static BookView SeedDepth()
+    {
+        var view = new BookView("PETR4", 4321);
+        view.ApplySnapshot(Snap("PETR4", 4321, T0));
+        // Bid: 30.20 (101, 103), 30.10 (102), 30.00 (100)
+        view.ApplyAdded(Add("PETR4", 4321, 102, BookSide.Bid, 30.20m, 200, T0));
+        view.ApplyAdded(Add("PETR4", 4321, 103, BookSide.Bid, 30.20m, 50, T0));
+        view.ApplyAdded(Add("PETR4", 4321, 101, BookSide.Bid, 30.10m, 100, T0));
+        view.ApplyAdded(Add("PETR4", 4321, 100, BookSide.Bid, 30.00m, 80, T0));
+        // Ask: 30.40 (201), 30.50 (202)
+        view.ApplyAdded(Add("PETR4", 4321, 201, BookSide.Ask, 30.40m, 300, T0));
+        view.ApplyAdded(Add("PETR4", 4321, 202, BookSide.Ask, 30.50m, 100, T0));
+        return view;
+    }
+
+    private static BookSnapshotEvent SnapWithSeq(string sym, ulong secId, uint rpt, DateTime ts) =>
+        new() { SecurityId = secId, Symbol = sym, RptSeq = rpt, ReceivedUtc = ts };
+
     // ── BookFeed wiring tests (uses real MarketDataClient events) ───
 
     [Fact]
