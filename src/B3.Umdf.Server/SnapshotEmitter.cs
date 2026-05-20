@@ -185,7 +185,7 @@ internal static class SnapshotEmitter
             // live subscribers receive the bust via MessageType.TradeBust.
             if (slot.Busted != 0) continue;
             var buf = new byte[37];
-            int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId);
+            int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId, slot.Flags);
             if (!session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len)))
                 return false;
         }

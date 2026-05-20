@@ -378,4 +378,18 @@ internal sealed class RecordingWebSocket : WebSocket
             return null;
         }
     }
+
+    public List<byte[]> AllFrames(MessageType t)
+    {
+        lock (_lock)
+        {
+            var result = new List<byte[]>();
+            foreach (var f in _frames)
+            {
+                if (f.Length >= 4 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(2)) == t)
+                    result.Add(f);
+            }
+            return result;
+        }
+    }
 }

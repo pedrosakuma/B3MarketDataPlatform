@@ -60,9 +60,9 @@ public enum TradeFlags : byte
 /// the frame from the WebSocket. Not the exchange match time.</param>
 /// <param name="Flags">Per-trade flag bitset — see <see cref="TradeFlags"/>.
 /// <see cref="TradeFlags.None"/> when the server pre-dates the flag byte
-/// (the SDK auto-detects payload length and defaults to <c>None</c>) or
-/// for trades replayed from the server's recent-trades snapshot, which
-/// does not carry flags.</param>
+/// (the SDK auto-detects payload length and defaults to <c>None</c>).
+/// Trades replayed from the server's recent-trades snapshot preserve the
+/// per-trade flags captured at ingest time.</param>
 public readonly record struct TradeEvent(
     ulong SecurityId,
     string Symbol,
