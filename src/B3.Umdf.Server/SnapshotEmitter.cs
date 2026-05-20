@@ -184,7 +184,7 @@ internal static class SnapshotEmitter
             // subscribers must not see busted trades in their initial history;
             // live subscribers receive the bust via MessageType.TradeBust.
             if (slot.Busted != 0) continue;
-            var buf = new byte[36];
+            var buf = new byte[37];
             int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId);
             if (!session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len)))
                 return false;

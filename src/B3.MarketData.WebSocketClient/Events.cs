@@ -25,6 +25,27 @@ public enum ConnectionState
 }
 
 /// <summary>
+/// Per-trade flag bitset. Currently signals whether the print was executed
+/// during an auction phase (opening cross, pre-open, or final-closing-call).
+/// Reserved bits are kept 0 for forward compatibility; mask with the
+/// individual values rather than equality-checking the whole byte.
+/// </summary>
+[System.Flags]
+public enum TradeFlags : byte
+{
+    /// <summary>No flags set — regular open-phase print.</summary>
+    None = 0,
+    /// <summary>
+    /// Trade is an auction print: either the SBE
+    /// <c>TradeCondition.OpeningPrice</c> bit was set on the source message
+    /// (opening / reopening cross), or the security's trading status was in
+    /// an auction phase (<c>RESERVED</c> / <c>FINAL_CLOSING_CALL</c>) at the
+    /// time of the trade.
+    /// </summary>
+    AuctionPrint = 1,
+}
+
+/// <summary>
 /// A live trade print. Price has the SBE 4-decimal exponent already
 /// applied (the raw wire value is <c>price × 10_000</c>).
 /// </summary>
@@ -37,13 +58,19 @@ public enum ConnectionState
 /// a future <see cref="TradeBustEvent"/>).</param>
 /// <param name="ReceivedUtc">UTC timestamp at which the SDK received
 /// the frame from the WebSocket. Not the exchange match time.</param>
+/// <param name="Flags">Per-trade flag bitset — see <see cref="TradeFlags"/>.
+/// <see cref="TradeFlags.None"/> when the server pre-dates the flag byte
+/// (the SDK auto-detects payload length and defaults to <c>None</c>) or
+/// for trades replayed from the server's recent-trades snapshot, which
+/// does not carry flags.</param>
 public readonly record struct TradeEvent(
     ulong SecurityId,
     string Symbol,
     decimal Price,
     long Qty,
     long TradeId,
-    DateTime ReceivedUtc);
+    DateTime ReceivedUtc,
+    TradeFlags Flags = TradeFlags.None);
 
 /// <summary>
 /// Cancellation of a previously-broadcast trade. Risk consumers usually

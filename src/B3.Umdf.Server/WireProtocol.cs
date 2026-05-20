@@ -297,16 +297,24 @@ public static class WireProtocol
         return totalLen;
     }
 
-    /// <summary>Write Trade: securityId, price, qty, tradeId.</summary>
-    public static int WriteTrade(Span<byte> dest, ulong securityId, long price, long qty, long tradeId)
+    /// <summary>
+    /// Write Trade: securityId, price, qty, tradeId, flags.
+    /// Wire layout: <c>[hdr 4][secId 8][price 8][qty 8][tradeId 8][flags 1]</c> = 37 bytes.
+    /// The trailing <paramref name="flags"/> byte (default 0) carries
+    /// <see cref="B3.Umdf.Book.TradeFlags"/> bits. Older clients that read the
+    /// previous 36-byte layout simply ignore the trailing byte — the framing
+    /// header always reports the true length so frame alignment stays intact.
+    /// </summary>
+    public static int WriteTrade(Span<byte> dest, ulong securityId, long price, long qty, long tradeId, byte flags = 0)
     {
-        const ushort totalLen = FramingHeaderSize + 8 + 8 + 8 + 8; // 36
+        const ushort totalLen = FramingHeaderSize + 8 + 8 + 8 + 8 + 1; // 37
         WriteFramingHeader(dest, totalLen, MessageType.Trade);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
         BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], qty); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId);
+        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId); offset += 8;
+        dest[offset] = flags;
         return totalLen;
     }
 

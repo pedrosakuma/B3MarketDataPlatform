@@ -166,7 +166,7 @@ bit order). Max `InfoSnapshot` body: 192 bytes.
 | **OrderAdded**   | `0x0030` | `[secId u64][orderId u64][side u8][price i64][qty i64]` |
 | **OrderUpdated** | `0x0031` | *(same as OrderAdded)* |
 | **OrderDeleted** | `0x0032` | `[secId u64][orderId u64][side u8]` |
-| **Trade**        | `0x0033` | `[secId u64][price i64][qty i64][tradeId i64]` |
+| **Trade**        | `0x0033` | `[secId u64][price i64][qty i64][tradeId i64][flags u8]` |
 | **BookCleared**  | `0x0034` | `[secId u64][clearSide u8]` |
 | **MarketTierUpdate** | `0x0036` | `[secId u64][side u8][totalQty i64][orderCount u32]` |
 | **LevelUpdate**  | `0x0037` | `[secId u64][side u8][price i64][totalQty i64][orderCount u32]` |
@@ -177,6 +177,20 @@ For `BookCleared`, `clearSide` = `0` (Both), `1` (Bid), or `2` (Ask).
 Prices use the SBE schema's exponents:
 `Price` / `PriceOptional` = `1e-4`, `Price8` = `1e-8`. Apply
 `mantissa × 10^-decimals` for display.
+
+`Trade.flags` is a `TradeFlags` bitset:
+
+| Bit | Name | Meaning |
+|----:|------|---------|
+| `0x01` | `AuctionPrint` | Trade executed during an auction phase. Set when the upstream SBE `TradeCondition.OpeningPrice` bit is on (opening / reopening cross) **or** the security's current `TradingStatus` is `RESERVED` (pre-open) or `FINAL_CLOSING_CALL`. |
+
+All other bits are reserved (must be 0). Clients MUST mask with the
+documented bit values rather than equality-checking the whole byte.
+Servers that predate the flag byte wrote the legacy 36-byte `Trade`
+frame; the framing header reports the true length, and decoders that
+read flags MUST treat absence as `0` (no flags set). Trade history
+frames replayed from the per-symbol recent-trades ring always carry
+`flags=0` (the ring does not persist per-trade flags).
 
 `MarketTierUpdate` represents B3 null-price MOA/MOC orders as an aggregate
 market tier per side. It is intentionally separate from priced order events:

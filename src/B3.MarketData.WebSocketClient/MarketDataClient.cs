@@ -458,9 +458,9 @@ public sealed class MarketDataClient : IAsyncDisposable
             }
             case WireFormat.MessageType.Trade:
             {
-                var (secId, price, qty, tradeId) = WireFormat.ReadTrade(payload);
+                var (secId, price, qty, tradeId, flags) = WireFormat.ReadTrade(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
-                var ev = new TradeEvent(secId, symbol, price / WireFormat.PriceScale, qty, tradeId, receivedUtc);
+                var ev = new TradeEvent(secId, symbol, price / WireFormat.PriceScale, qty, tradeId, receivedUtc, flags);
                 Enqueue(() => Trade?.Invoke(ev));
                 break;
             }

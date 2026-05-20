@@ -8,6 +8,25 @@ public enum BookClearSide : byte
     Ask = 2,
 }
 
+/// <summary>
+/// Per-trade flag bitset emitted alongside <see cref="IBookEventHandler.OnTrade"/>
+/// and <see cref="IBookEventHandler.OnForwardTrade"/>. Currently signals whether
+/// the print was executed during an auction phase (opening cross or pre-open /
+/// final-closing-call). Reserved bits are kept 0 for forward compatibility.
+/// </summary>
+[System.Flags]
+public enum TradeFlags : byte
+{
+    None = 0,
+    /// <summary>
+    /// Trade is an auction print: either <c>TradeCondition.OpeningPrice</c>
+    /// (opening / reopening cross) or the security's <c>TradingStatus</c> is in
+    /// an auction phase (<c>RESERVED</c> / <c>FINAL_CLOSING_CALL</c>) at the
+    /// time of the trade.
+    /// </summary>
+    AuctionPrint = 1,
+}
+
 public interface IBookEventHandler
 {
     void OnOrderAdded(OrderBook book, in OrderBookEntry entry);
@@ -27,9 +46,27 @@ public interface IBookEventHandler
 
     void OnMarketTierChanged(OrderBook book, BookSideType side, long totalQuantity, int orderCount) { }
     void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs);
+
+    /// <summary>
+    /// Flag-aware overload called by <c>BookManager</c>. Default implementation
+    /// forwards to the legacy <see cref="OnTrade(ulong,long,long,long,long)"/>
+    /// (dropping <paramref name="flags"/>) so existing implementers stay source-
+    /// and binary-compatible. Implementers that want to surface AuctionPrint
+    /// (or any future <see cref="TradeFlags"/> bit) override this overload.
+    /// </summary>
+    void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
+        => OnTrade(securityId, price, quantity, tradeId, sendingTimeNs);
     void OnBookCleared(ulong securityId, BookClearSide side);
 
     void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs) { }
+
+    /// <summary>
+    /// Flag-aware overload for <see cref="OnForwardTrade(ulong,long,long,long,long)"/>.
+    /// Default implementation forwards to the legacy method, dropping
+    /// <paramref name="flags"/>.
+    /// </summary>
+    void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
+        => OnForwardTrade(securityId, price, quantity, tradeId, sendingTimeNs);
     void OnTradeBust(ulong securityId, long price, long quantity, long tradeId) { }
     void OnExecutionSummary(ulong securityId, long lastPx, long fillQty) { }
 
