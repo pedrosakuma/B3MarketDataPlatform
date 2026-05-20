@@ -78,6 +78,10 @@ internal static class WireFormat
     public const int FieldTradingEvent = 21;
     public const int FieldPriceLimitType = 22;
     public const int FieldMinPriceIncrement = 23;
+    /// <summary>Raw <c>ImbalanceCondition</c> bitfield from upstream
+    /// <c>AuctionImbalance_19</c>. Surfaced as
+    /// <see cref="InfoSnapshotEvent.AuctionImbalanceCondition"/>.</summary>
+    public const int FieldAuctionImbalanceCondition = 24;
 
     public static bool TryReadHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
     {
@@ -203,6 +207,10 @@ internal static class WireFormat
         long? trades = null, openInterest = null;
         decimal? bandLow = null, bandHigh = null, refPx = null;
         long? volume = null, status = null, evt = null;
+        decimal? theoreticalOpeningPrice = null;
+        long? theoreticalOpeningSize = null;
+        long? auctionImbalanceSize = null;
+        AuctionImbalanceCondition? auctionImbalanceCondition = null;
 
         int offset = 12;
         for (int bit = 0; bit < 32; bit++)
@@ -219,6 +227,9 @@ internal static class WireFormat
                 case FieldLastTradePrice: lastTradePrice = v / PriceScale; break;
                 case FieldLastTradeSize: lastTradeSize = v; break;
                 case FieldSettlementPrice: settlement = v / PriceScale; break;
+                case FieldTheoreticalOpeningPrice: theoreticalOpeningPrice = v / PriceScale; break;
+                case FieldTheoreticalOpeningSize: theoreticalOpeningSize = v; break;
+                case FieldAuctionImbalanceSize: auctionImbalanceSize = v; break;
                 case FieldVwapPrice: vwap = v / PriceScale; break;
                 case FieldNumberOfTrades: trades = v; break;
                 case FieldOpenInterest: openInterest = v; break;
@@ -228,10 +239,15 @@ internal static class WireFormat
                 case FieldTradeVolume: volume = v; break;
                 case FieldTradingStatus: status = v; break;
                 case FieldTradingEvent: evt = v; break;
-                // Other bits (TheoreticalOpening*, Auction*, NetChange,
-                // AvgDailyTradedQty, MaxTradeVol, PriceLimitType,
-                // MinPriceIncrement) are consumed but not surfaced in
-                // the v1 typed event.
+                case FieldAuctionImbalanceCondition:
+                    // SBE ImbalanceCondition bits: 0x0100 = MoreBuyers,
+                    // 0x0200 = MoreSellers. Decoder masks low 16 bits and
+                    // translates to the clean SDK enum.
+                    auctionImbalanceCondition = DecodeImbalanceCondition((ushort)v);
+                    break;
+                // Other bits (NetChange, AvgDailyTradedQty, MaxTradeVol,
+                // PriceLimitType, MinPriceIncrement) are consumed but not
+                // surfaced in the v1 typed event.
             }
         }
 
@@ -256,7 +272,27 @@ internal static class WireFormat
             TradeVolume = volume,
             TradingStatus = status,
             TradingEvent = evt,
+            TheoreticalOpeningPrice = theoreticalOpeningPrice,
+            TheoreticalOpeningSize = theoreticalOpeningSize,
+            AuctionImbalanceSize = auctionImbalanceSize,
+            AuctionImbalanceCondition = auctionImbalanceCondition,
         };
+    }
+
+    // SBE ImbalanceCondition bit positions (uint16):
+    //   bit 8 (0x0100) = ImbalanceMoreBuyers
+    //   bit 9 (0x0200) = ImbalanceMoreSellers
+    private const ushort ImbalanceBitMoreBuyers = 0x0100;
+    private const ushort ImbalanceBitMoreSellers = 0x0200;
+
+    private static AuctionImbalanceCondition DecodeImbalanceCondition(ushort raw)
+    {
+        bool buyers = (raw & ImbalanceBitMoreBuyers) != 0;
+        bool sellers = (raw & ImbalanceBitMoreSellers) != 0;
+        if (buyers && sellers) return WebSocketClient.AuctionImbalanceCondition.Unknown;
+        if (buyers) return WebSocketClient.AuctionImbalanceCondition.MoreBuyers;
+        if (sellers) return WebSocketClient.AuctionImbalanceCondition.MoreSellers;
+        return WebSocketClient.AuctionImbalanceCondition.Balanced;
     }
 
     // ── MBO / order events ──────────────────────────────────────────

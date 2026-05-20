@@ -40,6 +40,7 @@ export const INFO_FIELDS = [
   'NetChange', 'NumberOfTrades', 'OpenInterest', 'PriceBandLow',
   'PriceBandHigh', 'TradingReferencePrice', 'AvgDailyTradedQty', 'MaxTradeVol',
   'TradingStatus', 'TradingEvent', 'PriceLimitType', 'MinPriceIncrement',
+  'AuctionImbalanceCondition',
 ];
 
 // Decimal places per price field, derived from SBE schema exponents.

@@ -58,6 +58,23 @@ public readonly record struct TradeBustEvent(
     DateTime ReceivedUtc);
 
 /// <summary>
+/// Decoded auction-imbalance side from <c>AuctionImbalance_19</c> (SBE schema
+/// 2.2.0 §AuctionImbalance). <see cref="Balanced"/> = both bits clear (no
+/// pending side); <see cref="MoreBuyers"/> / <see cref="MoreSellers"/> mirror
+/// the SBE <c>ImbalanceMoreBuyers</c> / <c>ImbalanceMoreSellers</c> flags.
+/// <see cref="Unknown"/> covers reserved combinations (both bits set) — kept
+/// distinct so forward-compat additions in the schema do not silently collapse
+/// to a known value.
+/// </summary>
+public enum AuctionImbalanceCondition : byte
+{
+    Balanced = 0,
+    MoreBuyers = 1,
+    MoreSellers = 2,
+    Unknown = 3,
+}
+
+/// <summary>
 /// Per-symbol info snapshot. Only fields actually present in the frame
 /// are populated; absent fields are <c>null</c>. Prices are scaled with
 /// the SBE 4-decimal exponent.
@@ -84,6 +101,36 @@ public sealed class InfoSnapshotEvent
     public long? TradeVolume { get; init; }
     public long? TradingStatus { get; init; }
     public long? TradingEvent { get; init; }
+
+    // ── Auction ─────────────────────────────────────────────────────
+    /// <summary>
+    /// Latest theoretical opening price from <c>TheoreticalOpeningPrice_16</c>.
+    /// Calculated and updated by the venue during every auction (pre-opening,
+    /// pre-closing, intra-day reopen). Scaled with the SBE 4-decimal exponent
+    /// (raw / 10_000). <c>null</c> when the venue has not yet published a TOP
+    /// for this security, or when the field is not present in this frame.
+    /// </summary>
+    public decimal? TheoreticalOpeningPrice { get; init; }
+
+    /// <summary>
+    /// Theoretical opening quantity matched at <see cref="TheoreticalOpeningPrice"/>
+    /// (raw, unscaled).
+    /// </summary>
+    public long? TheoreticalOpeningSize { get; init; }
+
+    /// <summary>
+    /// Remaining auction quantity from <c>AuctionImbalance_19</c> — the size
+    /// of the pending side (or 0 when balanced). Raw, unscaled. Pair with
+    /// <see cref="AuctionImbalanceCondition"/> to know which side is pending.
+    /// </summary>
+    public long? AuctionImbalanceSize { get; init; }
+
+    /// <summary>
+    /// Pending side of the auction imbalance. <c>null</c> when the venue
+    /// has not yet published an <c>AuctionImbalance</c> for this security
+    /// or when the field is not present in this frame.
+    /// </summary>
+    public AuctionImbalanceCondition? AuctionImbalanceCondition { get; init; }
 }
 
 /// <summary>

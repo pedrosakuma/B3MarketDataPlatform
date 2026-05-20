@@ -658,6 +658,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         }
 
         info.AuctionImbalanceSize = msg.MDEntrySize;
+        info.AuctionImbalanceCondition = (ushort)msg.ImbalanceCondition;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
 
