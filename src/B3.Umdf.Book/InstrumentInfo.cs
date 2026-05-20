@@ -73,6 +73,14 @@ public sealed class InstrumentInfo
 
     // Auction
     public long? AuctionImbalanceSize { get; set; }
+    /// <summary>
+    /// Raw <c>ImbalanceCondition</c> bitfield from <c>AuctionImbalance_19</c>
+    /// (SBE schema 2.2.0 §AuctionImbalance). Two bits are defined:
+    /// <c>0x0100</c> = ImbalanceMoreBuyers (P), <c>0x0200</c> = ImbalanceMoreSellers (Q).
+    /// All bits off = BALANCED. Kept as raw <c>ushort</c> so new bits added
+    /// upstream stay forward-compatible.
+    /// </summary>
+    public ushort? AuctionImbalanceCondition { get; set; }
 
     // Bands
     public long? PriceBandLow { get; set; }
@@ -158,6 +166,7 @@ public sealed class InstrumentInfo
         TheoreticalOpeningPrice = null;
         TheoreticalOpeningSize = null;
         AuctionImbalanceSize = null;
+        AuctionImbalanceCondition = null;
         PriceBandLow = null;
         PriceBandHigh = null;
         PriceLimitType = null;
@@ -214,6 +223,7 @@ public sealed class InstrumentInfo
         NumberOfTrades = null;
         NetChangeFromPrevDay = null;
         AuctionImbalanceSize = null;
+        AuctionImbalanceCondition = null;
 
         LastRptSeqOpeningPrice = 0;
         LastRptSeqTheoreticalOpeningPrice = 0;

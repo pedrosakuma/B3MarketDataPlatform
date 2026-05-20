@@ -195,6 +195,39 @@ public class WireProtocolTests
     }
 
     [Fact]
+    public void WriteInfoSnapshot_AuctionFields_RoundTrip()
+    {
+        var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
+        var info = new InstrumentInfo
+        {
+            TheoreticalOpeningPrice = 12_3450L, // 12.3450
+            TheoreticalOpeningSize = 7_500L,
+            AuctionImbalanceSize = 250L,
+            // SBE ImbalanceCondition bit 8 = MoreBuyers
+            AuctionImbalanceCondition = 0x0100,
+        };
+        int len = WireProtocol.WriteInfoSnapshot(buf, securityId: 99, info);
+
+        var (msgLen, type) = ReadFraming(buf);
+        Assert.Equal(len, msgLen);
+        Assert.Equal(MessageType.InfoSnapshot, type);
+
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12));
+        Assert.True((mask & (1u << WireProtocol.FieldTheoreticalOpeningPrice)) != 0);
+        Assert.True((mask & (1u << WireProtocol.FieldTheoreticalOpeningSize)) != 0);
+        Assert.True((mask & (1u << WireProtocol.FieldAuctionImbalanceSize)) != 0);
+        Assert.True((mask & (1u << WireProtocol.FieldAuctionImbalanceCondition)) != 0);
+
+        // Values appear in bit order. The set bits here are 7,8,9,24 → that's
+        // the order on the wire. (24 is set last, after the four lower bits.)
+        int off = 16;
+        Assert.Equal(12_3450L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8; // TheoreticalOpeningPrice
+        Assert.Equal(7_500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;   // TheoreticalOpeningSize
+        Assert.Equal(250L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;     // AuctionImbalanceSize
+        Assert.Equal(0x0100L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));            // AuctionImbalanceCondition
+    }
+
+    [Fact]
     public void WriteCandleUpdate_RoundTrip()
     {
         var buf = new byte[128];

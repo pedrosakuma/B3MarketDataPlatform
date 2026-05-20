@@ -144,20 +144,29 @@ snapshot; clients should reset any prior market tier when processing
 
 | Bit | Field | Bit | Field |
 |-----|-------|-----|-------|
-| 0 | OpeningPrice | 11 | VwapPrice |
-| 1 | ClosingPrice | 12 | NetChange |
-| 2 | HighPrice | 13 | NumberOfTrades |
-| 3 | LowPrice | 14 | OpenInterest |
-| 4 | LastTradePrice | 15 | PriceBandLow |
-| 5 | LastTradeSize | 16 | PriceBandHigh |
-| 6 | SettlementPrice | 17 | TradingReferencePrice |
-| 7 | TheoreticalOpeningPrice | 18 | AvgDailyTradedQty |
-| 8 | TheoreticalOpeningSize | 19 | MaxTradeVol |
-| 9 | AuctionImbalanceSize | 20 | TradingStatus |
-| 10 | TradeVolume | 21 | TradingEvent |
+| 0 | OpeningPrice | 12 | NetChange |
+| 1 | ClosingPrice | 13 | NumberOfTrades |
+| 2 | HighPrice | 14 | OpenInterest |
+| 3 | LowPrice | 15 | PriceBandLow |
+| 4 | LastTradePrice | 16 | PriceBandHigh |
+| 5 | LastTradeSize | 17 | TradingReferencePrice |
+| 6 | SettlementPrice | 18 | AvgDailyTradedQty |
+| 7 | TheoreticalOpeningPrice | 19 | MaxTradeVol |
+| 8 | TheoreticalOpeningSize | 20 | TradingStatus |
+| 9 | AuctionImbalanceSize | 21 | TradingEvent |
+| 10 | TradeVolume | 22 | PriceLimitType |
+| 11 | VwapPrice | 23 | MinPriceIncrement |
+|    |                         | 24 | AuctionImbalanceCondition |
 
 Only fields with their bit set are present in the payload (as `i64` in
-bit order). Max `InfoSnapshot` body: 192 bytes.
+bit order). Max `InfoSnapshot` body: 200 bytes.
+
+`AuctionImbalanceCondition` carries the raw SBE `ImbalanceCondition`
+bitfield from `AuctionImbalance_19` (low 16 bits): `0x0100` =
+`ImbalanceMoreBuyers`, `0x0200` = `ImbalanceMoreSellers`, all bits off =
+`Balanced`. The SDK decodes it into the
+`B3.MarketData.WebSocketClient.AuctionImbalanceCondition` enum;
+unrecognised combinations map to `Unknown`.
 
 ### Incrementals
 
