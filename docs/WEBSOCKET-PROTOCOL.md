@@ -198,8 +198,9 @@ documented bit values rather than equality-checking the whole byte.
 Servers that predate the flag byte wrote the legacy 36-byte `Trade`
 frame; the framing header reports the true length, and decoders that
 read flags MUST treat absence as `0` (no flags set). Trade history
-frames replayed from the per-symbol recent-trades ring always carry
-`flags=0` (the ring does not persist per-trade flags).
+frames replayed from the per-symbol recent-trades ring preserve the
+per-trade flags captured at ingest time (each ring slot stores the
+flag byte alongside price/qty/tradeId).
 
 `MarketTierUpdate` represents B3 null-price MOA/MOC orders as an aggregate
 market tier per side. It is intentionally separate from priced order events:

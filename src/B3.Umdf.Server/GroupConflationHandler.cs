@@ -307,10 +307,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         if (!_parent.IsSubscribed(securityId)) return;
 
         // Capture trade in the per-security ring (snapshot history for future
-        // subscribers that arrive while the symbol is warm).
+        // subscribers that arrive while the symbol is warm). Flags are stamped
+        // into the slot so SnapshotEmitter.SendTradeHistory replays the
+        // AuctionPrint bit instead of defaulting to None.
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
+        ring.Add(price, quantity, tradeId, (byte)flags);
 
         _eventsReceived++;
         BufferTrade(securityId, price, quantity, tradeId, (byte)flags);
@@ -352,7 +354,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         var ring = RecentTrades.GetOrAdd(securityId,
             static _ => new TradeRingBuffer(SubscriptionManager.MaxRecentTrades));
-        ring.Add(price, quantity, tradeId);
+        ring.Add(price, quantity, tradeId, (byte)flags);
 
         _eventsReceived++;
         BufferTrade(securityId, price, quantity, tradeId, (byte)flags);
