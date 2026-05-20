@@ -57,6 +57,7 @@ public sealed class BookFeed : IBookFeed, IDisposable
     private readonly Action<OrderDeletedEvent> _onDel;
     private readonly Action<BookClearedEvent> _onClr;
     private readonly Action<SymbolStaleStatusEvent> _onStale;
+    private readonly Action<UnsubscribedEvent> _onUnsubscribed;
     private int _disposed;
 
     /// <inheritdoc/>
@@ -71,12 +72,14 @@ public sealed class BookFeed : IBookFeed, IDisposable
         _onDel = OnDeleted;
         _onClr = OnCleared;
         _onStale = OnStale;
+        _onUnsubscribed = OnUnsubscribed;
         _client.BookSnapshot += _onSnap;
         _client.OrderAdded += _onAdd;
         _client.OrderUpdated += _onUpd;
         _client.OrderDeleted += _onDel;
         _client.BookCleared += _onClr;
         _client.SymbolStaleStatus += _onStale;
+        _client.Unsubscribed += _onUnsubscribed;
     }
 
     /// <inheritdoc/>
@@ -95,10 +98,12 @@ public sealed class BookFeed : IBookFeed, IDisposable
     }
 
     /// <summary>
-    /// Drop the in-memory book for <paramref name="symbol"/>. Call after
-    /// unsubscribing so long-running processes don't accumulate state for
-    /// symbols they no longer care about. (Phase 2 will add automatic eviction
-    /// tied to the subscription lifecycle.)
+    /// Drop the in-memory book for <paramref name="symbol"/>. Normally
+    /// <see cref="MarketDataClient.UnsubscribeAsync"/> handles eviction
+    /// automatically via the
+    /// <see cref="MarketDataClient.Unsubscribed"/> event; call this only when
+    /// you want to discard a book without unsubscribing (e.g. memory
+    /// reclamation for a symbol you still receive but no longer care about).
     /// </summary>
     public bool Forget(string symbol)
     {
@@ -152,6 +157,15 @@ public sealed class BookFeed : IBookFeed, IDisposable
         Changed?.Invoke(ev.Symbol);
     }
 
+    private void OnUnsubscribed(UnsubscribedEvent ev)
+    {
+        if (string.IsNullOrWhiteSpace(ev.Symbol)) return;
+        if (_bySymbol.TryRemove(ev.Symbol.Trim(), out _))
+        {
+            Changed?.Invoke(ev.Symbol);
+        }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
@@ -161,5 +175,6 @@ public sealed class BookFeed : IBookFeed, IDisposable
         _client.OrderDeleted -= _onDel;
         _client.BookCleared -= _onClr;
         _client.SymbolStaleStatus -= _onStale;
+        _client.Unsubscribed -= _onUnsubscribed;
     }
 }

@@ -201,6 +201,16 @@ public readonly record struct SymbolDelistedEvent(
     DateTime ReceivedUtc);
 
 /// <summary>
+/// Client-side notification raised after <see cref="MarketDataClient.UnsubscribeAsync"/>
+/// drops a symbol from the active subscription set. <see cref="SecurityId"/>
+/// is zero when no <c>SubscribeOk</c> had been observed yet.
+/// </summary>
+public readonly record struct UnsubscribedEvent(
+    string Symbol,
+    ulong SecurityId,
+    DateTime ReceivedUtc);
+
+/// <summary>
 /// Returned by the server when a <c>Subscribe</c> can't be satisfied.
 /// </summary>
 public enum SubscribeErrorCode : byte
