@@ -172,13 +172,20 @@ internal static class WireFormat
     public static ulong ReadSymbolDelisted(ReadOnlySpan<byte> payload)
         => BinaryPrimitives.ReadUInt64LittleEndian(payload);
 
-    public static (ulong SecurityId, long Price, long Qty, long TradeId) ReadTrade(ReadOnlySpan<byte> payload)
+    /// <summary>
+    /// Decode a Trade payload. Layout: <c>[secId u64][price i64][qty i64][tradeId i64][flags u8?]</c>.
+    /// The trailing flags byte was added in a later server build; when the
+    /// payload is the legacy 32 bytes (no flags), <see cref="TradeFlags.None"/>
+    /// is returned.
+    /// </summary>
+    public static (ulong SecurityId, long Price, long Qty, long TradeId, TradeFlags Flags) ReadTrade(ReadOnlySpan<byte> payload)
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
         long price = BinaryPrimitives.ReadInt64LittleEndian(payload[8..]);
         long qty = BinaryPrimitives.ReadInt64LittleEndian(payload[16..]);
         long tradeId = BinaryPrimitives.ReadInt64LittleEndian(payload[24..]);
-        return (secId, price, qty, tradeId);
+        var flags = payload.Length >= 33 ? (TradeFlags)payload[32] : TradeFlags.None;
+        return (secId, price, qty, tradeId, flags);
     }
 
     public static (ulong SecurityId, long TradeId) ReadTradeBust(ReadOnlySpan<byte> payload)

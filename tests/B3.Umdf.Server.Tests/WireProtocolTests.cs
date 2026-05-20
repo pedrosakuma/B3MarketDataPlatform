@@ -100,16 +100,28 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteTrade(buf, securityId: 1001, price: 55_000L, qty: 100L, tradeId: 9876L);
 
-        Assert.Equal(36, len);
+        Assert.Equal(37, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(36, msgLen);
+        Assert.Equal(37, msgLen);
         Assert.Equal(MessageType.Trade, type);
 
         int off = 4;
         Assert.Equal(1001UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(55_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(100L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
-        Assert.Equal(9876L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));
+        Assert.Equal(9876L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
+        Assert.Equal(0, buf[off]); // flags default
+    }
+
+    [Fact]
+    public void WriteTrade_WithAuctionFlag_RoundTrip()
+    {
+        var buf = new byte[64];
+        int len = WireProtocol.WriteTrade(buf, securityId: 1001, price: 55_000L, qty: 100L, tradeId: 9876L,
+            flags: (byte)TradeFlags.AuctionPrint);
+
+        Assert.Equal(37, len);
+        Assert.Equal((byte)TradeFlags.AuctionPrint, buf[36]);
     }
 
     [Fact]

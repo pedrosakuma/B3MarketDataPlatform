@@ -164,8 +164,12 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const securityId = v.getBigUint64(o, true); o += 8;
       const price = Number(v.getBigInt64(o, true)); o += 8;
       const qty = Number(v.getBigInt64(o, true)); o += 8;
-      const tradeId = Number(v.getBigInt64(o, true));
-      return { type: 'Trade', securityId, price, qty, tradeId };
+      const tradeId = Number(v.getBigInt64(o, true)); o += 8;
+      // Trailing flags byte (added later). Tolerate older servers that wrote
+      // the legacy 36-byte frame — treat absence as 0 (no flags).
+      const flags = o < msgLen ? v.getUint8(o) : 0;
+      const auctionPrint = (flags & 0x01) !== 0;
+      return { type: 'Trade', securityId, price, qty, tradeId, flags, auctionPrint };
     }
     case MSG.BOOK_CLEARED: {
       const securityId = v.getBigUint64(o, true); o += 8;

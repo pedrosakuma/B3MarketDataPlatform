@@ -23,7 +23,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly Dictionary<ulong, BufferedOrder> _orderBuffer = new();
     private readonly Dictionary<(ulong SecurityId, byte Side), (long TotalQty, int OrderCount)> _marketTierBuffer = new();
     private readonly List<(ulong SecurityId, byte Side)> _clearBuffer = new();
-    private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId)> _tradeBuffer = new();
+    private readonly Dictionary<(ulong SecurityId, long Price), (long Qty, long TradeId, byte Flags)> _tradeBuffer = new();
     // Per-symbol stale-status flips. Coalesced per security:
     // multiple flips in the same batch collapse to the latest value.
     private readonly Dictionary<ulong, bool> _staleStatusBuffer = new();
@@ -270,7 +270,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     }
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
+        => OnTrade(securityId, price, quantity, tradeId, sendingTimeNs, TradeFlags.None);
+
+    public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
     {
+        // Hybrid AuctionPrint derivation (issue #46):
+        //   (a) BookManager already lit TradeFlags.AuctionPrint if the SBE
+        //       TradeCondition.OpeningPrice bit is set (opening / reopening cross).
+        //   (b) Here we additionally light it if the security's current
+        //       TradingStatus is an auction phase (RESERVED / FINAL_CLOSING_CALL)
+        //       at the time of the trade — covers intraday auctions that don't
+        //       carry the OpeningPrice bit on the print itself.
+        if (IsAuctionPhase(securityId)) flags |= TradeFlags.AuctionPrint;
+
         // Always-on work — needed by *future* subscribers, so it must run even
         // when no client is currently subscribed:
         //   • Candle aggregator: chart history would have gaps otherwise.
@@ -301,7 +313,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         ring.Add(price, quantity, tradeId);
 
         _eventsReceived++;
-        BufferTrade(securityId, price, quantity, tradeId);
+        BufferTrade(securityId, price, quantity, tradeId, (byte)flags);
     }
 
     public void OnBookCleared(ulong securityId, BookClearSide side)
@@ -315,7 +327,12 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     }
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
+        => OnForwardTrade(securityId, price, quantity, tradeId, sendingTimeNs, TradeFlags.None);
+
+    public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
     {
+        if (IsAuctionPhase(securityId)) flags |= TradeFlags.AuctionPrint;
+
         // Always-on aggregation (same rationale as OnTrade): candles + InfoSnapshot
         // last-price must be maintained for late subscribers.
         if (IsOpenPhase(securityId))
@@ -338,7 +355,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         ring.Add(price, quantity, tradeId);
 
         _eventsReceived++;
-        BufferTrade(securityId, price, quantity, tradeId);
+        BufferTrade(securityId, price, quantity, tradeId, (byte)flags);
     }
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)
@@ -432,6 +449,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     {
         if (!_tradingStatus.TryGetValue(securityId, out int status)) return true;
         return status == (int)TradingSessionSubID.OPEN;
+    }
+
+    /// <summary>
+    /// True when the security is currently in an auction phase
+    /// (<c>RESERVED</c> / <c>FINAL_CLOSING_CALL</c>). Used to derive
+    /// <see cref="TradeFlags.AuctionPrint"/> for trades that the upstream
+    /// SBE message did not flag with <c>TradeCondition.OpeningPrice</c>
+    /// (e.g. intraday auction prints).
+    /// </summary>
+    private bool IsAuctionPhase(ulong securityId)
+    {
+        if (!_tradingStatus.TryGetValue(securityId, out int status)) return false;
+        return status == (int)TradingSessionSubID.RESERVED
+            || status == (int)TradingSessionSubID.FINAL_CLOSING_CALL;
     }
 
     // ── IMarketDataEventHandler ──
@@ -837,14 +868,16 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         slot = new BufferedOrder(PendingOrderKind.Deleted, securityId, side, 0, 0);
     }
 
-    private void BufferTrade(ulong securityId, long price, long quantity, long tradeId)
+    private void BufferTrade(ulong securityId, long price, long quantity, long tradeId, byte flags)
     {
         _tradesReceivedTotal++;
         ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(_tradeBuffer, (securityId, price), out bool existed);
         if (existed)
-            slot = (slot.Qty + quantity, tradeId);
+            // Coalesce qty within (secId, price); OR flag bits so AuctionPrint
+            // sticks if any of the merged prints carried it.
+            slot = (slot.Qty + quantity, tradeId, (byte)(slot.Flags | flags));
         else
-            slot = (quantity, tradeId);
+            slot = (quantity, tradeId, flags);
     }
 
     private void PurgeBufferedOrders(ulong securityId, byte clearSide)
@@ -1086,9 +1119,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             _scratchCandleSecIds.Add(secId);
 
         // Flush trades (Trades-flag opt-in routing)
-        foreach (var ((secId, price), (qty, tradeId)) in _tradeBuffer)
+        foreach (var ((secId, price), (qty, tradeId, flags)) in _tradeBuffer)
         {
-            int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId);
+            int len = WireProtocol.WriteTrade(tmp, secId, price, qty, tradeId, flags);
             AppendTradeEventToBatch(secId, tmp[..len], logicalCount: 1);
             flushed++;
         }

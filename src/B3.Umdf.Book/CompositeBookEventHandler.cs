@@ -39,6 +39,11 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
         foreach (var h in _handlers) h.OnTrade(securityId, price, quantity, tradeId, sendingTimeNs);
     }
 
+    public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
+    {
+        foreach (var h in _handlers) h.OnTrade(securityId, price, quantity, tradeId, sendingTimeNs, flags);
+    }
+
     public void OnBookCleared(ulong securityId, BookClearSide side)
     {
         foreach (var h in _handlers) h.OnBookCleared(securityId, side);
@@ -47,6 +52,11 @@ public sealed class CompositeBookEventHandler : IBookEventHandler
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
     {
         foreach (var h in _handlers) h.OnForwardTrade(securityId, price, quantity, tradeId, sendingTimeNs);
+    }
+
+    public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
+    {
+        foreach (var h in _handlers) h.OnForwardTrade(securityId, price, quantity, tradeId, sendingTimeNs, flags);
     }
 
     public void OnTradeBust(ulong securityId, long price, long quantity, long tradeId)

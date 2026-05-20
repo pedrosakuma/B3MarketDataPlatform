@@ -898,7 +898,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             return;
         }
 
-        _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        _eventHandler?.OnTrade(securityId, price, quantity, tradeId, tradeTimeNs,
+            msg.TradeCondition.IsOpeningPrice() ? TradeFlags.AuctionPrint : TradeFlags.None);
         RecordTrade(securityId, price, quantity, tradeId, tradeTimeNs);
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
@@ -955,7 +956,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             return;
         }
 
-        _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs);
+        _eventHandler?.OnForwardTrade(securityId, price, quantity, tradeId, tradeTimeNs,
+            msg.TradeCondition.IsOpeningPrice() ? TradeFlags.AuctionPrint : TradeFlags.None);
         RecordTrade(securityId, price, quantity, tradeId, tradeTimeNs);
         TrackMatchEvent(securityId, msg.MatchEventIndicator);
     }
