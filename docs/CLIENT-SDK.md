@@ -39,7 +39,7 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 });
 
 client.Trade        += t => Console.WriteLine($"{t.Symbol} @ {t.Price} x {t.Qty}{(t.Flags.HasFlag(TradeFlags.AuctionPrint) ? " (auction)" : "")}");
-client.InfoSnapshot += i => Console.WriteLine($"{i.Symbol} last={i.LastTradePrice}");
+client.InfoSnapshot += i => Console.WriteLine($"{i.Symbol} last={i.LastTradePrice} top={i.TheoreticalOpeningPrice} imb={i.AuctionImbalanceCondition}");
 client.ServerStatus += s => Console.WriteLine($"server ready={s.Ready}");
 client.SubscribeError += e => Console.WriteLine($"{e.Symbol} -> {e.ErrorCode}");
 

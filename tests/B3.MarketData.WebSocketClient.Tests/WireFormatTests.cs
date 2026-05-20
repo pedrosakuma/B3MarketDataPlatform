@@ -101,6 +101,42 @@ public class WireFormatTests
         // Unset fields stay null.
         Assert.Null(ev.OpeningPrice);
         Assert.Null(ev.VwapPrice);
+        Assert.Null(ev.TheoreticalOpeningPrice);
+        Assert.Null(ev.AuctionImbalanceSize);
+        Assert.Null(ev.AuctionImbalanceCondition);
+    }
+
+    [Theory]
+    [InlineData(0x0000, AuctionImbalanceCondition.Balanced)]
+    [InlineData(0x0100, AuctionImbalanceCondition.MoreBuyers)]
+    [InlineData(0x0200, AuctionImbalanceCondition.MoreSellers)]
+    [InlineData(0x0300, AuctionImbalanceCondition.Unknown)] // both bits set
+    public void InfoSnapshot_DecodesAuctionFields(int rawImbalance, AuctionImbalanceCondition expected)
+    {
+        // Set bits: TheoreticalOpeningPrice(7), TheoreticalOpeningSize(8),
+        //           AuctionImbalanceSize(9), AuctionImbalanceCondition(24).
+        uint mask = (1u << WireFormat.FieldTheoreticalOpeningPrice)
+                  | (1u << WireFormat.FieldTheoreticalOpeningSize)
+                  | (1u << WireFormat.FieldAuctionImbalanceSize)
+                  | (1u << WireFormat.FieldAuctionImbalanceCondition);
+        Span<byte> buf = stackalloc byte[256];
+        // header(4) + secId(8) + mask(4) + 4 * i64
+        ushort total = 4 + 8 + 4 + 32;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)WireFormat.MessageType.InfoSnapshot);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(buf[4..], 7UL);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf[12..], mask);
+        // Bit-order on wire: 7, 8, 9, 24.
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[16..], 30_2500L); // 30.25 TOP
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[24..], 1_500L);   // TOP size
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[32..], 800L);     // imbalance size
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[40..], rawImbalance);
+
+        var ev = WireFormat.ReadInfoSnapshot(buf[4..total], "VALE3", DateTime.UtcNow);
+        Assert.Equal(30.25m, ev.TheoreticalOpeningPrice);
+        Assert.Equal(1_500L, ev.TheoreticalOpeningSize);
+        Assert.Equal(800L, ev.AuctionImbalanceSize);
+        Assert.Equal(expected, ev.AuctionImbalanceCondition);
     }
 
     private static void WriteServerTradeFrame(Span<byte> dest, ulong securityId, long price, long qty, long tradeId, byte flags)

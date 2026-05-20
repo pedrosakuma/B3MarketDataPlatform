@@ -615,9 +615,14 @@ public static class WireProtocol
     public const int FieldTradingEvent = 21;
     public const int FieldPriceLimitType = 22;
     public const int FieldMinPriceIncrement = 23;
+    /// <summary>Raw <c>ImbalanceCondition</c> bitfield from the upstream
+    /// <c>AuctionImbalance_19</c> message: bit 8 = ImbalanceMoreBuyers (P),
+    /// bit 9 = ImbalanceMoreSellers (Q), all bits off = BALANCED. Widened
+    /// to i64 like every other slot. Decoder masks low 16 bits.</summary>
+    public const int FieldAuctionImbalanceCondition = 24;
 
-    /// <summary>Max buffer size for InfoSnapshot: header + securityId + mask + 24 fields × 8.</summary>
-    public const int InfoSnapshotMaxSize = FramingHeaderSize + 8 + 4 + 24 * 8; // 208
+    /// <summary>Max buffer size for InfoSnapshot: header + securityId + mask + 25 fields × 8.</summary>
+    public const int InfoSnapshotMaxSize = FramingHeaderSize + 8 + 4 + 25 * 8; // 216
 
     /// <summary>
     /// Write InfoSnapshot: securityId + u32 field bitmask + i64 values for present fields.
@@ -654,6 +659,9 @@ public static class WireProtocol
         // homogeneous (one slot = 8 bytes). Decoder reads low 8 bits.
         if (info.PriceLimitType is { } v22) { mask |= 1u << FieldPriceLimitType; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v22); offset += 8; }
         if (info.MinPriceIncrement is { } v23) { mask |= 1u << FieldMinPriceIncrement; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v23); offset += 8; }
+        // AuctionImbalanceCondition is a ushort bitfield; widened to i64 so the
+        // wire keeps one slot = 8 bytes. Decoder masks low 16 bits.
+        if (info.AuctionImbalanceCondition is { } v24) { mask |= 1u << FieldAuctionImbalanceCondition; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v24); offset += 8; }
 
         // Write framing header, securityId, and mask
         ushort totalLen = (ushort)offset;
