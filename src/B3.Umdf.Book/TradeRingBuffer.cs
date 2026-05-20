@@ -3,6 +3,9 @@ namespace B3.Umdf.Book;
 /// <summary>
 /// One slot in <see cref="TradeRingBuffer"/>. <see cref="Busted"/> is set when a
 /// later TradeBust_57 cancels this trade — see B3 BinaryUMDF v2.2.0 spec §10.
+/// <see cref="Flags"/> mirrors the wire-level <c>TradeFlags</c> bitset (e.g.
+/// <c>AuctionPrint</c>) so the snapshot history can faithfully replay the bit
+/// to late subscribers.
 /// </summary>
 internal struct TradeSlot
 {
@@ -10,6 +13,7 @@ internal struct TradeSlot
     public long Qty;
     public long TradeId;
     public byte Busted;
+    public byte Flags;
 }
 
 /// <summary>Fixed-capacity ring buffer of recent trades for a single security.</summary>
@@ -26,9 +30,9 @@ internal sealed class TradeRingBuffer
 
     public TradeRingBuffer(int capacity) => _buf = new TradeSlot[capacity];
 
-    public void Add(long price, long qty, long tradeId)
+    public void Add(long price, long qty, long tradeId, byte flags = 0)
     {
-        _buf[_head] = new TradeSlot { Price = price, Qty = qty, TradeId = tradeId, Busted = 0 };
+        _buf[_head] = new TradeSlot { Price = price, Qty = qty, TradeId = tradeId, Busted = 0, Flags = flags };
         _head = (_head + 1) % _buf.Length;
         if (_count < _buf.Length) _count++;
         _version++;
