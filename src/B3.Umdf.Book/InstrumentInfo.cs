@@ -9,6 +9,7 @@ public sealed class InstrumentInfo
 {
     private long _version;
     private long _securityDefinitionVersion;
+    private long _priceBandVersion;
 
     /// <summary>Monotonic version counter. Bumped by the feed thread on every mutation.</summary>
     public long Version => Volatile.Read(ref _version);
@@ -29,6 +30,20 @@ public sealed class InstrumentInfo
 
     /// <summary>Increment the SecurityDefinition version counter. Feed-thread-only.</summary>
     public void BumpSecurityDefinitionVersion() => ++_securityDefinitionVersion;
+
+    /// <summary>
+    /// Monotonic version counter dedicated to <c>PriceBand_22</c> deltas.
+    /// Bumped ONLY by <c>MarketDataManager.HandlePriceBand</c> when the band
+    /// values actually change (the venue may re-broadcast the same band
+    /// periodically). Used by the WebSocket fan-out to push
+    /// <see cref="B3.Umdf.Server.MessageType.PriceBand"/> frames on real
+    /// deltas without re-emitting them on unrelated <see cref="BumpVersion"/>
+    /// calls (status / VWAP / candle updates).
+    /// </summary>
+    public long PriceBandVersion => Volatile.Read(ref _priceBandVersion);
+
+    /// <summary>Increment the PriceBand version counter. Feed-thread-only.</summary>
+    public void BumpPriceBandVersion() => ++_priceBandVersion;
 
     /// <summary>
     /// Last observed <c>SecurityValidityTimestamp</c> from
@@ -116,6 +131,21 @@ public sealed class InstrumentInfo
     /// </summary>
     public byte? PriceLimitType { get; set; }
     public long? TradingReferencePrice { get; set; }
+
+    /// <summary>SBE PriceBandType (tag 1305) from <c>PriceBand_22</c>. Discriminator
+    /// for hard vs. soft / continuous vs. auction bands. Null when the venue did
+    /// not specify the band classification.</summary>
+    public byte? PriceBandType { get; set; }
+
+    /// <summary>SBE PriceBandMidpointPriceType from <c>PriceBand_22</c>. Only
+    /// emitted for Rejection / Auction bands when <see cref="PriceLimitType"/>
+    /// equals PERCENTAGE; null otherwise.</summary>
+    public byte? PriceBandMidpointPriceType { get; set; }
+
+    /// <summary><c>PriceBand_22.MDEntryTimestamp</c> (UTC nanoseconds since
+    /// epoch). Lets consumers age out stale bands independently of
+    /// <see cref="LastUpdateTimestamp"/> which is shared across stat templates.</summary>
+    public long? PriceBandTimestamp { get; set; }
     public long? AvgDailyTradedQty { get; set; }
     public long? MaxTradeVol { get; set; }
 
@@ -194,6 +224,9 @@ public sealed class InstrumentInfo
         PriceBandHigh = null;
         PriceLimitType = null;
         TradingReferencePrice = null;
+        PriceBandType = null;
+        PriceBandMidpointPriceType = null;
+        PriceBandTimestamp = null;
         AvgDailyTradedQty = null;
         MaxTradeVol = null;
         TradeVolume = null;

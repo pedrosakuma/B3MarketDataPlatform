@@ -702,15 +702,45 @@ public sealed class MarketDataManager : IFeedEventHandler
             info.LastRptSeqPriceBand = (uint)rs;
         }
 
-        info.PriceBandLow = msg.LowLimitPrice.Mantissa;
-        info.PriceBandHigh = msg.HighLimitPrice.Mantissa;
+        long? newLow = msg.LowLimitPrice.Mantissa;
+        long? newHigh = msg.HighLimitPrice.Mantissa;
+        byte? newLimitType = msg.PriceLimitType is { } plt ? (byte)plt : (byte?)null;
+        long? newRefPx = msg.TradingReferencePrice.Mantissa;
+        byte? newBandType = msg.PriceBandType is { } pbt ? (byte)pbt : (byte?)null;
+        byte? newMidpointType = msg.PriceBandMidpointPriceType is { } pmt ? (byte)pmt : (byte?)null;
+        ulong newTsRaw = msg.MDEntryTimestamp.Time ?? 0;
+        long newTs = (long)newTsRaw;
+
+        // Real-delta check: B3 may re-broadcast the same band on its periodic
+        // emission cadence; we only want to fan the PriceBand channel out on
+        // an actual change. TradingReferencePrice + Low/High + the three
+        // discriminators fully describe the band the consumer enforces.
+        bool changed =
+            newLow != info.PriceBandLow
+            || newHigh != info.PriceBandHigh
+            || newLimitType != info.PriceLimitType
+            || newRefPx != info.TradingReferencePrice
+            || newBandType != info.PriceBandType
+            || newMidpointType != info.PriceBandMidpointPriceType;
+
+        info.PriceBandLow = newLow;
+        info.PriceBandHigh = newHigh;
         // PriceLimitType is required for the consumer to interpret the band values
         // (PRICE_UNIT vs TICKS vs PERCENTAGE). For futures/percentages B3 sends e.g.
         // ±1.0000 as PERCENTAGE, which is meaningless without this discriminator.
-        info.PriceLimitType = msg.PriceLimitType is { } plt ? (byte)plt : (byte?)null;
-        info.TradingReferencePrice = msg.TradingReferencePrice.Mantissa;
-        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        info.PriceLimitType = newLimitType;
+        info.TradingReferencePrice = newRefPx;
+        info.PriceBandType = newBandType;
+        info.PriceBandMidpointPriceType = newMidpointType;
+        info.PriceBandTimestamp = newTs;
+        info.LastUpdateTimestamp = newTsRaw;
         info.BumpVersion();
+
+        if (changed)
+        {
+            info.BumpPriceBandVersion();
+            _eventHandler?.OnPriceBandChanged(securityId, info);
+        }
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }

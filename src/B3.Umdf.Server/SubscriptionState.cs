@@ -79,6 +79,12 @@ internal sealed class SubscriptionState
     /// static metadata) on bootstrap and on every subsequent real delta.</summary>
     public bool WantsSecurityDefinition => (Flags & DataFlags.SecurityDefinition) != 0;
 
+    /// <summary>True iff this subscription opted in to receive
+    /// <see cref="MessageType.PriceBand"/> push frames (dynamic tunnel
+    /// limits / trading reference price) on bootstrap and on every
+    /// subsequent real delta.</summary>
+    public bool WantsPriceBand => (Flags & DataFlags.PriceBand) != 0;
+
     /// <summary>True iff this subscription wants live trades and the given batch is
     /// past the snapshot cutoff. Trades share the same broadcast cutoff as Book/Mbp.</summary>
     public bool WantsTradesBatch(long batchSequence) =>

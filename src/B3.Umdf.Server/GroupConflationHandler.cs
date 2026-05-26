@@ -498,6 +498,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _parent.NotifySecurityDefinitionUpdated(securityId);
     }
 
+    public void OnPriceBandChanged(ulong securityId, InstrumentInfo info)
+    {
+        // Same shape as OnSecurityDefinitionChanged — PriceBand deltas don't
+        // touch any handler-local cache; they only need to wake every
+        // subscriber of the PriceBand channel for this securityId.
+        _parent.NotifyPriceBandUpdated(securityId);
+    }
+
     /// <summary>
     /// P13: handle a fully-reassembled News_5 delivery from MarketDataManager.
     /// Runs on the dispatch (feed) thread; spans are valid only for the call.

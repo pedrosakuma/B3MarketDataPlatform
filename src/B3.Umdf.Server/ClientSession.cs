@@ -33,6 +33,11 @@ public sealed class ClientSession : IDisposable
     // on real deltas — NOT on every BumpVersion). Populated/cleared via
     // OutboundKind.AddSecurityDefinitionSub / RemoveSecurityDefinitionSub deltas.
     private readonly Dictionary<ulong, long> _secDefVersions = new();
+    // Same pull-side dirty-flag model as _secDefVersions but tracks the per-symbol
+    // PriceBandVersion (bumped only by MarketDataManager.HandlePriceBand on real
+    // deltas — NOT on every BumpVersion). Populated/cleared via
+    // OutboundKind.AddPriceBandSub / RemovePriceBandSub deltas.
+    private readonly Dictionary<ulong, long> _priceBandVersions = new();
     private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
@@ -48,6 +53,7 @@ public sealed class ClientSession : IDisposable
     private int _disconnectRequested;
     private int _infoWakePending;
     private int _secDefWakePending;
+    private int _priceBandWakePending;
 
     /// <summary>
     /// Snapshot of currently subscribed securityIds. Returns a fresh array under
@@ -185,7 +191,8 @@ public sealed class ClientSession : IDisposable
         // doesn't keep scanning stale securityIds after the parent subscription is gone.
         bool infoOk = RemoveInfoSubscription(securityId);
         bool secDefOk = RemoveSecurityDefinitionSubscription(securityId);
-        return infoOk && secDefOk;
+        bool priceBandOk = RemovePriceBandSubscription(securityId);
+        return infoOk && secDefOk && priceBandOk;
     }
 
     /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.
@@ -205,6 +212,16 @@ public sealed class ClientSession : IDisposable
 
     public bool RemoveSecurityDefinitionSubscription(ulong securityId) =>
         TryEnqueueCore(OutboundMessage.RemoveSecurityDefinitionSub(securityId), "remove-secdef-sub");
+
+    /// <summary>Track a security for dirty-flag PriceBand delivery. Same
+    /// model as <see cref="AddSecurityDefinitionSubscription"/> but for the
+    /// dynamic price-band channel — routes through the outbound ring so
+    /// <c>_priceBandVersions</c> stays lock-free.</summary>
+    public bool AddPriceBandSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.AddPriceBandSub(securityId), "add-priceband-sub");
+
+    public bool RemovePriceBandSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.RemovePriceBandSub(securityId), "remove-priceband-sub");
 
     /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
@@ -277,6 +294,19 @@ public sealed class ClientSession : IDisposable
         return TryEnqueueCore(OutboundMessage.SecurityDefinitionWake, "secdef update");
     }
 
+    /// <summary>
+    /// Wake the writer so PriceBand subscriptions can flush the latest
+    /// band version. Coalesces multiple deltas into at most one pending
+    /// wake item per client (mirrors <see cref="NotifySecurityDefinitionAvailable"/>).
+    /// </summary>
+    public bool NotifyPriceBandAvailable()
+    {
+        if (Interlocked.Exchange(ref _priceBandWakePending, 1) != 0)
+            return true;
+
+        return TryEnqueueCore(OutboundMessage.PriceBandWake, "priceband update");
+    }
+
     // --- Write loop: coalesce + dirty-flag info ---
 
     private const int MaxDrainPerCycle = 16384;
@@ -314,6 +344,8 @@ public sealed class ClientSession : IDisposable
                     Interlocked.Exchange(ref _infoWakePending, 0);
                 if (drained.SawSecDefWake)
                     Interlocked.Exchange(ref _secDefWakePending, 0);
+                if (drained.SawPriceBandWake)
+                    Interlocked.Exchange(ref _priceBandWakePending, 0);
 
                 // Phase 2: coalesce drained payloads into the contiguous send buffer.
                 int offset = CoalesceMessages(messages, ref coalesceBuf);
@@ -322,6 +354,7 @@ public sealed class ClientSession : IDisposable
                 // version advanced since we last emitted them (dirty-flag pull model).
                 int infoMessages = AppendInfoSnapshots(ref coalesceBuf, ref offset);
                 int secDefMessages = AppendSecurityDefinitionSnapshots(ref coalesceBuf, ref offset);
+                int priceBandMessages = AppendPriceBandSnapshots(ref coalesceBuf, ref offset);
 
                 // Phase 4: send + accounting.
                 if (offset > 0)
@@ -337,7 +370,7 @@ public sealed class ClientSession : IDisposable
                     // in-flight send finish is preferable to a torn frame.
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, CancellationToken.None);
-                    int totalMessages = drained.LogicalCount + infoMessages + secDefMessages;
+                    int totalMessages = drained.LogicalCount + infoMessages + secDefMessages + priceBandMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
                     MetricsRegistry.WsMessagesSent.Add(totalMessages);
@@ -375,7 +408,7 @@ public sealed class ClientSession : IDisposable
     }
 
     private readonly record struct DrainResult(
-        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake, bool SawSecDefWake);
+        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake, bool SawSecDefWake, bool SawPriceBandWake);
 
     /// <summary>
     /// Drain up to <see cref="MaxDrainPerCycle"/> entries from the outbound ring,
@@ -394,6 +427,7 @@ public sealed class ClientSession : IDisposable
         long payloadBytesDrained = 0;
         bool sawInfoWake = false;
         bool sawSecDefWake = false;
+        bool sawPriceBandWake = false;
         while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
         {
             drained++;
@@ -431,9 +465,19 @@ public sealed class ClientSession : IDisposable
                 case OutboundKind.RemoveSecurityDefinitionSub:
                     _secDefVersions.Remove(outbound.SecurityId);
                     break;
+                case OutboundKind.PriceBandWake:
+                    sawPriceBandWake = true;
+                    break;
+                case OutboundKind.AddPriceBandSub:
+                    // Same seed-at-0 convention as AddSecurityDefinitionSub.
+                    _priceBandVersions.TryAdd(outbound.SecurityId, 0);
+                    break;
+                case OutboundKind.RemovePriceBandSub:
+                    _priceBandVersions.Remove(outbound.SecurityId);
+                    break;
             }
         }
-        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake, sawSecDefWake);
+        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake, sawSecDefWake, sawPriceBandWake);
     }
 
     /// <summary>
@@ -527,6 +571,40 @@ public sealed class ClientSession : IDisposable
             int len = WireProtocol.WriteSecurityDefinition(coalesceBuf.AsSpan(offset), secId, info);
             offset += len;
             _secDefVersions[secId] = ver;
+            emitted++;
+        }
+        return emitted;
+    }
+
+    /// <summary>
+    /// Pull-side dirty-flag delivery for the PriceBand channel. Scans every
+    /// security currently tracked in <c>_priceBandVersions</c> and emits a fresh
+    /// <see cref="MessageType.PriceBand"/> frame for those whose
+    /// <see cref="InstrumentInfo.PriceBandVersion"/> advanced since the last
+    /// cycle. Symbols whose band hasn't been observed yet (no PriceBand_22
+    /// received) are skipped — there is nothing meaningful to emit.
+    /// </summary>
+    private int AppendPriceBandSnapshots(ref byte[] coalesceBuf, ref int offset)
+    {
+        if (_marketDataManagers is not { } managers) return 0;
+        int emitted = 0;
+        foreach (var (secId, lastVer) in _priceBandVersions)
+        {
+            InstrumentInfo? info = null;
+            foreach (var mdm in managers)
+            {
+                if (mdm.InstrumentData.TryGetValue(secId, out info))
+                    break;
+            }
+            if (info is null) continue;
+            if (!info.PriceBandTimestamp.HasValue) continue;
+            long ver = info.PriceBandVersion;
+            if (ver <= lastVer) continue;
+
+            EnsureCapacity(ref coalesceBuf, offset, WireProtocol.PriceBandMaxSize);
+            int len = WireProtocol.WritePriceBand(coalesceBuf.AsSpan(offset), secId, info);
+            offset += len;
+            _priceBandVersions[secId] = ver;
             emitted++;
         }
         return emitted;

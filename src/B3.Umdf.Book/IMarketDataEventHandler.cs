@@ -15,6 +15,16 @@ public interface IMarketDataEventHandler
     void OnSecurityDefinitionChanged(ulong securityId, InstrumentInfo info) { }
 
     /// <summary>
+    /// Fired when a <c>PriceBand_22</c> arrives whose payload changed the
+    /// cached band (low/high limits, limit-type, midpoint-type, or trading
+    /// reference price). Idempotent re-broadcasts are short-circuited
+    /// upstream so this fires only on real deltas — useful for downstream
+    /// subscribers (e.g., WebSocket server pushing
+    /// <c>PriceBandEvent</c> only when the band actually moved).
+    /// </summary>
+    void OnPriceBandChanged(ulong securityId, InstrumentInfo info) { }
+
+    /// <summary>
     /// Fired when a SecurityDefinition arrives for an existing SecurityID
     /// whose canonical identity (Symbol/ISIN/MaturityDate/SecurityType)
     /// differs from the cached value — i.e. the exchange is reusing the

@@ -76,6 +76,12 @@ public sealed class MarketDataClient : IAsyncDisposable
     /// <see cref="SubscribeFlags.SecurityDefinition"/>.
     /// </summary>
     public event Action<SecurityDefinitionEvent>? SecurityDefinition;
+    /// <summary>
+    /// Dynamic per-symbol price band ("túnel de preço") sourced from
+    /// <c>PriceBand_22</c>. Fires on subscribe (bootstrap) and on every real
+    /// band change. Requires opt-in via <see cref="SubscribeFlags.PriceBand"/>.
+    /// </summary>
+    public event Action<PriceBandEvent>? PriceBand;
     public event Action<ServerStatusEvent>? ServerStatus;
     public event Action<ServerHelloEvent>? ServerHello;
     public event Action<SymbolDelistedEvent>? SymbolDelisted;
@@ -509,6 +515,14 @@ public sealed class MarketDataClient : IAsyncDisposable
                 // yet be populated for this securityId.
                 var ev = WireFormat.ReadSecurityDefinition(payload, receivedUtc);
                 Enqueue(() => SecurityDefinition?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.PriceBand:
+            {
+                // PriceBand embeds its own Symbol field on the wire, same as
+                // SecurityDefinition — no _securityIdToSymbol lookup needed.
+                var ev = WireFormat.ReadPriceBand(payload, receivedUtc);
+                Enqueue(() => PriceBand?.Invoke(ev));
                 break;
             }
             // ── L3 / order-by-order (MBO) ─────────────────────────

@@ -93,7 +93,7 @@ also enforces its own queue limits described in
 
 ## Scope of v1
 
-In: `Trade`, `TradeBust`, `InfoSnapshot`, `SecurityDefinition`,
+In: `Trade`, `TradeBust`, `InfoSnapshot`, `SecurityDefinition`, `PriceBand`,
 `ServerStatus`, `SubscribeError`, `ConnectionStateChanged`,
 reconnect+replay, DI extension, bounded back-pressure.
 
@@ -126,3 +126,52 @@ await client.SubscribeAsync("PETR4",
 `1e8`); all other numeric fields are unscaled. The event includes the
 resolved `Symbol` directly from the wire frame, so it works even before the
 `SubscribeOk` symbol cache is populated for first-sight securities.
+
+## PriceBand channel
+
+Pre-trade fat-finger guards (OPT-E `PriceBandCheck` and friends) need the
+venue-authoritative dynamic price band ("túnel de preço"): the rejection /
+auction band B3 itself enforces. Set `SubscribeFlags.PriceBand` (`0x40`)
+on `SubscribeAsync` to receive:
+
+* a bootstrap `PriceBandEvent` on subscribe (when the server has already
+  observed a `PriceBand_22` for the symbol), and
+* a fresh `PriceBandEvent` whenever B3 changes any of the band fields —
+  idempotent re-broadcasts (the venue may emit the same band periodically)
+  are suppressed server-side, so the event fires only on true band moves.
+
+```csharp
+client.PriceBand += pb =>
+    Console.WriteLine(
+        $"{pb.Symbol} [{pb.LowerBand}, {pb.UpperBand}] " +
+        $"limitType={pb.PriceLimitType} ref={pb.TradingReferencePrice}");
+await client.SubscribeAsync("WINJ5",
+    SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.PriceBand);
+// or just: SubscribeFlags.Everything
+```
+
+`LowerBand` / `UpperBand` are pre-scaled `decimal?` (raw `Price` mantissa
+divided by `1e4`); `TradingReferencePrice` is pre-scaled with the
+`Fixed8` exponent (`raw / 1e8`). `PriceLimitType` is REQUIRED to interpret
+the band: `0` = PRICE_UNIT (absolute prices), `1` = TICKS (offsets vs.
+reference price combined with tick size), `2` = PERCENTAGE (offsets vs.
+reference price — futures typically send e.g. `0.1000` for ±10 %, which
+is meaningless without the discriminator).
+
+The event includes the resolved `Symbol` directly from the wire frame, so
+it works even before the `SubscribeOk` symbol cache is populated.
+
+Drop-in seam for consumers that already have an `IPriceBandSource`
+interface (the B3TradingPlatform OPT-E pattern):
+
+```csharp
+public sealed class WebSocketPriceBandSource : IPriceBandSource
+{
+    private readonly ConcurrentDictionary<string, PriceBandEvent> _bands = new();
+    public WebSocketPriceBandSource(MarketDataClient c) =>
+        c.PriceBand += pb => _bands[pb.Symbol] = pb;
+    public bool TryGet(string symbol, out PriceBandEvent band) =>
+        _bands.TryGetValue(symbol, out band!);
+}
+```
+

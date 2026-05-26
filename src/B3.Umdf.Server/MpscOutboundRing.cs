@@ -25,6 +25,13 @@ internal enum OutboundKind : byte
     SecurityDefinitionWake = 4,
     AddSecurityDefinitionSub = 5,
     RemoveSecurityDefinitionSub = 6,
+    /// <summary>Wake the write loop to flush any <c>PriceBand</c> deltas that
+    /// arrived since the last cycle. Mirrors <see cref="SecurityDefinitionWake"/>
+    /// but for the dynamic price-band channel — kept independent so consumers
+    /// that subscribe only to one channel don't wake on the other's traffic.</summary>
+    PriceBandWake = 7,
+    AddPriceBandSub = 8,
+    RemovePriceBandSub = 9,
 }
 
 /// <summary>
@@ -64,6 +71,15 @@ internal readonly struct OutboundMessage
 
     public static OutboundMessage RemoveSecurityDefinitionSub(ulong securityId) =>
         new(OutboundKind.RemoveSecurityDefinitionSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static readonly OutboundMessage PriceBandWake =
+        new(OutboundKind.PriceBandWake, ReadOnlyMemory<byte>.Empty, securityId: 0, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage AddPriceBandSub(ulong securityId) =>
+        new(OutboundKind.AddPriceBandSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage RemovePriceBandSub(ulong securityId) =>
+        new(OutboundKind.RemovePriceBandSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
 
     public OutboundKind Kind { get; }
     public ReadOnlyMemory<byte> Payload { get; }

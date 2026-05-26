@@ -182,6 +182,23 @@ internal static class SnapshotEmitter
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
+    /// <summary>Send the cached <see cref="MessageType.PriceBand"/> frame for
+    /// one security. Used for the bootstrap push on Subscribe when the caller
+    /// already asserted <see cref="DataFlags.PriceBand"/> is set. Returns
+    /// <c>false</c> (no frame emitted) when no <c>PriceBand_22</c> has yet
+    /// been observed for the security — there is nothing meaningful to send,
+    /// and the consumer will get the first frame as soon as the venue emits
+    /// the band.</summary>
+    public static bool SendPriceBandSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
+    {
+        // Gate on having observed at least one PriceBand_22; PriceBandTimestamp
+        // is null until HandlePriceBand runs.
+        if (!info.PriceBandTimestamp.HasValue) return true;
+        var buf = new byte[WireProtocol.PriceBandMaxSize];
+        int len = WireProtocol.WritePriceBand(buf, securityId, info);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
     /// <summary>
     /// Replay every cached trade in the per-security ring buffer to the session,
     /// one Trade frame per entry. Bounded by <see cref="SubscriptionManager.MaxRecentTrades"/>.

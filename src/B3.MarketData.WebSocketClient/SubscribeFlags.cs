@@ -59,10 +59,22 @@ public enum SubscribeFlags : byte
     /// </summary>
     SecurityDefinition = 0x20,
 
+    /// <summary>
+    /// Dynamic per-symbol price band ("túnel de preço") via
+    /// <see cref="MarketDataClient.PriceBand"/>: low/high limits, limit-type,
+    /// midpoint-type, and trading reference price from <c>PriceBand_22</c>.
+    /// Bootstrap snapshot on subscribe (when the server has already observed
+    /// the band) + push on every real band change. Opt-in so legacy clients
+    /// keep their current bandwidth profile; required by pre-trade
+    /// fat-finger guards that want the venue-authoritative band instead of
+    /// a static config.
+    /// </summary>
+    PriceBand = 0x40,
+
     /// <summary>Legacy convenience: <see cref="Book"/> + <see cref="Info"/>.
-    /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, or Trades.</summary>
+    /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, Trades, SecurityDefinition, or PriceBand.</summary>
     All = Book | Info,
 
-    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition,
+    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand,
 }

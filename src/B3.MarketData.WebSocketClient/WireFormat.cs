@@ -53,6 +53,7 @@ internal static class WireFormat
         ServerHello = 0x00A0,
         ClientHello = 0x00A1,
         SecurityDefinition = 0x00B0,
+        PriceBand = 0x00B1,
     }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
@@ -114,6 +115,17 @@ internal static class WireFormat
     public const int SecurityDefinitionStringCfiCode = 3;
     public const int SecurityDefinitionStringSecurityGroup = 4;
     public const int SecurityDefinitionStringSecurityDescription = 5;
+
+    // PriceBand field-mask bit positions. Must match the server's
+    // WireProtocol.PriceBandField* constants — never reorder.
+    public const int PriceBandFieldLowerBand = 0;
+    public const int PriceBandFieldUpperBand = 1;
+    public const int PriceBandFieldTradingReferencePrice = 2;
+    public const int PriceBandFieldPriceLimitType = 3;
+    public const int PriceBandFieldPriceBandType = 4;
+    public const int PriceBandFieldPriceBandMidpointPriceType = 5;
+    public const int PriceBandFieldAsOfTimestampNanos = 6;
+    public const int PriceBandFieldRptSeq = 7;
 
     public static bool TryReadHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
     {
@@ -427,6 +439,69 @@ internal static class WireFormat
             CfiCode = cfiCode,
             SecurityGroup = securityGroup,
             SecurityDescription = securityDescription,
+        };
+    }
+
+    /// <summary>
+    /// Decode a <see cref="MessageType.PriceBand"/> body. Wire layout is:
+    /// <c>[u64 secId][u8 symLen][symbol UTF-8][u32 fieldMask][i64 slots…]</c>.
+    /// The mask is walked in bit order; unknown bits consume 8 bytes — that's
+    /// how the format stays append-only forward-compatible.
+    /// </summary>
+    public static PriceBandEvent ReadPriceBand(ReadOnlySpan<byte> payload, DateTime receivedUtc)
+    {
+        ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        int offset = 8;
+
+        int symLen = payload[offset++];
+        string symbol = symLen == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(payload.Slice(offset, symLen));
+        offset += symLen;
+
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+        offset += 4;
+
+        decimal? lowerBand = null;
+        decimal? upperBand = null;
+        decimal? tradingReferencePrice = null;
+        byte? priceLimitType = null;
+        byte? priceBandType = null;
+        byte? priceBandMidpointPriceType = null;
+        long? asOfTimestamp = null;
+        long? rptSeq = null;
+
+        for (int bit = 0; bit < 32; bit++)
+        {
+            if ((mask & (1u << bit)) == 0) continue;
+            long v = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
+            offset += 8;
+            switch (bit)
+            {
+                case PriceBandFieldLowerBand: lowerBand = v / PriceScale; break;
+                case PriceBandFieldUpperBand: upperBand = v / PriceScale; break;
+                case PriceBandFieldTradingReferencePrice: tradingReferencePrice = v / PriceScale8; break;
+                case PriceBandFieldPriceLimitType: priceLimitType = (byte)v; break;
+                case PriceBandFieldPriceBandType: priceBandType = (byte)v; break;
+                case PriceBandFieldPriceBandMidpointPriceType: priceBandMidpointPriceType = (byte)v; break;
+                case PriceBandFieldAsOfTimestampNanos: asOfTimestamp = v; break;
+                case PriceBandFieldRptSeq: rptSeq = v; break;
+            }
+        }
+
+        return new PriceBandEvent
+        {
+            SecurityId = secId,
+            Symbol = symbol,
+            ReceivedUtc = receivedUtc,
+            LowerBand = lowerBand,
+            UpperBand = upperBand,
+            TradingReferencePrice = tradingReferencePrice,
+            PriceLimitType = priceLimitType,
+            PriceBandType = priceBandType,
+            PriceBandMidpointPriceType = priceBandMidpointPriceType,
+            AsOfTimestamp = asOfTimestamp,
+            RptSeq = rptSeq,
         };
     }
 

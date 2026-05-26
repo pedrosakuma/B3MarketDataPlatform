@@ -518,6 +518,24 @@ public sealed class SubscriptionManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Wake <see cref="DataFlags.PriceBand"/> subscribers for a security so
+    /// their write loop emits a fresh <see cref="MessageType.PriceBand"/>
+    /// frame on the next cycle. Called by <c>GroupConflationHandler.OnPriceBandChanged</c>
+    /// — itself fired only when <c>MarketDataManager.HandlePriceBand</c>
+    /// detected a real delta (idempotent re-broadcasts short-circuit upstream).
+    /// </summary>
+    internal void NotifyPriceBandUpdated(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, state) in clients)
+        {
+            if (!state.WantsPriceBand) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+                session.NotifyPriceBandAvailable();
+        }
+    }
+
     // --- Subscribe handling (called on owning group's thread) ---
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
@@ -697,6 +715,25 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
+        if (flags.HasFlag(DataFlags.PriceBand))
+        {
+            // Same MDM search as SecurityDefinition. SnapshotEmitter.SendPriceBandSnapshot
+            // is itself a no-op when the band hasn't been observed yet; the next real
+            // PriceBand_22 will push it via the delta path.
+            if (_marketDataManagers is { } managers)
+            {
+                foreach (var mdm in managers)
+                {
+                    if (mdm.InstrumentData.TryGetValue(securityId, out var info))
+                    {
+                        if (!SnapshotEmitter.SendPriceBandSnapshot(session, securityId, info))
+                            return false;
+                        break;
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
@@ -735,6 +772,13 @@ public sealed class SubscriptionManager : IDisposable
             if (!wantsSecDef && hadSecDef && !session.RemoveSecurityDefinitionSubscription(securityId))
                 return false;
 
+            bool wantsPriceBand = flags.HasFlag(DataFlags.PriceBand);
+            bool hadPriceBand = hadPrevious && previous!.WantsPriceBand;
+            if (wantsPriceBand && !hadPriceBand && !session.AddPriceBandSubscription(securityId))
+                return false;
+            if (!wantsPriceBand && hadPriceBand && !session.RemovePriceBandSubscription(securityId))
+                return false;
+
             session.AddSubscription(securityId);
 
             bool wantsNews = (flags & DataFlags.News) != 0;
@@ -760,7 +804,9 @@ public sealed class SubscriptionManager : IDisposable
                 AddedNewsSubscription: wantsNews && !hadNews,
                 RemovedNewsSubscription: !wantsNews && hadNews,
                 AddedSecurityDefinitionSubscription: wantsSecDef && !hadSecDef,
-                RemovedSecurityDefinitionSubscription: !wantsSecDef && hadSecDef);
+                RemovedSecurityDefinitionSubscription: !wantsSecDef && hadSecDef,
+                AddedPriceBandSubscription: wantsPriceBand && !hadPriceBand,
+                RemovedPriceBandSubscription: !wantsPriceBand && hadPriceBand);
         }
 
         return true;
@@ -775,7 +821,9 @@ public sealed class SubscriptionManager : IDisposable
         bool AddedNewsSubscription,
         bool RemovedNewsSubscription,
         bool AddedSecurityDefinitionSubscription,
-        bool RemovedSecurityDefinitionSubscription);
+        bool RemovedSecurityDefinitionSubscription,
+        bool AddedPriceBandSubscription,
+        bool RemovedPriceBandSubscription);
 
     private void RollbackSubscriptionActivation(
         ClientSession session,
@@ -810,6 +858,12 @@ public sealed class SubscriptionManager : IDisposable
             session.RemoveSecurityDefinitionSubscription(securityId);
         else if (activation.RemovedSecurityDefinitionSubscription)
             session.AddSecurityDefinitionSubscription(securityId);
+
+        // Mirror the PriceBand subscription delta.
+        if (activation.AddedPriceBandSubscription)
+            session.RemovePriceBandSubscription(securityId);
+        else if (activation.RemovedPriceBandSubscription)
+            session.AddPriceBandSubscription(securityId);
     }
 
     /// <summary>

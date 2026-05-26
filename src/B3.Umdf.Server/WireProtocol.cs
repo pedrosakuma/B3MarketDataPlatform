@@ -133,6 +133,24 @@ public enum MessageType : ushort
     /// new bit positions; older SDKs MUST consume slots for unknown bits without
     /// alignment damage.</summary>
     SecurityDefinition = 0x00B0,
+
+    /// <summary>Server → Client: dynamic per-symbol price band (tunnel) snapshot
+    /// for a single security. Pushed (a) on initial Subscribe when
+    /// <see cref="DataFlags.PriceBand"/> is set and the server has already
+    /// observed at least one <c>PriceBand_22</c>, and (b) on every real change
+    /// to low/high limits, limit-type, midpoint-type, or trading reference
+    /// price. Idempotent re-broadcasts (the venue may emit the same band
+    /// periodically) are short-circuited upstream by
+    /// <c>MarketDataManager.HandlePriceBand</c>'s diff check, so this frame
+    /// only flows when the band actually moves.
+    /// Payload (little-endian, after the 4-byte framing header):
+    /// <c>[u64 securityId][u8 symbolLen][symbol UTF-8][u32 fieldMask][i64 values
+    /// for set bits in bit order]</c>.
+    /// Field mask bit positions are defined by <c>PriceBandField*</c>
+    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
+    /// new bit positions; older SDKs MUST consume slots for unknown bits without
+    /// alignment damage.</summary>
+    PriceBand = 0x00B1,
 }
 
 /// <summary>
@@ -196,11 +214,18 @@ public enum DataFlags : byte
     /// every subsequent real delta. Opt-in so legacy clients that only need
     /// price data don't pay metadata-frame bandwidth.</summary>
     SecurityDefinition = 0x20,
+    /// <summary>Dynamic per-symbol price band (tunnel) stream
+    /// (<see cref="MessageType.PriceBand"/>): low/high limits, limit-type,
+    /// midpoint-type, and trading reference price from <c>PriceBand_22</c>.
+    /// Pushed on Subscribe (when the server has already observed the band)
+    /// and on every subsequent real delta. Opt-in so legacy clients that
+    /// don't enforce pre-trade band checks don't pay the bandwidth.</summary>
+    PriceBand = 0x40,
     /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News, MBP, Trades, or SecurityDefinition.</summary>
+    /// does NOT include News, MBP, Trades, SecurityDefinition, or PriceBand.</summary>
     All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition,
+    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand,
 }
 
 /// <summary>
@@ -1130,6 +1155,84 @@ public static class WireProtocol
         bytes.CopyTo(dest[offset..]);
         offset += bytes.Length;
         return offset;
+    }
+
+    // PriceBand field-mask bit positions. Mirrored verbatim by the SDK's
+    // WireFormat.PriceBand* constants — never reorder. New fields are
+    // append-only at new bit positions; older SDKs MUST consume slots for
+    // unknown bits without surfacing them.
+    public const int PriceBandFieldLowerBand = 0;            // i64 (Price, /1e4)
+    public const int PriceBandFieldUpperBand = 1;            // i64 (Price, /1e4)
+    public const int PriceBandFieldTradingReferencePrice = 2;// i64 (Fixed8, /1e8)
+    public const int PriceBandFieldPriceLimitType = 3;       // i64 (byte enum)
+    public const int PriceBandFieldPriceBandType = 4;        // i64 (byte enum)
+    public const int PriceBandFieldPriceBandMidpointPriceType = 5; // i64 (byte enum)
+    public const int PriceBandFieldAsOfTimestampNanos = 6;   // i64 (UTC nanos)
+    public const int PriceBandFieldRptSeq = 7;               // i64 (widened uint)
+
+    /// <summary>
+    /// Maximum body size of a <see cref="MessageType.PriceBand"/> frame:
+    /// header(4) + secId(8) + symLen(1) + symbol(≤255) + fieldMask(4) + 8 numeric slots × 8.
+    /// </summary>
+    public const int PriceBandMaxSize =
+        FramingHeaderSize + 8 + 1 + 255 + 4 + 8 * 8;
+
+    /// <summary>
+    /// Serialize a <c>PriceBand</c> frame. <paramref name="dest"/> must
+    /// provide a buffer of at least <see cref="PriceBandMaxSize"/> bytes.
+    /// </summary>
+    public static int WritePriceBand(Span<byte> dest, ulong securityId, InstrumentInfo info)
+    {
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+
+        // Symbol — always present (single-byte length prefix; SBE Symbol is at most 20 bytes).
+        string symbol = info.Symbol ?? string.Empty;
+        var symBytes = Encoding.UTF8.GetBytes(symbol);
+        if (symBytes.Length > 255)
+        {
+            var trimmed = new byte[255];
+            Array.Copy(symBytes, trimmed, 255);
+            symBytes = trimmed;
+        }
+        dest[offset++] = (byte)symBytes.Length;
+        symBytes.CopyTo(dest[offset..]); offset += symBytes.Length;
+
+        // Field mask + slots — placeholder filled after we know which bits are set.
+        int maskOffset = offset;
+        offset += 4;
+        uint mask = 0;
+
+        if (info.PriceBandLow is { } v0)
+        { mask |= 1u << PriceBandFieldLowerBand;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v0); offset += 8; }
+        if (info.PriceBandHigh is { } v1)
+        { mask |= 1u << PriceBandFieldUpperBand;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v1); offset += 8; }
+        if (info.TradingReferencePrice is { } v2)
+        { mask |= 1u << PriceBandFieldTradingReferencePrice;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v2); offset += 8; }
+        if (info.PriceLimitType is { } v3)
+        { mask |= 1u << PriceBandFieldPriceLimitType;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v3); offset += 8; }
+        if (info.PriceBandType is { } v4)
+        { mask |= 1u << PriceBandFieldPriceBandType;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v4); offset += 8; }
+        if (info.PriceBandMidpointPriceType is { } v5)
+        { mask |= 1u << PriceBandFieldPriceBandMidpointPriceType;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v5); offset += 8; }
+        if (info.PriceBandTimestamp is { } v6)
+        { mask |= 1u << PriceBandFieldAsOfTimestampNanos;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v6); offset += 8; }
+        if (info.LastRptSeqPriceBand != 0)
+        { mask |= 1u << PriceBandFieldRptSeq;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], info.LastRptSeqPriceBand); offset += 8; }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[maskOffset..], mask);
+
+        ushort totalLen = (ushort)offset;
+        WriteFramingHeader(dest, totalLen, MessageType.PriceBand);
+        return totalLen;
     }
 
 }

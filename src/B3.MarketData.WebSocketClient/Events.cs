@@ -568,3 +568,65 @@ public sealed class SecurityDefinitionEvent
     public string? SecurityGroup { get; init; }
     public string? SecurityDescription { get; init; }
 }
+
+/// <summary>
+/// Dynamic per-symbol price band ("túnel de preço") sourced from B3 UMDF
+/// <c>PriceBand_22</c>. Pushed on subscribe (when the server has already
+/// observed the band) and on every subsequent real change to low/high
+/// limits, limit-type, midpoint-type, or trading reference price.
+/// Idempotent re-broadcasts are short-circuited upstream, so this event
+/// fires only on true deltas. Consumers should treat this as the
+/// authoritative pre-trade fat-finger band: no REST refetch / static
+/// config needed.
+/// </summary>
+public sealed class PriceBandEvent
+{
+    public ulong SecurityId { get; init; }
+    /// <summary>Resolved symbol (embedded directly in the wire frame, not
+    /// looked up from the secId→symbol cache).</summary>
+    public string Symbol { get; init; } = "";
+    public DateTime ReceivedUtc { get; init; }
+
+    /// <summary>Lower price-band limit, pre-scaled to a <see cref="decimal"/>
+    /// (raw / 10_000). Null when the venue did not specify a lower limit.
+    /// Interpretation depends on <see cref="PriceLimitType"/> — see remarks
+    /// on that property.</summary>
+    public decimal? LowerBand { get; init; }
+
+    /// <summary>Upper price-band limit, pre-scaled to a <see cref="decimal"/>
+    /// (raw / 10_000). Null when the venue did not specify an upper limit.
+    /// Interpretation depends on <see cref="PriceLimitType"/> — see remarks
+    /// on that property.</summary>
+    public decimal? UpperBand { get; init; }
+
+    /// <summary>Trading reference price (anchor for percentage / tick bands),
+    /// pre-scaled to a <see cref="decimal"/> (raw / 100_000_000 — SBE
+    /// <c>Fixed8</c> exponent). Null when not provided.</summary>
+    public decimal? TradingReferencePrice { get; init; }
+
+    /// <summary>SBE PriceLimitType (tag 1306) — REQUIRED to interpret
+    /// <see cref="LowerBand"/> / <see cref="UpperBand"/>:
+    /// 0 = PRICE_UNIT (absolute prices), 1 = TICKS (offsets vs.
+    /// <see cref="TradingReferencePrice"/> combined with the security's
+    /// tick size), 2 = PERCENTAGE (offsets vs.
+    /// <see cref="TradingReferencePrice"/>; e.g. 1.0000 = ±100%).</summary>
+    public byte? PriceLimitType { get; init; }
+
+    /// <summary>SBE PriceBandType (tag 1305). Discriminator for the band
+    /// classification (hard / soft / continuous / auction).</summary>
+    public byte? PriceBandType { get; init; }
+
+    /// <summary>SBE PriceBandMidpointPriceType. Only meaningful when
+    /// <see cref="PriceLimitType"/> = PERCENTAGE on rejection / auction
+    /// bands; null otherwise.</summary>
+    public byte? PriceBandMidpointPriceType { get; init; }
+
+    /// <summary>UMDF <c>MDEntryTimestamp</c> (UTC nanoseconds since epoch)
+    /// of the band emission. Lets consumers age out stale bands.</summary>
+    public long? AsOfTimestamp { get; init; }
+
+    /// <summary>UMDF <c>RptSeq</c> of the band emission (widened to
+    /// <see cref="long"/>). Null when the venue did not provide it on this
+    /// emission.</summary>
+    public long? RptSeq { get; init; }
+}

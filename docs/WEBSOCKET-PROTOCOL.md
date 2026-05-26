@@ -52,6 +52,7 @@ Get               0x0003        Unsubscribed        0x0012
                                 NewsEnd             0x0092
                                 ServerHello         0x00A0
                                 SecurityDefinition  0x00B0
+                                PriceBand           0x00B1
 ```
 
 ## Client → Server
@@ -74,7 +75,8 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x10` | Trades | Trade prints (`Trade`) + corrections (`TradeBust`) + per-symbol recent-trades history snapshot on subscribe. Independent of `Book`/`Mbp` — opt in to receive live tape. Note: `LastTradePrice`/`LastTradeSize` in `InfoSnapshot` belong to `Info`, not this flag. |
 | `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
-| `0x3F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` |
+| `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol low/high limits, limit-type, midpoint-type, and trading reference price from UMDF `PriceBand_22`). Bootstrap snapshot on subscribe (when the band has already been observed) + push on every real band change. Opt-in; required by pre-trade fat-finger guards that want the venue-authoritative band instead of a static config. |
+| `0x7F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` |
 
 > **News and Trades are opt-in.** Existing clients that send `0x03` (or
 > `0x00`) keep the legacy behaviour and never receive news or trade frames.
@@ -203,6 +205,37 @@ Pushed on subscribe (bootstrap snapshot) and again on every real
 suppressed via the `SecurityValidityTimestamp` short-circuit in
 `MarketDataManager.HandleSecurityDefinition`, so this frame fires only on true
 changes (typical: a few times per security per session).
+
+### PriceBand (opt-in via `DataFlags.PriceBand`)
+
+| Message | Type | Payload |
+|---------|------|---------|
+| **PriceBand** | `0x00B1` | `[secId u64][symLen u8][symbol UTF-8][fieldMask u32][i64 × popcount(fieldMask)]` |
+
+Single-bitmask layout: every field is widened to `i64` (one 8-byte slot per
+set bit, in bit order). Unknown bits are still consumed by the SDK so older
+clients keep their alignment when new fields are appended.
+
+`fieldMask` bit positions:
+
+| Bit | Field |
+|-----|-------|
+| 0 | LowerBand (`Price`: `raw / 1e4`) |
+| 1 | UpperBand (`Price`: `raw / 1e4`) |
+| 2 | TradingReferencePrice (`Fixed8`: `raw / 1e8`) |
+| 3 | PriceLimitType (byte enum — REQUIRED to interpret Lower/Upper: `0` PRICE_UNIT, `1` TICKS, `2` PERCENTAGE) |
+| 4 | PriceBandType (byte enum — hard / soft / continuous / auction discriminator) |
+| 5 | PriceBandMidpointPriceType (byte enum — only set on PERCENTAGE rejection / auction bands) |
+| 6 | AsOfTimestamp (UTC nanoseconds since epoch — UMDF `MDEntryTimestamp`) |
+| 7 | RptSeq (UMDF `RptSeq`, widened from `uint`) |
+
+Pushed on subscribe (bootstrap snapshot, only when a `PriceBand_22` has
+already been observed) and again on every real change to low/high limits,
+limit-type, midpoint-type, or trading reference price. Idempotent
+re-broadcasts (the venue may emit the same band periodically) are
+short-circuited upstream by the diff check in
+`MarketDataManager.HandlePriceBand`, so this frame fires only on true band
+moves.
 
 ### Incrementals
 
