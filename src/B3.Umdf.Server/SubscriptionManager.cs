@@ -692,6 +692,23 @@ public sealed class SubscriptionManager : IDisposable
                 if (!SnapshotEmitter.SendTradeHistory(session, securityId, trades))
                     return false;
             }
+
+            // Trades-only subscribers (no Book/Mbp) still need candles for the
+            // chart panel. Book and Mbp already send candles above, so only
+            // emit here if neither is set.
+            if (!flags.HasFlag(DataFlags.Book) && !flags.HasFlag(DataFlags.Mbp))
+            {
+                if (group.Candles.TryGetValue(securityId, out var agg))
+                {
+                    if (!SnapshotEmitter.SendCandleHistory(session, securityId, agg))
+                        return false;
+                }
+                else
+                {
+                    if (!SnapshotEmitter.SendEmptyCandleSnapshot(session, securityId))
+                        return false;
+                }
+            }
         }
 
         if (flags.HasFlag(DataFlags.Info))

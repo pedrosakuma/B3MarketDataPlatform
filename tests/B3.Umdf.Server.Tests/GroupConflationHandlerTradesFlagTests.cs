@@ -131,6 +131,54 @@ public class GroupConflationHandlerTradesFlagTests
     }
 
     [Fact]
+    public async Task TradesOnlySubscriber_ReceivesCandleSnapshot()
+    {
+        var w = NewWiring();
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            // Pre-seed candles by subscribing a "warm" client that requests
+            // Trades, then firing a trade. After Phase C the ring requires an
+            // active subscriber to hydrate.
+            var warmRec = new RecordingWebSocket();
+            var warmSession = new ClientSession(warmRec, channelCapacity: 64);
+            w.Manager.RegisterClient(warmSession);
+            _ = Task.Run(() => warmSession.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(warmSession.Id, Symbol, DataFlags.Trades,
+                w.BookManager, w.Group, bookBatchCutoffSequence: 0);
+            await WaitUntil(() => w.Manager.IsSubscribedFor(SecurityId), TimeSpan.FromSeconds(1));
+
+            w.Group.OnTrade(SecurityId, price: 100, quantity: 5, tradeId: 1, sendingTimeNs: 0);
+            w.Group.OnBatchComplete();
+
+            // Wait for trade ring to populate.
+            await WaitUntil(() => w.Group.RecentTrades.ContainsKey(SecurityId)
+                                  && w.Group.RecentTrades[SecurityId].AsSpan().Length > 0,
+                            TimeSpan.FromSeconds(1));
+
+            // Now subscribe a NEW client with only Trades flag (no Book/Mbp).
+            // Must receive CandleSnapshot so the chart panel works.
+            var tradesOnlyRec = new RecordingWebSocket();
+            var tradesOnlySession = new ClientSession(tradesOnlyRec, channelCapacity: 64);
+            w.Manager.RegisterClient(tradesOnlySession);
+            _ = Task.Run(() => tradesOnlySession.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(tradesOnlySession.Id, Symbol, DataFlags.Trades,
+                w.BookManager, w.Group, bookBatchCutoffSequence: 0);
+
+            await WaitUntil(() => tradesOnlyRec.HasMessageType(MessageType.CandleSnapshot), TimeSpan.FromSeconds(2));
+
+            // Verify Trades-only subscriber also gets the Trade history snapshot.
+            Assert.True(tradesOnlyRec.CountByType(MessageType.Trade) >= 1,
+                "Trades-only subscriber should receive trade history snapshot");
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task TradeHistorySnapshot_OnlySentWithTradesFlag()
     {
         var w = NewWiring();
