@@ -516,3 +516,55 @@ public sealed class NewsEvent
     public string Url { get; init; } = "";
     public DateTime ReceivedUtc { get; init; }
 }
+
+/// <summary>
+/// Static per-security metadata sourced from B3's <c>SecurityDefinition_12</c>
+/// (UMDF instrument definition). Pushed over the WebSocket on subscribe (when
+/// the client opts in via <see cref="SubscribeFlags.SecurityDefinition"/>) and
+/// again on every real definition change — idempotent re-broadcasts upstream
+/// are suppressed (the server short-circuits on unchanged
+/// <c>SecurityValidityTimestamp</c>), so this event fires only on true deltas.
+/// Consumers should treat this as the authoritative source of tick size and
+/// lot size for pre-trade guards: no REST refetch needed.
+/// </summary>
+public sealed class SecurityDefinitionEvent
+{
+    public ulong SecurityId { get; init; }
+    /// <summary>Resolved symbol (embedded directly in the wire frame, not
+    /// looked up from the secId→symbol cache).</summary>
+    public string Symbol { get; init; } = "";
+    public DateTime ReceivedUtc { get; init; }
+
+    /// <summary>
+    /// Minimum price increment (tick size). Scaled with the SBE
+    /// <c>Fixed8</c> exponent: <c>raw / 100_000_000m</c>. Pre-trade
+    /// guards should round/snap order prices to a multiple of this value.
+    /// </summary>
+    public decimal? MinPriceIncrement { get; init; }
+
+    /// <summary>
+    /// Minimum trade volume (lot size), unscaled, from
+    /// <c>SecurityDefinition_12.MinTradeVol</c>. Order quantities must be
+    /// integer multiples of this value to be accepted by the venue.
+    /// </summary>
+    public long? MinTradeVolume { get; init; }
+
+    public long? PriceDivisor { get; init; }
+    public long? ContractMultiplier { get; init; }
+    public long? StrikePrice { get; init; }
+    public long? MaturityDate { get; init; }
+    public long? PutOrCall { get; init; }
+    public long? ExerciseStyle { get; init; }
+    public long? SecurityType { get; init; }
+    public long? SecuritySubType { get; init; }
+    public long? Product { get; init; }
+    public long? MarketSegmentID { get; init; }
+    public long? TickSizeDenominator { get; init; }
+
+    public string? IsinNumber { get; init; }
+    public string? Currency { get; init; }
+    public string? Asset { get; init; }
+    public string? CfiCode { get; init; }
+    public string? SecurityGroup { get; init; }
+    public string? SecurityDescription { get; init; }
+}

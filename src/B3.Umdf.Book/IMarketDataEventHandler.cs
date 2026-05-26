@@ -6,6 +6,15 @@ public interface IMarketDataEventHandler
     void OnMarketDataUpdated(ulong securityId, InstrumentInfo info) { }
 
     /// <summary>
+    /// Fired when a <c>SecurityDefinition_12</c> arrives whose payload was
+    /// actually parsed and applied (i.e., NOT an idempotent re-broadcast
+    /// short-circuited by <c>LastSecurityValidityTimestamp</c>). Useful for
+    /// downstream subscribers (e.g., WebSocket server pushing
+    /// <c>SecurityDefinitionEvent</c> only on real deltas).
+    /// </summary>
+    void OnSecurityDefinitionChanged(ulong securityId, InstrumentInfo info) { }
+
+    /// <summary>
     /// Fired when a SecurityDefinition arrives for an existing SecurityID
     /// whose canonical identity (Symbol/ISIN/MaturityDate/SecurityType)
     /// differs from the cached value — i.e. the exchange is reusing the

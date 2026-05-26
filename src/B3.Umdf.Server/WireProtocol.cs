@@ -116,6 +116,23 @@ public enum MessageType : ushort
     /// Backwards compatible: clients that never send ClientHello are assumed to speak
     /// the current <see cref="WireProtocol.ProtocolVersion"/>.</summary>
     ClientHello = 0x00A1,
+
+    /// <summary>Server → Client: full <c>SecurityDefinition</c> (static instrument metadata
+    /// — tick, lot, identity, classification) for a single security. Pushed (a) on
+    /// initial Subscribe when <see cref="DataFlags.SecurityDefinition"/> is set and
+    /// the server already has the definition cached, and (b) on every subsequent
+    /// real change (identity, tick, lot, …). Re-broadcasts that don't change any
+    /// field are short-circuited upstream by
+    /// <c>MarketDataManager.HandleSecurityDefinition</c>'s validity-timestamp
+    /// fast-path, so this frame only flows on true deltas.
+    /// Payload (little-endian, after the 4-byte framing header):
+    /// <c>[u64 securityId][u8 symbolLen][symbol UTF-8][u32 numericFieldMask]
+    /// [i64 values for set bits in bit order][u32 stringFieldMask][per set bit: u16 len][bytes]</c>.
+    /// Field mask bit positions are defined by <c>SecurityDefinitionField*</c>
+    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
+    /// new bit positions; older SDKs MUST consume slots for unknown bits without
+    /// alignment damage.</summary>
+    SecurityDefinition = 0x00B0,
 }
 
 /// <summary>
@@ -172,11 +189,18 @@ public enum DataFlags : byte
     /// <c>LastTradePrice</c> in <see cref="MessageType.InfoSnapshot"/> is part of
     /// <see cref="Info"/> and is not gated by this flag.</summary>
     Trades = 0x10,
+    /// <summary>Static instrument metadata stream
+    /// (<see cref="MessageType.SecurityDefinition"/>): tick, lot, identity,
+    /// classification fields from <c>SecurityDefinition_12</c>. Pushed on
+    /// Subscribe (when the server already has the definition cached) and on
+    /// every subsequent real delta. Opt-in so legacy clients that only need
+    /// price data don't pay metadata-frame bandwidth.</summary>
+    SecurityDefinition = 0x20,
     /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News, MBP, or Trades.</summary>
+    /// does NOT include News, MBP, Trades, or SecurityDefinition.</summary>
     All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades.</summary>
-    Everything = Book | Info | News | Mbp | Trades,
+    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition,
 }
 
 /// <summary>
@@ -950,6 +974,162 @@ public static class WireProtocol
         if (payload.Length < o + fragLen) return false;
         fragment = payload.Slice(o, fragLen);
         return true;
+    }
+
+    // --- SecurityDefinition (variable-length, dual-bitmask) ---
+
+    // Numeric field bit positions in SecurityDefinition.numericFieldMask (u32).
+    // Each present bit consumes one i64 slot (8 bytes), in bit-ascending order.
+    // New numeric fields are append-only — bumping the bit position is a wire
+    // break. SDKs MUST consume slots for unknown bits without alignment damage.
+    public const int SecurityDefinitionFieldMinPriceIncrement = 0;
+    public const int SecurityDefinitionFieldMinTradeVolume = 1;
+    public const int SecurityDefinitionFieldPriceDivisor = 2;
+    public const int SecurityDefinitionFieldContractMultiplier = 3;
+    public const int SecurityDefinitionFieldStrikePrice = 4;
+    public const int SecurityDefinitionFieldMaturityDate = 5;
+    public const int SecurityDefinitionFieldPutOrCall = 6;
+    public const int SecurityDefinitionFieldExerciseStyle = 7;
+    public const int SecurityDefinitionFieldSecurityType = 8;
+    public const int SecurityDefinitionFieldSecuritySubType = 9;
+    public const int SecurityDefinitionFieldProduct = 10;
+    public const int SecurityDefinitionFieldMarketSegmentID = 11;
+    public const int SecurityDefinitionFieldTickSizeDenominator = 12;
+
+    // String field bit positions in SecurityDefinition.stringFieldMask (u32).
+    // Each present bit consumes [u16 len][bytes]; len is the UTF-8 byte length
+    // (Latin1 also fits since it's a subset). New string fields are append-only.
+    public const int SecurityDefinitionStringIsin = 0;
+    public const int SecurityDefinitionStringCurrency = 1;
+    public const int SecurityDefinitionStringAsset = 2;
+    public const int SecurityDefinitionStringCfiCode = 3;
+    public const int SecurityDefinitionStringSecurityGroup = 4;
+    public const int SecurityDefinitionStringSecurityDescription = 5;
+
+    /// <summary>
+    /// Conservative upper bound for a SecurityDefinition frame. Symbol up to 32 bytes,
+    /// 13 numeric slots × 8 bytes, 6 string slots × (2-byte len + up to ~512 bytes for
+    /// SecurityDescription, smaller for the rest). Stays comfortably below the u16
+    /// framing-length ceiling.
+    /// </summary>
+    public const int SecurityDefinitionMaxSize =
+        FramingHeaderSize       // 4
+        + 8                     // securityId
+        + 1 + 32                // symbol len + bytes
+        + 4                     // numeric mask
+        + 13 * 8                // numeric slots
+        + 4                     // string mask
+        + 6 * (2 + 512);        // string slots (worst case: each up to 512 bytes)
+
+    /// <summary>
+    /// Write a <see cref="MessageType.SecurityDefinition"/> frame for one security.
+    /// <paramref name="info"/> is the cached <c>InstrumentInfo</c> populated by
+    /// <c>MarketDataManager.HandleSecurityDefinition</c>. Strings are encoded as
+    /// UTF-8; numeric fields are written as i64 (widened from native types) in
+    /// ascending bit order. Returns total bytes written. Caller is expected to
+    /// provide a buffer of at least <see cref="SecurityDefinitionMaxSize"/> bytes.
+    /// </summary>
+    public static int WriteSecurityDefinition(Span<byte> dest, ulong securityId, InstrumentInfo info)
+    {
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+
+        // Symbol — always present (single-byte length prefix; SBE Symbol is at most 20 bytes).
+        string symbol = info.Symbol ?? string.Empty;
+        var symBytes = Encoding.UTF8.GetBytes(symbol);
+        if (symBytes.Length > 255)
+        {
+            // Defensive: B3 Symbol field is bounded but clamp anyway.
+            var trimmed = new byte[255];
+            Array.Copy(symBytes, trimmed, 255);
+            symBytes = trimmed;
+        }
+        dest[offset++] = (byte)symBytes.Length;
+        symBytes.CopyTo(dest[offset..]); offset += symBytes.Length;
+
+        // Numeric mask + slots (mask placeholder filled after we know which bits are set).
+        int numericMaskOffset = offset;
+        offset += 4;
+        uint numericMask = 0;
+
+        if (info.MinPriceIncrement is { } v0)
+        { numericMask |= 1u << SecurityDefinitionFieldMinPriceIncrement;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v0); offset += 8; }
+        if (info.MinTradeVolume is { } v1)
+        { numericMask |= 1u << SecurityDefinitionFieldMinTradeVolume;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v1); offset += 8; }
+        if (info.PriceDivisor is { } v2)
+        { numericMask |= 1u << SecurityDefinitionFieldPriceDivisor;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v2); offset += 8; }
+        if (info.ContractMultiplier is { } v3)
+        { numericMask |= 1u << SecurityDefinitionFieldContractMultiplier;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v3); offset += 8; }
+        if (info.StrikePrice is { } v4)
+        { numericMask |= 1u << SecurityDefinitionFieldStrikePrice;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v4); offset += 8; }
+        if (info.MaturityDate is { } v5)
+        { numericMask |= 1u << SecurityDefinitionFieldMaturityDate;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v5); offset += 8; }
+        if (info.PutOrCall is { } v6)
+        { numericMask |= 1u << SecurityDefinitionFieldPutOrCall;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v6); offset += 8; }
+        if (info.ExerciseStyle is { } v7)
+        { numericMask |= 1u << SecurityDefinitionFieldExerciseStyle;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v7); offset += 8; }
+        if (info.SecurityType is { } v8)
+        { numericMask |= 1u << SecurityDefinitionFieldSecurityType;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v8); offset += 8; }
+        if (info.SecuritySubType is { } v9)
+        { numericMask |= 1u << SecurityDefinitionFieldSecuritySubType;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v9); offset += 8; }
+        if (info.Product is { } v10)
+        { numericMask |= 1u << SecurityDefinitionFieldProduct;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v10); offset += 8; }
+        if (info.MarketSegmentID is { } v11)
+        { numericMask |= 1u << SecurityDefinitionFieldMarketSegmentID;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v11); offset += 8; }
+        if (info.TickSizeDenominator is { } v12)
+        { numericMask |= 1u << SecurityDefinitionFieldTickSizeDenominator;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v12); offset += 8; }
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[numericMaskOffset..], numericMask);
+
+        // String mask + slots.
+        int stringMaskOffset = offset;
+        offset += 4;
+        uint stringMask = 0;
+
+        offset = WriteOptionalString(dest, offset, info.IsinNumber, SecurityDefinitionStringIsin, ref stringMask);
+        offset = WriteOptionalString(dest, offset, info.Currency, SecurityDefinitionStringCurrency, ref stringMask);
+        offset = WriteOptionalString(dest, offset, info.Asset, SecurityDefinitionStringAsset, ref stringMask);
+        offset = WriteOptionalString(dest, offset, info.CfiCode, SecurityDefinitionStringCfiCode, ref stringMask);
+        offset = WriteOptionalString(dest, offset, info.SecurityGroup, SecurityDefinitionStringSecurityGroup, ref stringMask);
+        offset = WriteOptionalString(dest, offset, info.SecurityDescription, SecurityDefinitionStringSecurityDescription, ref stringMask);
+
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[stringMaskOffset..], stringMask);
+
+        ushort totalLen = (ushort)offset;
+        WriteFramingHeader(dest, totalLen, MessageType.SecurityDefinition);
+        return totalLen;
+    }
+
+    private static int WriteOptionalString(Span<byte> dest, int offset, string? value, int bit, ref uint mask)
+    {
+        if (string.IsNullOrEmpty(value)) return offset;
+        var bytes = Encoding.UTF8.GetBytes(value);
+        if (bytes.Length > ushort.MaxValue)
+        {
+            // Defensive: SecurityDescription is bounded by the SBE schema; clamp anyway.
+            var trimmed = new byte[ushort.MaxValue];
+            Array.Copy(bytes, trimmed, ushort.MaxValue);
+            bytes = trimmed;
+        }
+        mask |= 1u << bit;
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[offset..], (ushort)bytes.Length);
+        offset += 2;
+        bytes.CopyTo(dest[offset..]);
+        offset += bytes.Length;
+        return offset;
     }
 
 }

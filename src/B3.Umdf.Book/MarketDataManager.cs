@@ -371,6 +371,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.SecuritySubType = msg.SecuritySubType;
         info.Product = (int)msg.Product;
         info.MinPriceIncrement = msg.MinPriceIncrement.Mantissa;
+        info.MinTradeVolume = msg.MinTradeVol;
         info.PriceDivisor = msg.PriceDivisor.Mantissa;
         info.ContractMultiplier = msg.ContractMultiplier.Mantissa;
         info.StrikePrice = msg.StrikePrice.Mantissa;
@@ -431,6 +432,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         info.SecurityDescription = secDesc;
 
         info.BumpVersion();
+        info.BumpSecurityDefinitionVersion();
+        _eventHandler?.OnSecurityDefinitionChanged(securityId, info);
     }
 
     private void HandleSecurityStatus(in SecurityStatus_3DataReader reader)

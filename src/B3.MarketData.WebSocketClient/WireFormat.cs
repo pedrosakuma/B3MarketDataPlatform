@@ -17,6 +17,10 @@ internal static class WireFormat
     /// <summary>SBE schema's <c>Price</c>/<c>PriceOptional</c> exponent (1e-4).</summary>
     public const decimal PriceScale = 10_000m;
 
+    /// <summary>SBE schema's <c>Fixed8</c> exponent (1e-8) — used by
+    /// <c>SecurityDefinition_12.MinPriceIncrement</c>.</summary>
+    public const decimal PriceScale8 = 100_000_000m;
+
     public enum MessageType : ushort
     {
         Subscribe = 0x0001,
@@ -48,6 +52,7 @@ internal static class WireFormat
         NewsEnd = 0x0092,
         ServerHello = 0x00A0,
         ClientHello = 0x00A1,
+        SecurityDefinition = 0x00B0,
     }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
@@ -82,6 +87,33 @@ internal static class WireFormat
     /// <c>AuctionImbalance_19</c>. Surfaced as
     /// <see cref="InfoSnapshotEvent.AuctionImbalanceCondition"/>.</summary>
     public const int FieldAuctionImbalanceCondition = 24;
+
+    // SecurityDefinition numeric field-mask bit positions. Must match the
+    // server's WireProtocol.SecurityDefinitionField* constants. New fields
+    // are append-only at new bit positions; older SDKs MUST consume slots
+    // for unknown bits without surfacing them (the decoder walks the mask
+    // in bit order and skips 8 bytes per set bit it does not recognise).
+    public const int SecurityDefinitionFieldMinPriceIncrement = 0;
+    public const int SecurityDefinitionFieldMinTradeVolume = 1;
+    public const int SecurityDefinitionFieldPriceDivisor = 2;
+    public const int SecurityDefinitionFieldContractMultiplier = 3;
+    public const int SecurityDefinitionFieldStrikePrice = 4;
+    public const int SecurityDefinitionFieldMaturityDate = 5;
+    public const int SecurityDefinitionFieldPutOrCall = 6;
+    public const int SecurityDefinitionFieldExerciseStyle = 7;
+    public const int SecurityDefinitionFieldSecurityType = 8;
+    public const int SecurityDefinitionFieldSecuritySubType = 9;
+    public const int SecurityDefinitionFieldProduct = 10;
+    public const int SecurityDefinitionFieldMarketSegmentID = 11;
+    public const int SecurityDefinitionFieldTickSizeDenominator = 12;
+
+    // SecurityDefinition string-mask bit positions (mirrors server).
+    public const int SecurityDefinitionStringIsin = 0;
+    public const int SecurityDefinitionStringCurrency = 1;
+    public const int SecurityDefinitionStringAsset = 2;
+    public const int SecurityDefinitionStringCfiCode = 3;
+    public const int SecurityDefinitionStringSecurityGroup = 4;
+    public const int SecurityDefinitionStringSecurityDescription = 5;
 
     public static bool TryReadHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
     {
@@ -283,6 +315,118 @@ internal static class WireFormat
             TheoreticalOpeningSize = theoreticalOpeningSize,
             AuctionImbalanceSize = auctionImbalanceSize,
             AuctionImbalanceCondition = auctionImbalanceCondition,
+        };
+    }
+
+    /// <summary>
+    /// Decode a <see cref="MessageType.SecurityDefinition"/> body. Wire layout
+    /// is: <c>[u64 secId][u8 symLen][symbol UTF-8][u32 numericMask][i64 slots…]
+    /// [u32 stringMask][per set bit: u16 len][bytes UTF-8]</c>. Both masks are
+    /// walked in bit order; unknown numeric bits consume 8 bytes, unknown
+    /// string bits consume a length-prefixed slot — that's how the format
+    /// stays append-only forward-compatible.
+    /// </summary>
+    public static SecurityDefinitionEvent ReadSecurityDefinition(ReadOnlySpan<byte> payload, DateTime receivedUtc)
+    {
+        ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        int offset = 8;
+
+        int symLen = payload[offset++];
+        string symbol = symLen == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(payload.Slice(offset, symLen));
+        offset += symLen;
+
+        uint numericMask = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+        offset += 4;
+
+        decimal? minPriceIncrement = null;
+        long? minTradeVolume = null;
+        long? priceDivisor = null;
+        long? contractMultiplier = null;
+        long? strikePrice = null;
+        long? maturityDate = null;
+        long? putOrCall = null;
+        long? exerciseStyle = null;
+        long? securityType = null;
+        long? securitySubType = null;
+        long? product = null;
+        long? marketSegmentID = null;
+        long? tickSizeDenominator = null;
+
+        for (int bit = 0; bit < 32; bit++)
+        {
+            if ((numericMask & (1u << bit)) == 0) continue;
+            long v = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
+            offset += 8;
+            switch (bit)
+            {
+                case SecurityDefinitionFieldMinPriceIncrement:
+                    minPriceIncrement = v / PriceScale8;
+                    break;
+                case SecurityDefinitionFieldMinTradeVolume: minTradeVolume = v; break;
+                case SecurityDefinitionFieldPriceDivisor: priceDivisor = v; break;
+                case SecurityDefinitionFieldContractMultiplier: contractMultiplier = v; break;
+                case SecurityDefinitionFieldStrikePrice: strikePrice = v; break;
+                case SecurityDefinitionFieldMaturityDate: maturityDate = v; break;
+                case SecurityDefinitionFieldPutOrCall: putOrCall = v; break;
+                case SecurityDefinitionFieldExerciseStyle: exerciseStyle = v; break;
+                case SecurityDefinitionFieldSecurityType: securityType = v; break;
+                case SecurityDefinitionFieldSecuritySubType: securitySubType = v; break;
+                case SecurityDefinitionFieldProduct: product = v; break;
+                case SecurityDefinitionFieldMarketSegmentID: marketSegmentID = v; break;
+                case SecurityDefinitionFieldTickSizeDenominator: tickSizeDenominator = v; break;
+            }
+        }
+
+        uint stringMask = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+        offset += 4;
+
+        string? isin = null, currency = null, asset = null, cfiCode = null;
+        string? securityGroup = null, securityDescription = null;
+
+        for (int bit = 0; bit < 32; bit++)
+        {
+            if ((stringMask & (1u << bit)) == 0) continue;
+            ushort len = BinaryPrimitives.ReadUInt16LittleEndian(payload[offset..]);
+            offset += 2;
+            string s = len == 0 ? string.Empty : Encoding.UTF8.GetString(payload.Slice(offset, len));
+            offset += len;
+            switch (bit)
+            {
+                case SecurityDefinitionStringIsin: isin = s; break;
+                case SecurityDefinitionStringCurrency: currency = s; break;
+                case SecurityDefinitionStringAsset: asset = s; break;
+                case SecurityDefinitionStringCfiCode: cfiCode = s; break;
+                case SecurityDefinitionStringSecurityGroup: securityGroup = s; break;
+                case SecurityDefinitionStringSecurityDescription: securityDescription = s; break;
+            }
+        }
+
+        return new SecurityDefinitionEvent
+        {
+            SecurityId = secId,
+            Symbol = symbol,
+            ReceivedUtc = receivedUtc,
+            MinPriceIncrement = minPriceIncrement,
+            MinTradeVolume = minTradeVolume,
+            PriceDivisor = priceDivisor,
+            ContractMultiplier = contractMultiplier,
+            StrikePrice = strikePrice,
+            MaturityDate = maturityDate,
+            PutOrCall = putOrCall,
+            ExerciseStyle = exerciseStyle,
+            SecurityType = securityType,
+            SecuritySubType = securitySubType,
+            Product = product,
+            MarketSegmentID = marketSegmentID,
+            TickSizeDenominator = tickSizeDenominator,
+            IsinNumber = isin,
+            Currency = currency,
+            Asset = asset,
+            CfiCode = cfiCode,
+            SecurityGroup = securityGroup,
+            SecurityDescription = securityDescription,
         };
     }
 

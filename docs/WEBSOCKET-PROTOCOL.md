@@ -50,6 +50,8 @@ Get               0x0003        Unsubscribed        0x0012
                                 NewsBegin           0x0090
                                 NewsChunk           0x0091
                                 NewsEnd             0x0092
+                                ServerHello         0x00A0
+                                SecurityDefinition  0x00B0
 ```
 
 ## Client → Server
@@ -71,7 +73,8 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x10` | Trades | Trade prints (`Trade`) + corrections (`TradeBust`) + per-symbol recent-trades history snapshot on subscribe. Independent of `Book`/`Mbp` — opt in to receive live tape. Note: `LastTradePrice`/`LastTradeSize` in `InfoSnapshot` belong to `Info`, not this flag. |
-| `0x1F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` |
+| `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
+| `0x3F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` |
 
 > **News and Trades are opt-in.** Existing clients that send `0x03` (or
 > `0x00`) keep the legacy behaviour and never receive news or trade frames.
@@ -167,6 +170,39 @@ bitfield from `AuctionImbalance_19` (low 16 bits): `0x0100` =
 `Balanced`. The SDK decodes it into the
 `B3.MarketData.WebSocketClient.AuctionImbalanceCondition` enum;
 unrecognised combinations map to `Unknown`.
+
+### SecurityDefinition (opt-in via `DataFlags.SecurityDefinition`)
+
+| Message | Type | Payload |
+|---------|------|---------|
+| **SecurityDefinition** | `0x00B0` | `[secId u64][symLen u8][symbol UTF-8][numericMask u32][i64 × popcount(numericMask)][stringMask u32][per set bit: u16 len + bytes UTF-8]` |
+
+Dual-bitmask layout: numeric fields are widened to `i64` (one 8-byte slot per
+set numeric bit, in bit order); string fields follow with a length-prefixed
+slot per set string bit (in bit order). Unknown bits on either mask are still
+consumed by the SDK so older clients keep their alignment when new fields are
+appended.
+
+Numeric `numericMask` bit positions:
+
+| Bit | Field | Bit | Field |
+|-----|-------|-----|-------|
+| 0 | MinPriceIncrement (Fixed8: `raw / 1e8`) | 7 | ExerciseStyle |
+| 1 | MinTradeVolume (lot size, unscaled) | 8 | SecurityType |
+| 2 | PriceDivisor | 9 | SecuritySubType |
+| 3 | ContractMultiplier | 10 | Product |
+| 4 | StrikePrice | 11 | MarketSegmentID |
+| 5 | MaturityDate | 12 | TickSizeDenominator |
+| 6 | PutOrCall |   |   |
+
+String `stringMask` bit positions: `0` Isin, `1` Currency, `2` Asset,
+`3` CfiCode, `4` SecurityGroup, `5` SecurityDescription.
+
+Pushed on subscribe (bootstrap snapshot) and again on every real
+`SecurityDefinition_12` delta — idempotent re-broadcasts upstream are
+suppressed via the `SecurityValidityTimestamp` short-circuit in
+`MarketDataManager.HandleSecurityDefinition`, so this frame fires only on true
+changes (typical: a few times per security per session).
 
 ### Incrementals
 

@@ -93,10 +93,36 @@ also enforces its own queue limits described in
 
 ## Scope of v1
 
-In: `Trade`, `TradeBust`, `InfoSnapshot`, `ServerStatus`,
-`SubscribeError`, `ConnectionStateChanged`, reconnect+replay, DI
-extension, bounded back-pressure.
+In: `Trade`, `TradeBust`, `InfoSnapshot`, `SecurityDefinition`,
+`ServerStatus`, `SubscribeError`, `ConnectionStateChanged`,
+reconnect+replay, DI extension, bounded back-pressure.
 
 Out (intentional): MBO/MBP order-book streams, recovery REST, auth
 tokens. These remain accessible via the raw protocol described in
 [`docs/WEBSOCKET-PROTOCOL.md`](WEBSOCKET-PROTOCOL.md).
+
+## SecurityDefinition channel
+
+Pre-trade guards typically need the static instrument metadata
+(`MinPriceIncrement` = tick size, `MinTradeVolume` = lot size, ISIN,
+currency, CFI code …). Set `SubscribeFlags.SecurityDefinition` (`0x20`)
+on `SubscribeAsync` to receive:
+
+* a bootstrap `SecurityDefinitionEvent` on subscribe (when the server
+  already has a definition for the symbol), and
+* a fresh `SecurityDefinitionEvent` whenever B3 publishes a real
+  `SecurityDefinition_12` delta — idempotent re-broadcasts are
+  suppressed server-side, so the event fires only on true changes.
+
+```csharp
+client.SecurityDefinition += sd =>
+    Console.WriteLine($"{sd.Symbol} tick={sd.MinPriceIncrement} lot={sd.MinTradeVolume} isin={sd.IsinNumber}");
+await client.SubscribeAsync("PETR4",
+    SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.SecurityDefinition);
+// or just: SubscribeFlags.Everything
+```
+
+`MinPriceIncrement` is already scaled (raw SBE `Fixed8` mantissa divided by
+`1e8`); all other numeric fields are unscaled. The event includes the
+resolved `Symbol` directly from the wire frame, so it works even before the
+`SubscribeOk` symbol cache is populated for first-sight securities.

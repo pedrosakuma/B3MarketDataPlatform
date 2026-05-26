@@ -172,6 +172,16 @@ internal static class SnapshotEmitter
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
+    /// <summary>Send the cached <see cref="MessageType.SecurityDefinition"/> frame
+    /// for one security. Used for the bootstrap push on Subscribe when the
+    /// caller already asserted <see cref="DataFlags.SecurityDefinition"/> is set.</summary>
+    public static bool SendSecurityDefinitionSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
+    {
+        var buf = new byte[WireProtocol.SecurityDefinitionMaxSize];
+        int len = WireProtocol.WriteSecurityDefinition(buf, securityId, info);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
     /// <summary>
     /// Replay every cached trade in the per-security ring buffer to the session,
     /// one Trade frame per entry. Bounded by <see cref="SubscriptionManager.MaxRecentTrades"/>.

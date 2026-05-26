@@ -500,6 +500,24 @@ public sealed class SubscriptionManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Wake <see cref="DataFlags.SecurityDefinition"/> subscribers for a security
+    /// so their write loop emits a fresh <see cref="MessageType.SecurityDefinition"/>
+    /// frame on the next cycle. Called by <c>GroupConflationHandler.OnSecurityDefinitionChanged</c>
+    /// — itself fired only when <c>MarketDataManager.HandleSecurityDefinition</c>
+    /// actually applied the payload (idempotent re-broadcasts short-circuit upstream).
+    /// </summary>
+    internal void NotifySecurityDefinitionUpdated(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, state) in clients)
+        {
+            if (!state.WantsSecurityDefinition) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+                session.NotifySecurityDefinitionAvailable();
+        }
+    }
+
     // --- Subscribe handling (called on owning group's thread) ---
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
@@ -658,6 +676,27 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
+        if (flags.HasFlag(DataFlags.SecurityDefinition))
+        {
+            // Same MDM search as Info — the static metadata lives on the same InstrumentInfo.
+            // Skip emission when no Symbol is cached yet (HandleSecurityDefinition was never
+            // entered for this securityId); the next real definition will push it via
+            // the delta path.
+            if (_marketDataManagers is { } managers)
+            {
+                foreach (var mdm in managers)
+                {
+                    if (mdm.InstrumentData.TryGetValue(securityId, out var info)
+                        && !string.IsNullOrEmpty(info.Symbol))
+                    {
+                        if (!SnapshotEmitter.SendSecurityDefinitionSnapshot(session, securityId, info))
+                            return false;
+                        break;
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
@@ -689,6 +728,13 @@ public sealed class SubscriptionManager : IDisposable
             if (!wantsInfo && hadInfo && !session.RemoveInfoSubscription(securityId))
                 return false;
 
+            bool wantsSecDef = flags.HasFlag(DataFlags.SecurityDefinition);
+            bool hadSecDef = hadPrevious && previous!.WantsSecurityDefinition;
+            if (wantsSecDef && !hadSecDef && !session.AddSecurityDefinitionSubscription(securityId))
+                return false;
+            if (!wantsSecDef && hadSecDef && !session.RemoveSecurityDefinitionSubscription(securityId))
+                return false;
+
             session.AddSubscription(securityId);
 
             bool wantsNews = (flags & DataFlags.News) != 0;
@@ -712,7 +758,9 @@ public sealed class SubscriptionManager : IDisposable
                 AddedInfoSubscription: wantsInfo && !hadInfo,
                 RemovedInfoSubscription: !wantsInfo && hadInfo,
                 AddedNewsSubscription: wantsNews && !hadNews,
-                RemovedNewsSubscription: !wantsNews && hadNews);
+                RemovedNewsSubscription: !wantsNews && hadNews,
+                AddedSecurityDefinitionSubscription: wantsSecDef && !hadSecDef,
+                RemovedSecurityDefinitionSubscription: !wantsSecDef && hadSecDef);
         }
 
         return true;
@@ -725,7 +773,9 @@ public sealed class SubscriptionManager : IDisposable
         bool AddedInfoSubscription,
         bool RemovedInfoSubscription,
         bool AddedNewsSubscription,
-        bool RemovedNewsSubscription);
+        bool RemovedNewsSubscription,
+        bool AddedSecurityDefinitionSubscription,
+        bool RemovedSecurityDefinitionSubscription);
 
     private void RollbackSubscriptionActivation(
         ClientSession session,
@@ -754,6 +804,12 @@ public sealed class SubscriptionManager : IDisposable
         // Mirror the news-counter delta applied during activation.
         if (activation.AddedNewsSubscription) session.DecrementNewsSubscriptions();
         else if (activation.RemovedNewsSubscription) session.IncrementNewsSubscriptions();
+
+        // Mirror the SecurityDefinition subscription delta.
+        if (activation.AddedSecurityDefinitionSubscription)
+            session.RemoveSecurityDefinitionSubscription(securityId);
+        else if (activation.RemovedSecurityDefinitionSubscription)
+            session.AddSecurityDefinitionSubscription(securityId);
     }
 
     /// <summary>

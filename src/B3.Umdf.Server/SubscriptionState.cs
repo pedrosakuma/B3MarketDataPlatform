@@ -74,6 +74,11 @@ internal sealed class SubscriptionState
     /// clients without this bit do not receive any trade frames.</summary>
     public bool WantsTrades => (Flags & DataFlags.Trades) != 0;
 
+    /// <summary>True iff this subscription opted in to receive
+    /// <see cref="MessageType.SecurityDefinition"/> push frames (tick/lot/identity
+    /// static metadata) on bootstrap and on every subsequent real delta.</summary>
+    public bool WantsSecurityDefinition => (Flags & DataFlags.SecurityDefinition) != 0;
+
     /// <summary>True iff this subscription wants live trades and the given batch is
     /// past the snapshot cutoff. Trades share the same broadcast cutoff as Book/Mbp.</summary>
     public bool WantsTradesBatch(long batchSequence) =>

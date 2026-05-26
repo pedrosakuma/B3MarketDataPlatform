@@ -28,6 +28,11 @@ public sealed class ClientSession : IDisposable
     // Owned by RunWriteLoopAsync. Populated/cleared exclusively via OutboundKind.AddInfoSub/
     // RemoveInfoSub deltas drained from _outbound, so no synchronization is needed.
     private readonly Dictionary<ulong, long> _infoVersions = new();
+    // Same pull-side dirty-flag model as _infoVersions but tracks the per-symbol
+    // SecurityDefinitionVersion (bumped only by MarketDataManager.HandleSecurityDefinition
+    // on real deltas — NOT on every BumpVersion). Populated/cleared via
+    // OutboundKind.AddSecurityDefinitionSub / RemoveSecurityDefinitionSub deltas.
+    private readonly Dictionary<ulong, long> _secDefVersions = new();
     private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
@@ -42,6 +47,7 @@ public sealed class ClientSession : IDisposable
     private long _broadcastDropCount;
     private int _disconnectRequested;
     private int _infoWakePending;
+    private int _secDefWakePending;
 
     /// <summary>
     /// Snapshot of currently subscribed securityIds. Returns a fresh array under
@@ -175,7 +181,11 @@ public sealed class ClientSession : IDisposable
     {
         lock (_subscriptionsLock)
             _subscriptions.Remove(securityId);
-        return RemoveInfoSubscription(securityId);
+        // Best-effort cleanup of both per-channel dirty-flag maps so the WriteLoop
+        // doesn't keep scanning stale securityIds after the parent subscription is gone.
+        bool infoOk = RemoveInfoSubscription(securityId);
+        bool secDefOk = RemoveSecurityDefinitionSubscription(securityId);
+        return infoOk && secDefOk;
     }
 
     /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.
@@ -186,6 +196,15 @@ public sealed class ClientSession : IDisposable
 
     public bool RemoveInfoSubscription(ulong securityId) =>
         TryEnqueueCore(OutboundMessage.RemoveInfoSub(securityId), "remove-info-sub");
+
+    /// <summary>Track a security for dirty-flag SecurityDefinition delivery. Same
+    /// model as <see cref="AddInfoSubscription"/> but for the metadata channel —
+    /// routes through the outbound ring so <c>_secDefVersions</c> stays lock-free.</summary>
+    public bool AddSecurityDefinitionSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.AddSecurityDefinitionSub(securityId), "add-secdef-sub");
+
+    public bool RemoveSecurityDefinitionSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.RemoveSecurityDefinitionSub(securityId), "remove-secdef-sub");
 
     /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
@@ -245,6 +264,19 @@ public sealed class ClientSession : IDisposable
         return TryEnqueueCore(OutboundMessage.InfoWake, "info update");
     }
 
+    /// <summary>
+    /// Wake the writer so SecurityDefinition subscriptions can flush the latest
+    /// metadata version. Coalesces multiple deltas into at most one pending
+    /// wake item per client (mirrors <see cref="NotifyInfoAvailable"/>).
+    /// </summary>
+    public bool NotifySecurityDefinitionAvailable()
+    {
+        if (Interlocked.Exchange(ref _secDefWakePending, 1) != 0)
+            return true;
+
+        return TryEnqueueCore(OutboundMessage.SecurityDefinitionWake, "secdef update");
+    }
+
     // --- Write loop: coalesce + dirty-flag info ---
 
     private const int MaxDrainPerCycle = 16384;
@@ -280,6 +312,8 @@ public sealed class ClientSession : IDisposable
                     Interlocked.Add(ref _pendingBytes, -drained.PayloadBytes);
                 if (drained.SawInfoWake)
                     Interlocked.Exchange(ref _infoWakePending, 0);
+                if (drained.SawSecDefWake)
+                    Interlocked.Exchange(ref _secDefWakePending, 0);
 
                 // Phase 2: coalesce drained payloads into the contiguous send buffer.
                 int offset = CoalesceMessages(messages, ref coalesceBuf);
@@ -287,6 +321,7 @@ public sealed class ClientSession : IDisposable
                 // Phase 3: append info snapshots for any subscribed securities whose
                 // version advanced since we last emitted them (dirty-flag pull model).
                 int infoMessages = AppendInfoSnapshots(ref coalesceBuf, ref offset);
+                int secDefMessages = AppendSecurityDefinitionSnapshots(ref coalesceBuf, ref offset);
 
                 // Phase 4: send + accounting.
                 if (offset > 0)
@@ -302,7 +337,7 @@ public sealed class ClientSession : IDisposable
                     // in-flight send finish is preferable to a torn frame.
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, CancellationToken.None);
-                    int totalMessages = drained.LogicalCount + infoMessages;
+                    int totalMessages = drained.LogicalCount + infoMessages + secDefMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
                     MetricsRegistry.WsMessagesSent.Add(totalMessages);
@@ -340,7 +375,7 @@ public sealed class ClientSession : IDisposable
     }
 
     private readonly record struct DrainResult(
-        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake);
+        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake, bool SawSecDefWake);
 
     /// <summary>
     /// Drain up to <see cref="MaxDrainPerCycle"/> entries from the outbound ring,
@@ -358,6 +393,7 @@ public sealed class ClientSession : IDisposable
         int logicalDrained = 0;
         long payloadBytesDrained = 0;
         bool sawInfoWake = false;
+        bool sawSecDefWake = false;
         while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
         {
             drained++;
@@ -381,9 +417,23 @@ public sealed class ClientSession : IDisposable
                 case OutboundKind.RemoveInfoSub:
                     _infoVersions.Remove(outbound.SecurityId);
                     break;
+                case OutboundKind.SecurityDefinitionWake:
+                    sawSecDefWake = true;
+                    break;
+                case OutboundKind.AddSecurityDefinitionSub:
+                    // Seed baseline at 0 so the next dirty-scan emits the current
+                    // value. This is the same convention used by AddInfoSub and
+                    // means clients may see a duplicate bootstrap frame (one from
+                    // the synchronous SendSecurityDefinitionSnapshot, one from the
+                    // drain-time scan); harmless and rare given SecDef cadence.
+                    _secDefVersions.TryAdd(outbound.SecurityId, 0);
+                    break;
+                case OutboundKind.RemoveSecurityDefinitionSub:
+                    _secDefVersions.Remove(outbound.SecurityId);
+                    break;
             }
         }
-        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake);
+        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake, sawSecDefWake);
     }
 
     /// <summary>
@@ -445,6 +495,41 @@ public sealed class ClientSession : IDisposable
             infoMessages++;
         }
         return infoMessages;
+    }
+
+    /// <summary>
+    /// Pull-side dirty-flag delivery for the SecurityDefinition channel. Scans every
+    /// security currently tracked in <c>_secDefVersions</c> and emits a fresh
+    /// <see cref="MessageType.SecurityDefinition"/> frame for those whose
+    /// <see cref="InstrumentInfo.SecurityDefinitionVersion"/> advanced since the
+    /// last cycle. Bootstrap baselines are seeded by <c>AddSecurityDefinitionSub</c>,
+    /// so the very first scan after a Subscribe is a no-op (the bootstrap snapshot
+    /// was already emitted synchronously). Returns the number of frames appended.
+    /// </summary>
+    private int AppendSecurityDefinitionSnapshots(ref byte[] coalesceBuf, ref int offset)
+    {
+        if (_marketDataManagers is not { } managers) return 0;
+        int emitted = 0;
+        foreach (var (secId, lastVer) in _secDefVersions)
+        {
+            InstrumentInfo? info = null;
+            foreach (var mdm in managers)
+            {
+                if (mdm.InstrumentData.TryGetValue(secId, out info))
+                    break;
+            }
+            if (info is null) continue;
+            if (string.IsNullOrEmpty(info.Symbol)) continue;
+            long ver = info.SecurityDefinitionVersion;
+            if (ver <= lastVer) continue;
+
+            EnsureCapacity(ref coalesceBuf, offset, WireProtocol.SecurityDefinitionMaxSize);
+            int len = WireProtocol.WriteSecurityDefinition(coalesceBuf.AsSpan(offset), secId, info);
+            offset += len;
+            _secDefVersions[secId] = ver;
+            emitted++;
+        }
+        return emitted;
     }
 
     /// <summary>

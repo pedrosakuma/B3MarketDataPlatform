@@ -69,6 +69,13 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<TradeEvent>? Trade;
     public event Action<TradeBustEvent>? TradeBust;
     public event Action<InfoSnapshotEvent>? InfoSnapshot;
+    /// <summary>
+    /// Static per-security metadata (<c>SecurityDefinition_12</c> projection,
+    /// including tick size / lot size). Fires on subscribe (bootstrap) and on
+    /// every real definition change. Requires opt-in via
+    /// <see cref="SubscribeFlags.SecurityDefinition"/>.
+    /// </summary>
+    public event Action<SecurityDefinitionEvent>? SecurityDefinition;
     public event Action<ServerStatusEvent>? ServerStatus;
     public event Action<ServerHelloEvent>? ServerHello;
     public event Action<SymbolDelistedEvent>? SymbolDelisted;
@@ -492,6 +499,16 @@ public sealed class MarketDataClient : IAsyncDisposable
                 // payload buffer (the receive loop owns the rented array).
                 var ev = WireFormat.ReadInfoSnapshot(payload, symbol, receivedUtc);
                 Enqueue(() => InfoSnapshot?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.SecurityDefinition:
+            {
+                // SecurityDefinition embeds its own Symbol field on the wire, so
+                // the decoder does not consult _securityIdToSymbol — useful for
+                // first-sight pushes where the SubscribeOk symbol cache may not
+                // yet be populated for this securityId.
+                var ev = WireFormat.ReadSecurityDefinition(payload, receivedUtc);
+                Enqueue(() => SecurityDefinition?.Invoke(ev));
                 break;
             }
             // ── L3 / order-by-order (MBO) ─────────────────────────

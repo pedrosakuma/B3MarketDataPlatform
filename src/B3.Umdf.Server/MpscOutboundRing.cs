@@ -18,6 +18,13 @@ internal enum OutboundKind : byte
     InfoWake = 1,
     AddInfoSub = 2,
     RemoveInfoSub = 3,
+    /// <summary>Wake the write loop to flush any <c>SecurityDefinition</c> deltas
+    /// that arrived since the last cycle. Mirrors <see cref="InfoWake"/> but for
+    /// the SecurityDefinition channel — kept independent so consumers that
+    /// subscribe only to one channel don't wake on the other's traffic.</summary>
+    SecurityDefinitionWake = 4,
+    AddSecurityDefinitionSub = 5,
+    RemoveSecurityDefinitionSub = 6,
 }
 
 /// <summary>
@@ -48,6 +55,15 @@ internal readonly struct OutboundMessage
 
     public static OutboundMessage RemoveInfoSub(ulong securityId) =>
         new(OutboundKind.RemoveInfoSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static readonly OutboundMessage SecurityDefinitionWake =
+        new(OutboundKind.SecurityDefinitionWake, ReadOnlyMemory<byte>.Empty, securityId: 0, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage AddSecurityDefinitionSub(ulong securityId) =>
+        new(OutboundKind.AddSecurityDefinitionSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage RemoveSecurityDefinitionSub(ulong securityId) =>
+        new(OutboundKind.RemoveSecurityDefinitionSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
 
     public OutboundKind Kind { get; }
     public ReadOnlyMemory<byte> Payload { get; }

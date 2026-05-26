@@ -8,12 +8,27 @@ namespace B3.Umdf.Book;
 public sealed class InstrumentInfo
 {
     private long _version;
+    private long _securityDefinitionVersion;
 
     /// <summary>Monotonic version counter. Bumped by the feed thread on every mutation.</summary>
     public long Version => Volatile.Read(ref _version);
 
     /// <summary>Increment the version counter after updating fields. Feed-thread-only.</summary>
     public void BumpVersion() => ++_version;
+
+    /// <summary>
+    /// Monotonic version counter dedicated to <c>SecurityDefinition_12</c> deltas.
+    /// Bumped ONLY by <c>MarketDataManager.HandleSecurityDefinition</c> when the
+    /// payload is actually applied (i.e., not in the idempotent re-broadcast
+    /// fast-path). Used by the WebSocket fan-out to push
+    /// <see cref="B3.Umdf.Server.MessageType.SecurityDefinition"/> frames on real
+    /// deltas without re-emitting them on unrelated <see cref="BumpVersion"/>
+    /// calls (status/info updates).
+    /// </summary>
+    public long SecurityDefinitionVersion => Volatile.Read(ref _securityDefinitionVersion);
+
+    /// <summary>Increment the SecurityDefinition version counter. Feed-thread-only.</summary>
+    public void BumpSecurityDefinitionVersion() => ++_securityDefinitionVersion;
 
     /// <summary>
     /// Last observed <c>SecurityValidityTimestamp</c> from
@@ -51,6 +66,13 @@ public sealed class InstrumentInfo
     public int? SecuritySubType { get; set; }
     public int? Product { get; set; }
     public long? MinPriceIncrement { get; set; }
+    /// <summary>
+    /// Minimum trade volume (lot size) from <c>SecurityDefinition_12.MinTradeVol</c>
+    /// — the smallest order size the venue accepts for this instrument. Raw
+    /// integer (no Fixed8 exponent). Required by downstream pre-trade tick/lot
+    /// guards (see issue #55 / B3TradingPlatform#454).
+    /// </summary>
+    public long? MinTradeVolume { get; set; }
     public long? PriceDivisor { get; set; }
     public long? ContractMultiplier { get; set; }
     public long? StrikePrice { get; set; }
@@ -148,6 +170,7 @@ public sealed class InstrumentInfo
         SecuritySubType = null;
         Product = null;
         MinPriceIncrement = null;
+        MinTradeVolume = null;
         PriceDivisor = null;
         ContractMultiplier = null;
         StrikePrice = null;

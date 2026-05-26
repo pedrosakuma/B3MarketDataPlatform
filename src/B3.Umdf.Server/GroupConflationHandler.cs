@@ -489,6 +489,15 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _parent.NotifyInfoUpdated(securityId);
     }
 
+    public void OnSecurityDefinitionChanged(ulong securityId, InstrumentInfo info)
+    {
+        // SecurityDefinition deltas are independent of the trading-status /
+        // VWAP caches above (those track dynamic state), so no per-handler
+        // bookkeeping is required here — we just wake every subscriber of the
+        // SecurityDefinition channel for this securityId.
+        _parent.NotifySecurityDefinitionUpdated(securityId);
+    }
+
     /// <summary>
     /// P13: handle a fully-reassembled News_5 delivery from MarketDataManager.
     /// Runs on the dispatch (feed) thread; spans are valid only for the call.

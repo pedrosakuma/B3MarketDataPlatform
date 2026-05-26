@@ -48,10 +48,21 @@ public enum SubscribeFlags : byte
     /// </summary>
     Trades = 0x10,
 
+    /// <summary>
+    /// Static per-security metadata (tick size / lot size and full
+    /// <c>SecurityDefinition_12</c> projection) via
+    /// <see cref="MarketDataClient.SecurityDefinition"/>. Bootstrap snapshot
+    /// on subscribe + push on every real definition change. Opt-in so legacy
+    /// clients keep their current bandwidth profile; required by pre-trade
+    /// guards that need <c>MinPriceIncrement</c> / <c>MinTradeVol</c> without
+    /// a REST refetch.
+    /// </summary>
+    SecurityDefinition = 0x20,
+
     /// <summary>Legacy convenience: <see cref="Book"/> + <see cref="Info"/>.
     /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, or Trades.</summary>
     All = Book | Info,
 
-    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades.</summary>
-    Everything = Book | Info | News | Mbp | Trades,
+    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition,
 }
