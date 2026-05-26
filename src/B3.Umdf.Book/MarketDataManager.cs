@@ -706,10 +706,21 @@ public sealed class MarketDataManager : IFeedEventHandler
             info.LastRptSeqQuantityBand = (uint)rs;
         }
 
+        // Delta-detection: capture old values
+        var oldAvg = info.AvgDailyTradedQty;
+        var oldMax = info.MaxTradeVol;
+
         info.AvgDailyTradedQty = msg.AvgDailyTradedQty;
         info.MaxTradeVol = msg.MaxTradeVol;
         info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
         info.BumpVersion();
+
+        // Fire PriceBand hook only on real delta (QuantityBand contributes to the same channel)
+        if (info.AvgDailyTradedQty != oldAvg || info.MaxTradeVol != oldMax)
+        {
+            info.BumpPriceBandVersion();
+            _eventHandler?.OnPriceBandChanged(securityId, info);
+        }
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }

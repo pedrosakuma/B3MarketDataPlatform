@@ -118,4 +118,26 @@ public class WireProtocolPriceBandTests
         Assert.False(DataFlags.All.HasFlag(DataFlags.PriceBand));
         Assert.Equal((byte)0x40, (byte)DataFlags.PriceBand);
     }
+
+    [Fact]
+    public void WritePriceBand_QuantityBandFields_MaskAndValuesCorrect()
+    {
+        var buf = new byte[WireProtocol.PriceBandMaxSize];
+        var info = new InstrumentInfo
+        {
+            Symbol = "PETR4",
+            AvgDailyTradedQty = 1_000_000,
+            MaxTradeVol = 500_000,
+        };
+        int len = WireProtocol.WritePriceBand(buf, securityId: 99, info);
+
+        int off = WireProtocol.FramingHeaderSize + 8 + 1 + 5;
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off)); off += 4;
+        Assert.NotEqual(0u, mask & (1u << WireProtocol.PriceBandFieldAvgDailyTradedQty));
+        Assert.NotEqual(0u, mask & (1u << WireProtocol.PriceBandFieldMaxOrderQty));
+
+        // Slots: AvgDailyTradedQty (bit 8), MaxOrderQty (bit 9).
+        Assert.Equal(1_000_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
+        Assert.Equal(500_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));
+    }
 }

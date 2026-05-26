@@ -1186,13 +1186,15 @@ public static class WireProtocol
     public const int PriceBandFieldPriceBandMidpointPriceType = 5; // i64 (byte enum)
     public const int PriceBandFieldAsOfTimestampNanos = 6;   // i64 (UTC nanos)
     public const int PriceBandFieldRptSeq = 7;               // i64 (widened uint)
+    public const int PriceBandFieldAvgDailyTradedQty = 8;    // i64 (from QuantityBand_21)
+    public const int PriceBandFieldMaxOrderQty = 9;          // i64 (from QuantityBand_21)
 
     /// <summary>
     /// Maximum body size of a <see cref="MessageType.PriceBand"/> frame:
-    /// header(4) + secId(8) + symLen(1) + symbol(≤255) + fieldMask(4) + 8 numeric slots × 8.
+    /// header(4) + secId(8) + symLen(1) + symbol(≤255) + fieldMask(4) + 10 numeric slots × 8.
     /// </summary>
     public const int PriceBandMaxSize =
-        FramingHeaderSize + 8 + 1 + 255 + 4 + 8 * 8;
+        FramingHeaderSize + 8 + 1 + 255 + 4 + 10 * 8;
 
     /// <summary>
     /// Serialize a <c>PriceBand</c> frame. <paramref name="dest"/> must
@@ -1244,6 +1246,12 @@ public static class WireProtocol
         if (info.LastRptSeqPriceBand != 0)
         { mask |= 1u << PriceBandFieldRptSeq;
           BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], info.LastRptSeqPriceBand); offset += 8; }
+        if (info.AvgDailyTradedQty is { } v8)
+        { mask |= 1u << PriceBandFieldAvgDailyTradedQty;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v8); offset += 8; }
+        if (info.MaxTradeVol is { } v9)
+        { mask |= 1u << PriceBandFieldMaxOrderQty;
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v9); offset += 8; }
 
         BinaryPrimitives.WriteUInt32LittleEndian(dest[maskOffset..], mask);
 

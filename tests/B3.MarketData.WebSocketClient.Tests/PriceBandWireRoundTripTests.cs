@@ -74,6 +74,31 @@ public class PriceBandWireRoundTripTests
         Assert.Null(ev.PriceBandMidpointPriceType);
         Assert.Null(ev.AsOfTimestamp);
         Assert.Null(ev.RptSeq);
+        Assert.Null(ev.AvgDailyTradedQty);
+        Assert.Null(ev.MaxOrderQty);
+    }
+
+    [Fact]
+    public void Roundtrip_QuantityBandFields_Preserved()
+    {
+        var info = new InstrumentInfo
+        {
+            Symbol = "VALE3",
+            AvgDailyTradedQty = 2_500_000L,
+            MaxTradeVol = 750_000L,
+        };
+
+        var buf = new byte[B3.Umdf.Server.WireProtocol.PriceBandMaxSize];
+        int len = B3.Umdf.Server.WireProtocol.WritePriceBand(buf, securityId: 11UL, info);
+
+        var ev = WireFormat.ReadPriceBand(
+            buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize),
+            receivedUtc: DateTime.UtcNow);
+
+        Assert.Equal(11UL, ev.SecurityId);
+        Assert.Equal("VALE3", ev.Symbol);
+        Assert.Equal(2_500_000L, ev.AvgDailyTradedQty);
+        Assert.Equal(750_000L, ev.MaxOrderQty);
     }
 
     [Fact]

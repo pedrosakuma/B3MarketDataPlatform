@@ -127,6 +127,8 @@ internal static class WireFormat
     public const int PriceBandFieldPriceBandMidpointPriceType = 5;
     public const int PriceBandFieldAsOfTimestampNanos = 6;
     public const int PriceBandFieldRptSeq = 7;
+    public const int PriceBandFieldAvgDailyTradedQty = 8;
+    public const int PriceBandFieldMaxOrderQty = 9;
 
     // WireProtocol.AuctionField* constants — never reorder.
     public const int AuctionFieldImbalanceQty = 0;
@@ -479,6 +481,8 @@ internal static class WireFormat
         byte? priceBandMidpointPriceType = null;
         long? asOfTimestamp = null;
         long? rptSeq = null;
+        long? avgDailyTradedQty = null;
+        long? maxOrderQty = null;
 
         for (int bit = 0; bit < 32; bit++)
         {
@@ -495,6 +499,8 @@ internal static class WireFormat
                 case PriceBandFieldPriceBandMidpointPriceType: priceBandMidpointPriceType = (byte)v; break;
                 case PriceBandFieldAsOfTimestampNanos: asOfTimestamp = v; break;
                 case PriceBandFieldRptSeq: rptSeq = v; break;
+                case PriceBandFieldAvgDailyTradedQty: avgDailyTradedQty = v; break;
+                case PriceBandFieldMaxOrderQty: maxOrderQty = v; break;
             }
         }
 
@@ -511,6 +517,8 @@ internal static class WireFormat
             PriceBandMidpointPriceType = priceBandMidpointPriceType,
             AsOfTimestamp = asOfTimestamp,
             RptSeq = rptSeq,
+            AvgDailyTradedQty = avgDailyTradedQty,
+            MaxOrderQty = maxOrderQty,
         };
     }
 

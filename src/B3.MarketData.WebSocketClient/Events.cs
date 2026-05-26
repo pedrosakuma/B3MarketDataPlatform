@@ -629,6 +629,19 @@ public sealed class PriceBandEvent
     /// <see cref="long"/>). Null when the venue did not provide it on this
     /// emission.</summary>
     public long? RptSeq { get; init; }
+
+    // ── QuantityBand_21 fields ──
+
+    /// <summary>Average daily traded quantity for this security, from UMDF
+    /// <c>QuantityBand_21</c>. Used by quantity-limit pre-trade guards.
+    /// Null when no QuantityBand has been observed.</summary>
+    public long? AvgDailyTradedQty { get; init; }
+
+    /// <summary>Maximum order quantity allowed for this security, from UMDF
+    /// <c>QuantityBand_21</c>. Fat-finger guards use this as the venue-
+    /// authoritative single-order qty ceiling. Null when no QuantityBand
+    /// has been observed.</summary>
+    public long? MaxOrderQty { get; init; }
 }
 
 /// <summary>

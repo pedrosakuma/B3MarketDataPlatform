@@ -76,7 +76,7 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x10` | Trades | Trade prints (`Trade`) + corrections (`TradeBust`) + per-symbol recent-trades history snapshot on subscribe. Independent of `Book`/`Mbp` — opt in to receive live tape. Note: `LastTradePrice`/`LastTradeSize` in `InfoSnapshot` belong to `Info`, not this flag. |
 | `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
-| `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol low/high limits, limit-type, midpoint-type, and trading reference price from UMDF `PriceBand_22`). Bootstrap snapshot on subscribe (when the band has already been observed) + push on every real band change. Opt-in; required by pre-trade fat-finger guards that want the venue-authoritative band instead of a static config. |
+| `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol price + quantity limits from UMDF `PriceBand_22` + `QuantityBand_21`). Includes low/high price limits, limit-type, midpoint-type, trading reference price, plus `AvgDailyTradedQty` and `MaxOrderQty` for quantity-based fat-finger guards. Bootstrap snapshot on subscribe + push on every real band change. Opt-in; required by pre-trade guards that want the venue-authoritative bands instead of a static config. |
 | `0x80` | Auction | `Auction` frame (aggregated auction state from UMDF `AuctionImbalance_19` + `SecurityGroupPhase_10`). Imbalance qty/side + trading phase + TradSesOpenTime. Bootstrap snapshot on subscribe + push on every real delta. Opt-in for clients needing pre-open/auction-phase state or imbalance-aware algo logic. |
 | `0xFF` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction` |
 
@@ -230,14 +230,16 @@ clients keep their alignment when new fields are appended.
 | 5 | PriceBandMidpointPriceType (byte enum — only set on PERCENTAGE rejection / auction bands) |
 | 6 | AsOfTimestamp (UTC nanoseconds since epoch — UMDF `MDEntryTimestamp`) |
 | 7 | RptSeq (UMDF `RptSeq`, widened from `uint`) |
+| 8 | AvgDailyTradedQty (`i64` — from UMDF `QuantityBand_21`) |
+| 9 | MaxOrderQty (`i64` — from UMDF `QuantityBand_21.MaxTradeVol`) |
 
-Pushed on subscribe (bootstrap snapshot, only when a `PriceBand_22` has
-already been observed) and again on every real change to low/high limits,
-limit-type, midpoint-type, or trading reference price. Idempotent
+Pushed on subscribe (bootstrap snapshot, only when a `PriceBand_22` or
+`QuantityBand_21` has already been observed) and again on every real change
+to price limits, quantity limits, or any discriminator. Idempotent
 re-broadcasts (the venue may emit the same band periodically) are
 short-circuited upstream by the diff check in
-`MarketDataManager.HandlePriceBand`, so this frame fires only on true band
-moves.
+`MarketDataManager.HandlePriceBand` / `HandleQuantityBand`, so this frame
+fires only on true band moves.
 
 ### Auction (opt-in via `DataFlags.Auction`)
 

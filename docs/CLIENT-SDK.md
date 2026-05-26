@@ -129,13 +129,12 @@ resolved `Symbol` directly from the wire frame, so it works even before the
 
 ## PriceBand channel
 
-Pre-trade fat-finger guards (OPT-E `PriceBandCheck` and friends) need the
-venue-authoritative dynamic price band ("túnel de preço"): the rejection /
-auction band B3 itself enforces. Set `SubscribeFlags.PriceBand` (`0x40`)
-on `SubscribeAsync` to receive:
+Pre-trade fat-finger guards (OPT-E `PriceBandCheck`, `QuantityBandCheck` and
+friends) need the venue-authoritative dynamic bands. Set
+`SubscribeFlags.PriceBand` (`0x40`) on `SubscribeAsync` to receive:
 
 * a bootstrap `PriceBandEvent` on subscribe (when the server has already
-  observed a `PriceBand_22` for the symbol), and
+  observed a `PriceBand_22` or `QuantityBand_21` for the symbol), and
 * a fresh `PriceBandEvent` whenever B3 changes any of the band fields —
   idempotent re-broadcasts (the venue may emit the same band periodically)
   are suppressed server-side, so the event fires only on true band moves.
@@ -143,20 +142,25 @@ on `SubscribeAsync` to receive:
 ```csharp
 client.PriceBand += pb =>
     Console.WriteLine(
-        $"{pb.Symbol} [{pb.LowerBand}, {pb.UpperBand}] " +
-        $"limitType={pb.PriceLimitType} ref={pb.TradingReferencePrice}");
+        $"{pb.Symbol} price=[{pb.LowerBand}, {pb.UpperBand}] " +
+        $"limitType={pb.PriceLimitType} " +
+        $"avgQty={pb.AvgDailyTradedQty} maxQty={pb.MaxOrderQty}");
 await client.SubscribeAsync("WINJ5",
     SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.PriceBand);
 // or just: SubscribeFlags.Everything
 ```
 
-`LowerBand` / `UpperBand` are pre-scaled `decimal?` (raw `Price` mantissa
-divided by `1e4`); `TradingReferencePrice` is pre-scaled with the
-`Fixed8` exponent (`raw / 1e8`). `PriceLimitType` is REQUIRED to interpret
-the band: `0` = PRICE_UNIT (absolute prices), `1` = TICKS (offsets vs.
-reference price combined with tick size), `2` = PERCENTAGE (offsets vs.
-reference price — futures typically send e.g. `0.1000` for ±10 %, which
-is meaningless without the discriminator).
+**Price fields** (from `PriceBand_22`):
+- `LowerBand` / `UpperBand`: pre-scaled `decimal?` (raw `Price` mantissa / 1e4)
+- `TradingReferencePrice`: pre-scaled `decimal?` (raw / 1e8)
+- `PriceLimitType`: REQUIRED to interpret bands — `0` PRICE_UNIT (absolute),
+  `1` TICKS (offsets vs. reference), `2` PERCENTAGE (offsets vs. reference)
+- `PriceBandType`, `PriceBandMidpointPriceType`: discriminator enums
+
+**Quantity fields** (from `QuantityBand_21`):
+- `AvgDailyTradedQty`: average daily traded quantity (raw `i64`)
+- `MaxOrderQty`: maximum order quantity allowed — use as venue-authoritative
+  single-order qty ceiling for fat-finger guards
 
 The event includes the resolved `Symbol` directly from the wire frame, so
 it works even before the `SubscribeOk` symbol cache is populated.
