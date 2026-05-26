@@ -94,7 +94,7 @@ also enforces its own queue limits described in
 ## Scope of v1
 
 In: `Trade`, `TradeBust`, `InfoSnapshot`, `SecurityDefinition`, `PriceBand`,
-`ServerStatus`, `SubscribeError`, `ConnectionStateChanged`,
+`Auction`, `ServerStatus`, `SubscribeError`, `ConnectionStateChanged`,
 reconnect+replay, DI extension, bounded back-pressure.
 
 Out (intentional): MBO/MBP order-book streams, recovery REST, auth
@@ -174,4 +174,37 @@ public sealed class WebSocketPriceBandSource : IPriceBandSource
         _bands.TryGetValue(symbol, out band!);
 }
 ```
+
+## Auction channel
+
+Aggregated auction state sourced from two UMDF templates:
+`AuctionImbalance_19` (imbalance qty/side) and `SecurityGroupPhase_10`
+(trading phase/pre-open time). Set `SubscribeFlags.Auction` (`0x80`)
+to receive:
+
+* a bootstrap `AuctionEvent` on subscribe (when either template has
+  already been observed), and
+* a fresh `AuctionEvent` whenever either template fires with a real
+  delta — idempotent re-broadcasts upstream are suppressed.
+
+```csharp
+client.Auction += a =>
+    Console.WriteLine(
+        $"{a.Symbol} status={a.TradingStatus} imb={a.ImbalanceQty} " +
+        $"side={a.ImbalanceSide} openTime={a.TradSesOpenTime}");
+await client.SubscribeAsync("PETR4",
+    SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Auction);
+// or just: SubscribeFlags.Everything
+```
+
+`ImbalanceSide` is an enum (`Balanced`, `MoreBuyers`, `MoreSellers`)
+decoded from the raw `ImbalanceCondition` bitfield (`0x0100` = MoreBuyers,
+`0x0200` = MoreSellers). `TradingStatus` is the SBE `TradingSessionSubID`
+enum (`2` = Pre-Open, `4` = Call, `17` = Continuous, …). `TradSesOpenTime`
+is populated only when the status is Pre-Open and B3 publishes the
+scheduled opening time (UTC epoch nanos); null otherwise.
+
+The two UMDF templates can fire independently — each bump yields a push
+with whatever is currently populated. Null fields mean "not yet received
+from UMDF" or "not applicable to the current phase".
 

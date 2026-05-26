@@ -85,6 +85,11 @@ internal sealed class SubscriptionState
     /// subsequent real delta.</summary>
     public bool WantsPriceBand => (Flags & DataFlags.PriceBand) != 0;
 
+    /// <summary>True iff this subscription opted in to receive
+    /// <see cref="MessageType.Auction"/> push frames (imbalance qty/condition
+    /// and trading phase) on bootstrap and on every subsequent real delta.</summary>
+    public bool WantsAuction => (Flags & DataFlags.Auction) != 0;
+
     /// <summary>True iff this subscription wants live trades and the given batch is
     /// past the snapshot cutoff. Trades share the same broadcast cutoff as Book/Mbp.</summary>
     public bool WantsTradesBatch(long batchSequence) =>

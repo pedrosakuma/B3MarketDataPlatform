@@ -506,6 +506,13 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _parent.NotifyPriceBandUpdated(securityId);
     }
 
+    public void OnAuctionChanged(ulong securityId, InstrumentInfo info)
+    {
+        // Same shape as OnPriceBandChanged — Auction deltas wake every
+        // subscriber of the Auction channel for this securityId.
+        _parent.NotifyAuctionUpdated(securityId);
+    }
+
     /// <summary>
     /// P13: handle a fully-reassembled News_5 delivery from MarketDataManager.
     /// Runs on the dispatch (feed) thread; spans are valid only for the call.

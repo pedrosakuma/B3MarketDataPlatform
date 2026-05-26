@@ -32,6 +32,12 @@ internal enum OutboundKind : byte
     PriceBandWake = 7,
     AddPriceBandSub = 8,
     RemovePriceBandSub = 9,
+    /// <summary>Wake the write loop to flush any <c>Auction</c> deltas that
+    /// arrived since the last cycle. Mirrors <see cref="PriceBandWake"/>
+    /// but for the auction channel (imbalance + group phase).</summary>
+    AuctionWake = 10,
+    AddAuctionSub = 11,
+    RemoveAuctionSub = 12,
 }
 
 /// <summary>
@@ -80,6 +86,15 @@ internal readonly struct OutboundMessage
 
     public static OutboundMessage RemovePriceBandSub(ulong securityId) =>
         new(OutboundKind.RemovePriceBandSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static readonly OutboundMessage AuctionWake =
+        new(OutboundKind.AuctionWake, ReadOnlyMemory<byte>.Empty, securityId: 0, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage AddAuctionSub(ulong securityId) =>
+        new(OutboundKind.AddAuctionSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
+
+    public static OutboundMessage RemoveAuctionSub(ulong securityId) =>
+        new(OutboundKind.RemoveAuctionSub, ReadOnlyMemory<byte>.Empty, securityId, logicalCount: 0, pooledArray: null);
 
     public OutboundKind Kind { get; }
     public ReadOnlyMemory<byte> Payload { get; }

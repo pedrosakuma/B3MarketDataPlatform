@@ -10,6 +10,7 @@ public sealed class InstrumentInfo
     private long _version;
     private long _securityDefinitionVersion;
     private long _priceBandVersion;
+    private long _auctionVersion;
 
     /// <summary>Monotonic version counter. Bumped by the feed thread on every mutation.</summary>
     public long Version => Volatile.Read(ref _version);
@@ -44,6 +45,20 @@ public sealed class InstrumentInfo
 
     /// <summary>Increment the PriceBand version counter. Feed-thread-only.</summary>
     public void BumpPriceBandVersion() => ++_priceBandVersion;
+
+    /// <summary>
+    /// Monotonic version counter dedicated to auction state deltas
+    /// (<c>AuctionImbalance_19</c> + <c>SecurityGroupPhase_10</c>).
+    /// Bumped ONLY when the imbalance or group-phase fields actually change.
+    /// Used by the WebSocket fan-out to push
+    /// <see cref="B3.Umdf.Server.MessageType.Auction"/> frames on real
+    /// deltas without re-emitting them on unrelated <see cref="BumpVersion"/>
+    /// calls (status / price updates).
+    /// </summary>
+    public long AuctionVersion => Volatile.Read(ref _auctionVersion);
+
+    /// <summary>Increment the Auction version counter. Feed-thread-only.</summary>
+    public void BumpAuctionVersion() => ++_auctionVersion;
 
     /// <summary>
     /// Last observed <c>SecurityValidityTimestamp</c> from
@@ -118,6 +133,10 @@ public sealed class InstrumentInfo
     /// upstream stay forward-compatible.
     /// </summary>
     public ushort? AuctionImbalanceCondition { get; set; }
+
+    /// <summary><c>AuctionImbalance_19.MDEntryTimestamp</c> (UTC nanoseconds since
+    /// epoch). Timestamp of the last auction imbalance update.</summary>
+    public long? AuctionTimestamp { get; set; }
 
     // Bands
     public long? PriceBandLow { get; set; }
@@ -220,6 +239,7 @@ public sealed class InstrumentInfo
         TheoreticalOpeningSize = null;
         AuctionImbalanceSize = null;
         AuctionImbalanceCondition = null;
+        AuctionTimestamp = null;
         PriceBandLow = null;
         PriceBandHigh = null;
         PriceLimitType = null;

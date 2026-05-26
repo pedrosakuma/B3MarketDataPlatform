@@ -71,10 +71,19 @@ public enum SubscribeFlags : byte
     /// </summary>
     PriceBand = 0x40,
 
+    /// <summary>
+    /// Aggregated auction state: imbalance qty/side from <c>AuctionImbalance_19</c>
+    /// plus trading phase from <c>SecurityGroupPhase_10</c>.
+    /// Bootstrap snapshot on subscribe + push on every real delta.
+    /// Opt-in for clients that need to display pre-open / auction-phase
+    /// state or build imbalance-aware algo logic.
+    /// </summary>
+    Auction = 0x80,
+
     /// <summary>Legacy convenience: <see cref="Book"/> + <see cref="Info"/>.
-    /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, Trades, SecurityDefinition, or PriceBand.</summary>
+    /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction.</summary>
     All = Book | Info,
 
-    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand,
+    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
 }

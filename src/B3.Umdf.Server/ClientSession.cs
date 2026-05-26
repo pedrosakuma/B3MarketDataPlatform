@@ -38,6 +38,10 @@ public sealed class ClientSession : IDisposable
     // deltas — NOT on every BumpVersion). Populated/cleared via
     // OutboundKind.AddPriceBandSub / RemovePriceBandSub deltas.
     private readonly Dictionary<ulong, long> _priceBandVersions = new();
+    // Same pull-side dirty-flag model as _priceBandVersions but tracks the per-symbol
+    // AuctionVersion (bumped only on imbalance/phase real deltas). Populated/cleared
+    // via OutboundKind.AddAuctionSub / RemoveAuctionSub deltas.
+    private readonly Dictionary<ulong, long> _auctionVersions = new();
     private MarketDataManager[]? _marketDataManagers;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _logger;
@@ -54,6 +58,7 @@ public sealed class ClientSession : IDisposable
     private int _infoWakePending;
     private int _secDefWakePending;
     private int _priceBandWakePending;
+    private int _auctionWakePending;
 
     /// <summary>
     /// Snapshot of currently subscribed securityIds. Returns a fresh array under
@@ -187,12 +192,13 @@ public sealed class ClientSession : IDisposable
     {
         lock (_subscriptionsLock)
             _subscriptions.Remove(securityId);
-        // Best-effort cleanup of both per-channel dirty-flag maps so the WriteLoop
+        // Best-effort cleanup of all per-channel dirty-flag maps so the WriteLoop
         // doesn't keep scanning stale securityIds after the parent subscription is gone.
         bool infoOk = RemoveInfoSubscription(securityId);
         bool secDefOk = RemoveSecurityDefinitionSubscription(securityId);
         bool priceBandOk = RemovePriceBandSubscription(securityId);
-        return infoOk && secDefOk && priceBandOk;
+        bool auctionOk = RemoveAuctionSubscription(securityId);
+        return infoOk && secDefOk && priceBandOk && auctionOk;
     }
 
     /// <summary>Track a security for dirty-flag info delivery. Called on the feed thread.
@@ -222,6 +228,16 @@ public sealed class ClientSession : IDisposable
 
     public bool RemovePriceBandSubscription(ulong securityId) =>
         TryEnqueueCore(OutboundMessage.RemovePriceBandSub(securityId), "remove-priceband-sub");
+
+    /// <summary>Track a security for dirty-flag Auction delivery. Same
+    /// model as <see cref="AddPriceBandSubscription"/> but for the auction
+    /// channel (imbalance + group phase) — routes through the outbound ring
+    /// so <c>_auctionVersions</c> stays lock-free.</summary>
+    public bool AddAuctionSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.AddAuctionSub(securityId), "add-auction-sub");
+
+    public bool RemoveAuctionSubscription(ulong securityId) =>
+        TryEnqueueCore(OutboundMessage.RemoveAuctionSub(securityId), "remove-auction-sub");
 
     /// <summary>Set the MarketDataManagers for on-demand info reads (one per group).</summary>
     public void SetMarketDataManagers(MarketDataManager[] managers) =>
@@ -307,6 +323,19 @@ public sealed class ClientSession : IDisposable
         return TryEnqueueCore(OutboundMessage.PriceBandWake, "priceband update");
     }
 
+    /// <summary>
+    /// Wake the writer so Auction subscriptions can flush the latest
+    /// auction version (imbalance + phase). Coalesces multiple deltas into
+    /// at most one pending wake item per client.
+    /// </summary>
+    public bool NotifyAuctionAvailable()
+    {
+        if (Interlocked.Exchange(ref _auctionWakePending, 1) != 0)
+            return true;
+
+        return TryEnqueueCore(OutboundMessage.AuctionWake, "auction update");
+    }
+
     // --- Write loop: coalesce + dirty-flag info ---
 
     private const int MaxDrainPerCycle = 16384;
@@ -346,6 +375,8 @@ public sealed class ClientSession : IDisposable
                     Interlocked.Exchange(ref _secDefWakePending, 0);
                 if (drained.SawPriceBandWake)
                     Interlocked.Exchange(ref _priceBandWakePending, 0);
+                if (drained.SawAuctionWake)
+                    Interlocked.Exchange(ref _auctionWakePending, 0);
 
                 // Phase 2: coalesce drained payloads into the contiguous send buffer.
                 int offset = CoalesceMessages(messages, ref coalesceBuf);
@@ -355,6 +386,7 @@ public sealed class ClientSession : IDisposable
                 int infoMessages = AppendInfoSnapshots(ref coalesceBuf, ref offset);
                 int secDefMessages = AppendSecurityDefinitionSnapshots(ref coalesceBuf, ref offset);
                 int priceBandMessages = AppendPriceBandSnapshots(ref coalesceBuf, ref offset);
+                int auctionMessages = AppendAuctionSnapshots(ref coalesceBuf, ref offset);
 
                 // Phase 4: send + accounting.
                 if (offset > 0)
@@ -370,7 +402,7 @@ public sealed class ClientSession : IDisposable
                     // in-flight send finish is preferable to a torn frame.
                     await Socket.SendAsync(coalesceBuf.AsMemory(0, offset),
                         WebSocketMessageType.Binary, true, CancellationToken.None);
-                    int totalMessages = drained.LogicalCount + infoMessages + secDefMessages + priceBandMessages;
+                    int totalMessages = drained.LogicalCount + infoMessages + secDefMessages + priceBandMessages + auctionMessages;
                     Interlocked.Add(ref _messagesSent, totalMessages);
                     Interlocked.Add(ref _bytesSent, offset);
                     MetricsRegistry.WsMessagesSent.Add(totalMessages);
@@ -408,7 +440,7 @@ public sealed class ClientSession : IDisposable
     }
 
     private readonly record struct DrainResult(
-        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake, bool SawSecDefWake, bool SawPriceBandWake);
+        int Count, int LogicalCount, long PayloadBytes, bool SawInfoWake, bool SawSecDefWake, bool SawPriceBandWake, bool SawAuctionWake);
 
     /// <summary>
     /// Drain up to <see cref="MaxDrainPerCycle"/> entries from the outbound ring,
@@ -428,6 +460,7 @@ public sealed class ClientSession : IDisposable
         bool sawInfoWake = false;
         bool sawSecDefWake = false;
         bool sawPriceBandWake = false;
+        bool sawAuctionWake = false;
         while (drained < MaxDrainPerCycle && _outbound.TryDequeue(out var outbound))
         {
             drained++;
@@ -475,9 +508,18 @@ public sealed class ClientSession : IDisposable
                 case OutboundKind.RemovePriceBandSub:
                     _priceBandVersions.Remove(outbound.SecurityId);
                     break;
+                case OutboundKind.AuctionWake:
+                    sawAuctionWake = true;
+                    break;
+                case OutboundKind.AddAuctionSub:
+                    _auctionVersions.TryAdd(outbound.SecurityId, 0);
+                    break;
+                case OutboundKind.RemoveAuctionSub:
+                    _auctionVersions.Remove(outbound.SecurityId);
+                    break;
             }
         }
-        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake, sawSecDefWake, sawPriceBandWake);
+        return new DrainResult(drained, logicalDrained, payloadBytesDrained, sawInfoWake, sawSecDefWake, sawPriceBandWake, sawAuctionWake);
     }
 
     /// <summary>
@@ -605,6 +647,39 @@ public sealed class ClientSession : IDisposable
             int len = WireProtocol.WritePriceBand(coalesceBuf.AsSpan(offset), secId, info);
             offset += len;
             _priceBandVersions[secId] = ver;
+            emitted++;
+        }
+        return emitted;
+    }
+
+    /// <summary>
+    /// Pull-side dirty-flag delivery for the Auction channel. Scans every
+    /// security currently tracked in <c>_auctionVersions</c> and emits a fresh
+    /// <see cref="MessageType.Auction"/> frame for those whose
+    /// <see cref="InstrumentInfo.AuctionVersion"/> advanced since the last
+    /// cycle. Symbols with no imbalance or trading status yet are skipped.
+    /// </summary>
+    private int AppendAuctionSnapshots(ref byte[] coalesceBuf, ref int offset)
+    {
+        if (_marketDataManagers is not { } managers) return 0;
+        int emitted = 0;
+        foreach (var (secId, lastVer) in _auctionVersions)
+        {
+            InstrumentInfo? info = null;
+            foreach (var mdm in managers)
+            {
+                if (mdm.InstrumentData.TryGetValue(secId, out info))
+                    break;
+            }
+            if (info is null) continue;
+            if (!info.AuctionTimestamp.HasValue && !info.TradingStatus.HasValue) continue;
+            long ver = info.AuctionVersion;
+            if (ver <= lastVer) continue;
+
+            EnsureCapacity(ref coalesceBuf, offset, WireProtocol.AuctionMaxSize);
+            int len = WireProtocol.WriteAuction(coalesceBuf.AsSpan(offset), secId, info);
+            offset += len;
+            _auctionVersions[secId] = ver;
             emitted++;
         }
         return emitted;

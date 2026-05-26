@@ -25,6 +25,16 @@ public interface IMarketDataEventHandler
     void OnPriceBandChanged(ulong securityId, InstrumentInfo info) { }
 
     /// <summary>
+    /// Fired when auction state changes: <c>AuctionImbalance_19</c> (imbalance
+    /// qty/condition) or <c>SecurityGroupPhase_10</c> (group trading phase).
+    /// Idempotent re-broadcasts are short-circuited upstream so this fires
+    /// only on real deltas — useful for downstream subscribers (e.g.,
+    /// WebSocket server pushing <c>AuctionEvent</c> only when imbalance or
+    /// phase actually changed).
+    /// </summary>
+    void OnAuctionChanged(ulong securityId, InstrumentInfo info) { }
+
+    /// <summary>
     /// Fired when a SecurityDefinition arrives for an existing SecurityID
     /// whose canonical identity (Symbol/ISIN/MaturityDate/SecurityType)
     /// differs from the cached value — i.e. the exchange is reusing the

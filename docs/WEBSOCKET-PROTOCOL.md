@@ -53,6 +53,7 @@ Get               0x0003        Unsubscribed        0x0012
                                 ServerHello         0x00A0
                                 SecurityDefinition  0x00B0
                                 PriceBand           0x00B1
+                                Auction             0x00B2
 ```
 
 ## Client → Server
@@ -70,13 +71,14 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x00` | None | Treated as `All` |
 | `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `BookCleared`). **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
-| `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News, MBP, or Trades) |
+| `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction) |
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
 | `0x10` | Trades | Trade prints (`Trade`) + corrections (`TradeBust`) + per-symbol recent-trades history snapshot on subscribe. Independent of `Book`/`Mbp` — opt in to receive live tape. Note: `LastTradePrice`/`LastTradeSize` in `InfoSnapshot` belong to `Info`, not this flag. |
 | `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
 | `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol low/high limits, limit-type, midpoint-type, and trading reference price from UMDF `PriceBand_22`). Bootstrap snapshot on subscribe (when the band has already been observed) + push on every real band change. Opt-in; required by pre-trade fat-finger guards that want the venue-authoritative band instead of a static config. |
-| `0x7F` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` |
+| `0x80` | Auction | `Auction` frame (aggregated auction state from UMDF `AuctionImbalance_19` + `SecurityGroupPhase_10`). Imbalance qty/side + trading phase + TradSesOpenTime. Bootstrap snapshot on subscribe + push on every real delta. Opt-in for clients needing pre-open/auction-phase state or imbalance-aware algo logic. |
+| `0xFF` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction` |
 
 > **News and Trades are opt-in.** Existing clients that send `0x03` (or
 > `0x00`) keep the legacy behaviour and never receive news or trade frames.
@@ -236,6 +238,44 @@ re-broadcasts (the venue may emit the same band periodically) are
 short-circuited upstream by the diff check in
 `MarketDataManager.HandlePriceBand`, so this frame fires only on true band
 moves.
+
+### Auction (opt-in via `DataFlags.Auction`)
+
+| Message | Type | Payload |
+|---------|------|---------|
+| **Auction** | `0x00B2` | `[secId u64][symLen u8][symbol UTF-8][fieldMask u8][i64 × popcount(fieldMask)]` |
+
+Single-bitmask layout: every field is widened to `i64` (one 8-byte slot per
+set bit, in bit order). Unknown bits are still consumed by the SDK so older
+clients keep their alignment when new fields are appended. Note: `fieldMask`
+is 1 byte (vs. 4 bytes for PriceBand) because Auction has only 6 defined
+fields and doesn't need extensibility to the same degree.
+
+`fieldMask` bit positions:
+
+| Bit | Field |
+|-----|-------|
+| 0 | ImbalanceQty (`i64`) — remaining quantity to match (UMDF `MDEntrySize`) |
+| 1 | ImbalanceCondition (`u16` widened) — raw SBE bitfield: `0x0100` MoreBuyers, `0x0200` MoreSellers, `0` Balanced |
+| 2 | TradingStatus (`int` widened) — SBE `TradingSessionSubID` enum: `2` Pre-Open, `4` Call, `17` Continuous, etc. |
+| 3 | TradSesOpenTime (`i64`) — scheduled opening time (UTC nanos since epoch); only populated in Pre-Open phase |
+| 4 | AsOfTimestamp (`i64`) — latest `MDEntryTimestamp` from either UMDF template |
+| 5 | RptSeq (`uint` widened) — latest `RptSeq` from either source |
+
+Aggregated state sourced from two UMDF templates:
+
+- **AuctionImbalance_19**: `ImbalanceQty` + `ImbalanceCondition`
+- **SecurityGroupPhase_10**: `TradingStatus` + `TradSesOpenTime`
+
+Either template can independently trigger a version bump / push — each bump
+yields a push with whatever is currently populated. Null fields mean "not
+yet received from UMDF" or "not applicable to the current auction phase".
+
+Pushed on subscribe (bootstrap snapshot, only when either template has
+already been observed) and again on every real delta. Idempotent
+re-broadcasts upstream are short-circuited by the diff check in
+`MarketDataManager.HandleAuctionImbalance` / `HandleSecurityGroupPhase`,
+so this frame fires only on true deltas.
 
 ### Incrementals
 

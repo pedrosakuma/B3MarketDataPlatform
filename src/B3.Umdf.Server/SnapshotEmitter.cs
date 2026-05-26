@@ -199,6 +199,20 @@ internal static class SnapshotEmitter
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
+    /// <summary>Send the cached <see cref="MessageType.Auction"/> frame for
+    /// one security. Used for the bootstrap push on Subscribe when the caller
+    /// already asserted <see cref="DataFlags.Auction"/> is set. Returns
+    /// <c>true</c> (no-op) when no <c>AuctionImbalance_19</c> or
+    /// <c>SecurityGroupPhase_10</c> has yet been observed for the security.</summary>
+    public static bool SendAuctionSnapshot(ClientSession session, ulong securityId, InstrumentInfo info)
+    {
+        // Gate on having observed at least one auction-related message
+        if (!info.AuctionTimestamp.HasValue && !info.TradingStatus.HasValue) return true;
+        var buf = new byte[WireProtocol.AuctionMaxSize];
+        int len = WireProtocol.WriteAuction(buf, securityId, info);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
     /// <summary>
     /// Replay every cached trade in the per-security ring buffer to the session,
     /// one Trade frame per entry. Bounded by <see cref="SubscriptionManager.MaxRecentTrades"/>.

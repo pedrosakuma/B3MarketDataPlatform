@@ -54,6 +54,7 @@ internal static class WireFormat
         ClientHello = 0x00A1,
         SecurityDefinition = 0x00B0,
         PriceBand = 0x00B1,
+        Auction = 0x00B2,
     }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
@@ -126,6 +127,14 @@ internal static class WireFormat
     public const int PriceBandFieldPriceBandMidpointPriceType = 5;
     public const int PriceBandFieldAsOfTimestampNanos = 6;
     public const int PriceBandFieldRptSeq = 7;
+
+    // WireProtocol.AuctionField* constants — never reorder.
+    public const int AuctionFieldImbalanceQty = 0;
+    public const int AuctionFieldImbalanceCondition = 1;
+    public const int AuctionFieldTradingStatus = 2;
+    public const int AuctionFieldTradSesOpenTime = 3;
+    public const int AuctionFieldAsOfTimestampNanos = 4;
+    public const int AuctionFieldRptSeq = 5;
 
     public static bool TryReadHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
     {
@@ -500,6 +509,69 @@ internal static class WireFormat
             PriceLimitType = priceLimitType,
             PriceBandType = priceBandType,
             PriceBandMidpointPriceType = priceBandMidpointPriceType,
+            AsOfTimestamp = asOfTimestamp,
+            RptSeq = rptSeq,
+        };
+    }
+
+    /// <summary>
+    /// Parse a <see cref="MessageType.Auction"/> frame.
+    /// Layout: <c>[securityId u64][symLen u8][symbol bytes][fieldMask u8][i64 values for set bits]</c>.
+    /// </summary>
+    public static AuctionEvent ReadAuction(ReadOnlySpan<byte> payload, DateTime receivedUtc)
+    {
+        ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        int offset = 8;
+
+        int symLen = payload[offset++];
+        string symbol = symLen == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(payload.Slice(offset, symLen));
+        offset += symLen;
+
+        byte mask = payload[offset++];
+
+        long? imbalanceQty = null;
+        ushort? imbalanceCondition = null;
+        int? tradingStatus = null;
+        long? tradSesOpenTime = null;
+        long? asOfTimestamp = null;
+        long? rptSeq = null;
+
+        for (int bit = 0; bit < 8; bit++)
+        {
+            if ((mask & (1 << bit)) == 0) continue;
+            long v = BinaryPrimitives.ReadInt64LittleEndian(payload[offset..]);
+            offset += 8;
+            switch (bit)
+            {
+                case AuctionFieldImbalanceQty: imbalanceQty = v; break;
+                case AuctionFieldImbalanceCondition: imbalanceCondition = (ushort)v; break;
+                case AuctionFieldTradingStatus: tradingStatus = (int)v; break;
+                case AuctionFieldTradSesOpenTime: tradSesOpenTime = v; break;
+                case AuctionFieldAsOfTimestampNanos: asOfTimestamp = v; break;
+                case AuctionFieldRptSeq: rptSeq = v; break;
+            }
+        }
+
+        // Decode imbalance side from condition bits
+        ImbalanceSide side = ImbalanceSide.Balanced;
+        if (imbalanceCondition.HasValue)
+        {
+            if ((imbalanceCondition.Value & ImbalanceBitMoreBuyers) != 0) side = ImbalanceSide.MoreBuyers;
+            else if ((imbalanceCondition.Value & ImbalanceBitMoreSellers) != 0) side = ImbalanceSide.MoreSellers;
+        }
+
+        return new AuctionEvent
+        {
+            SecurityId = secId,
+            Symbol = symbol,
+            ReceivedUtc = receivedUtc,
+            ImbalanceQty = imbalanceQty,
+            ImbalanceSide = side,
+            ImbalanceConditionRaw = imbalanceCondition,
+            TradingStatus = tradingStatus,
+            TradSesOpenTime = tradSesOpenTime,
             AsOfTimestamp = asOfTimestamp,
             RptSeq = rptSeq,
         };

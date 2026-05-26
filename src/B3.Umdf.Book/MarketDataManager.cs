@@ -510,8 +510,17 @@ public sealed class MarketDataManager : IFeedEventHandler
                 var info = kv.Value;
                 if (info.FollowsGroupStatus)
                 {
+                    var oldStatus = info.TradingStatus;
                     info.TradingStatus = status;
                     info.BumpVersion();
+
+                    // Fire auction hook only on real status delta
+                    if (status != oldStatus)
+                    {
+                        info.BumpAuctionVersion();
+                        _eventHandler?.OnAuctionChanged(kv.Key, info);
+                    }
+
                     _eventHandler?.OnMarketDataUpdated(kv.Key, info);
                 }
             }
@@ -660,10 +669,26 @@ public sealed class MarketDataManager : IFeedEventHandler
             info.LastRptSeqAuctionImbalance = (uint)rs;
         }
 
-        info.AuctionImbalanceSize = msg.MDEntrySize;
-        info.AuctionImbalanceCondition = (ushort)msg.ImbalanceCondition;
-        info.LastUpdateTimestamp = msg.MDEntryTimestamp.Time ?? 0;
+        // Capture old values for delta detection
+        var oldSize = info.AuctionImbalanceSize;
+        var oldCondition = info.AuctionImbalanceCondition;
+
+        var newSize = msg.MDEntrySize;
+        var newCondition = (ushort)msg.ImbalanceCondition;
+        var newTsRaw = msg.MDEntryTimestamp.Time ?? 0;
+
+        info.AuctionImbalanceSize = newSize;
+        info.AuctionImbalanceCondition = newCondition;
+        info.AuctionTimestamp = newTsRaw == 0 ? null : (long)newTsRaw;
+        info.LastUpdateTimestamp = newTsRaw;
         info.BumpVersion();
+
+        // Fire auction hook only on real delta
+        if (newSize != oldSize || newCondition != oldCondition)
+        {
+            info.BumpAuctionVersion();
+            _eventHandler?.OnAuctionChanged(securityId, info);
+        }
 
         _eventHandler?.OnMarketDataUpdated(securityId, info);
     }

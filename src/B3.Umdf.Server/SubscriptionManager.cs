@@ -536,6 +536,23 @@ public sealed class SubscriptionManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Wake <see cref="DataFlags.Auction"/> subscribers for a security so
+    /// their write loop emits a fresh <see cref="MessageType.Auction"/>
+    /// frame on the next cycle. Called by <c>GroupConflationHandler.OnAuctionChanged</c>
+    /// — itself fired only when imbalance or group-phase fields actually changed.
+    /// </summary>
+    internal void NotifyAuctionUpdated(ulong securityId)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+        foreach (var (clientId, state) in clients)
+        {
+            if (!state.WantsAuction) continue;
+            if (_clients.TryGetValue(clientId, out var session))
+                session.NotifyAuctionAvailable();
+        }
+    }
+
     // --- Subscribe handling (called on owning group's thread) ---
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
@@ -734,6 +751,24 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
+        if (flags.HasFlag(DataFlags.Auction))
+        {
+            // Same MDM search as PriceBand. SnapshotEmitter.SendAuctionSnapshot
+            // is a no-op when no imbalance or trading status has been observed yet.
+            if (_marketDataManagers is { } managers)
+            {
+                foreach (var mdm in managers)
+                {
+                    if (mdm.InstrumentData.TryGetValue(securityId, out var info))
+                    {
+                        if (!SnapshotEmitter.SendAuctionSnapshot(session, securityId, info))
+                            return false;
+                        break;
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
@@ -779,6 +814,13 @@ public sealed class SubscriptionManager : IDisposable
             if (!wantsPriceBand && hadPriceBand && !session.RemovePriceBandSubscription(securityId))
                 return false;
 
+            bool wantsAuction = flags.HasFlag(DataFlags.Auction);
+            bool hadAuction = hadPrevious && previous!.WantsAuction;
+            if (wantsAuction && !hadAuction && !session.AddAuctionSubscription(securityId))
+                return false;
+            if (!wantsAuction && hadAuction && !session.RemoveAuctionSubscription(securityId))
+                return false;
+
             session.AddSubscription(securityId);
 
             bool wantsNews = (flags & DataFlags.News) != 0;
@@ -806,7 +848,9 @@ public sealed class SubscriptionManager : IDisposable
                 AddedSecurityDefinitionSubscription: wantsSecDef && !hadSecDef,
                 RemovedSecurityDefinitionSubscription: !wantsSecDef && hadSecDef,
                 AddedPriceBandSubscription: wantsPriceBand && !hadPriceBand,
-                RemovedPriceBandSubscription: !wantsPriceBand && hadPriceBand);
+                RemovedPriceBandSubscription: !wantsPriceBand && hadPriceBand,
+                AddedAuctionSubscription: wantsAuction && !hadAuction,
+                RemovedAuctionSubscription: !wantsAuction && hadAuction);
         }
 
         return true;
@@ -823,7 +867,9 @@ public sealed class SubscriptionManager : IDisposable
         bool AddedSecurityDefinitionSubscription,
         bool RemovedSecurityDefinitionSubscription,
         bool AddedPriceBandSubscription,
-        bool RemovedPriceBandSubscription);
+        bool RemovedPriceBandSubscription,
+        bool AddedAuctionSubscription,
+        bool RemovedAuctionSubscription);
 
     private void RollbackSubscriptionActivation(
         ClientSession session,
@@ -864,6 +910,12 @@ public sealed class SubscriptionManager : IDisposable
             session.RemovePriceBandSubscription(securityId);
         else if (activation.RemovedPriceBandSubscription)
             session.AddPriceBandSubscription(securityId);
+
+        // Mirror the Auction subscription delta.
+        if (activation.AddedAuctionSubscription)
+            session.RemoveAuctionSubscription(securityId);
+        else if (activation.RemovedAuctionSubscription)
+            session.AddAuctionSubscription(securityId);
     }
 
     /// <summary>

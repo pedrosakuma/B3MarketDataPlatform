@@ -630,3 +630,76 @@ public sealed class PriceBandEvent
     /// emission.</summary>
     public long? RptSeq { get; init; }
 }
+
+/// <summary>
+/// Indicates which side has the auction imbalance.
+/// Derived from the SBE <c>ImbalanceCondition</c> bit-field:
+/// bit 8 (0x0100) = MoreBuyers, bit 9 (0x0200) = MoreSellers.
+/// When neither bit is set, the imbalance is Balanced.
+/// </summary>
+public enum ImbalanceSide
+{
+    /// <summary>Neither more buyers nor more sellers — balanced.</summary>
+    Balanced = 0,
+    /// <summary>More buyers than sellers (bit 8 set in SBE).</summary>
+    MoreBuyers = 1,
+    /// <summary>More sellers than buyers (bit 9 set in SBE).</summary>
+    MoreSellers = 2,
+}
+
+/// <summary>
+/// Aggregated auction state from two UMDF templates:
+/// <c>AuctionImbalance_19</c> (imbalance qty/side) and
+/// <c>SecurityGroupPhase_10</c> (trading status/pre-open time).
+/// Pushed on subscribe (when the server has already observed data)
+/// and on every subsequent real change. Both sources can independently
+/// trigger updates — each bump yields a push with whatever is currently
+/// populated. Null fields mean "not yet received from UMDF" or "not
+/// applicable to the current auction phase".
+/// </summary>
+public sealed class AuctionEvent
+{
+    public ulong SecurityId { get; init; }
+
+    /// <summary>Resolved symbol (embedded directly in the wire frame).</summary>
+    public string Symbol { get; init; } = "";
+
+    public DateTime ReceivedUtc { get; init; }
+
+    // ── AuctionImbalance_19 fields ──
+
+    /// <summary>Remaining quantity to match (MDEntrySize). Zero or positive.
+    /// Null when no imbalance message was received yet.</summary>
+    public long? ImbalanceQty { get; init; }
+
+    /// <summary>Which side has excess quantity: <see cref="ImbalanceSide.MoreBuyers"/>,
+    /// <see cref="ImbalanceSide.MoreSellers"/>, or <see cref="ImbalanceSide.Balanced"/>.
+    /// Null when no imbalance message was received yet.</summary>
+    public ImbalanceSide ImbalanceSide { get; init; }
+
+    /// <summary>Raw SBE <c>ImbalanceCondition</c> bit-field (uint16). Exposed
+    /// for advanced consumers who need flags beyond buyer/seller side.</summary>
+    public ushort? ImbalanceConditionRaw { get; init; }
+
+    // ── SecurityGroupPhase_10 fields ──
+
+    /// <summary>SBE <c>TradingSessionSubID</c> — the trading phase for this
+    /// security/group. Common values: 2=Pre-Open, 4=Call, 17=Continuous.
+    /// Null when no phase message was received yet.</summary>
+    public int? TradingStatus { get; init; }
+
+    /// <summary>UMDF <c>TradSesOpenTime</c> (UTC epoch nanos) — the scheduled
+    /// opening time for Pre-Open phase (tag 342). Only populated when the
+    /// status is Pre-Open and B3 publishes it; null otherwise.</summary>
+    public long? TradSesOpenTime { get; init; }
+
+    // ── Common envelope fields ──
+
+    /// <summary>Latest <c>MDEntryTimestamp</c> (UTC nanos since epoch) from
+    /// either AuctionImbalance or SecurityGroupPhase.</summary>
+    public long? AsOfTimestamp { get; init; }
+
+    /// <summary>Latest <c>RptSeq</c> (widened to <see cref="long"/>) from
+    /// either source. Null when not provided.</summary>
+    public long? RptSeq { get; init; }
+}

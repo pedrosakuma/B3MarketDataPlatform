@@ -151,6 +151,16 @@ public enum MessageType : ushort
     /// new bit positions; older SDKs MUST consume slots for unknown bits without
     /// alignment damage.</summary>
     PriceBand = 0x00B1,
+
+    /// <summary>Server → Client: auction state for one security (imbalance +
+    /// trading phase). Pushed on Subscribe (when the server has observed
+    /// imbalance or group-phase data) and on every subsequent real delta.
+    /// Layout: <c>[securityId u64][symLen u8][symbol ...][fieldMask u8][i64 values
+    /// for set bits in bit order]</c>.
+    /// Field mask bit positions are defined by <c>AuctionField*</c>
+    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
+    /// new bit positions.</summary>
+    Auction = 0x00B2,
 }
 
 /// <summary>
@@ -221,11 +231,18 @@ public enum DataFlags : byte
     /// and on every subsequent real delta. Opt-in so legacy clients that
     /// don't enforce pre-trade band checks don't pay the bandwidth.</summary>
     PriceBand = 0x40,
+    /// <summary>Auction state stream (<see cref="MessageType.Auction"/>):
+    /// imbalance quantity/condition from <c>AuctionImbalance_19</c> and
+    /// group trading phase from <c>SecurityGroupPhase_10</c>. Pushed on
+    /// Subscribe (when the server has observed imbalance or phase data)
+    /// and on every subsequent real delta. Opt-in so legacy clients that
+    /// don't trade in auctions don't pay the bandwidth.</summary>
+    Auction = 0x80,
     /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News, MBP, Trades, SecurityDefinition, or PriceBand.</summary>
+    /// does NOT include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction.</summary>
     All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand,
+    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.</summary>
+    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
 }
 
 /// <summary>
@@ -1232,6 +1249,76 @@ public static class WireProtocol
 
         ushort totalLen = (ushort)offset;
         WriteFramingHeader(dest, totalLen, MessageType.PriceBand);
+        return totalLen;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    //  Auction frame (0x00B2) — imbalance + group phase
+    // ───────────────────────────────────────────────────────────────────────
+
+    public const int AuctionFieldImbalanceQty = 0;           // i64
+    public const int AuctionFieldImbalanceCondition = 1;     // i64 (ushort widened)
+    public const int AuctionFieldTradingStatus = 2;          // i64 (int widened)
+    public const int AuctionFieldTradSesOpenTime = 3;        // i64 (UTC nanos)
+    public const int AuctionFieldAsOfTimestampNanos = 4;     // i64 (UTC nanos)
+    public const int AuctionFieldRptSeq = 5;                 // i64 (widened uint)
+
+    /// <summary>
+    /// Maximum body size of a <see cref="MessageType.Auction"/> frame:
+    /// header(4) + secId(8) + symLen(1) + symbol(≤255) + fieldMask(1) + 6 numeric slots × 8.
+    /// </summary>
+    public const int AuctionMaxSize =
+        FramingHeaderSize + 8 + 1 + 255 + 1 + 6 * 8;
+
+    /// <summary>
+    /// Serialize an <see cref="MessageType.Auction"/> frame.
+    /// <paramref name="dest"/> must provide at least <see cref="AuctionMaxSize"/> bytes.
+    /// </summary>
+    public static int WriteAuction(Span<byte> dest, ulong securityId, InstrumentInfo info)
+    {
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+
+        // Symbol — single-byte length prefix
+        string symbol = info.Symbol ?? string.Empty;
+        var symBytes = Encoding.UTF8.GetBytes(symbol);
+        if (symBytes.Length > 255)
+        {
+            var trimmed = new byte[255];
+            Array.Copy(symBytes, trimmed, 255);
+            symBytes = trimmed;
+        }
+        dest[offset++] = (byte)symBytes.Length;
+        symBytes.CopyTo(dest[offset..]); offset += symBytes.Length;
+
+        // Field mask (1 byte) + slots
+        int maskOffset = offset;
+        offset += 1;
+        byte mask = 0;
+
+        if (info.AuctionImbalanceSize is { } v0)
+        { mask |= (byte)(1 << AuctionFieldImbalanceQty);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v0); offset += 8; }
+        if (info.AuctionImbalanceCondition is { } v1)
+        { mask |= (byte)(1 << AuctionFieldImbalanceCondition);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v1); offset += 8; }
+        if (info.TradingStatus is { } v2)
+        { mask |= (byte)(1 << AuctionFieldTradingStatus);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v2); offset += 8; }
+        if (info.TradSesOpenTime is { } v3)
+        { mask |= (byte)(1 << AuctionFieldTradSesOpenTime);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], (long)v3); offset += 8; }
+        if (info.AuctionTimestamp is { } v4)
+        { mask |= (byte)(1 << AuctionFieldAsOfTimestampNanos);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v4); offset += 8; }
+        if (info.LastRptSeqAuctionImbalance != 0)
+        { mask |= (byte)(1 << AuctionFieldRptSeq);
+          BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], info.LastRptSeqAuctionImbalance); offset += 8; }
+
+        dest[maskOffset] = mask;
+
+        ushort totalLen = (ushort)offset;
+        WriteFramingHeader(dest, totalLen, MessageType.Auction);
         return totalLen;
     }
 

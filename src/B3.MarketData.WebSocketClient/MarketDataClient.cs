@@ -82,6 +82,13 @@ public sealed class MarketDataClient : IAsyncDisposable
     /// band change. Requires opt-in via <see cref="SubscribeFlags.PriceBand"/>.
     /// </summary>
     public event Action<PriceBandEvent>? PriceBand;
+    /// <summary>
+    /// Aggregated auction state: imbalance qty/side from <c>AuctionImbalance_19</c>
+    /// plus trading phase from <c>SecurityGroupPhase_10</c>.
+    /// Fires on subscribe (bootstrap) and on every real delta.
+    /// Requires opt-in via <see cref="SubscribeFlags.Auction"/>.
+    /// </summary>
+    public event Action<AuctionEvent>? Auction;
     public event Action<ServerStatusEvent>? ServerStatus;
     public event Action<ServerHelloEvent>? ServerHello;
     public event Action<SymbolDelistedEvent>? SymbolDelisted;
@@ -523,6 +530,13 @@ public sealed class MarketDataClient : IAsyncDisposable
                 // SecurityDefinition — no _securityIdToSymbol lookup needed.
                 var ev = WireFormat.ReadPriceBand(payload, receivedUtc);
                 Enqueue(() => PriceBand?.Invoke(ev));
+                break;
+            }
+            case WireFormat.MessageType.Auction:
+            {
+                // Auction embeds Symbol on the wire — no _securityIdToSymbol needed.
+                var ev = WireFormat.ReadAuction(payload, receivedUtc);
+                Enqueue(() => Auction?.Invoke(ev));
                 break;
             }
             // ── L3 / order-by-order (MBO) ─────────────────────────
