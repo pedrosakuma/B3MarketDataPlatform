@@ -26,3 +26,11 @@ jobs:
 
     - name: Test
       run: dotnet test --no-build --verbosity normal
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: JS golden-vector decode test
+      run: node --test tests/golden/

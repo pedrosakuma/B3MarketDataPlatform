@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using System.Buffers.Binary;
 using B3.Umdf.Book;
 using B3.Umdf.Server;
@@ -44,8 +45,8 @@ public class SecurityDefinitionWireRoundTripTests
         int len = B3.Umdf.Server.WireProtocol.WriteSecurityDefinition(buf, securityId: 12345UL, info);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var hLen, out var type));
-        Assert.Equal(len, hLen);
-        Assert.Equal(WireFormat.MessageType.SecurityDefinition, type);
+        Assert.Equal((uint)len, hLen);
+        Assert.Equal(MessageType.SecurityDefinition, type);
 
         var ev = WireFormat.ReadSecurityDefinition(
             new ReadOnlySpan<byte>(buf, WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize),

@@ -252,14 +252,14 @@ public class WebSocketHostIntegrationTests
 
             Assert.Equal(WebSocketMessageType.Binary, result.MessageType);
 
-            // Frame 0: ServerHello (length-prefixed, type at offset 2).
-            ushort len = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(buffer);
-            ushort type = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
+            // Frame 0: ServerHello (u32 length @0, u16 type @4).
+            uint len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(buffer);
+            ushort type = System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(4));
             Assert.Equal((ushort)MessageType.ServerHello, type);
             Assert.True(filled >= len, $"frame should be at least {len} bytes (got {filled})");
 
             var (protocolVersion, capabilities, buildVersion) =
-                WireProtocol.ReadServerHello(buffer.AsSpan(WireProtocol.FramingHeaderSize, len - WireProtocol.FramingHeaderSize));
+                WireProtocol.ReadServerHello(buffer.AsSpan(WireProtocol.FramingHeaderSize, (int)len - WireProtocol.FramingHeaderSize));
 
             Assert.Equal(WireProtocol.ProtocolVersion, protocolVersion);
             Assert.False(string.IsNullOrEmpty(buildVersion), "ServerHello.buildVersion must be non-empty");

@@ -1,290 +1,55 @@
 using System.Buffers.Binary;
 using System.Text;
 using B3.Umdf.Book;
+using B3.MarketData.Wire;
 
 namespace B3.Umdf.Server;
 
-/// <summary>Message type identifiers for the binary WebSocket protocol.</summary>
-public enum MessageType : ushort
-{
-    // Client → Server
-    Subscribe = 0x0001,
-    Unsubscribe = 0x0002,
-    Get = 0x0003,
-
-    // Server → Client
-    SubscribeOk = 0x0010,
-    SubscribeError = 0x0011,
-    Unsubscribed = 0x0012,
-    BookSnapshot = 0x0020,
-    InfoSnapshot = 0x0021,
-    /// <summary>Server → Client: aggregated price-level snapshot (MBP) for a security.
-    /// Carries every live price level as (price, totalQty, orderCount). Sent on
-    /// initial subscribe when <see cref="DataFlags.Mbp"/> is requested. Paired
-    /// with incremental <see cref="LevelUpdate"/> / <see cref="LevelDeleted"/>.</summary>
-    LevelSnapshot = 0x0022,
-    OrderAdded = 0x0030,
-    OrderUpdated = 0x0031,
-    OrderDeleted = 0x0032,
-    Trade = 0x0033,
-    BookCleared = 0x0034,
-    /// <summary>Server → Client: cancellation of a previously-broadcast trade
-    /// (TradeBust_57 from B3 spec §10). Carries securityId + tradeId so the
-    /// frontend can mark the corresponding entry in the trade history as
-    /// cancelled. Sent exactly once per bust observed on the wire.</summary>
-    TradeBust = 0x0035,
-    /// <summary>Server → Client: aggregate null-price MOA/MOC market tier for one side.
-    /// Carries total quantity and order count; it is deliberately separate from
-    /// OrderAdded/Updated so no sentinel price is needed.</summary>
-    MarketTierUpdate = 0x0036,
-    /// <summary>Server → Client: incremental MBP price-level update.
-    /// Carries (securityId, side, price, totalQty, orderCount) for a level whose
-    /// aggregate just changed. Conflated last-write-wins by (secId, side, price)
-    /// in the per-group MBP buffer so a level touched many times in one packet
-    /// still emits at most one frame per packet.</summary>
-    LevelUpdate = 0x0037,
-    /// <summary>Server → Client: incremental MBP level removal.
-    /// Sent when a price level was fully drained (last order deleted/moved away).
-    /// Carries (securityId, side, price). Frontend MUST drop the level from its
-    /// per-symbol map.</summary>
-    LevelDeleted = 0x0038,
-    RankingsUpdate = 0x0040,
-
-    /// <summary>Server → Client: broadcast of server feed status (ready / not ready).</summary>
-    ServerStatus = 0x0050,
-
-    /// <summary>Server → Client: full candle history for a security on subscribe.</summary>
-    CandleSnapshot = 0x0060,
-
-    /// <summary>Server → Client: single candle update (latest candle changed or new candle).</summary>
-    CandleUpdate = 0x0061,
-
-    /// <summary>Server → Client: per-symbol stale-status transition.
-    /// Sent when a subscribed security flips between Healthy and Stale so the UI can dim
-    /// rows / show a stale indicator. Coalesced per security in the conflation buffer:
-    /// the last value within a packet wins.</summary>
-    SymbolStaleStatus = 0x0070,
-
-    /// <summary>Server → Client: terminal notification that a previously-subscribed
-    /// security has been delisted by the venue. Carries only the securityId; clients
-    /// MUST stop expecting further data for that symbol and SHOULD remove it from
-    /// their UI. The server cleans up the per-symbol subscription map after sending,
-    /// so subsequent <c>Subscribe</c> attempts for the same symbol will fail with
-    /// <see cref="SubscribeErrorCode.UnknownSymbol"/>.
-    /// Issued via <c>SubscriptionManager.NotifyDelisted</c>; integration with the
-    /// upstream SBE delisting trigger is intentionally a follow-up.</summary>
-    SymbolDelisted = 0x0071,
-
-    /// <summary>Server → Client: aggregate recovery progress.
-    /// Periodic broadcast (~250ms) of total stale symbols and per-kind breakdown across
-    /// all channel groups. Stops after totalStale=0 has been broadcast once so clients
-    /// can clear the dashboard banner. Independent of <see cref="SymbolStaleStatus"/>:
-    /// that message targets per-row dimming for subscribed symbols, this one drives the
-    /// global "Recovering N/M symbols" banner.</summary>
-    RecoveryProgress = 0x0080,
-
-    /// <summary>Server → Client: start of a News delivery (template SBE 5).
-    /// Carries the metadata header (securityId, newsId, source, lang, origTime,
-    /// total lengths) but NOT the variable-length text payloads — those follow
-    /// as zero or more <see cref="NewsChunk"/> messages and a final
-    /// <see cref="NewsEnd"/>. Fragmentation is required because the framing
-    /// header uses u16 length (max ~65 KB) but a reassembled News may exceed
-    /// that. All News fragments for a given delivery share the same newsId.</summary>
-    NewsBegin = 0x0090,
-    /// <summary>Server → Client: a single payload fragment for an in-flight News
-    /// delivery. Carries newsId + field discriminator (0=Headline,1=Text,2=URL)
-    /// + bytes. Up to 60 KB per fragment.</summary>
-    NewsChunk = 0x0091,
-    /// <summary>Server → Client: explicit terminator for a News delivery.
-    /// Lets clients release per-news buffers and surface the assembled news to
-    /// the UI exactly once.</summary>
-    NewsEnd = 0x0092,
-
-    /// <summary>Server → Client: protocol/version handshake. Sent as the very first
-    /// frame after a client connects (before <see cref="ServerStatus"/>) so consumers
-    /// can negotiate features and surface the server build to operators.
-    /// Payload: <c>[u32 protocolVersion][u32 capabilities][u8 buildVerLen][buildVer UTF-8]</c>.
-    /// The MessageType is purely additive — older clients that don't recognise it MUST
-    /// skip the frame (length-prefixed) and continue parsing the next message.</summary>
-    ServerHello = 0x00A0,
-
-    /// <summary>Client → Server: optional version-negotiation handshake. If sent it MUST
-    /// arrive before any <see cref="Subscribe"/> / <see cref="Get"/> / <see cref="Unsubscribe"/>
-    /// frame. Payload: <c>[u32 protocolVersion]</c> — the version the client intends to
-    /// speak. Servers reject (WS close 1003 "protocol_version_unsupported") any value
-    /// outside <see cref="WireProtocol.SupportedProtocolVersionMin"/>..<see cref="WireProtocol.SupportedProtocolVersionMax"/>.
-    /// Backwards compatible: clients that never send ClientHello are assumed to speak
-    /// the current <see cref="WireProtocol.ProtocolVersion"/>.</summary>
-    ClientHello = 0x00A1,
-
-    /// <summary>Server → Client: full <c>SecurityDefinition</c> (static instrument metadata
-    /// — tick, lot, identity, classification) for a single security. Pushed (a) on
-    /// initial Subscribe when <see cref="DataFlags.SecurityDefinition"/> is set and
-    /// the server already has the definition cached, and (b) on every subsequent
-    /// real change (identity, tick, lot, …). Re-broadcasts that don't change any
-    /// field are short-circuited upstream by
-    /// <c>MarketDataManager.HandleSecurityDefinition</c>'s validity-timestamp
-    /// fast-path, so this frame only flows on true deltas.
-    /// Payload (little-endian, after the 4-byte framing header):
-    /// <c>[u64 securityId][u8 symbolLen][symbol UTF-8][u32 numericFieldMask]
-    /// [i64 values for set bits in bit order][u32 stringFieldMask][per set bit: u16 len][bytes]</c>.
-    /// Field mask bit positions are defined by <c>SecurityDefinitionField*</c>
-    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
-    /// new bit positions; older SDKs MUST consume slots for unknown bits without
-    /// alignment damage.</summary>
-    SecurityDefinition = 0x00B0,
-
-    /// <summary>Server → Client: dynamic per-symbol price band (tunnel) snapshot
-    /// for a single security. Pushed (a) on initial Subscribe when
-    /// <see cref="DataFlags.PriceBand"/> is set and the server has already
-    /// observed at least one <c>PriceBand_22</c>, and (b) on every real change
-    /// to low/high limits, limit-type, midpoint-type, or trading reference
-    /// price. Idempotent re-broadcasts (the venue may emit the same band
-    /// periodically) are short-circuited upstream by
-    /// <c>MarketDataManager.HandlePriceBand</c>'s diff check, so this frame
-    /// only flows when the band actually moves.
-    /// Payload (little-endian, after the 4-byte framing header):
-    /// <c>[u64 securityId][u8 symbolLen][symbol UTF-8][u32 fieldMask][i64 values
-    /// for set bits in bit order]</c>.
-    /// Field mask bit positions are defined by <c>PriceBandField*</c>
-    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
-    /// new bit positions; older SDKs MUST consume slots for unknown bits without
-    /// alignment damage.</summary>
-    PriceBand = 0x00B1,
-
-    /// <summary>Server → Client: auction state for one security (imbalance +
-    /// trading phase). Pushed on Subscribe (when the server has observed
-    /// imbalance or group-phase data) and on every subsequent real delta.
-    /// Layout: <c>[securityId u64][symLen u8][symbol ...][fieldMask u8][i64 values
-    /// for set bits in bit order]</c>.
-    /// Field mask bit positions are defined by <c>AuctionField*</c>
-    /// constants on <see cref="WireProtocol"/>. New fields are append-only at
-    /// new bit positions.</summary>
-    Auction = 0x00B2,
-}
-
 /// <summary>
-/// Bitfield of optional server-side features advertised in <see cref="MessageType.ServerHello"/>.
-/// Clients MUST treat unknown bits as reserved (ignore + log). New flags are appended
-/// only — bits MUST NOT be reused or repurposed once shipped.
-/// </summary>
-[Flags]
-public enum ServerCapabilities : uint
-{
-    None = 0,
-    /// <summary>Server pushes initial book/info/MBP snapshot frames immediately on
-    /// successful Subscribe. Always set today; documented as a flag so clients can
-    /// branch cleanly once a future server might allow snapshot opt-out.</summary>
-    SnapshotOnSubscribe = 0x0001,
-    /// <summary>Server emits <see cref="MessageType.SymbolDelisted"/> as the terminal
-    /// notification when a subscribed security is delisted mid-session.</summary>
-    SymbolDelistedNotification = 0x0002,
-}
-
-public enum SubscribeErrorCode : byte
-{
-    UnknownSymbol = 0x01,
-    NotReady = 0x02,
-}
-
-/// <summary>
-/// Bitmask for the data channels a client wants to receive.
-/// Sent in the Subscribe message; echoed back in SubscribeOk.
-/// </summary>
-[Flags]
-public enum DataFlags : byte
-{
-    None = 0x00,
-    /// <summary>BookSnapshot + order incrementals (OrderAdded/Updated/Deleted, Trade, BookCleared).</summary>
-    Book = 0x01,
-    /// <summary>InfoSnapshot + incremental market data / security status updates.</summary>
-    Info = 0x02,
-    /// <summary>News deliveries (NewsBegin/Chunk/End). Opt-in: clients without this
-    /// bit receive no news, even for symbols they're subscribed to. Both
-    /// instrument-scoped and global news flow through this flag.</summary>
-    News = 0x04,
-    /// <summary>Aggregated price-level (MBP) stream: <see cref="MessageType.LevelSnapshot"/>
-    /// + incremental <see cref="MessageType.LevelUpdate"/>/<see cref="MessageType.LevelDeleted"/>.
-    /// Independent of <see cref="Book"/>: a client may request only MBP, only
-    /// MBO (Book), or both. MBP is the recommended default for UI consumers
-    /// since the wire is conflated per (secId, side, price) instead of per
-    /// orderId, dramatically reducing bandwidth on hot levels.</summary>
-    Mbp = 0x08,
-    /// <summary>Trade prints (live <see cref="MessageType.Trade"/>) and corrections
-    /// (<see cref="MessageType.TradeBust"/>), plus the per-symbol recent-trades
-    /// history sent on subscribe. Opt-in (default OFF): clients that only want
-    /// quotes (Book and/or Mbp) avoid trade-stream bandwidth entirely. Note that
-    /// <c>LastTradePrice</c> in <see cref="MessageType.InfoSnapshot"/> is part of
-    /// <see cref="Info"/> and is not gated by this flag.</summary>
-    Trades = 0x10,
-    /// <summary>Static instrument metadata stream
-    /// (<see cref="MessageType.SecurityDefinition"/>): tick, lot, identity,
-    /// classification fields from <c>SecurityDefinition_12</c>. Pushed on
-    /// Subscribe (when the server already has the definition cached) and on
-    /// every subsequent real delta. Opt-in so legacy clients that only need
-    /// price data don't pay metadata-frame bandwidth.</summary>
-    SecurityDefinition = 0x20,
-    /// <summary>Dynamic per-symbol price band (tunnel) stream
-    /// (<see cref="MessageType.PriceBand"/>): low/high limits, limit-type,
-    /// midpoint-type, and trading reference price from <c>PriceBand_22</c>.
-    /// Pushed on Subscribe (when the server has already observed the band)
-    /// and on every subsequent real delta. Opt-in so legacy clients that
-    /// don't enforce pre-trade band checks don't pay the bandwidth.</summary>
-    PriceBand = 0x40,
-    /// <summary>Auction state stream (<see cref="MessageType.Auction"/>):
-    /// imbalance quantity/condition from <c>AuctionImbalance_19</c> and
-    /// group trading phase from <c>SecurityGroupPhase_10</c>. Pushed on
-    /// Subscribe (when the server has observed imbalance or phase data)
-    /// and on every subsequent real delta. Opt-in so legacy clients that
-    /// don't trade in auctions don't pay the bandwidth.</summary>
-    Auction = 0x80,
-    /// <summary>Legacy convenience: Book + Info. Kept stable for compatibility;
-    /// does NOT include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction.</summary>
-    All = Book | Info,
-    /// <summary>Convenience alias for "every data class": Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
-}
-
-/// <summary>
-/// Binary serialization for the WebSocket protocol.
-/// All messages have a 4-byte framing header: [u16 messageLength][u16 messageType].
-/// messageLength includes the header itself.
+/// Binary serialization for the WebSocket protocol v2. Every message begins with
+/// the shared 8-byte framing header <c>[u32 length][u16 type][u16 headerFlags]</c>
+/// (see <see cref="WireFrame"/>); <c>length</c> includes the header itself.
+/// Enums (<see cref="MessageType"/>, <see cref="DataFlags"/>,
+/// <see cref="ServerCapabilities"/>, <see cref="SubscribeErrorCode"/>) live in the
+/// shared <c>B3.MarketData.Wire</c> assembly so the server and SDK cannot drift.
 /// </summary>
 public static class WireProtocol
 {
-    public const int FramingHeaderSize = 4;
+    public const int FramingHeaderSize = WireV2.HeaderSize;
 
-    public static void WriteFramingHeader(Span<byte> dest, ushort totalLength, MessageType type)
-    {
-        BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLength);
-        BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)type);
-    }
+    public static void WriteFramingHeader(Span<byte> dest, int totalLength, MessageType type)
+        => WireFrame.WriteHeader(dest, totalLength, type);
 
-    public static bool TryReadFramingHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
+    /// <summary>Read the v2 framing header. Returns false when the buffer is too
+    /// short OR the frame carries any header flag this build does not understand
+    /// (an unknown flag may change payload interpretation, e.g. compression, so it
+    /// MUST NOT be parsed as a plain frame).</summary>
+    public static bool TryReadFramingHeader(ReadOnlySpan<byte> src, out uint length, out MessageType type)
     {
-        if (src.Length < FramingHeaderSize)
+        if (!WireFrame.TryReadHeader(src, out length, out type, out var headerFlags)
+            || headerFlags != HeaderFlags.None)
         {
             length = 0;
             type = 0;
             return false;
         }
-        length = BinaryPrimitives.ReadUInt16LittleEndian(src);
-        type = (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(src[2..]);
         return true;
     }
 
     // --- Client → Server ---
 
     /// <summary>
-    /// Parse a Subscribe message. Returns symbol and data flags.
-    /// Format: [flags 1B][symbolLen 1B][symbol...].
+    /// Parse a Subscribe message (payload = everything after the 8-byte header).
+    /// Format: <c>[flags u32][symbolLen u8][symbol…]</c>. Unknown flag bits are
+    /// masked off (skip-unknown): the server only honours channels it knows about
+    /// and echoes the accepted set back in <see cref="MessageType.SubscribeOk"/>.
     /// </summary>
     public static (string symbol, DataFlags flags) ReadSubscribe(ReadOnlySpan<byte> payload)
     {
-        var flags = (DataFlags)payload[0];
+        var flags = (DataFlags)BinaryPrimitives.ReadUInt32LittleEndian(payload) & DataFlags.AllKnown;
         if (flags == DataFlags.None) flags = DataFlags.All; // treat 0 as "all"
-        byte symbolLen = payload[1];
-        var symbol = Encoding.UTF8.GetString(payload.Slice(2, symbolLen));
+        byte symbolLen = payload[4];
+        var symbol = Encoding.UTF8.GetString(payload.Slice(5, symbolLen));
         return (symbol, flags);
     }
 
@@ -296,151 +61,76 @@ public static class WireProtocol
 
     // --- Server → Client ---
 
-    /// <summary>Write ServerStatus: 1-byte ready flag. Total: 5 bytes.</summary>
+    /// <summary>Write ServerStatus: 1-byte ready flag. Total: 9 bytes.</summary>
     public static int WriteServerStatus(Span<byte> dest, bool ready)
-    {
-        const ushort totalLen = FramingHeaderSize + 1;
-        WriteFramingHeader(dest, totalLen, MessageType.ServerStatus);
-        dest[4] = ready ? (byte)1 : (byte)0;
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new ServerStatusFrame(ready));
 
-    /// <summary>Write SubscribeOk: securityId + flags + symbol.</summary>
+    /// <summary>Write SubscribeOk: <c>[secId u64][flags u32][symLen u8][symbol…]</c>.</summary>
     public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, DataFlags flags, string symbol)
     {
-        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[14..]);
-        ushort totalLen = (ushort)(FramingHeaderSize + 8 + 1 + 1 + symbolLen);
+        int o = FramingHeaderSize;
+        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(o + 8 + 4 + 1)..]);
+        int totalLen = o + 8 + 4 + 1 + symbolLen;
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeOk);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        dest[12] = (byte)flags;
-        dest[13] = (byte)symbolLen;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[o..], securityId); o += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)flags); o += 4;
+        dest[o] = (byte)symbolLen;
         return totalLen;
     }
 
-    /// <summary>Write SubscribeError: errorCode + symbol.</summary>
+    /// <summary>Write SubscribeError: <c>[errCode u8][symLen u8][symbol…]</c>.</summary>
     public static int WriteSubscribeError(Span<byte> dest, SubscribeErrorCode errorCode, string symbol)
     {
-        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[6..]);
-        ushort totalLen = (ushort)(FramingHeaderSize + 1 + 1 + symbolLen);
+        int o = FramingHeaderSize;
+        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(o + 2)..]);
+        int totalLen = o + 2 + symbolLen;
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeError);
-        dest[4] = (byte)errorCode;
-        dest[5] = (byte)symbolLen;
+        dest[o] = (byte)errorCode;
+        dest[o + 1] = (byte)symbolLen;
         return totalLen;
     }
 
     /// <summary>Write Unsubscribed: securityId.</summary>
     public static int WriteUnsubscribed(Span<byte> dest, ulong securityId)
-    {
-        const ushort totalLen = FramingHeaderSize + 8;
-        WriteFramingHeader(dest, totalLen, MessageType.Unsubscribed);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new SecurityIdFrame(MessageType.Unsubscribed, securityId));
 
     /// <summary>Write OrderAdded/Updated: securityId, orderId, side, price, qty.</summary>
     public static int WriteOrderEvent(Span<byte> dest, MessageType type, ulong securityId, ulong orderId, byte side, long price, long qty)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 8 + 1 + 8 + 8; // 37
-        WriteFramingHeader(dest, totalLen, type);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], orderId); offset += 8;
-        dest[offset++] = side;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], qty);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new OrderEventFrame(type, securityId, orderId, price, qty, side));
 
     /// <summary>Write OrderDeleted: securityId, orderId, side.</summary>
     public static int WriteOrderDeleted(Span<byte> dest, ulong securityId, ulong orderId, byte side)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 8 + 1; // 21
-        WriteFramingHeader(dest, totalLen, MessageType.OrderDeleted);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], orderId); offset += 8;
-        dest[offset] = side;
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new OrderDeletedFrame(securityId, orderId, side));
 
     /// <summary>
     /// Write Trade: securityId, price, qty, tradeId, flags.
-    /// Wire layout: <c>[hdr 4][secId 8][price 8][qty 8][tradeId 8][flags 1]</c> = 37 bytes.
-    /// The trailing <paramref name="flags"/> byte (default 0) carries
-    /// <see cref="B3.Umdf.Book.TradeFlags"/> bits. Older clients that read the
-    /// previous 36-byte layout simply ignore the trailing byte — the framing
-    /// header always reports the true length so frame alignment stays intact.
+    /// Wire layout (v2): <c>[hdr 8][secId 8][price 8][qty 8][tradeId 8][flags 1]</c> = 41 bytes.
+    /// The trailing <paramref name="flags"/> byte carries <see cref="B3.Umdf.Book.TradeFlags"/>
+    /// bits. Per the min-length rule, future fields are appended and older decoders
+    /// ignore trailing bytes.
     /// </summary>
     public static int WriteTrade(Span<byte> dest, ulong securityId, long price, long qty, long tradeId, byte flags = 0)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 8 + 8 + 8 + 1; // 37
-        WriteFramingHeader(dest, totalLen, MessageType.Trade);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], qty); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId); offset += 8;
-        dest[offset] = flags;
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new TradeFrame(securityId, price, qty, tradeId, flags));
 
     /// <summary>Write TradeBust: securityId + tradeId.</summary>
     public static int WriteTradeBust(Span<byte> dest, ulong securityId, long tradeId)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 8; // 20
-        WriteFramingHeader(dest, totalLen, MessageType.TradeBust);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], tradeId);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new TradeBustFrame(securityId, tradeId));
 
     /// <summary>Write MarketTierUpdate: securityId + side + aggregate qty + order count.</summary>
     public static int WriteMarketTierUpdate(Span<byte> dest, ulong securityId, byte side, long totalQty, int orderCount)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 1 + 8 + 4; // 25
-        WriteFramingHeader(dest, totalLen, MessageType.MarketTierUpdate);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        dest[offset++] = side;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount));
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new MarketTierUpdateFrame(securityId, side, totalQty, checked((uint)orderCount)));
 
-    /// <summary>
-    /// Write LevelUpdate (MBP incremental). Layout:
-    /// header(4) + securityId(8) + side(1) + price(8) + totalQty(8) + orderCount(4) = 33 bytes.
-    /// </summary>
-    public const int LevelUpdateSize = FramingHeaderSize + 8 + 1 + 8 + 8 + 4;
+    /// <summary>Total bytes of a <see cref="MessageType.LevelUpdate"/> frame.</summary>
+    public const int LevelUpdateSize = LevelUpdateFrame.WireSize;
+    /// <summary>Write LevelUpdate (MBP incremental).</summary>
     public static int WriteLevelUpdate(Span<byte> dest, ulong securityId, byte side, long price, long totalQty, int orderCount)
-    {
-        const ushort totalLen = LevelUpdateSize;
-        WriteFramingHeader(dest, totalLen, MessageType.LevelUpdate);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        dest[offset++] = side;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price); offset += 8;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], totalQty); offset += 8;
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], checked((uint)orderCount));
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new LevelUpdateFrame(securityId, side, price, totalQty, checked((uint)orderCount)));
 
-    /// <summary>
-    /// Write LevelDeleted (MBP incremental). Layout:
-    /// header(4) + securityId(8) + side(1) + price(8) = 21 bytes.
-    /// </summary>
-    public const int LevelDeletedSize = FramingHeaderSize + 8 + 1 + 8;
+    /// <summary>Total bytes of a <see cref="MessageType.LevelDeleted"/> frame.</summary>
+    public const int LevelDeletedSize = LevelDeletedFrame.WireSize;
+    /// <summary>Write LevelDeleted (MBP incremental).</summary>
     public static int WriteLevelDeleted(Span<byte> dest, ulong securityId, byte side, long price)
-    {
-        const ushort totalLen = LevelDeletedSize;
-        WriteFramingHeader(dest, totalLen, MessageType.LevelDeleted);
-        int offset = FramingHeaderSize;
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
-        dest[offset++] = side;
-        BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], price);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new LevelDeletedFrame(securityId, side, price));
 
     /// <summary>
     /// Per-level entry size inside <see cref="MessageType.LevelSnapshot"/>:
@@ -460,7 +150,7 @@ public static class WireProtocol
     /// </summary>
     public static int WriteLevelSnapshotHeader(Span<byte> dest, ulong securityId, ushort bidCount, ushort askCount)
     {
-        ushort totalLen = (ushort)LevelSnapshotSize(bidCount, askCount);
+        int totalLen = LevelSnapshotSize(bidCount, askCount);
         WriteFramingHeader(dest, totalLen, MessageType.LevelSnapshot);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
@@ -480,20 +170,14 @@ public static class WireProtocol
 
     /// <summary>Write BookCleared: securityId + clearSide byte.</summary>
     public static int WriteBookCleared(Span<byte> dest, ulong securityId, byte clearSide)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 1; // 13
-        WriteFramingHeader(dest, totalLen, MessageType.BookCleared);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        dest[12] = clearSide;
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new BookClearedFrame(securityId, clearSide));
 
     /// <summary>
     /// Current server-side wire protocol version. Bumped only on a breaking change to
     /// the framing or to the semantics of an existing <see cref="MessageType"/>.
     /// Additive new MessageTypes do NOT bump this field.
     /// </summary>
-    public const uint ProtocolVersion = 1;
+    public const uint ProtocolVersion = WireV2.ProtocolVersion;
 
     /// <summary>
     /// Minimum protocol version the server can speak with a client. A
@@ -503,35 +187,33 @@ public static class WireProtocol
     /// distinct constant so the negotiation path is shaped correctly for the day
     /// the server bumps <see cref="SupportedProtocolVersionMax"/>.
     /// </summary>
-    public const uint SupportedProtocolVersionMin = 1;
+    public const uint SupportedProtocolVersionMin = WireV2.SupportedProtocolVersionMin;
 
     /// <summary>
     /// Maximum protocol version the server can speak with a client. Mirrors
     /// <see cref="ProtocolVersion"/> today; future server releases that gain a new
     /// wire format should bump <see cref="ProtocolVersion"/> + this constant.
     /// </summary>
-    public const uint SupportedProtocolVersionMax = ProtocolVersion;
+    public const uint SupportedProtocolVersionMax = WireV2.SupportedProtocolVersionMax;
 
     /// <summary>
-    /// Total bytes of a <see cref="MessageType.ClientHello"/> frame: header(4) + version(4).
+    /// Total bytes of a <see cref="MessageType.ClientHello"/> frame:
+    /// header(8) + protocolVersion(4) + clientCapabilities(4) = 16.
     /// </summary>
-    public const int ClientHelloSize = FramingHeaderSize + 4;
+    public const int ClientHelloSize = ClientHelloFrame.WireSize;
 
     /// <summary>
-    /// Write a <see cref="MessageType.ClientHello"/> frame: <c>[u32 protocolVersion]</c>.
-    /// Used by the C# SDK (and tests) to advertise the version the client intends to speak.
+    /// Write a <see cref="MessageType.ClientHello"/> frame:
+    /// <c>[u32 protocolVersion][u32 clientCapabilities]</c>. Used by the C# SDK
+    /// (and tests) to advertise the version and features the client speaks.
     /// </summary>
-    public static int WriteClientHello(Span<byte> dest, uint protocolVersion)
-    {
-        const ushort totalLen = ClientHelloSize;
-        WriteFramingHeader(dest, totalLen, MessageType.ClientHello);
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[FramingHeaderSize..], protocolVersion);
-        return totalLen;
-    }
+    public static int WriteClientHello(Span<byte> dest, uint protocolVersion, ClientCapabilities capabilities = ClientCapabilities.None)
+        => WireFrame.Write(dest, new ClientHelloFrame(protocolVersion, capabilities));
 
     /// <summary>
-    /// Parse a <see cref="MessageType.ClientHello"/> payload (everything after the 4-byte
-    /// framing header). Returns the version the client claims to support.
+    /// Parse a <see cref="MessageType.ClientHello"/> payload (everything after the
+    /// 8-byte framing header). Returns the version the client claims to support;
+    /// trailing capability bytes are read separately / ignored (min-length rule).
     /// </summary>
     public static uint ReadClientHello(ReadOnlySpan<byte> payload)
         => BinaryPrimitives.ReadUInt32LittleEndian(payload);
@@ -539,7 +221,7 @@ public static class WireProtocol
 
     /// <summary>
     /// Maximum buffer needed for a <see cref="MessageType.ServerHello"/> frame:
-    /// header(4) + protocolVersion(4) + capabilities(4) + buildVerLen(1) + 255 UTF-8 bytes.
+    /// header(8) + protocolVersion(4) + capabilities(4) + buildVerLen(1) + 255 UTF-8 bytes.
     /// </summary>
     public const int ServerHelloMaxSize = FramingHeaderSize + 4 + 4 + 1 + 255;
 
@@ -566,18 +248,19 @@ public static class WireProtocol
             Array.Copy(encoded, trimmed, 255);
             encoded = trimmed;
         }
-        ushort totalLen = (ushort)(FramingHeaderSize + 4 + 4 + 1 + encoded.Length);
+        int o = FramingHeaderSize;
+        int totalLen = o + 4 + 4 + 1 + encoded.Length;
         WriteFramingHeader(dest, totalLen, MessageType.ServerHello);
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[4..], protocolVersion);
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[8..], (uint)capabilities);
-        dest[12] = (byte)encoded.Length;
-        encoded.CopyTo(dest[13..]);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], protocolVersion); o += 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)capabilities); o += 4;
+        dest[o] = (byte)encoded.Length; o += 1;
+        encoded.CopyTo(dest[o..]);
         return totalLen;
     }
 
     /// <summary>
     /// Parse a <see cref="MessageType.ServerHello"/> payload (everything after the
-    /// 4-byte framing header). Returns the negotiated tuple. Used by the C# client
+    /// 8-byte framing header). Returns the negotiated tuple. Used by the C# client
     /// SDK and useful to round-trip in tests.
     /// </summary>
     public static (uint ProtocolVersion, ServerCapabilities Capabilities, string BuildVersion) ReadServerHello(
@@ -592,29 +275,17 @@ public static class WireProtocol
 
     /// <summary>
     /// Write a <see cref="MessageType.SymbolDelisted"/> frame: <c>[securityId u64]</c>.
-    /// Total: 12 bytes. Sent once per subscriber when a security is delisted.
+    /// Total: 16 bytes. Sent once per subscriber when a security is delisted.
     /// </summary>
     public static int WriteSymbolDelisted(Span<byte> dest, ulong securityId)
-    {
-        const ushort totalLen = FramingHeaderSize + 8; // 12
-        WriteFramingHeader(dest, totalLen, MessageType.SymbolDelisted);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new SecurityIdFrame(MessageType.SymbolDelisted, securityId));
 
     /// <summary>
-    /// Write SymbolStaleStatus: securityId + isStale byte.
-    /// Total: 13 bytes. Pushed when a subscribed security flips between
-    /// Healthy and Stale.
+    /// Write SymbolStaleStatus: securityId + isStale byte. Total: 17 bytes. Pushed
+    /// when a subscribed security flips between Healthy and Stale.
     /// </summary>
     public static int WriteSymbolStaleStatus(Span<byte> dest, ulong securityId, bool isStale)
-    {
-        const ushort totalLen = FramingHeaderSize + 8 + 1; // 13
-        WriteFramingHeader(dest, totalLen, MessageType.SymbolStaleStatus);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        dest[12] = isStale ? (byte)1 : (byte)0;
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new SymbolStaleStatusFrame(securityId, isStale));
 
     /// <summary>
     /// Max buffer size for RecoveryProgress: header(4) + totals(8) + kindCount(1)
@@ -649,7 +320,7 @@ public static class WireProtocol
             kindCount++;
         }
         dest[kindCountOffset] = kindCount;
-        WriteFramingHeader(dest, (ushort)offset, MessageType.RecoveryProgress);
+        WriteFramingHeader(dest, offset, MessageType.RecoveryProgress);
         return offset;
     }
 
@@ -730,7 +401,7 @@ public static class WireProtocol
         if (info.AuctionImbalanceCondition is { } v24) { mask |= 1u << FieldAuctionImbalanceCondition; BinaryPrimitives.WriteInt64LittleEndian(dest[offset..], v24); offset += 8; }
 
         // Write framing header, securityId, and mask
-        ushort totalLen = (ushort)offset;
+        int totalLen = offset;
         WriteFramingHeader(dest, totalLen, MessageType.InfoSnapshot);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[FramingHeaderSize..], securityId);
         BinaryPrimitives.WriteUInt32LittleEndian(dest[(FramingHeaderSize + 8)..], mask);
@@ -754,7 +425,7 @@ public static class WireProtocol
     /// </summary>
     public static int WriteBookSnapshotHeader(Span<byte> dest, ulong securityId, uint rptSeq, ushort bidCount, ushort askCount)
     {
-        ushort totalLen = (ushort)BookSnapshotSize(bidCount, askCount);
+        int totalLen = BookSnapshotSize(bidCount, askCount);
         WriteFramingHeader(dest, totalLen, MessageType.BookSnapshot);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
@@ -791,7 +462,7 @@ public static class WireProtocol
         offset = WriteRankingCategory(dest, offset, gainers);
         offset = WriteRankingCategory(dest, offset, losers);
 
-        ushort totalLen = (ushort)offset;
+        int totalLen = offset;
         WriteFramingHeader(dest, totalLen, MessageType.RankingsUpdate);
         return totalLen;
     }
@@ -835,7 +506,7 @@ public static class WireProtocol
     /// </summary>
     internal static int WriteCandleSnapshot(Span<byte> dest, ulong securityId, int resolution, byte flags, ReadOnlySpan<Candle> candles)
     {
-        ushort totalLen = (ushort)(CandleSnapshotHeaderSize + candles.Length * CandleSize);
+        int totalLen = (CandleSnapshotHeaderSize + candles.Length * CandleSize);
         WriteFramingHeader(dest, totalLen, MessageType.CandleSnapshot);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
@@ -856,7 +527,7 @@ public static class WireProtocol
     /// </summary>
     internal static int WriteCandleUpdate(Span<byte> dest, ulong securityId, int resolution, in Candle candle)
     {
-        const ushort totalLen = (ushort)CandleUpdateMessageSize;
+        const int totalLen = CandleUpdateMessageSize;
         WriteFramingHeader(dest, totalLen, MessageType.CandleUpdate);
         int offset = FramingHeaderSize;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
@@ -927,7 +598,7 @@ public static class WireProtocol
         uint totalTextLen,
         uint totalUrlLen)
     {
-        const ushort totalLen = (ushort)NewsBeginTotalSize;
+        const int totalLen = NewsBeginTotalSize;
         WriteFramingHeader(dest, totalLen, MessageType.NewsBegin);
         int o = FramingHeaderSize;
         dest[o++] = NewsFrameVersion;
@@ -957,7 +628,7 @@ public static class WireProtocol
     {
         if (fragment.Length > NewsChunkMaxFragment)
             throw new ArgumentOutOfRangeException(nameof(fragment), $"News fragment exceeds {NewsChunkMaxFragment} bytes");
-        ushort totalLen = (ushort)(FramingHeaderSize + NewsChunkHeaderSize + fragment.Length);
+        int totalLen = (FramingHeaderSize + NewsChunkHeaderSize + fragment.Length);
         WriteFramingHeader(dest, totalLen, isFinal ? MessageType.NewsEnd : MessageType.NewsChunk);
         int o = FramingHeaderSize;
         dest[o++] = NewsFrameVersion;
@@ -1150,7 +821,7 @@ public static class WireProtocol
 
         BinaryPrimitives.WriteUInt32LittleEndian(dest[stringMaskOffset..], stringMask);
 
-        ushort totalLen = (ushort)offset;
+        int totalLen = offset;
         WriteFramingHeader(dest, totalLen, MessageType.SecurityDefinition);
         return totalLen;
     }
@@ -1255,7 +926,7 @@ public static class WireProtocol
 
         BinaryPrimitives.WriteUInt32LittleEndian(dest[maskOffset..], mask);
 
-        ushort totalLen = (ushort)offset;
+        int totalLen = offset;
         WriteFramingHeader(dest, totalLen, MessageType.PriceBand);
         return totalLen;
     }
@@ -1325,7 +996,7 @@ public static class WireProtocol
 
         dest[maskOffset] = mask;
 
-        ushort totalLen = (ushort)offset;
+        int totalLen = offset;
         WriteFramingHeader(dest, totalLen, MessageType.Auction);
         return totalLen;
     }

@@ -554,9 +554,9 @@ function connect(url) {
     const buf = evt.data;
     const view = new DataView(buf);
     let offset = 0;
-    while (offset + 4 <= buf.byteLength) {
-      const len = view.getUint16(offset, true);
-      if (len < 4 || offset + len > buf.byteLength) break;
+    while (offset + 8 <= buf.byteLength) {
+      const len = view.getUint32(offset, true);
+      if (len < 8 || offset + len > buf.byteLength) break;
       stats.msgs++;
       const msg = parseMessage(buf, offset, len);
       if (msg) handleMessage(msg);

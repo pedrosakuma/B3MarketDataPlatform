@@ -11,8 +11,8 @@ namespace B3.Umdf.Server.Tests;
 /// </summary>
 public class WireProtocolAuctionTests
 {
-    private static (ushort length, MessageType type) ReadFraming(Span<byte> buf) =>
-        (BinaryPrimitives.ReadUInt16LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]));
+    private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
+        ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 
     [Fact]
     public void WriteAuction_MessageTypeIs0x00B2()
@@ -126,7 +126,7 @@ public class WireProtocolAuctionTests
     [Fact]
     public void DataFlags_Auction_IsInEverythingButNotAll()
     {
-        Assert.True(DataFlags.Everything.HasFlag(DataFlags.Auction));
+        Assert.True(DataFlags.AllKnown.HasFlag(DataFlags.Auction));
         Assert.False(DataFlags.All.HasFlag(DataFlags.Auction));
         Assert.Equal((byte)0x80, (byte)DataFlags.Auction);
     }
@@ -135,6 +135,6 @@ public class WireProtocolAuctionTests
     public void DataFlags_Everything_Is0xFF()
     {
         // After adding Auction (0x80), Everything should be all bits set.
-        Assert.Equal((byte)0xFF, (byte)DataFlags.Everything);
+        Assert.Equal((byte)0xFF, (byte)DataFlags.AllKnown);
     }
 }

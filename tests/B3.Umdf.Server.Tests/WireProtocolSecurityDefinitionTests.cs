@@ -12,8 +12,8 @@ namespace B3.Umdf.Server.Tests;
 /// </summary>
 public class WireProtocolSecurityDefinitionTests
 {
-    private static (ushort length, MessageType type) ReadFraming(Span<byte> buf) =>
-        (BinaryPrimitives.ReadUInt16LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]));
+    private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
+        ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 
     [Fact]
     public void WriteSecurityDefinition_MessageTypeIs0x00B0()
@@ -111,7 +111,7 @@ public class WireProtocolSecurityDefinitionTests
     [Fact]
     public void DataFlags_SecurityDefinition_IsInEverythingButNotInAll()
     {
-        Assert.True(DataFlags.Everything.HasFlag(DataFlags.SecurityDefinition));
+        Assert.True(DataFlags.AllKnown.HasFlag(DataFlags.SecurityDefinition));
         Assert.False(DataFlags.All.HasFlag(DataFlags.SecurityDefinition));
         Assert.Equal((byte)0x20, (byte)DataFlags.SecurityDefinition);
     }

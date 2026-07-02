@@ -1,18 +1,20 @@
 using System.Buffers.Binary;
 using System.Text;
+using B3.MarketData.Wire;
 
 namespace B3.MarketData.WebSocketClient;
 
 /// <summary>
-/// Binary wire format for the B3MarketDataPlatform WebSocket protocol.
-/// Mirrors a minimal subset of the server's <c>WireProtocol</c> + the
-/// <c>MessageType</c> enum, just for the v1 SDK surface.
-/// Layout: <c>[length u16][type u16][payload]</c>, little-endian; length
-/// includes the 4-byte header.
+/// Binary wire format (v2) for the B3MarketDataPlatform WebSocket protocol.
+/// Framing and the <see cref="MessageType"/> / <see cref="DataFlags"/> enums plus
+/// the blittable fixed-frame structs come from the shared <c>B3.MarketData.Wire</c>
+/// assembly so this SDK cannot drift from the server. Layout:
+/// <c>[u32 length][u16 type][u16 headerFlags][payload]</c>, little-endian; length
+/// includes the 8-byte header.
 /// </summary>
 internal static class WireFormat
 {
-    public const int FramingHeaderSize = 4;
+    public const int FramingHeaderSize = WireV2.HeaderSize;
 
     /// <summary>SBE schema's <c>Price</c>/<c>PriceOptional</c> exponent (1e-4).</summary>
     public const decimal PriceScale = 10_000m;
@@ -20,42 +22,6 @@ internal static class WireFormat
     /// <summary>SBE schema's <c>Fixed8</c> exponent (1e-8) — used by
     /// <c>SecurityDefinition_12.MinPriceIncrement</c>.</summary>
     public const decimal PriceScale8 = 100_000_000m;
-
-    public enum MessageType : ushort
-    {
-        Subscribe = 0x0001,
-        Unsubscribe = 0x0002,
-        SubscribeOk = 0x0010,
-        SubscribeError = 0x0011,
-        Unsubscribed = 0x0012,
-        BookSnapshot = 0x0020,
-        InfoSnapshot = 0x0021,
-        LevelSnapshot = 0x0022,
-        OrderAdded = 0x0030,
-        OrderUpdated = 0x0031,
-        OrderDeleted = 0x0032,
-        Trade = 0x0033,
-        BookCleared = 0x0034,
-        TradeBust = 0x0035,
-        MarketTierUpdate = 0x0036,
-        LevelUpdate = 0x0037,
-        LevelDeleted = 0x0038,
-        RankingsUpdate = 0x0040,
-        ServerStatus = 0x0050,
-        CandleSnapshot = 0x0060,
-        CandleUpdate = 0x0061,
-        SymbolStaleStatus = 0x0070,
-        SymbolDelisted = 0x0071,
-        RecoveryProgress = 0x0080,
-        NewsBegin = 0x0090,
-        NewsChunk = 0x0091,
-        NewsEnd = 0x0092,
-        ServerHello = 0x00A0,
-        ClientHello = 0x00A1,
-        SecurityDefinition = 0x00B0,
-        PriceBand = 0x00B1,
-        Auction = 0x00B2,
-    }
 
     // InfoSnapshot field-mask bit positions. Must match the server's
     // WireProtocol field constants (Field*). Only the bits the SDK
@@ -138,16 +104,15 @@ internal static class WireFormat
     public const int AuctionFieldAsOfTimestampNanos = 4;
     public const int AuctionFieldRptSeq = 5;
 
-    public static bool TryReadHeader(ReadOnlySpan<byte> src, out ushort length, out MessageType type)
+    public static bool TryReadHeader(ReadOnlySpan<byte> src, out uint length, out MessageType type)
     {
-        if (src.Length < FramingHeaderSize)
+        if (!WireFrame.TryReadHeader(src, out length, out type, out var headerFlags)
+            || headerFlags != HeaderFlags.None)
         {
             length = 0;
             type = 0;
             return false;
         }
-        length = BinaryPrimitives.ReadUInt16LittleEndian(src);
-        type = (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(src[2..]);
         return true;
     }
 
@@ -156,46 +121,35 @@ internal static class WireFormat
     /// on every (re)connect; servers that do not understand the version close the
     /// connection with WS code 1003.
     /// </summary>
-    public const uint ProtocolVersion = 1;
+    public const uint ProtocolVersion = WireV2.ProtocolVersion;
 
-    /// <summary>Encode a <c>ClientHello</c> frame: <c>[u32 protocolVersion]</c>.</summary>
-    public static int WriteClientHello(Span<byte> dest, uint protocolVersion)
-    {
-        const ushort totalLen = FramingHeaderSize + 4;
-        BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)MessageType.ClientHello);
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[FramingHeaderSize..], protocolVersion);
-        return totalLen;
-    }
+    /// <summary>Encode a <c>ClientHello</c> frame:
+    /// <c>[u32 protocolVersion][u32 clientCapabilities]</c> (16 bytes).</summary>
+    public static int WriteClientHello(Span<byte> dest, uint protocolVersion, ClientCapabilities capabilities = ClientCapabilities.None)
+        => WireFrame.Write(dest, new ClientHelloFrame(protocolVersion, capabilities));
 
-    /// <summary>Encode a <c>Subscribe</c> frame: <c>[flags u8][symLen u8][symbol UTF-8…]</c>.</summary>
+    /// <summary>Encode a <c>Subscribe</c> frame: <c>[flags u32][symLen u8][symbol UTF-8…]</c>.</summary>
     public static int WriteSubscribe(Span<byte> dest, SubscribeFlags flags, string symbol)
     {
-        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(FramingHeaderSize + 2)..]);
-        ushort totalLen = (ushort)(FramingHeaderSize + 1 + 1 + symbolLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)MessageType.Subscribe);
-        dest[FramingHeaderSize] = (byte)flags;
-        dest[FramingHeaderSize + 1] = (byte)symbolLen;
+        int o = FramingHeaderSize;
+        int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(o + 4 + 1)..]);
+        int totalLen = o + 4 + 1 + symbolLen;
+        WireFrame.WriteHeader(dest, totalLen, MessageType.Subscribe);
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)flags);
+        dest[o + 4] = (byte)symbolLen;
         return totalLen;
     }
 
     /// <summary>Encode an <c>Unsubscribe</c> frame: <c>[securityId u64]</c>.</summary>
     public static int WriteUnsubscribe(Span<byte> dest, ulong securityId)
-    {
-        const ushort totalLen = FramingHeaderSize + 8;
-        BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)MessageType.Unsubscribe);
-        BinaryPrimitives.WriteUInt64LittleEndian(dest[FramingHeaderSize..], securityId);
-        return totalLen;
-    }
+        => WireFrame.Write(dest, new SecurityIdFrame(MessageType.Unsubscribe, securityId));
 
-    public static (ulong SecurityId, byte Flags, string Symbol) ReadSubscribeOk(ReadOnlySpan<byte> payload)
+    public static (ulong SecurityId, uint Flags, string Symbol) ReadSubscribeOk(ReadOnlySpan<byte> payload)
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
-        byte flags = payload[8];
-        byte symLen = payload[9];
-        string sym = Encoding.UTF8.GetString(payload.Slice(10, symLen));
+        uint flags = BinaryPrimitives.ReadUInt32LittleEndian(payload[8..]);
+        byte symLen = payload[12];
+        string sym = Encoding.UTF8.GetString(payload.Slice(13, symLen));
         return (secId, flags, sym);
     }
 
@@ -608,9 +562,9 @@ internal static class WireFormat
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
         ulong orderId = BinaryPrimitives.ReadUInt64LittleEndian(payload[8..]);
-        byte side = payload[16];
-        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[17..]);
-        long qty = BinaryPrimitives.ReadInt64LittleEndian(payload[25..]);
+        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[16..]);
+        long qty = BinaryPrimitives.ReadInt64LittleEndian(payload[24..]);
+        byte side = payload[32];
         return (secId, orderId, side, price, qty);
     }
 
@@ -635,9 +589,9 @@ internal static class WireFormat
     public static (ulong SecurityId, byte Side, long TotalQty, int OrderCount) ReadMarketTierUpdate(ReadOnlySpan<byte> payload)
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
-        byte side = payload[8];
-        long totalQty = BinaryPrimitives.ReadInt64LittleEndian(payload[9..]);
-        int orderCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[17..]);
+        long totalQty = BinaryPrimitives.ReadInt64LittleEndian(payload[8..]);
+        int orderCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[16..]);
+        byte side = payload[20];
         return (secId, side, totalQty, orderCount);
     }
 
@@ -699,10 +653,10 @@ internal static class WireFormat
     public static (ulong SecurityId, byte Side, long Price, long TotalQty, int OrderCount) ReadLevelUpdate(ReadOnlySpan<byte> payload)
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
-        byte side = payload[8];
-        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[9..]);
-        long totalQty = BinaryPrimitives.ReadInt64LittleEndian(payload[17..]);
-        int orderCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[25..]);
+        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[8..]);
+        long totalQty = BinaryPrimitives.ReadInt64LittleEndian(payload[16..]);
+        int orderCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[24..]);
+        byte side = payload[28];
         return (secId, side, price, totalQty, orderCount);
     }
 
@@ -710,8 +664,8 @@ internal static class WireFormat
     public static (ulong SecurityId, byte Side, long Price) ReadLevelDeleted(ReadOnlySpan<byte> payload)
     {
         ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
-        byte side = payload[8];
-        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[9..]);
+        long price = BinaryPrimitives.ReadInt64LittleEndian(payload[8..]);
+        byte side = payload[16];
         return (secId, side, price);
     }
 

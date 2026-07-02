@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using B3.Umdf.Book;
 using B3.Umdf.Server;
 
@@ -29,8 +30,8 @@ public class AuctionWireRoundTripTests
         int len = B3.Umdf.Server.WireProtocol.WriteAuction(buf, securityId: 42UL, info);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var hLen, out var type));
-        Assert.Equal(len, hLen);
-        Assert.Equal(WireFormat.MessageType.Auction, type);
+        Assert.Equal((uint)len, hLen);
+        Assert.Equal(MessageType.Auction, type);
 
         var ev = WireFormat.ReadAuction(
             buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize),

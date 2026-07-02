@@ -798,7 +798,7 @@ public sealed class ClientSession : IDisposable
     public async IAsyncEnumerable<(MessageType type, ReadOnlyMemory<byte> payload)> ReadMessagesAsync(
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        // Max client message: header(4) + flags(1) + symbolLen(1) + symbol(255) = 261
+        // Max client message: header(8) + flags(4) + symbolLen(1) + symbol(255) = 268
         var buffer = new byte[512];
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _cts.Token);
 
@@ -823,9 +823,10 @@ public sealed class ClientSession : IDisposable
 
             var span = buffer.AsSpan(0, result.Count);
             if (!WireProtocol.TryReadFramingHeader(span, out var length, out var type)) continue;
-            if (length > result.Count) continue;
+            if (length > (uint)result.Count) continue;
 
-            var payload = buffer.AsMemory(WireProtocol.FramingHeaderSize, length - WireProtocol.FramingHeaderSize);
+            int payloadLen = (int)length - WireProtocol.FramingHeaderSize;
+            var payload = buffer.AsMemory(WireProtocol.FramingHeaderSize, payloadLen);
             yield return (type, payload);
         }
     }

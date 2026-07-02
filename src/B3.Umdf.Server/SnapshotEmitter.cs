@@ -53,7 +53,7 @@ internal static class SnapshotEmitter
     /// </summary>
     public static bool SendServerStatus(ClientSession session, bool ready)
     {
-        var buf = new byte[5];
+        var buf = new byte[9];
         WireProtocol.WriteServerStatus(buf, ready);
         return session.TryEnqueue(buf);
     }
@@ -225,7 +225,7 @@ internal static class SnapshotEmitter
             // subscribers must not see busted trades in their initial history;
             // live subscribers receive the bust via MessageType.TradeBust.
             if (slot.Busted != 0) continue;
-            var buf = new byte[37];
+            var buf = new byte[41];
             int len = WireProtocol.WriteTrade(buf, securityId, slot.Price, slot.Qty, slot.TradeId, slot.Flags);
             if (!session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len)))
                 return false;

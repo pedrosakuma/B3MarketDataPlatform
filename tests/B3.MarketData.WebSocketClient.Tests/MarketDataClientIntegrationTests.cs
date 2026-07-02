@@ -67,6 +67,41 @@ public class MarketDataClientIntegrationTests
     }
 
     [Fact]
+    public async Task CoalescedBatch_LargerThan64KiB_GrowsBufferAndDecodesAll()
+    {
+        // 2000 × 40-byte Trade frames = 80 000 bytes in a SINGLE WS message,
+        // exceeding the client's initial 64 KiB receive buffer and forcing a grow.
+        const int tradeCount = 2000;
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            var sym = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            await TestWsServer.SendSubscribeOkAsync(ws, securityId: 555, sym, ct);
+            await TestWsServer.SendCoalescedTradesAsync(ws, securityId: 555, tradeCount, ct);
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        int received = 0;
+        var all = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.Trade += _ =>
+        {
+            if (Interlocked.Increment(ref received) == tradeCount)
+                all.TrySetResult(true);
+        };
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+        await client.SubscribeAsync("PETR4");
+
+        await all.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal(tradeCount, Volatile.Read(ref received));
+    }
+
+    [Fact]
     public async Task SubscribeError_IsSurfacedAsTypedEvent()
     {
         var port = FindFreePort();
@@ -194,11 +229,11 @@ public class MarketDataClientIntegrationTests
 
             // Send an unknown opcode (0xFFFE) — payload is 4 trailing bytes — then a
             // valid Trade frame to assert the decoder kept going.
-            const ushort unknownTotal = 4 + 4;
+            const ushort unknownTotal = 8 + 4;
             var unknown = new byte[unknownTotal];
-            BinaryPrimitives.WriteUInt16LittleEndian(unknown, unknownTotal);
-            BinaryPrimitives.WriteUInt16LittleEndian(unknown.AsSpan(2), 0xFFFE);
-            BinaryPrimitives.WriteUInt32LittleEndian(unknown.AsSpan(4), 0xDEADBEEF);
+            BinaryPrimitives.WriteUInt32LittleEndian(unknown, unknownTotal);
+            BinaryPrimitives.WriteUInt16LittleEndian(unknown.AsSpan(4), 0xFFFE);
+            BinaryPrimitives.WriteUInt32LittleEndian(unknown.AsSpan(8), 0xDEADBEEF);
             await ws.SendAsync(unknown, WebSocketMessageType.Binary, true, ct);
 
             await TestWsServer.SendTradeAsync(ws, securityId: 42, price: 12345, qty: 100, tradeId: 1, ct);
@@ -330,71 +365,93 @@ internal sealed class TestWsServer : IAsyncDisposable
                 filled += result.Count;
             } while (!result.EndOfMessage);
 
-            // [len u16][type u16=0x0001][flags u8][symLen u8][symbol]
-            ushort len = BinaryPrimitives.ReadUInt16LittleEndian(buffer);
-            ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(2));
+            // v2: [len u32][type u16][flags u16][flags u32][symLen u8][symbol]
+            ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buffer.AsSpan(4));
             if (type == 0x00A1) continue; // ClientHello — ignore
             if (type != 0x0001) throw new InvalidOperationException($"expected Subscribe, got 0x{type:X4}");
-            byte symLen = buffer[5];
-            return Encoding.UTF8.GetString(buffer, 6, symLen);
+            byte symLen = buffer[12];
+            return Encoding.UTF8.GetString(buffer, 13, symLen);
         }
     }
 
     public static Task SendSubscribeOkAsync(WebSocket ws, ulong securityId, string symbol, CancellationToken ct)
     {
-        // [len u16][type u16=0x0010][secId u64][flags u8][symLen u8][symbol]
+        // v2: [len u32][type u16=0x0010][flags u16][secId u64][flags u32][symLen u8][symbol]
         var symBytes = Encoding.UTF8.GetBytes(symbol);
-        ushort total = (ushort)(4 + 8 + 1 + 1 + symBytes.Length);
+        ushort total = (ushort)(8 + 8 + 4 + 1 + symBytes.Length);
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0010);
-        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(4), securityId);
-        buf[12] = (byte)0x10; // Trades flag
-        buf[13] = (byte)symBytes.Length;
-        symBytes.CopyTo(buf, 14);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), 0x0010);
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(8), securityId);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(16), 0x10); // Trades flag
+        buf[20] = (byte)symBytes.Length;
+        symBytes.CopyTo(buf, 21);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 
     public static Task SendSubscribeErrorAsync(WebSocket ws, string symbol, byte errorCode, CancellationToken ct)
     {
-        // [len u16][type u16=0x0011][errorCode u8][symLen u8][symbol]
+        // v2: [len u32][type u16=0x0011][flags u16][errorCode u8][symLen u8][symbol]
         var symBytes = Encoding.UTF8.GetBytes(symbol);
-        ushort total = (ushort)(4 + 1 + 1 + symBytes.Length);
+        ushort total = (ushort)(8 + 1 + 1 + symBytes.Length);
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0011);
-        buf[4] = errorCode;
-        buf[5] = (byte)symBytes.Length;
-        symBytes.CopyTo(buf, 6);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), 0x0011);
+        buf[8] = errorCode;
+        buf[9] = (byte)symBytes.Length;
+        symBytes.CopyTo(buf, 10);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 
     public static Task SendTradeAsync(WebSocket ws, ulong securityId, long price, long qty, long tradeId, CancellationToken ct)
     {
-        // [len u16][type u16=0x0033][secId u64][price i64][qty i64][tradeId i64]
-        const ushort total = 4 + 8 + 8 + 8 + 8;
+        // v2: [len u32][type u16=0x0033][flags u16][secId u64][price i64][qty i64][tradeId i64]
+        const ushort total = 8 + 8 + 8 + 8 + 8;
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0033);
-        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(4), securityId);
-        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(12), price);
-        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(20), qty);
-        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(28), tradeId);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), 0x0033);
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(8), securityId);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(16), price);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(24), qty);
+        BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(32), tradeId);
+        return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    /// <summary>
+    /// Concatenate <paramref name="count"/> Trade frames into ONE WebSocket
+    /// binary message (server-style coalescing) and send it in a single
+    /// <c>SendAsync</c>. Used to exercise the client's grow-on-demand receive
+    /// buffer when a coalesced batch exceeds the initial 64 KiB.
+    /// </summary>
+    public static Task SendCoalescedTradesAsync(WebSocket ws, ulong securityId, int count, CancellationToken ct)
+    {
+        const int frameSize = 8 + 8 + 8 + 8 + 8; // 40-byte v2 Trade (flags omitted, min-length)
+        var buf = new byte[frameSize * count];
+        for (int i = 0; i < count; i++)
+        {
+            var f = buf.AsSpan(i * frameSize, frameSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(f, frameSize);
+            BinaryPrimitives.WriteUInt16LittleEndian(f[4..], 0x0033);
+            BinaryPrimitives.WriteUInt64LittleEndian(f[8..], securityId);
+            BinaryPrimitives.WriteInt64LittleEndian(f[16..], 100_000 + i);
+            BinaryPrimitives.WriteInt64LittleEndian(f[24..], 1);
+            BinaryPrimitives.WriteInt64LittleEndian(f[32..], i);
+        }
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 
     public static Task SendServerHelloAsync(WebSocket ws, uint protocolVersion, uint capabilities, string buildVersion, CancellationToken ct)
     {
-        // [len u16][type u16=0x00A0][protocolVersion u32][capabilities u32][buildVerLen u8][buildVer UTF-8…]
+        // v2: [len u32][type u16=0x00A0][flags u16][protocolVersion u32][capabilities u32][buildVerLen u8][buildVer UTF-8…]
         var buildBytes = Encoding.UTF8.GetBytes(buildVersion);
-        ushort total = (ushort)(4 + 4 + 4 + 1 + buildBytes.Length);
+        ushort total = (ushort)(8 + 4 + 4 + 1 + buildBytes.Length);
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x00A0);
-        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), protocolVersion);
-        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(8), capabilities);
-        buf[12] = (byte)buildBytes.Length;
-        buildBytes.CopyTo(buf, 13);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), 0x00A0);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(8), protocolVersion);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(12), capabilities);
+        buf[16] = (byte)buildBytes.Length;
+        buildBytes.CopyTo(buf, 17);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
     }
 
@@ -402,13 +459,13 @@ internal sealed class TestWsServer : IAsyncDisposable
         byte source, ushort language, long origTimeNanos,
         uint headlineLen, uint textLen, uint urlLen, CancellationToken ct)
     {
-        // [len u16][type u16=0x0090][version u8][secId u64][newsId u64][source u8][lang u16][origTime i64]
+        // v2: [len u32][type u16=0x0090][flags u16][version u8][secId u64][newsId u64][source u8][lang u16][origTime i64]
         // [hLen u32][tLen u32][uLen u32]
-        ushort total = (ushort)(4 + 1 + 8 + 8 + 1 + 2 + 8 + 4 + 4 + 4);
+        ushort total = (ushort)(8 + 1 + 8 + 8 + 1 + 2 + 8 + 4 + 4 + 4);
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), 0x0090);
-        int o = 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), 0x0090);
+        int o = 8;
         buf[o++] = 1; // version
         BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), securityIdOrZero); o += 8;
         BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), newsId); o += 8;
@@ -424,13 +481,13 @@ internal sealed class TestWsServer : IAsyncDisposable
     public static Task SendNewsChunkAsync(WebSocket ws, ulong newsId, byte fieldByte,
         byte[] fragment, bool isFinal, CancellationToken ct)
     {
-        // [len u16][type u16][version u8][newsId u64][field u8][fragLen u16][bytes]
+        // v2: [len u32][type u16][flags u16][version u8][newsId u64][field u8][fragLen u16][bytes]
         ushort opcode = isFinal ? (ushort)0x0092 : (ushort)0x0091;
-        ushort total = (ushort)(4 + 1 + 8 + 1 + 2 + fragment.Length);
+        ushort total = (ushort)(8 + 1 + 8 + 1 + 2 + fragment.Length);
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), opcode);
-        int o = 4;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), opcode);
+        int o = 8;
         buf[o++] = 1; // version
         BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(o), newsId); o += 8;
         buf[o++] = fieldByte;

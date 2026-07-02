@@ -5,6 +5,7 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj" />
+    <Project Path="src/B3.MarketData.Wire/B3.MarketData.Wire.csproj" />
     <Project Path="src/B3.Umdf.Book/B3.Umdf.Book.csproj" />
     <Project Path="src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj" />
     <Project Path="src/B3.Umdf.Feed/B3.Umdf.Feed.csproj" />

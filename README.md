@@ -43,8 +43,8 @@ straight from the B3 SBE XML schema.
   1 s candles), and 2 s rankings broadcast.
 - **News pipeline (`News_5`)** — multi-part SBE reassembly with strict per-part
   validation, 5 s TTL, 16 MiB inflight cap, and zero-copy span delivery.
-  Fragmented over the wire as `NewsBegin`/`NewsChunk`/`NewsEnd` so payloads
-  larger than the `u16` framing length still flow through the same client
+  Fragmented over the wire as `NewsBegin`/`NewsChunk`/`NewsEnd` so arbitrarily
+  large payloads still flow through the same client
   pipeline. (Note: zero `News_5` occurrences observed in 8 sample PCAPs;
   pipeline is verified via synthetic fixtures.)
 - **Layered backpressure** — bounded per-client outbound ring, hard

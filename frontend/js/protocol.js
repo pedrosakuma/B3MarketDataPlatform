@@ -78,23 +78,24 @@ const encoder = new TextEncoder();
 
 export function buildSubscribeOrGet(msgType, symbol, flags) {
   const symBytes = encoder.encode(symbol.toUpperCase().trim());
-  const totalLen = 4 + 1 + 1 + symBytes.length;
+  // v2: [len u32][type u16][headerFlags u16][flags u32][symLen u8][symbol]
+  const totalLen = 8 + 4 + 1 + symBytes.length;
   const buf = new ArrayBuffer(totalLen);
   const v = new DataView(buf);
-  v.setUint16(0, totalLen, true);
-  v.setUint16(2, msgType, true);
-  v.setUint8(4, flags);
-  v.setUint8(5, symBytes.length);
-  new Uint8Array(buf, 6).set(symBytes);
+  v.setUint32(0, totalLen, true);
+  v.setUint16(4, msgType, true);
+  v.setUint32(8, flags >>> 0, true);
+  v.setUint8(12, symBytes.length);
+  new Uint8Array(buf, 13).set(symBytes);
   return buf;
 }
 
 export function buildUnsubscribe(securityId) {
-  const buf = new ArrayBuffer(12);
+  const buf = new ArrayBuffer(16);
   const v = new DataView(buf);
-  v.setUint16(0, 12, true);
-  v.setUint16(2, MSG.UNSUBSCRIBE, true);
-  v.setBigUint64(4, securityId, true);
+  v.setUint32(0, 16, true);
+  v.setUint16(4, MSG.UNSUBSCRIBE, true);
+  v.setBigUint64(8, securityId, true);
   return buf;
 }
 
@@ -104,15 +105,15 @@ export function buildUnsubscribe(securityId) {
 const decoder = new TextDecoder();
 
 export function parseMessage(buf, baseOffset, msgLen) {
-  if (msgLen < 4) return null;
+  if (msgLen < 8) return null;
   const v = new DataView(buf, baseOffset, msgLen);
-  const type = v.getUint16(2, true);
-  let o = 4;
+  const type = v.getUint16(4, true);
+  let o = 8;
 
   switch (type) {
     case MSG.SUBSCRIBE_OK: {
       const securityId = v.getBigUint64(o, true); o += 8;
-      const flags = v.getUint8(o); o += 1;
+      const flags = v.getUint32(o, true); o += 4;
       const sLen = v.getUint8(o); o += 1;
       const symbol = decoder.decode(new Uint8Array(buf, baseOffset + o, sLen));
       return { type: 'SubscribeOk', securityId, flags, symbol };
@@ -146,11 +147,12 @@ export function parseMessage(buf, baseOffset, msgLen) {
     }
     case MSG.ORDER_ADDED:
     case MSG.ORDER_UPDATED: {
+      // v2 layout: secId, orderId, price, qty, side (side moved to the end).
       const securityId = v.getBigUint64(o, true); o += 8;
       const orderId = v.getBigUint64(o, true); o += 8;
-      const side = v.getUint8(o); o += 1;
       const price = Number(v.getBigInt64(o, true)); o += 8;
-      const qty = Number(v.getBigInt64(o, true));
+      const qty = Number(v.getBigInt64(o, true)); o += 8;
+      const side = v.getUint8(o);
       const typeName = type === MSG.ORDER_ADDED ? 'OrderAdded' : 'OrderUpdated';
       return { type: typeName, securityId, orderId, side, price, qty };
     }
@@ -165,8 +167,8 @@ export function parseMessage(buf, baseOffset, msgLen) {
       const price = Number(v.getBigInt64(o, true)); o += 8;
       const qty = Number(v.getBigInt64(o, true)); o += 8;
       const tradeId = Number(v.getBigInt64(o, true)); o += 8;
-      // Trailing flags byte (added later). Tolerate older servers that wrote
-      // the legacy 36-byte frame — treat absence as 0 (no flags).
+      // Trailing flags byte. Min-length rule: tolerate a shorter frame that
+      // omits it by treating absence as 0 (no flags).
       const flags = o < msgLen ? v.getUint8(o) : 0;
       const auctionPrint = (flags & 0x01) !== 0;
       return { type: 'Trade', securityId, price, qty, tradeId, flags, auctionPrint };
@@ -177,10 +179,11 @@ export function parseMessage(buf, baseOffset, msgLen) {
       return { type: 'BookCleared', securityId, side };
     }
     case MSG.MARKET_TIER_UPDATE: {
+      // v2 layout: secId, totalQty, orderCount(u32), side(u8).
       const securityId = v.getBigUint64(o, true); o += 8;
-      const side = v.getUint8(o); o += 1;
       const qty = Number(v.getBigInt64(o, true)); o += 8;
-      const count = v.getUint32(o, true);
+      const count = v.getUint32(o, true); o += 4;
+      const side = v.getUint8(o);
       return { type: 'MarketTierUpdate', securityId, side, qty, count };
     }
     case MSG.LEVEL_SNAPSHOT: {
@@ -206,17 +209,19 @@ export function parseMessage(buf, baseOffset, msgLen) {
       return { type: 'LevelSnapshot', securityId, bids, asks };
     }
     case MSG.LEVEL_UPDATE: {
+      // v2 layout: secId, price, totalQty, orderCount(u32), side(u8).
       const securityId = v.getBigUint64(o, true); o += 8;
-      const side = v.getUint8(o); o += 1;
       const price = Number(v.getBigInt64(o, true)); o += 8;
       const qty = Number(v.getBigInt64(o, true)); o += 8;
-      const count = v.getUint32(o, true);
+      const count = v.getUint32(o, true); o += 4;
+      const side = v.getUint8(o);
       return { type: 'LevelUpdate', securityId, side, price, qty, count };
     }
     case MSG.LEVEL_DELETED: {
+      // v2 layout: secId, price, side(u8).
       const securityId = v.getBigUint64(o, true); o += 8;
-      const side = v.getUint8(o); o += 1;
-      const price = Number(v.getBigInt64(o, true));
+      const price = Number(v.getBigInt64(o, true)); o += 8;
+      const side = v.getUint8(o);
       return { type: 'LevelDeleted', securityId, side, price };
     }
     case MSG.RANKINGS_UPDATE: {
