@@ -55,3 +55,6 @@ package-lock.json
 # Source generator output (for inspection only)
 src/B3.Umdf.Sbe/generated/
 profiles/
+
+## Copilot CLI session artifacts
+.copilot/
