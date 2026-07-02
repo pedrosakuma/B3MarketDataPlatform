@@ -33,4 +33,4 @@ jobs:
         node-version: '22'
 
     - name: JS golden-vector decode test
-      run: node --test tests/golden/
+      run: node --test tests/golden/*.test.mjs
