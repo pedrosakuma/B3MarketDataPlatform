@@ -1,0 +1,34 @@
+name: Unlist NuGet — B3.MarketData.WebSocketClient
+
+# Manually unlist (soft-delete) a published package version from nuget.org.
+# Unlisting hides the version from search/restore-by-range but keeps it
+# resolvable by exact pinned reference; it does NOT hard-delete.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to unlist (e.g. 0.9.0)"
+        required: true
+        type: string
+
+jobs:
+  unlist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Unlist from nuget.org
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NUGET_API_KEY secret is not configured."
+            exit 1
+          fi
+          dotnet nuget delete B3.MarketData.WebSocketClient "${{ inputs.version }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "$NUGET_API_KEY" \
+            --non-interactive
