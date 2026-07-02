@@ -5,8 +5,8 @@ namespace B3.Umdf.Server.Tests;
 
 public class WireProtocolTests
 {
-    private static (ushort length, MessageType type) ReadFraming(Span<byte> buf) =>
-        (BinaryPrimitives.ReadUInt16LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]));
+    private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
+        ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 
     [Fact]
     public void WriteServerStatus_Ready_EncodesCorrectly()
@@ -14,11 +14,11 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteServerStatus(buf, ready: true);
 
-        Assert.Equal(5, len);
+        Assert.Equal(9, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(5, msgLen);
+        Assert.Equal(9, msgLen);
         Assert.Equal(MessageType.ServerStatus, type);
-        Assert.Equal(1, buf[4]);
+        Assert.Equal(1, buf[8]);
     }
 
     [Fact]
@@ -26,7 +26,7 @@ public class WireProtocolTests
     {
         var buf = new byte[64];
         WireProtocol.WriteServerStatus(buf, ready: false);
-        Assert.Equal(0, buf[4]);
+        Assert.Equal(0, buf[8]);
     }
 
     [Fact]
@@ -39,11 +39,11 @@ public class WireProtocolTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.SubscribeOk, type);
 
-        ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4));
+        ulong secId = BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8));
         Assert.Equal(12345UL, secId);
-        Assert.Equal((byte)DataFlags.All, buf[12]);
-        int symLen = buf[13];
-        Assert.Equal("PETR4", System.Text.Encoding.UTF8.GetString(buf, 14, symLen));
+        Assert.Equal((uint)DataFlags.All, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(16)));
+        int symLen = buf[20];
+        Assert.Equal("PETR4", System.Text.Encoding.UTF8.GetString(buf, 21, symLen));
     }
 
     [Fact]
@@ -55,9 +55,9 @@ public class WireProtocolTests
         var (msgLen, type) = ReadFraming(buf);
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.SubscribeError, type);
-        Assert.Equal((byte)SubscribeErrorCode.UnknownSymbol, buf[4]);
-        int symLen = buf[5];
-        Assert.Equal("UNKNOWN", System.Text.Encoding.UTF8.GetString(buf, 6, symLen));
+        Assert.Equal((byte)SubscribeErrorCode.UnknownSymbol, buf[8]);
+        int symLen = buf[9];
+        Assert.Equal("UNKNOWN", System.Text.Encoding.UTF8.GetString(buf, 10, symLen));
     }
 
     [Fact]
@@ -67,17 +67,17 @@ public class WireProtocolTests
         int len = WireProtocol.WriteOrderEvent(buf, MessageType.OrderAdded,
             securityId: 99, orderId: 42, side: 1, price: 10_000L, qty: 500L);
 
-        Assert.Equal(37, len);
+        Assert.Equal(41, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(37, msgLen);
+        Assert.Equal(41, msgLen);
         Assert.Equal(MessageType.OrderAdded, type);
 
-        int off = 4;
+        int off = 8;
         Assert.Equal(99UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
-        Assert.Equal(1, buf[off++]);
         Assert.Equal(10_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
-        Assert.Equal(500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));
+        Assert.Equal(500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
+        Assert.Equal(1, buf[off]);
     }
 
     [Fact]
@@ -86,12 +86,12 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteOrderDeleted(buf, securityId: 7, orderId: 3, side: 2);
 
-        Assert.Equal(21, len);
+        Assert.Equal(25, len);
         var (_, type) = ReadFraming(buf);
         Assert.Equal(MessageType.OrderDeleted, type);
-        Assert.Equal(7UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(3UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(12)));
-        Assert.Equal(2, buf[20]);
+        Assert.Equal(7UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(3UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(16)));
+        Assert.Equal(2, buf[24]);
     }
 
     [Fact]
@@ -100,12 +100,12 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteTrade(buf, securityId: 1001, price: 55_000L, qty: 100L, tradeId: 9876L);
 
-        Assert.Equal(37, len);
+        Assert.Equal(41, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(37, msgLen);
+        Assert.Equal(41, msgLen);
         Assert.Equal(MessageType.Trade, type);
 
-        int off = 4;
+        int off = 8;
         Assert.Equal(1001UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(55_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(100L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
@@ -120,8 +120,8 @@ public class WireProtocolTests
         int len = WireProtocol.WriteTrade(buf, securityId: 1001, price: 55_000L, qty: 100L, tradeId: 9876L,
             flags: (byte)TradeFlags.AuctionPrint);
 
-        Assert.Equal(37, len);
-        Assert.Equal((byte)TradeFlags.AuctionPrint, buf[36]);
+        Assert.Equal(41, len);
+        Assert.Equal((byte)TradeFlags.AuctionPrint, buf[40]);
     }
 
     [Fact]
@@ -130,11 +130,11 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteBookCleared(buf, securityId: 500, clearSide: 3);
 
-        Assert.Equal(13, len);
+        Assert.Equal(17, len);
         var (_, type) = ReadFraming(buf);
         Assert.Equal(MessageType.BookCleared, type);
-        Assert.Equal(500UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(3, buf[12]);
+        Assert.Equal(500UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(3, buf[16]);
     }
 
     [Fact]
@@ -143,16 +143,16 @@ public class WireProtocolTests
         var buf = new byte[64];
         int len = WireProtocol.WriteMarketTierUpdate(buf, securityId: 501, side: 0, totalQty: 12345, orderCount: 7);
 
-        Assert.Equal(25, len);
+        Assert.Equal(29, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(25, msgLen);
+        Assert.Equal(29, msgLen);
         Assert.Equal(MessageType.MarketTierUpdate, type);
 
-        int off = 4;
+        int off = 8;
         Assert.Equal(501UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
-        Assert.Equal(0, buf[off++]);
         Assert.Equal(12345L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
-        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off)));
+        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off))); off += 4;
+        Assert.Equal(0, buf[off]);
     }
 
     [Fact]
@@ -162,13 +162,13 @@ public class WireProtocolTests
         var info = new InstrumentInfo();
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId: 42, info);
 
-        // framing(4) + secId(8) + mask(4) = 16 bytes minimum (no fields set)
-        Assert.Equal(16, len);
+        // framing(8) + secId(8) + mask(4) = 20 bytes minimum (no fields set)
+        Assert.Equal(20, len);
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(16, msgLen);
+        Assert.Equal(20, msgLen);
         Assert.Equal(MessageType.InfoSnapshot, type);
-        Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12));
+        Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(16));
         Assert.Equal(0u, mask);
     }
 
@@ -189,7 +189,7 @@ public class WireProtocolTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.InfoSnapshot, type);
 
-        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12));
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(16));
         Assert.NotEqual(0u, mask);
         Assert.True((mask & (1u << WireProtocol.FieldOpeningPrice)) != 0);
         Assert.True((mask & (1u << WireProtocol.FieldHighPrice)) != 0);
@@ -200,7 +200,7 @@ public class WireProtocolTests
         Assert.True((mask & (1u << WireProtocol.FieldClosingPrice)) == 0);
 
         // Verify values (in bit order: OpeningPrice first)
-        int off = 16; // after framing(4)+secId(8)+mask(4)
+        int off = 20; // after framing(8)+secId(8)+mask(4)
         Assert.Equal(10_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(12_000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8; // High
         Assert.Equal(9_500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off)));           // Low
@@ -224,7 +224,7 @@ public class WireProtocolTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.InfoSnapshot, type);
 
-        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12));
+        uint mask = BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(16));
         Assert.True((mask & (1u << WireProtocol.FieldTheoreticalOpeningPrice)) != 0);
         Assert.True((mask & (1u << WireProtocol.FieldTheoreticalOpeningSize)) != 0);
         Assert.True((mask & (1u << WireProtocol.FieldAuctionImbalanceSize)) != 0);
@@ -232,7 +232,7 @@ public class WireProtocolTests
 
         // Values appear in bit order. The set bits here are 7,8,9,24 → that's
         // the order on the wire. (24 is set last, after the four lower bits.)
-        int off = 16;
+        int off = 20;
         Assert.Equal(12_3450L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8; // TheoreticalOpeningPrice
         Assert.Equal(7_500L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;   // TheoreticalOpeningSize
         Assert.Equal(250L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8;     // AuctionImbalanceSize
@@ -251,7 +251,7 @@ public class WireProtocolTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.CandleUpdate, type);
 
-        int off = 4;
+        int off = WireProtocol.FramingHeaderSize;
         Assert.Equal(333UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(1, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off))); off += 2;
         Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(off))); off += 8; // Time
@@ -279,7 +279,7 @@ public class WireProtocolTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.CandleSnapshot, type);
 
-        int off = 4;
+        int off = WireProtocol.FramingHeaderSize;
         Assert.Equal(55UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(off))); off += 8;
         Assert.Equal(1, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(off))); off += 2; // resolution
         Assert.Equal(WireProtocol.CandleFlagFirst | WireProtocol.CandleFlagLast, buf[off++]);
@@ -328,9 +328,9 @@ public class WireProtocolTests
     {
         var buf = new byte[64];
         WireProtocol.WriteServerStatus(buf, ready: true);
-        bool ok = WireProtocol.TryReadFramingHeader(buf, out ushort length, out MessageType type);
+        bool ok = WireProtocol.TryReadFramingHeader(buf, out uint length, out MessageType type);
         Assert.True(ok);
-        Assert.Equal(5, length);
+        Assert.Equal(9u, length);
         Assert.Equal(MessageType.ServerStatus, type);
     }
 
@@ -349,13 +349,13 @@ public class WireProtocolTests
         int len = WireProtocol.WriteRecoveryProgress(buf, totalSymbols: 18000, totalStaleSymbols: 0,
             staleByKind: ReadOnlySpan<int>.Empty);
 
-        Assert.Equal(13, len); // 4 framing + 4 + 4 + 1
+        Assert.Equal(17, len); // 8 framing + 4 + 4 + 1
         var (msgLen, type) = ReadFraming(buf);
-        Assert.Equal(13, msgLen);
+        Assert.Equal(17, msgLen);
         Assert.Equal(MessageType.RecoveryProgress, type);
-        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
-        Assert.Equal(0, buf[12]); // kindCount
+        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12)));
+        Assert.Equal(0, buf[16]); // kindCount
     }
 
     [Fact]
@@ -372,11 +372,11 @@ public class WireProtocolTests
         var (msgLen, type) = ReadFraming(buf);
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.RecoveryProgress, type);
-        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(20u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
-        Assert.Equal(2, buf[12]); // kindCount = 2
+        Assert.Equal(18000u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(20u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(12)));
+        Assert.Equal(2, buf[16]); // kindCount = 2
 
-        int off = 13;
+        int off = 17;
         Assert.Equal(0, buf[off++]);
         Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(off))); off += 4;
         Assert.Equal(10, buf[off++]);
@@ -397,6 +397,6 @@ public class WireProtocolTests
         var (msgLen, type) = ReadFraming(buf);
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.RecoveryProgress, type);
-        Assert.Equal(14, buf[12]);
+        Assert.Equal(14, buf[16]);
     }
 }

@@ -62,10 +62,10 @@ public class TradeHistoryFlagsTests
 
         Assert.Equal(3, recorder.CountByType(MessageType.Trade));
         var frames = recorder.AllFrames(MessageType.Trade);
-        Assert.All(frames, f => Assert.Equal(37, f.Length));
-        Assert.Equal(0, frames[0][36]);
-        Assert.Equal((byte)TradeFlags.AuctionPrint, frames[1][36]);
-        Assert.Equal((byte)TradeFlags.AuctionPrint, frames[2][36]);
+        Assert.All(frames, f => Assert.Equal(41, f.Length));
+        Assert.Equal(0, frames[0][40]);
+        Assert.Equal((byte)TradeFlags.AuctionPrint, frames[1][40]);
+        Assert.Equal((byte)TradeFlags.AuctionPrint, frames[2][40]);
     }
 
     private static async Task WaitUntil(Func<bool> predicate, TimeSpan timeout)

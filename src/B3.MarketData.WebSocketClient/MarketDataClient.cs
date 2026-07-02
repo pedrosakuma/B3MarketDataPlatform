@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
@@ -380,9 +381,13 @@ public sealed class MarketDataClient : IAsyncDisposable
 
     private async Task ReceiveLoopAsync(ClientWebSocket socket, CancellationToken ct)
     {
-        // 64 KiB matches the protocol's u16-length cap; anything larger
-        // would be a server-side bug (and we'd close on it anyway).
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        // Start small and grow on demand for the rare coalesced batch that
+        // exceeds it, up to WireV2.MaxFrameLength (16 MiB). Renting the max up
+        // front would pin 16 MiB per live connection while typical messages are
+        // only a few KiB. The 16 MiB ceiling comfortably clears the server's
+        // per-client coalescing/pending cap, so no legitimate batch is rejected.
+        const int InitialReceiveBufferSize = 64 * 1024;
+        var buffer = ArrayPool<byte>.Shared.Rent(InitialReceiveBufferSize);
         try
         {
             while (!ct.IsCancellationRequested && socket.State == WebSocketState.Open)
@@ -399,7 +404,17 @@ public sealed class MarketDataClient : IAsyncDisposable
                     }
                     filled += result.Count;
                     if (filled == buffer.Length && !result.EndOfMessage)
-                        throw new InvalidOperationException("WebSocket frame exceeded 64 KiB buffer (protocol violation).");
+                    {
+                        if (buffer.Length >= WireV2.MaxFrameLength)
+                            throw new InvalidOperationException(
+                                $"WebSocket message exceeded {WireV2.MaxFrameLength} bytes (protocol violation).");
+
+                        int newSize = (int)Math.Min((long)buffer.Length * 2, WireV2.MaxFrameLength);
+                        var bigger = ArrayPool<byte>.Shared.Rent(newSize);
+                        Buffer.BlockCopy(buffer, 0, bigger, 0, filled);
+                        ArrayPool<byte>.Shared.Return(buffer);
+                        buffer = bigger;
+                    }
                 }
                 while (!result.EndOfMessage);
 
@@ -429,34 +444,34 @@ public sealed class MarketDataClient : IAsyncDisposable
 
         while (offset < span.Length)
         {
-            if (!WireFormat.TryReadHeader(span[offset..], out ushort len, out var type) || len < WireFormat.FramingHeaderSize)
+            if (!WireFormat.TryReadHeader(span[offset..], out uint len, out var type) || len < WireFormat.FramingHeaderSize)
             {
-                _logger.LogWarning("Truncated frame header at offset {Offset}; dropping rest of packet.", offset);
+                _logger.LogWarning("Truncated/unsupported frame header at offset {Offset}; dropping rest of packet.", offset);
                 return;
             }
-            if (offset + len > span.Length)
+            if (offset + (int)len > span.Length)
             {
                 _logger.LogWarning("Truncated frame body (declared {Len}, available {Avail}); dropping rest.", len, span.Length - offset);
                 return;
             }
 
-            var payload = span.Slice(offset + WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize);
+            var payload = span.Slice(offset + WireFormat.FramingHeaderSize, (int)len - WireFormat.FramingHeaderSize);
             DecodeAndEnqueue(type, payload, receivedUtc);
-            offset += len;
+            offset += (int)len;
         }
     }
 
-    private void DecodeAndEnqueue(WireFormat.MessageType type, ReadOnlySpan<byte> payload, DateTime receivedUtc)
+    private void DecodeAndEnqueue(MessageType type, ReadOnlySpan<byte> payload, DateTime receivedUtc)
     {
         switch (type)
         {
-            case WireFormat.MessageType.ServerStatus:
+            case MessageType.ServerStatus:
             {
                 bool ready = WireFormat.ReadServerStatus(payload);
                 Enqueue(() => ServerStatus?.Invoke(new ServerStatusEvent(ready, receivedUtc)));
                 break;
             }
-            case WireFormat.MessageType.ServerHello:
+            case MessageType.ServerHello:
             {
                 var (ver, caps, build) = WireFormat.ReadServerHello(payload);
                 var ev = new ServerHelloEvent(ver, caps, build, receivedUtc);
@@ -464,14 +479,14 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => ServerHello?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.SymbolDelisted:
+            case MessageType.SymbolDelisted:
             {
                 ulong secId = WireFormat.ReadSymbolDelisted(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
                 Enqueue(() => SymbolDelisted?.Invoke(new SymbolDelistedEvent(secId, symbol, receivedUtc)));
                 break;
             }
-            case WireFormat.MessageType.SubscribeOk:
+            case MessageType.SubscribeOk:
             {
                 var (secId, _, sym) = WireFormat.ReadSubscribeOk(payload);
                 _securityIdToSymbol[secId] = sym;
@@ -479,7 +494,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                     rec.SecurityId = secId;
                 break;
             }
-            case WireFormat.MessageType.SubscribeError:
+            case MessageType.SubscribeError:
             {
                 var (sym, code) = WireFormat.ReadSubscribeError(payload);
                 Enqueue(() => SubscribeError?.Invoke(new SubscribeErrorEvent(
@@ -488,7 +503,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                     receivedUtc)));
                 break;
             }
-            case WireFormat.MessageType.Trade:
+            case MessageType.Trade:
             {
                 var (secId, price, qty, tradeId, flags) = WireFormat.ReadTrade(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -496,14 +511,14 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => Trade?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.TradeBust:
+            case MessageType.TradeBust:
             {
                 var (secId, tradeId) = WireFormat.ReadTradeBust(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
                 Enqueue(() => TradeBust?.Invoke(new TradeBustEvent(secId, symbol, tradeId, receivedUtc)));
                 break;
             }
-            case WireFormat.MessageType.InfoSnapshot:
+            case MessageType.InfoSnapshot:
             {
                 ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -514,7 +529,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => InfoSnapshot?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.SecurityDefinition:
+            case MessageType.SecurityDefinition:
             {
                 // SecurityDefinition embeds its own Symbol field on the wire, so
                 // the decoder does not consult _securityIdToSymbol — useful for
@@ -524,7 +539,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => SecurityDefinition?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.PriceBand:
+            case MessageType.PriceBand:
             {
                 // PriceBand embeds its own Symbol field on the wire, same as
                 // SecurityDefinition — no _securityIdToSymbol lookup needed.
@@ -532,7 +547,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => PriceBand?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.Auction:
+            case MessageType.Auction:
             {
                 // Auction embeds Symbol on the wire — no _securityIdToSymbol needed.
                 var ev = WireFormat.ReadAuction(payload, receivedUtc);
@@ -540,7 +555,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 break;
             }
             // ── L3 / order-by-order (MBO) ─────────────────────────
-            case WireFormat.MessageType.BookSnapshot:
+            case MessageType.BookSnapshot:
             {
                 ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -548,7 +563,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => BookSnapshot?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.OrderAdded:
+            case MessageType.OrderAdded:
             {
                 var (secId, orderId, sideByte, price, qty) = WireFormat.ReadOrderEvent(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -557,7 +572,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => OrderAdded?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.OrderUpdated:
+            case MessageType.OrderUpdated:
             {
                 var (secId, orderId, sideByte, price, qty) = WireFormat.ReadOrderEvent(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -566,7 +581,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => OrderUpdated?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.OrderDeleted:
+            case MessageType.OrderDeleted:
             {
                 var (secId, orderId, sideByte) = WireFormat.ReadOrderDeleted(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -574,7 +589,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => OrderDeleted?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.BookCleared:
+            case MessageType.BookCleared:
             {
                 var (secId, clearByte) = WireFormat.ReadBookCleared(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -585,7 +600,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => BookCleared?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.MarketTierUpdate:
+            case MessageType.MarketTierUpdate:
             {
                 var (secId, sideByte, totalQty, orderCount) = WireFormat.ReadMarketTierUpdate(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -595,7 +610,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 break;
             }
             // ── MBP / aggregated levels ───────────────────────────
-            case WireFormat.MessageType.LevelSnapshot:
+            case MessageType.LevelSnapshot:
             {
                 ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -603,7 +618,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => LevelSnapshot?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.LevelUpdate:
+            case MessageType.LevelUpdate:
             {
                 var (secId, sideByte, price, totalQty, orderCount) = WireFormat.ReadLevelUpdate(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -612,7 +627,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => LevelUpdate?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.LevelDeleted:
+            case MessageType.LevelDeleted:
             {
                 var (secId, sideByte, price) = WireFormat.ReadLevelDeleted(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -622,21 +637,21 @@ public sealed class MarketDataClient : IAsyncDisposable
                 break;
             }
             // ── Stale / recovery ──────────────────────────────────
-            case WireFormat.MessageType.SymbolStaleStatus:
+            case MessageType.SymbolStaleStatus:
             {
                 var (secId, isStale) = WireFormat.ReadSymbolStaleStatus(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
                 Enqueue(() => SymbolStaleStatus?.Invoke(new SymbolStaleStatusEvent(secId, symbol, isStale, receivedUtc)));
                 break;
             }
-            case WireFormat.MessageType.RecoveryProgress:
+            case MessageType.RecoveryProgress:
             {
                 var ev = WireFormat.ReadRecoveryProgress(payload, receivedUtc);
                 Enqueue(() => RecoveryProgress?.Invoke(ev));
                 break;
             }
             // ── Candles ───────────────────────────────────────────
-            case WireFormat.MessageType.CandleSnapshot:
+            case MessageType.CandleSnapshot:
             {
                 ulong secId = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -644,7 +659,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                 Enqueue(() => CandleSnapshot?.Invoke(ev));
                 break;
             }
-            case WireFormat.MessageType.CandleUpdate:
+            case MessageType.CandleUpdate:
             {
                 var (secId, resolution, candle) = WireFormat.ReadCandleUpdate(payload);
                 string symbol = _securityIdToSymbol.TryGetValue(secId, out var s) ? s : "";
@@ -653,14 +668,14 @@ public sealed class MarketDataClient : IAsyncDisposable
                 break;
             }
             // ── Rankings ──────────────────────────────────────────
-            case WireFormat.MessageType.RankingsUpdate:
+            case MessageType.RankingsUpdate:
             {
                 var ev = WireFormat.ReadRankingsUpdate(payload, receivedUtc);
                 Enqueue(() => RankingsUpdate?.Invoke(ev));
                 break;
             }
             // ── News (fragmented; reassembled before raising) ─────
-            case WireFormat.MessageType.NewsBegin:
+            case MessageType.NewsBegin:
             {
                 var hdr = WireFormat.ReadNewsBegin(payload);
                 if (hdr.Version != WireFormat.NewsFrameVersion)
@@ -675,7 +690,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                     (int)Math.Min(hdr.TotalUrlLen, int.MaxValue));
                 break;
             }
-            case WireFormat.MessageType.NewsChunk:
+            case MessageType.NewsChunk:
             {
                 var (version, newsId, field) = WireFormat.ReadNewsChunk(payload, out var fragment);
                 if (version != WireFormat.NewsFrameVersion) break;
@@ -683,7 +698,7 @@ public sealed class MarketDataClient : IAsyncDisposable
                     ra.Append(field, fragment);
                 break;
             }
-            case WireFormat.MessageType.NewsEnd:
+            case MessageType.NewsEnd:
             {
                 var (version, newsId, field) = WireFormat.ReadNewsChunk(payload, out var fragment);
                 if (version != WireFormat.NewsFrameVersion) break;
@@ -697,7 +712,7 @@ public sealed class MarketDataClient : IAsyncDisposable
             }
             // Unsubscribed (0x0012) is currently silent — the application
             // already knows it called UnsubscribeAsync.
-            case WireFormat.MessageType.Unsubscribed:
+            case MessageType.Unsubscribed:
                 break;
             default:
             {

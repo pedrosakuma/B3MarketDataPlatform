@@ -1,0 +1,118 @@
+{
+  "protocolVersion": 2,
+  "headerSize": 8,
+  "vectors": [
+    {
+      "name": "SubscribeOk",
+      "type": "SubscribeOk",
+      "hex": "1a0000001000000039300000000000001f000000055045545234",
+      "expected": {
+        "securityId": "12345",
+        "flags": 31,
+        "symbol": "PETR4"
+      }
+    },
+    {
+      "name": "OrderAdded",
+      "type": "OrderAdded",
+      "hex": "290000003000000063000000000000002a000000000000001027000000000000f40100000000000001",
+      "expected": {
+        "securityId": "99",
+        "orderId": "42",
+        "price": 10000,
+        "qty": 500,
+        "side": 1
+      }
+    },
+    {
+      "name": "Trade",
+      "type": "Trade",
+      "hex": "2900000033000000e903000000000000d8d60000000000006400000000000000942600000000000001",
+      "expected": {
+        "securityId": "1001",
+        "price": 55000,
+        "qty": 100,
+        "tradeId": 9876,
+        "flags": 1,
+        "auctionPrint": true
+      }
+    },
+    {
+      "name": "TradeForwardCompatTrailing",
+      "type": "Trade",
+      "hex": "3900000033000000d20700000000000060ea000000000000c800000000000000d2040000000000000000000000000000000000000000000000",
+      "expected": {
+        "securityId": "2002",
+        "price": 60000,
+        "qty": 200,
+        "tradeId": 1234,
+        "flags": 0,
+        "auctionPrint": false
+      }
+    },
+    {
+      "name": "MarketTierUpdate",
+      "type": "MarketTierUpdate",
+      "hex": "1d00000036000000f50100000000000039300000000000000700000000",
+      "expected": {
+        "securityId": "501",
+        "qty": 12345,
+        "count": 7,
+        "side": 0
+      }
+    },
+    {
+      "name": "LevelUpdate",
+      "type": "LevelUpdate",
+      "hex": "25000000370000002a0000000000000087d612000000000094260000000000000200000001",
+      "expected": {
+        "securityId": "42",
+        "price": 1234567,
+        "qty": 9876,
+        "count": 2,
+        "side": 1
+      }
+    },
+    {
+      "name": "LevelDeleted",
+      "type": "LevelDeleted",
+      "hex": "19000000380000006300000000000000fbffffffffffffff00",
+      "expected": {
+        "securityId": "99",
+        "price": -5,
+        "side": 0
+      }
+    },
+    {
+      "name": "ServerStatus",
+      "type": "ServerStatus",
+      "hex": "090000005000000001",
+      "expected": {
+        "ready": true
+      }
+    },
+    {
+      "name": "InfoSnapshot",
+      "type": "InfoSnapshot",
+      "hex": "2c000000210000004d000000000000000d0000001027000000000000e02e0000000000001c25000000000000",
+      "expected": {
+        "securityId": "77",
+        "fields": {
+          "OpeningPrice": 10000,
+          "HighPrice": 12000,
+          "LowPrice": 9500
+        }
+      }
+    },
+    {
+      "name": "ServerHello",
+      "type": "ServerHello",
+      "hex": "1b000000a000000002000000030000000a746573742d6275696c64",
+      "expected": {
+        "protocolVersion": 2,
+        "capabilities": 3,
+        "buildVersion": "test-build"
+      }
+    }
+  ]
+}

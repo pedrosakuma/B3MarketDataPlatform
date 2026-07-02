@@ -1,6 +1,7 @@
+using B3.MarketData.Wire;
 using System.Buffers.Binary;
 using ServerWire = B3.Umdf.Server.WireProtocol;
-using ServerMsg = B3.Umdf.Server.MessageType;
+using ServerMsg = B3.MarketData.Wire.MessageType;
 
 namespace B3.MarketData.WebSocketClient.Tests;
 
@@ -21,8 +22,8 @@ public class ParityWireRoundTripTests
             price: 12_3456, qty: 250);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var totalLen, out var type));
-        Assert.Equal(len, totalLen);
-        Assert.Equal(WireFormat.MessageType.OrderAdded, type);
+        Assert.Equal((uint)len, totalLen);
+        Assert.Equal(MessageType.OrderAdded, type);
 
         var (secId, orderId, side, price, qty) = WireFormat.ReadOrderEvent(
             buf.AsSpan(WireFormat.FramingHeaderSize));
@@ -42,7 +43,7 @@ public class ParityWireRoundTripTests
             securityId: 7, orderId: 555, side: (byte)BookSide.Ask);
 
         WireFormat.TryReadHeader(buf, out _, out var type);
-        Assert.Equal(WireFormat.MessageType.OrderDeleted, type);
+        Assert.Equal(MessageType.OrderDeleted, type);
 
         var (secId, orderId, side) = WireFormat.ReadOrderDeleted(
             buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize));
@@ -54,7 +55,7 @@ public class ParityWireRoundTripTests
     [Fact]
     public void BookCleared_RoundTrips()
     {
-        var buf = new byte[16];
+        var buf = new byte[17];
         ServerWire.WriteBookCleared(buf, securityId: 1, clearSide: (byte)BookClearSide.Bid);
 
         var (secId, clearByte) = WireFormat.ReadBookCleared(
@@ -71,7 +72,7 @@ public class ParityWireRoundTripTests
             securityId: 11, side: (byte)BookSide.Bid, totalQty: 5_000, orderCount: 3);
 
         WireFormat.TryReadHeader(buf, out _, out var type);
-        Assert.Equal(WireFormat.MessageType.MarketTierUpdate, type);
+        Assert.Equal(MessageType.MarketTierUpdate, type);
 
         var (secId, side, qty, count) = WireFormat.ReadMarketTierUpdate(
             buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize));
@@ -89,7 +90,7 @@ public class ParityWireRoundTripTests
             securityId: 99, side: (byte)BookSide.Ask, price: 25_5000, totalQty: 1_200, orderCount: 4);
 
         WireFormat.TryReadHeader(buf, out _, out var type);
-        Assert.Equal(WireFormat.MessageType.LevelUpdate, type);
+        Assert.Equal(MessageType.LevelUpdate, type);
 
         var (secId, side, price, qty, count) = WireFormat.ReadLevelUpdate(
             buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize));
@@ -157,7 +158,7 @@ public class ParityWireRoundTripTests
     [Fact]
     public void SymbolStaleStatus_RoundTrips()
     {
-        var buf = new byte[16];
+        var buf = new byte[17];
         ServerWire.WriteSymbolStaleStatus(buf, securityId: 77, isStale: true);
 
         var (secId, isStale) = WireFormat.ReadSymbolStaleStatus(
@@ -267,14 +268,14 @@ public class ParityWireRoundTripTests
         const int candleCount = 1;
         int total = WireFormat.FramingHeaderSize + 8 + 2 + 1 + 2 + candleCount * 56;
         var buf = new byte[total];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, (ushort)total);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), (ushort)WireFormat.MessageType.CandleSnapshot);
-        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(4), secId);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(12), resolution);
-        buf[14] = flags;
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(15), (ushort)candleCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, (uint)total);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), (ushort)MessageType.CandleSnapshot);
+        BinaryPrimitives.WriteUInt64LittleEndian(buf.AsSpan(8), secId);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(16), resolution);
+        buf[18] = flags;
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(19), (ushort)candleCount);
         // Candle: time, open, high, low, close, volume, avg
-        int o = 17;
+        int o = 21;
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(o), 1_700_000_000_000_000_000L); o += 8;
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(o), 36_7000L); o += 8;          // open 36.70
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(o), 37_0000L); o += 8;          // high 37.00

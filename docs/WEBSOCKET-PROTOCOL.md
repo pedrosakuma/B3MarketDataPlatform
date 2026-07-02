@@ -1,34 +1,88 @@
 # WebSocket Binary Protocol
 
+**Protocol version: 2** (`ProtocolVersion = 2`). See the
+[Forward-Compatibility Contract](#forward-compatibility-contract) for the rules
+that keep every future change additive.
+
 The server speaks a compact, length-prefixed binary protocol over a single
-WebSocket. All numeric fields are **little-endian**.
+WebSocket. All numeric fields are **little-endian** (the protocol is LE-only; a
+big-endian runtime is rejected).
 
 - Default URL: `ws://<host>:<ws-port>/ws` (e.g. `ws://localhost:8080/ws`).
-- Frames are WebSocket **binary** messages (one wire message per frame).
-- Multiple wire messages may be coalesced inside a single TCP segment by the
-  server's per-client `UMDF_CLIENT_COALESCE_WINDOW_MS` window.
+- Frames are WebSocket **binary** messages.
+- **A single WebSocket binary message MAY contain multiple wire frames**
+  concatenated back-to-back (*coalescing*). The server batches whatever is
+  queued for a client during its per-client `UMDF_CLIENT_COALESCE_WINDOW_MS`
+  window into one `SendAsync`. Decoders **MUST** therefore treat each WS message
+  as a stream: read the `messageLength` at the current offset, consume that many
+  bytes, advance, and repeat until the message is drained — never assume one WS
+  message equals one wire frame. See
+  [Consuming coalesced messages](#consuming-coalesced-messages).
 
 ## Framing
 
-Every message starts with a fixed 4-byte header:
+Every message starts with a fixed **8-byte** header:
 
 ```
  0               1               2               3
  0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|       messageLength (u16)     |       messageType (u16)       |
+|                     messageLength (u32)                       |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                          payload …                            |
+|       messageType (u16)       |      headerFlags (u16)        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                          payload … (@8)                       |
 ```
 
-- `messageLength` is the total frame size **including the header itself**.
-- Maximum single message size: `65 535 bytes` (`u16`).
+- `messageLength` (`u32`) is the total frame size **including the 8-byte header
+  itself**. It is authoritative: decoders MUST use it to find the next frame and
+  to skip trailing bytes they do not understand.
+- `messageType` (`u16`) identifies the frame.
+- `headerFlags` (`u16`) is `0` in protocol v2. Reserved for future transport
+  features (e.g. compression / fragmentation). A receiver that sees **any**
+  header-flag bit it does not understand **MUST reject the frame / close the
+  connection** — an unknown bit may change how the payload is interpreted.
+- The payload always starts at byte offset **8**.
+- Maximum single frame size: **16 MiB** (`MaxFrameLength`, a DoS guard against a
+  bogus `u32` length). Frames larger than this are rejected.
+
+## Consuming coalesced messages
+
+Because one WebSocket binary message can pack many wire frames, a consumer
+splits them in a loop driven entirely by `messageLength`:
+
+```
+offset = 0
+while offset < wsMessage.length:
+    length = readU32LE(wsMessage, offset)          # total frame size incl. 8-byte header
+    if length < 8 or offset + length > wsMessage.length:
+        drop rest of message (truncated/corrupt)   # should not happen from a healthy server
+    type        = readU16LE(wsMessage, offset + 4)
+    headerFlags = readU16LE(wsMessage, offset + 6)  # reject if any unknown bit is set
+    payload     = wsMessage[offset + 8 : offset + length]
+    dispatch(type, payload)
+    offset += length
+```
+
+Sizing the receive buffer:
+
+- A single **frame** never exceeds `MaxFrameLength` (16 MiB). A single coalesced
+  **WS message** is bounded by the server's per-client outbound cap
+  (`UMDF_CLIENT_MAX_PENDING_BYTES`, default 4 MiB), so in practice a message
+  stays well under 16 MiB.
+- Consumers should **not** pre-allocate the maximum. Start with a small buffer
+  (the reference SDK uses 64 KiB) and **grow on demand** — doubling up to a
+  16 MiB ceiling — only for the rare batch that overflows it. This keeps
+  steady-state memory at a few KiB per connection while still tolerating a large
+  coalesced burst; a message that would exceed the 16 MiB ceiling is treated as
+  a protocol violation and the connection is closed.
 
 ## Message types
 
 ```
 Client → Server                 Server → Client
 ─────────────────────────────   ─────────────────────────────────
+ClientHello       0x00A1        ServerHello         0x00A0
 Subscribe         0x0001        SubscribeOk         0x0010
 Unsubscribe       0x0002        SubscribeError      0x0011
 Get               0x0003        Unsubscribed        0x0012
@@ -60,11 +114,20 @@ Get               0x0003        Unsubscribed        0x0012
 
 | Message | Type | Payload |
 |---------|------|---------|
-| **Subscribe**   | `0x0001` | `[flags u8][symLen u8][symbol UTF-8…]` |
+| **ClientHello** | `0x00A1` | `[protocolVersion u32][clientCapabilities u32]` |
+| **Subscribe**   | `0x0001` | `[flags u32][symLen u8][symbol UTF-8…]` |
 | **Unsubscribe** | `0x0002` | `[securityId u64]` |
-| **Get**         | `0x0003` | `[flags u8][symLen u8][symbol UTF-8…]` |
+| **Get**         | `0x0003` | `[flags u32][symLen u8][symbol UTF-8…]` |
 
-`flags` is a `DataFlags` bitmask:
+**ClientHello** is optional. The server sends `ServerHello` first on connect; a
+client MAY reply with `ClientHello` to declare the `protocolVersion` it speaks
+(and any `clientCapabilities`, all `0` today). Clients that never send it are
+assumed to speak the current `ProtocolVersion`. If a `ClientHello` claims a
+version outside the server's supported `[min, max]` range, the server closes the
+socket with WS close code `1003` (unsupported data). Trailing bytes beyond the
+two known `u32` fields are ignored (min-length rule).
+
+`flags` is a `DataFlags` `u32` bitmask:
 
 | Value | Name | Meaning |
 |-------|------|---------|
@@ -78,7 +141,15 @@ Get               0x0003        Unsubscribed        0x0012
 | `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
 | `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol price + quantity limits from UMDF `PriceBand_22` + `QuantityBand_21`). Includes low/high price limits, limit-type, midpoint-type, trading reference price, plus `AvgDailyTradedQty` and `MaxOrderQty` for quantity-based fat-finger guards. Bootstrap snapshot on subscribe + push on every real band change. Opt-in; required by pre-trade guards that want the venue-authoritative bands instead of a static config. |
 | `0x80` | Auction | `Auction` frame (aggregated auction state from UMDF `AuctionImbalance_19` + `SecurityGroupPhase_10`). Imbalance qty/side + trading phase + TradSesOpenTime. Bootstrap snapshot on subscribe + push on every real delta. Opt-in for clients needing pre-open/auction-phase state or imbalance-aware algo logic. |
-| `0xFF` | Everything | `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction` |
+| `0x000000FF` | AllKnown | Every channel this build knows about: `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction`. **This is NOT all-ones** — new channels are added to `AllKnown` explicitly, so unknown/future bits stay unrequested. |
+
+> **`flags` is a `u32`.** The high 24 bits are currently unused. The server
+> **masks off any bit it does not recognise** and echoes only the accepted set
+> back in `SubscribeOk.flags`, so a client can inspect the reply to learn which
+> channels it actually got. Do **not** send `0xFFFFFFFF` to mean "everything" —
+> use `AllKnown`; sending all-ones would silently opt you into channels this
+> build does not implement (they are masked off) and, worse, into future
+> channels you are not prepared to decode.
 
 > **News and Trades are opt-in.** Existing clients that send `0x03` (or
 > `0x00`) keep the legacy behaviour and never receive news or trade frames.
@@ -100,13 +171,13 @@ Behavior:
 ### Hex example — Subscribe `BEEF3` (Book + Info)
 
 ```
- 0c 00 01 00 03 05 42 45 45 46 33
- └──┬──┘└──┬──┘ │  │  └────┬────┘
-   len   type  fl ln    "BEEF3"
-   12    0x01  All 5
+ 12 00 00 00  01 00  00 00  03 00 00 00  05  42 45 45 46 33
+ └────┬────┘ └──┬─┘ └──┬─┘ └────┬─────┘  │   └────┬──────┘
+   len(u32)   type   hdrFlags  flags(u32) ln    "BEEF3"
+    18       0x0001    0        All=3      5
 ```
 
-Total length = 12 bytes (4 header + 1 flags + 1 symLen + 5 symbol).
+Total length = 18 bytes (8 header + 4 flags + 1 symLen + 5 symbol).
 
 ## Server → Client
 
@@ -114,10 +185,17 @@ Total length = 12 bytes (4 header + 1 flags + 1 symLen + 5 symbol).
 
 | Message | Type | Payload |
 |---------|------|---------|
+| **ServerHello**    | `0x00A0` | `[protocolVersion u32][serverCapabilities u32][buildLen u8][build UTF-8…]` |
 | **ServerStatus**   | `0x0050` | `[ready u8]` |
-| **SubscribeOk**    | `0x0010` | `[securityId u64][flags u8][symLen u8][symbol UTF-8…]` |
+| **SubscribeOk**    | `0x0010` | `[securityId u64][flags u32][symLen u8][symbol UTF-8…]` |
 | **SubscribeError** | `0x0011` | `[errorCode u8][symLen u8][symbol UTF-8…]` |
 | **Unsubscribed**   | `0x0012` | `[securityId u64]` |
+
+**ServerHello** is the **first** server-initiated frame on every connection. It
+advertises the server's `protocolVersion` and a `serverCapabilities` bitmask
+(`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification; append-only).
+`SubscribeOk.flags` echoes the **accepted** `DataFlags` (`u32`) after the server
+masks off unknown/unimplemented bits requested by the client.
 
 `ServerStatus.ready` = `1` once **every** feed group is in `RealTime`,
 `0` otherwise. The server emits one immediately on connect and again on
@@ -283,14 +361,23 @@ so this frame fires only on true deltas.
 
 | Message | Type | Payload |
 |---------|------|---------|
-| **OrderAdded**   | `0x0030` | `[secId u64][orderId u64][side u8][price i64][qty i64]` |
+| **OrderAdded**   | `0x0030` | `[secId u64][orderId u64][price i64][qty i64][side u8]` |
 | **OrderUpdated** | `0x0031` | *(same as OrderAdded)* |
 | **OrderDeleted** | `0x0032` | `[secId u64][orderId u64][side u8]` |
 | **Trade**        | `0x0033` | `[secId u64][price i64][qty i64][tradeId i64][flags u8]` |
 | **BookCleared**  | `0x0034` | `[secId u64][clearSide u8]` |
-| **MarketTierUpdate** | `0x0036` | `[secId u64][side u8][totalQty i64][orderCount u32]` |
-| **LevelUpdate**  | `0x0037` | `[secId u64][side u8][price i64][totalQty i64][orderCount u32]` |
-| **LevelDeleted** | `0x0038` | `[secId u64][side u8][price i64]` |
+| **MarketTierUpdate** | `0x0036` | `[secId u64][totalQty i64][orderCount u32][side u8]` |
+| **LevelUpdate**  | `0x0037` | `[secId u64][price i64][totalQty i64][orderCount u32][side u8]` |
+| **LevelDeleted** | `0x0038` | `[secId u64][price i64][side u8]` |
+
+> **v2 hot-frame layout.** These fixed-size frames are laid out **largest-field
+> first** (`u64`/`i64` before `u32` before `u8`) so they map to blittable
+> structs with natural alignment. The single-byte discriminators (`side`,
+> `flags`) sit at the **end** of the payload. This is the one place v2 reordered
+> fields relative to v1; all other (variable) frames keep their historic field
+> order. Decoders MUST honour the framing length and the min-length rule (read
+> the fields they know, ignore any trailing bytes) rather than assuming an exact
+> size.
 
 For order events and `MarketTierUpdate`, `side` = `0` (Bid) or `1` (Ask).
 For `BookCleared`, `clearSide` = `0` (Both), `1` (Bid), or `2` (Ask).
@@ -306,12 +393,12 @@ Prices use the SBE schema's exponents:
 
 All other bits are reserved (must be 0). Clients MUST mask with the
 documented bit values rather than equality-checking the whole byte.
-Servers that predate the flag byte wrote the legacy 36-byte `Trade`
-frame; the framing header reports the true length, and decoders that
-read flags MUST treat absence as `0` (no flags set). Trade history
-frames replayed from the per-symbol recent-trades ring preserve the
-per-trade flags captured at ingest time (each ring slot stores the
-flag byte alongside price/qty/tradeId).
+Decoders MUST apply the **min-length rule**: read the fields they know
+using the framing length, treat a `flags` byte that is absent (a shorter
+frame) as `0`, and ignore any trailing bytes beyond what they understand.
+Trade history frames replayed from the per-symbol recent-trades ring
+preserve the per-trade flags captured at ingest time (each ring slot
+stores the flag byte alongside price/qty/tradeId).
 
 `MarketTierUpdate` represents B3 null-price MOA/MOC orders as an aggregate
 market tier per side. It is intentionally separate from priced order events:
@@ -336,8 +423,8 @@ The server retains **the last 10 hours of 1 s candles per instrument**. On
 subscribe (with `Book` flag) the entire window is delivered as a sequence
 of `CandleSnapshot` frames:
 
-- Each snapshot carries up to **1364 candles** (the per-message limit
-  imposed by the `u16` framing length).
+- Each snapshot carries up to **1364 candles** (a per-frame chunk cap that
+  bounds individual message size).
 - `flags`:
   - `0x01` (`First`) — first batch of the snapshot; client should reset
     its candle buffer for that security.
@@ -347,8 +434,8 @@ of `CandleSnapshot` frames:
 
 ### News (opt-in via `DataFlags.News`)
 
-News deliveries are split across three message types so that bodies larger
-than the `u16` framing length (~64 KiB) still fit in the protocol. A single
+News deliveries are split across three message types so that arbitrarily
+large bodies stay within a bounded per-frame size. A single
 logical news item is emitted as exactly one `NewsBegin`, then `N`
 `NewsChunk` frames (one or more per field, in `Headline → Text → URL`
 order), then exactly one `NewsEnd` (which carries the *last* fragment of
@@ -377,6 +464,45 @@ Routing:
 Clients with the `News` flag will not receive news that arrives **before**
 they subscribe — the server has no replay buffer for news.
 
+## Forward-Compatibility Contract
+
+Protocol v2 is designed so that **every future change is additive** — a v2
+decoder keeps working against a newer server, and a newer decoder keeps working
+against a v2 server. The rules below are **normative**; both the server and every
+client decoder MUST follow them.
+
+1. **`messageLength` is authoritative.** Always use the framing length to locate
+   the next frame and to bound the current one. Never infer a frame's end from
+   the fields you happen to know.
+2. **Skip-unknown / min-length rule.** Fixed frames have a documented minimum
+   length. A decoder reads only the fields it knows and **ignores any trailing
+   bytes**. New fields are appended at the end of a frame (length-gated), so an
+   old decoder transparently skips them. Never validate an *exact* frame size —
+   only `length >= minLength`. A field that is absent (shorter frame than your
+   build expects) is treated as its documented default (e.g. `Trade.flags = 0`).
+3. **Append-only type & bit space.** Message-type codes, `DataFlags` bits,
+   capability bits, and per-field bitmask positions are **never renumbered or
+   reused**. New values are only ever *added*. A decoder that receives an unknown
+   `messageType` MUST skip the whole frame (using `length`); an unknown
+   `DataFlags`/mask bit MUST be ignored (the server masks off unknown requested
+   bits and echoes only the accepted set in `SubscribeOk`).
+4. **`headerFlags` is reject-on-unknown.** Unlike payload extensions, an unknown
+   header-flag bit may change how the payload is framed/encoded (e.g.
+   compression). A receiver that sees any header-flag bit it does not understand
+   MUST reject the frame / close the connection rather than skip it.
+5. **Little-endian only.** All integers are LE. A big-endian runtime is
+   unsupported and rejected at startup.
+6. **`MaxFrameLength` guard.** A frame whose `messageLength` exceeds 16 MiB is
+   rejected before allocation (DoS protection against a bogus `u32` length).
+7. **Version negotiation.** The server announces its version in `ServerHello`;
+   a client MAY announce its own in `ClientHello`. Incompatible versions are
+   closed with WS `1003`. Because of rules 1–3, a version bump is only required
+   for a genuinely breaking change — additive channels/fields do **not** need one.
+
+Because v2 already reserves `headerFlags`, widened `DataFlags`/lengths to `u32`,
+and mandates skip-unknown everywhere, the intent is that **no further breaking
+wire change is needed** after v2.
+
 ## Subscription flow
 
 ```mermaid
@@ -385,6 +511,11 @@ sequenceDiagram
     participant C as Client
     participant S as Server (feed thread)
 
+    Note over C,S: WS connect
+    S-->>C: ServerHello(version, capabilities)
+    opt client negotiates
+        C->>S: ClientHello(version)
+    end
     C->>S: Subscribe(BEEF3, Book+Info)
     Note right of S: ProcessPendingRequests()
     S-->>C: SubscribeOk(id, flags)
@@ -415,6 +546,7 @@ sequenceDiagram
     Note over C,S: TCP/WS drop
     Note left of C: reconnect, exponential backoff
     C->>S: (open)
+    S-->>C: ServerHello(version, capabilities)
     S-->>C: ServerStatus(ready=1)
     Note right of S: or ready=0 while a group is recovering
     C->>S: Subscribe(symA, flags)

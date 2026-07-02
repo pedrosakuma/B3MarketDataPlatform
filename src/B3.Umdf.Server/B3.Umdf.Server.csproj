@@ -14,6 +14,8 @@
     <ProjectReference Include="..\B3.Umdf.Transport\B3.Umdf.Transport.csproj" />
     <ProjectReference Include="..\B3.Umdf.Feed\B3.Umdf.Feed.csproj" />
     <ProjectReference Include="..\B3.Umdf.Book\B3.Umdf.Book.csproj" />
+    <!-- Single canonical wire-protocol definition, shared with the SDK. -->
+    <ProjectReference Include="..\B3.MarketData.Wire\B3.MarketData.Wire.csproj" />
   </ItemGroup>
 
   <ItemGroup>

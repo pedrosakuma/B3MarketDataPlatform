@@ -119,7 +119,7 @@ client.SecurityDefinition += sd =>
     Console.WriteLine($"{sd.Symbol} tick={sd.MinPriceIncrement} lot={sd.MinTradeVolume} isin={sd.IsinNumber}");
 await client.SubscribeAsync("PETR4",
     SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.SecurityDefinition);
-// or just: SubscribeFlags.Everything
+// or just: SubscribeFlags.AllKnown
 ```
 
 `MinPriceIncrement` is already scaled (raw SBE `Fixed8` mantissa divided by
@@ -147,7 +147,7 @@ client.PriceBand += pb =>
         $"avgQty={pb.AvgDailyTradedQty} maxQty={pb.MaxOrderQty}");
 await client.SubscribeAsync("WINJ5",
     SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.PriceBand);
-// or just: SubscribeFlags.Everything
+// or just: SubscribeFlags.AllKnown
 ```
 
 **Price fields** (from `PriceBand_22`):
@@ -198,7 +198,7 @@ client.Auction += a =>
         $"side={a.ImbalanceSide} openTime={a.TradSesOpenTime}");
 await client.SubscribeAsync("PETR4",
     SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Auction);
-// or just: SubscribeFlags.Everything
+// or just: SubscribeFlags.AllKnown
 ```
 
 `ImbalanceSide` is an enum (`Balanced`, `MoreBuyers`, `MoreSellers`)

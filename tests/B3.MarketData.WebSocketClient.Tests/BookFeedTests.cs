@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Net.WebSockets;
 using System.Text;
 using ServerWire = B3.Umdf.Server.WireProtocol;
-using ServerMsg = B3.Umdf.Server.MessageType;
+using ServerMsg = B3.MarketData.Wire.MessageType;
 
 namespace B3.MarketData.WebSocketClient.Tests;
 

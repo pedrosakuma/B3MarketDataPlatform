@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using System.Buffers.Binary;
 using B3.Umdf.Book;
 using B3.Umdf.Server;
@@ -33,8 +34,8 @@ public class PriceBandWireRoundTripTests
         int len = B3.Umdf.Server.WireProtocol.WritePriceBand(buf, securityId: 42UL, info);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var hLen, out var type));
-        Assert.Equal(len, hLen);
-        Assert.Equal(WireFormat.MessageType.PriceBand, type);
+        Assert.Equal((uint)len, hLen);
+        Assert.Equal(MessageType.PriceBand, type);
 
         var ev = WireFormat.ReadPriceBand(
             buf.AsSpan(WireFormat.FramingHeaderSize, len - WireFormat.FramingHeaderSize),

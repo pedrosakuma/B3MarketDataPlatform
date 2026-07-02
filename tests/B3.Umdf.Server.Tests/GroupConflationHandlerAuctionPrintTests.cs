@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using B3.Umdf.Book;
 using B3.Umdf.Mbo.Sbe.V16;
+using MessageType = B3.MarketData.Wire.MessageType;
 using B3.Umdf.Server;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -148,8 +149,8 @@ public class GroupConflationHandlerAuctionPrintTests
             Thread.Sleep(10);
         }
         Assert.NotNull(frame);
-        Assert.Equal(37, frame!.Length);
-        return (TradeFlags)frame[36];
+        Assert.Equal(41, frame!.Length);
+        return (TradeFlags)frame[40];
     }
 
     private static void SetTradingStatus((SubscriptionManager Manager, GroupConflationHandler Group,

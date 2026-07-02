@@ -179,7 +179,7 @@ public sealed class SubscriptionManager : IDisposable
             foreach (var k in subs.Keys) clientIds[i++] = k;
         }
 
-        var buf = new byte[12];
+        var buf = new byte[16];
         int len = WireProtocol.WriteSymbolDelisted(buf, securityId);
         var payload = new ReadOnlyMemory<byte>(buf, 0, len);
 
@@ -977,7 +977,7 @@ public sealed class SubscriptionManager : IDisposable
         }
 
         if (!enqueueAck) return;
-        var buf = new byte[12];
+        var buf = new byte[16];
         int len = WireProtocol.WriteUnsubscribed(buf, securityId);
         session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
@@ -1080,7 +1080,7 @@ public sealed class SubscriptionManager : IDisposable
 
     private void BroadcastServerStatus(bool ready)
     {
-        var buf = new byte[5];
+        var buf = new byte[9];
         WireProtocol.WriteServerStatus(buf, ready);
         var payload = new ReadOnlyMemory<byte>(buf);
         foreach (var (_, client) in _clients)

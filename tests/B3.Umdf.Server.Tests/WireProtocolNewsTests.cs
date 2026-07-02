@@ -101,8 +101,8 @@ public class WireProtocolNewsTests
         WireProtocol.WriteNewsChunk(chunk, 1, WireProtocol.NewsField.Text, data, isFinal: false);
         WireProtocol.WriteNewsChunk(end, 1, WireProtocol.NewsField.Text, data, isFinal: true);
 
-        // Type byte sits inside the framing header — they must differ.
-        Assert.NotEqual(chunk[2], end[2]);
+        // Type field (u16) sits inside the framing header at offset 4 — they must differ.
+        Assert.NotEqual(chunk[4], end[4]);
     }
 
     [Fact]
@@ -126,9 +126,9 @@ public class WireProtocolNewsTests
     [Fact]
     public void DataFlags_Everything_IncludesNewsBit()
     {
-        Assert.True((DataFlags.Everything & DataFlags.News) == DataFlags.News);
-        Assert.True((DataFlags.Everything & DataFlags.Book) == DataFlags.Book);
-        Assert.True((DataFlags.Everything & DataFlags.Info) == DataFlags.Info);
+        Assert.True((DataFlags.AllKnown & DataFlags.News) == DataFlags.News);
+        Assert.True((DataFlags.AllKnown & DataFlags.Book) == DataFlags.Book);
+        Assert.True((DataFlags.AllKnown & DataFlags.Info) == DataFlags.Info);
     }
 
     [Fact]

@@ -119,7 +119,7 @@ public class WireProtocolFramingFuzzTests
                 // Reject obviously malformed framing per server contract.
                 if (len < WireProtocol.FramingHeaderSize) break;
                 if (offset + len > buf.Length) break;
-                offset += len;
+                offset += (int)len;
             }
             // Must never advance past the buffer end. If this assert fires, the framing
             // loop has a bounds bug exploitable as out-of-bounds read.
@@ -133,17 +133,17 @@ public class WireProtocolFramingFuzzTests
     /// drive the parser into a slice past the end.
     /// </summary>
     [Theory]
-    [InlineData(0xFFFF)] // max u16 — claims 65535 bytes
+    [InlineData(0xFFFF)] // claims 65535 bytes
     [InlineData(0x0100)] // 256 bytes
-    [InlineData(0x0005)] // just one byte beyond the truncated frame
+    [InlineData(0x0009)] // just one byte beyond the header-only frame
     public void OversizedLengthHeader_IsRejected(int claimedLen)
     {
-        var buf = new byte[4]; // header-only, no payload
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, (ushort)claimedLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), (ushort)MessageType.Subscribe);
+        var buf = new byte[8]; // header-only, no payload
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, (uint)claimedLen);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), (ushort)MessageType.Subscribe);
 
         Assert.True(WireProtocol.TryReadFramingHeader(buf, out var len, out _));
-        Assert.Equal((ushort)claimedLen, len);
+        Assert.Equal((uint)claimedLen, len);
         // Caller is responsible for "len > available" check; verify it works:
         Assert.True(len > buf.Length || len == buf.Length, "test setup: claimed length should exceed real buffer");
     }
@@ -188,7 +188,7 @@ public class WireProtocolFramingFuzzTests
             if (!WireProtocol.TryReadFramingHeader(buf[offset..], out var len, out _)) break;
             if (len < WireProtocol.FramingHeaderSize) break;
             if (offset + len > buf.Length) break;
-            offset += len;
+            offset += (int)len;
         }
         return offset;
     }

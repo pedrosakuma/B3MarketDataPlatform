@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
@@ -91,7 +92,7 @@ public class MarketDataClientFramingFuzzTests
                 if (!WireFormat.TryReadHeader(buf.AsSpan(offset), out var len, out _) ||
                     len < WireFormat.FramingHeaderSize) break;
                 if (offset + len > buf.Length) break;
-                offset += len;
+                offset += (int)len;
             }
             Assert.True(offset <= buf.Length, $"DispatchFrames loop walked past end (offset={offset}, length={buf.Length})");
         });
@@ -102,14 +103,14 @@ public class MarketDataClientFramingFuzzTests
     /// The framing loop must reject the partial frame and stop, NOT slice past the end.
     /// </summary>
     [Theory]
-    [InlineData(5)]      // claims one byte beyond a 4-byte header buffer
+    [InlineData(9)]      // claims one byte beyond an 8-byte header buffer
     [InlineData(255)]
-    [InlineData(0xFFFF)] // u16 max
+    [InlineData(0xFFFF)]
     public void OversizedClaimedLength_DoesNotCausePastEndRead(int claimedLen)
     {
-        var buf = new byte[4];
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, (ushort)claimedLen);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), (ushort)WireFormat.MessageType.ServerStatus);
+        var buf = new byte[8];
+        BinaryPrimitives.WriteUInt32LittleEndian(buf, (uint)claimedLen);
+        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(4), (ushort)MessageType.ServerStatus);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var len, out _));
         // Same loop the SDK runs:
@@ -133,14 +134,13 @@ public class MarketDataClientFramingFuzzTests
     {
         var buf = new byte[10];
         // Claim a 16-byte ServerHello frame but only deliver 10 bytes.
-        BinaryPrimitives.WriteUInt16LittleEndian(buf, 16);
-        BinaryPrimitives.WriteUInt16LittleEndian(buf.AsSpan(2), (ushort)WireFormat.MessageType.ServerHello);
+        WireFrame.WriteHeader(buf, 16, MessageType.ServerHello);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var len, out var type));
-        Assert.Equal(16, len);
-        Assert.Equal(WireFormat.MessageType.ServerHello, type);
-        // Loop must NOT slice into a 12-byte payload from a 6-byte tail; the bounds check
+        Assert.Equal(16u, len);
+        Assert.Equal(MessageType.ServerHello, type);
+        // Loop must NOT slice into a payload from a short tail; the bounds check
         // (offset + len > buf.Length) is the exact gate exercised here.
-        Assert.True(0 + len > buf.Length);
+        Assert.True(0 + len > (uint)buf.Length);
     }
 }

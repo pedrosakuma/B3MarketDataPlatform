@@ -1,14 +1,15 @@
 # WebSocket API — consumer guide
 
-**Status: v1, stable.** This page is the contract surface for downstream
+**Status: v2, stable.** This page is the contract surface for downstream
 apps that want to consume `B3MarketDataPlatform` over the network without
 reverse-engineering the bundled JS frontend. The exhaustive wire spec
 (framing, full message catalog, every field) lives in
 [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md); this file is a thin
 landing page that highlights the parts a typical consumer needs.
 
-The canonical downstream use case driving v1 is `B3TradingPlatform`'s
-`IReferencePrice` (last-trade price feed for pre-trade risk).
+The canonical downstream use case driving the protocol is
+`B3TradingPlatform`'s `IReferencePrice` (last-trade price feed for
+pre-trade risk).
 
 ---
 
@@ -31,7 +32,7 @@ All messages — both directions — are length-prefixed little-endian
 binary frames sent as **WebSocket binary messages**:
 
 ```
-[length u16][type u16][payload …]   length includes the 4-byte header
+[length u32][type u16][headerFlags u16][payload …]   length includes the 8-byte header
 ```
 
 **The protocol is binary, not JSON.** This is a deliberate performance
@@ -39,9 +40,21 @@ choice: each message decodes with zero allocations using
 `BinaryPrimitives.ReadXxxLittleEndian`. A typed C# subscriber is ~50
 lines.
 
-`type` is a `u16` from the catalog in
-[WEBSOCKET-PROTOCOL.md §Message types](WEBSOCKET-PROTOCOL.md#message-types).
-The ones a price consumer cares about:
+`length` (`u32`) is the whole frame including the header; `type` is a `u16`
+from the catalog in
+[WEBSOCKET-PROTOCOL.md §Message types](WEBSOCKET-PROTOCOL.md#message-types);
+`headerFlags` (`u16`) is `0` in v2 — **reject any frame whose header-flags
+carry a bit you don't understand**. The payload starts at byte offset **8**.
+
+> **One WebSocket message may carry several frames.** The server *coalesces*
+> everything queued for you during a short window into a single binary message,
+> so your read loop must split frames by `length` and iterate until the message
+> is drained — do not assume one WS message equals one frame. Start with a small
+> receive buffer and grow it on demand (up to 16 MiB) rather than pre-allocating
+> the max. See
+> [WEBSOCKET-PROTOCOL.md §Consuming coalesced messages](WEBSOCKET-PROTOCOL.md#consuming-coalesced-messages).
+
+The types a price consumer cares about:
 
 | Direction | Type | Name | Purpose |
 |-----------|------|------|---------|
@@ -67,6 +80,7 @@ The minimal flow for an `IReferencePrice`-style consumer:
    (`Trades` only) — or `0x12` (`Info|Trades`) if you also want the
    periodic `InfoSnapshot` fields (which include `LastTradePrice` /
    `LastTradeSize` as canonical "last value seen by the server").
+   `flags` is a **`u32`**.
 4. Read frames in a loop. For each `Trade` (`0x0033`), update your
    in-memory `lastPrice[securityId] = price * 1e-4`.
 5. On `TradeBust` (`0x0035`), risk consumers usually **ignore** it (the
@@ -77,22 +91,22 @@ The minimal flow for an `IReferencePrice`-style consumer:
 ### Subscribe frame layout
 
 ```
-Subscribe (0x0001) — body: [flags u8][symLen u8][symbol UTF-8…]
+Subscribe (0x0001) — body (after 8-byte header): [flags u32][symLen u8][symbol UTF-8…]
 ```
 
 Example — subscribe to `PETR4` for trades only (`flags=0x10`):
 
 ```
-0c 00 01 00 10 05 50 45 54 52 34
-└──┬──┘└──┬──┘ │  │  └────┬────┘
-  len   type  fl ln    "PETR4"
-   12  0x0001 Trades 5
+12 00 00 00  01 00  00 00  10 00 00 00  05  50 45 54 52 34
+└────┬────┘ └──┬─┘ └──┬─┘ └────┬─────┘  │   └────┬──────┘
+  len(u32)   type   hdrFlags  flags(u32) ln    "PETR4"
+   18       0x0001    0        Trades     5
 ```
 
 Server replies with **`SubscribeOk`** (`0x0010`):
 
 ```
-SubscribeOk — body: [securityId u64][flags u8][symLen u8][symbol UTF-8…]
+SubscribeOk — body (after 8-byte header): [securityId u64][flags u32][symLen u8][symbol UTF-8…]
 ```
 
 Persist `securityId` — every subsequent server frame uses it as the
@@ -101,8 +115,9 @@ primary key, *not* the symbol string.
 ### `Trade` frame layout
 
 ```
-Trade (0x0033) — body: [securityId u64][price i64][qty i64][tradeId i64]
-Total: 4 + 8 + 8 + 8 + 8 = 36 bytes
+Trade (0x0033) — body (after 8-byte header):
+  [securityId u64][price i64][qty i64][tradeId i64][flags u8]
+Total: 8 (header) + 8 + 8 + 8 + 8 + 1 = 41 bytes
 ```
 
 | Field | Type | Notes |
@@ -111,28 +126,31 @@ Total: 4 + 8 + 8 + 8 + 8 = 36 bytes
 | `price` | `i64` LE | Mantissa with **exponent `-4`** (B3 SBE `Price`). Display value = `price × 10⁻⁴`. |
 | `qty` | `i64` LE | Trade size, integer units. |
 | `tradeId` | `i64` LE | Server-assigned, monotonically increasing per security. |
+| `flags` | `u8` | `TradeFlags` bitset (`0x01` = AuctionPrint). Trailing field — treat as `0` if the frame is shorter than 41 bytes (min-length rule). |
 
 ### `Trade` hex example
 
 A trade of **10.0000 @ 50** for `securityId = 0x00000000CAFEBABE`,
-`tradeId = 9999`:
+`tradeId = 9999`, `flags = 0`:
 
 ```
-24 00 33 00  BE BA FE CA 00 00 00 00  A0 86 01 00 00 00 00 00  32 00 00 00 00 00 00 00  0F 27 00 00 00 00 00 00
-└──┬──┘└──┬──┘└────────┬────────────┘└────────┬────────────┘└────────┬────────────┘└────────┬────────────┘
- len=36  type=0x33     securityId=             price=100000           qty=50                 tradeId=9999
-                       0xCAFEBABE              (= 10.0000)
+29 00 00 00  33 00  00 00  BE BA FE CA 00 00 00 00  A0 86 01 00 00 00 00 00  32 00 00 00 00 00 00 00  0F 27 00 00 00 00 00 00  00
+└────┬────┘ └──┬─┘ └──┬─┘ └────────┬────────────┘ └────────┬────────────┘ └────────┬────────────┘ └────────┬────────────┘ └┬┘
+ len=41(u32) type  hdrFlags   securityId=              price=100000            qty=50                 tradeId=9999          flags
+             0x33    0         0xCAFEBABE               (= 10.0000)                                                          =0
 ```
 
 C# decode:
 
 ```csharp
-ushort len  = BinaryPrimitives.ReadUInt16LittleEndian(buf);            // 36
-ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]);       // 0x0033
-ulong  sid  = BinaryPrimitives.ReadUInt64LittleEndian(buf[4..]);
-long   pxM  = BinaryPrimitives.ReadInt64LittleEndian(buf[12..]);       // mantissa
-long   qty  = BinaryPrimitives.ReadInt64LittleEndian(buf[20..]);
-long   tid  = BinaryPrimitives.ReadInt64LittleEndian(buf[28..]);
+uint  len  = BinaryPrimitives.ReadUInt32LittleEndian(buf);            // 41
+ushort type = BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]);      // 0x0033
+// buf[6..8] = headerFlags (must be 0)
+ulong  sid  = BinaryPrimitives.ReadUInt64LittleEndian(buf[8..]);
+long   pxM  = BinaryPrimitives.ReadInt64LittleEndian(buf[16..]);      // mantissa
+long   qty  = BinaryPrimitives.ReadInt64LittleEndian(buf[24..]);
+long   tid  = BinaryPrimitives.ReadInt64LittleEndian(buf[32..]);
+byte   flg  = len > 40 ? buf[40] : (byte)0;                           // min-length rule
 decimal price = pxM / 10_000m;
 ```
 
@@ -147,10 +165,10 @@ A minimal snapshot with **only** `LastTradePrice = 10.0000` for
 `securityId = 0x00000000CAFEBABE` (mask bit 4):
 
 ```
-18 00 21 00  BE BA FE CA 00 00 00 00  10 00 00 00  A0 86 01 00 00 00 00 00
-└──┬──┘└──┬──┘└────────┬────────────┘└─────┬─────┘└────────┬────────────┘
- len=24  type=0x21     securityId          mask=0x10        LastTradePrice
-                       0xCAFEBABE          (bit 4)          = 100000 → 10.0000
+1c 00 00 00  21 00  00 00  BE BA FE CA 00 00 00 00  10 00 00 00  A0 86 01 00 00 00 00 00
+└────┬────┘ └──┬─┘ └──┬─┘ └────────┬────────────┘ └─────┬─────┘ └────────┬────────────┘
+ len=28(u32) type  hdrFlags   securityId=            mask=0x10       LastTradePrice
+             0x21    0         0xCAFEBABE             (bit 4)         = 100000 → 10.0000
 ```
 
 For the full bit map (24 fields, including `LastTradeSize`,
@@ -176,26 +194,27 @@ For the full bit map (24 fields, including `LastTradeSize`,
 
 ## Versioning & breaking-change policy
 
-- **v1 is stable.** Existing message types and field layouts (the rows
-  in the table above, plus everything else in
-  [WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md)) will not change shape
-  within v1.
+- **v2 is the current wire and is stable.** It replaced the pre-1.0 v1 wire
+  with a single, deliberate breaking change (8-byte `u32`-length header,
+  `u32` `DataFlags`, blittable hot-frame layout) so that **every future
+  change can be additive**. The full rules live in
+  [WEBSOCKET-PROTOCOL.md §Forward-Compatibility Contract](WEBSOCKET-PROTOCOL.md#forward-compatibility-contract).
+  Clients built against v0.x SDK tags must upgrade.
 - **Additive changes are non-breaking** and may ship in any release:
-  - New `MessageType` values.
-  - New bits in `DataFlags`.
-  - New bits in `InfoSnapshot.fieldMask` (appended at the next free
-    bit position; existing masks remain valid).
+  - New `MessageType` values (unknown types are skipped via the framing length).
+  - New bits in `DataFlags` (unknown bits are masked off by the server).
+  - New trailing fields appended to an existing fixed frame (old decoders
+    skip them via the min-length rule).
+  - New bits in `InfoSnapshot.fieldMask` (appended at the next free bit
+    position; existing masks remain valid).
   - New optional REST endpoints alongside the WS layer.
-- **Breaking changes require a v2 surface.** That includes: changing
-  the size or order of fields in an existing message, removing a
-  message type, repurposing a `DataFlags` bit, or changing the framing
-  header. v2 will be advertised by a new `MessageType` (e.g. a
-  versioned `Hello`) before the legacy v1 wire is removed; v1 will be
-  supported for at least one major release after v2 ships.
-- The published Docker image tag (`v1.x.y`) is the stability anchor.
-  Pin to a specific `vX.Y.Z` (or `sha-<short>`) in production; `latest`
-  tracks `main` and may include experimental aditive features behind
-  flags.
+- **A future breaking change would require a v3 surface** and a
+  `ProtocolVersion` bump advertised in `ServerHello`. Because v2 already
+  reserves `headerFlags`, widened lengths/flags to `u32`, and mandates
+  skip-unknown everywhere, none is anticipated.
+- The published Docker image tag (`v1.x.y`) is the stability anchor. Pin to
+  a specific `vX.Y.Z` (or `sha-<short>`) in production; `latest` tracks
+  `main` and may include experimental additive features behind flags.
 
 ## Out of scope here
 

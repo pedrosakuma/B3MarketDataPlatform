@@ -90,12 +90,12 @@ public class GroupConflationHandlerMbpTests
 
             var lu = rec.LastFrame(MessageType.LevelUpdate);
             Assert.NotNull(lu);
-            // Layout: header(4) + secId(8) + side(1) + price(8) + totalQty(8) + count(4)
-            Assert.Equal(SecurityId, BinaryPrimitives.ReadUInt64LittleEndian(lu.AsSpan(4)));
-            Assert.Equal((byte)BookSideType.Bid, lu[12]);
-            Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(lu.AsSpan(13)));
-            Assert.Equal(10L, BinaryPrimitives.ReadInt64LittleEndian(lu.AsSpan(21))); // 7 + 3
-            Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(lu.AsSpan(29)));
+            // v2 layout: header(8) + secId(8) + price(8) + totalQty(8) + count u32 + side u8
+            Assert.Equal(SecurityId, BinaryPrimitives.ReadUInt64LittleEndian(lu.AsSpan(8)));
+            Assert.Equal((byte)BookSideType.Bid, lu[36]);
+            Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(lu.AsSpan(16)));
+            Assert.Equal(10L, BinaryPrimitives.ReadInt64LittleEndian(lu.AsSpan(24))); // 7 + 3
+            Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(lu.AsSpan(32)));
         }
         finally
         {
@@ -130,9 +130,9 @@ public class GroupConflationHandlerMbpTests
             Assert.Equal(0, rec.CountByType(MessageType.LevelUpdate));
 
             var ld = rec.LastFrame(MessageType.LevelDeleted)!;
-            Assert.Equal(SecurityId, BinaryPrimitives.ReadUInt64LittleEndian(ld.AsSpan(4)));
-            Assert.Equal((byte)BookSideType.Bid, ld[12]);
-            Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(ld.AsSpan(13)));
+            Assert.Equal(SecurityId, BinaryPrimitives.ReadUInt64LittleEndian(ld.AsSpan(8)));
+            Assert.Equal((byte)BookSideType.Bid, ld[24]);
+            Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(ld.AsSpan(16)));
         }
         finally
         {
@@ -336,10 +336,10 @@ internal sealed class RecordingWebSocket : WebSocket
         lock (_lock)
         {
             int o = 0;
-            while (o + 4 <= bytes.Length)
+            while (o + 8 <= bytes.Length)
             {
-                int frameLen = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(o));
-                if (frameLen < 4 || o + frameLen > bytes.Length) break;
+                int frameLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(o));
+                if (frameLen < 8 || o + frameLen > bytes.Length) break;
                 var frame = new byte[frameLen];
                 Buffer.BlockCopy(bytes, o, frame, 0, frameLen);
                 _frames.Add(frame);
@@ -358,7 +358,7 @@ internal sealed class RecordingWebSocket : WebSocket
             int n = 0;
             foreach (var f in _frames)
             {
-                if (f.Length >= 4 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(2)) == t)
+                if (f.Length >= 8 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(4)) == t)
                     n++;
             }
             return n;
@@ -372,7 +372,7 @@ internal sealed class RecordingWebSocket : WebSocket
             for (int i = _frames.Count - 1; i >= 0; i--)
             {
                 var f = _frames[i];
-                if (f.Length >= 4 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(2)) == t)
+                if (f.Length >= 8 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(4)) == t)
                     return f;
             }
             return null;
@@ -386,7 +386,7 @@ internal sealed class RecordingWebSocket : WebSocket
             var result = new List<byte[]>();
             foreach (var f in _frames)
             {
-                if (f.Length >= 4 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(2)) == t)
+                if (f.Length >= 8 && (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(f.AsSpan(4)) == t)
                     result.Add(f);
             }
             return result;

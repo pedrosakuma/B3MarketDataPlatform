@@ -11,8 +11,8 @@ namespace B3.Umdf.Server.Tests;
 /// </summary>
 public class WireProtocolPriceBandTests
 {
-    private static (ushort length, MessageType type) ReadFraming(Span<byte> buf) =>
-        (BinaryPrimitives.ReadUInt16LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]));
+    private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
+        ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 
     [Fact]
     public void WritePriceBand_MessageTypeIs0x00B1()
@@ -114,7 +114,7 @@ public class WireProtocolPriceBandTests
     [Fact]
     public void DataFlags_PriceBand_IsInEverythingButNotAll()
     {
-        Assert.True(DataFlags.Everything.HasFlag(DataFlags.PriceBand));
+        Assert.True(DataFlags.AllKnown.HasFlag(DataFlags.PriceBand));
         Assert.False(DataFlags.All.HasFlag(DataFlags.PriceBand));
         Assert.Equal((byte)0x40, (byte)DataFlags.PriceBand);
     }

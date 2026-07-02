@@ -3,10 +3,11 @@ namespace B3.MarketData.WebSocketClient;
 /// <summary>
 /// Bitmask matching the server's <c>DataFlags</c> enum. Combine with <c>|</c>
 /// (e.g. <c>Trades | Info | Mbp</c>). Bit positions are part of the wire
-/// contract — never reorder or repurpose.
+/// contract — never reorder or repurpose. Underlying type is <c>uint</c> to
+/// match the 32-bit wire <c>DataFlags</c>, leaving room for future channels.
 /// </summary>
 [Flags]
-public enum SubscribeFlags : byte
+public enum SubscribeFlags : uint
 {
     /// <summary>
     /// L3 / order-by-order book: <see cref="MarketDataClient.BookSnapshot"/> on
@@ -84,6 +85,10 @@ public enum SubscribeFlags : byte
     /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction.</summary>
     All = Book | Info,
 
-    /// <summary>Convenience alias for every data class: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.</summary>
-    Everything = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
+    /// <summary>Every data class this SDK build knows about: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.
+    /// NOT all-ones — future channels are added here explicitly so unknown bits stay unrequested.</summary>
+    AllKnown = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
+
+    /// <summary>Deprecated alias for <see cref="AllKnown"/>. Prefer <see cref="AllKnown"/>.</summary>
+    Everything = AllKnown,
 }

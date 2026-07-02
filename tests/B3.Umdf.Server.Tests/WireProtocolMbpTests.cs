@@ -4,8 +4,8 @@ namespace B3.Umdf.Server.Tests;
 
 public class WireProtocolMbpTests
 {
-    private static (ushort length, MessageType type) ReadFraming(Span<byte> buf) =>
-        (BinaryPrimitives.ReadUInt16LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[2..]));
+    private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
+        ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 
     [Fact]
     public void WriteLevelUpdate_RoundTrip()
@@ -18,11 +18,11 @@ public class WireProtocolMbpTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.LevelUpdate, type);
 
-        Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(1, buf[12]);
-        Assert.Equal(1234567L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(13)));
-        Assert.Equal(9876L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(21)));
-        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(29)));
+        Assert.Equal(42UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(1, buf[36]);
+        Assert.Equal(1234567L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(16)));
+        Assert.Equal(9876L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(24)));
+        Assert.Equal(7u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(32)));
     }
 
     [Fact]
@@ -36,9 +36,9 @@ public class WireProtocolMbpTests
         Assert.Equal(len, msgLen);
         Assert.Equal(MessageType.LevelDeleted, type);
 
-        Assert.Equal(99UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        Assert.Equal(0, buf[12]);
-        Assert.Equal(-5L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(13)));
+        Assert.Equal(99UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        Assert.Equal(0, buf[24]);
+        Assert.Equal(-5L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(16)));
     }
 
     [Fact]
@@ -57,14 +57,14 @@ public class WireProtocolMbpTests
         var (msgLen, type) = ReadFraming(buf);
         Assert.Equal(buf.Length, msgLen);
         Assert.Equal(MessageType.LevelSnapshot, type);
-        Assert.Equal(7UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(4)));
-        Assert.Equal((ushort)bidCount, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(12)));
-        Assert.Equal((ushort)askCount, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(14)));
+        Assert.Equal(7UL, BinaryPrimitives.ReadUInt64LittleEndian(buf.AsSpan(8)));
+        Assert.Equal((ushort)bidCount, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(16)));
+        Assert.Equal((ushort)askCount, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(18)));
 
-        // First bid entry begins at offset 16.
-        Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(16)));
-        Assert.Equal(50L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(24)));
-        Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(32)));
+        // First bid entry begins at offset 20.
+        Assert.Equal(1000L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(20)));
+        Assert.Equal(50L, BinaryPrimitives.ReadInt64LittleEndian(buf.AsSpan(28)));
+        Assert.Equal(3u, BinaryPrimitives.ReadUInt32LittleEndian(buf.AsSpan(36)));
     }
 
     [Fact]
@@ -76,15 +76,15 @@ public class WireProtocolMbpTests
         var (msgLen, type) = ReadFraming(buf);
         Assert.Equal(buf.Length, msgLen);
         Assert.Equal(MessageType.LevelSnapshot, type);
-        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(12)));
-        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(14)));
+        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(16)));
+        Assert.Equal(0, BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(18)));
     }
 
     [Fact]
     public void DataFlags_MbpBitMatchesProtocol()
     {
         Assert.Equal((DataFlags)0x08, DataFlags.Mbp);
-        Assert.True((DataFlags.Everything & DataFlags.Mbp) == DataFlags.Mbp);
+        Assert.True((DataFlags.AllKnown & DataFlags.Mbp) == DataFlags.Mbp);
         Assert.True((DataFlags.Book & DataFlags.Mbp) == 0);
     }
 }

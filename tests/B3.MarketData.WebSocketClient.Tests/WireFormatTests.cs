@@ -1,3 +1,4 @@
+using B3.MarketData.Wire;
 using B3.MarketData.WebSocketClient;
 
 namespace B3.MarketData.WebSocketClient.Tests;
@@ -13,13 +14,13 @@ public class WireFormatTests
     [Fact]
     public void Trade_RoundTrip_ScalesPriceWithSbeExponent()
     {
-        // Encode a Trade frame the way the server would.
-        Span<byte> buf = stackalloc byte[37];
+        // Encode a Trade frame the way the server would (v2 blittable struct).
+        Span<byte> buf = stackalloc byte[TradeFrame.WireSize];
         WriteServerTradeFrame(buf, securityId: 42, price: 12_3456, qty: 100, tradeId: 7, flags: 0);
 
         Assert.True(WireFormat.TryReadHeader(buf, out var len, out var type));
-        Assert.Equal(37, len);
-        Assert.Equal(WireFormat.MessageType.Trade, type);
+        Assert.Equal((uint)TradeFrame.WireSize, len);
+        Assert.Equal(MessageType.Trade, type);
 
         var (secId, price, qty, tradeId, flags) = WireFormat.ReadTrade(buf[WireFormat.FramingHeaderSize..]);
         Assert.Equal(42UL, secId);
@@ -38,7 +39,7 @@ public class WireFormatTests
     [InlineData(1, TradeFlags.AuctionPrint)]
     public void Trade_DecodesFlagsByte(byte raw, TradeFlags expected)
     {
-        Span<byte> buf = stackalloc byte[37];
+        Span<byte> buf = stackalloc byte[TradeFrame.WireSize];
         WriteServerTradeFrame(buf, securityId: 99, price: 1000, qty: 7, tradeId: 123, flags: raw);
 
         var (_, _, _, _, flags) = WireFormat.ReadTrade(buf[WireFormat.FramingHeaderSize..]);
@@ -46,19 +47,20 @@ public class WireFormatTests
     }
 
     [Fact]
-    public void Trade_LegacyServer_OmittedFlagsByte_DefaultsToNone()
+    public void Trade_ForwardCompat_TrailingExtensionBytes_AreIgnored()
     {
-        // Simulate an older server that wrote the 36-byte trade frame.
-        Span<byte> buf = stackalloc byte[36];
-        const ushort totalLen = 36;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf, totalLen);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)WireFormat.MessageType.Trade);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(buf[4..], 42UL);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[12..], 1000L);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[20..], 7L);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[28..], 123L);
+        // A future server appends fields after the v2 core; the min-length rule
+        // says older decoders read the known core and ignore the trailing bytes.
+        Span<byte> buf = stackalloc byte[TradeFrame.WireSize + 8];
+        WireFrame.Write(buf, new TradeFrame(42UL, 1000L, 7L, 123L, flags: 0));
+        // Re-stamp the framing length to advertise the longer frame.
+        WireFrame.WriteHeader(buf, TradeFrame.WireSize + 8, MessageType.Trade);
 
-        var (_, _, _, _, flags) = WireFormat.ReadTrade(buf[WireFormat.FramingHeaderSize..]);
+        var (secId, price, qty, tradeId, flags) = WireFormat.ReadTrade(buf[WireFormat.FramingHeaderSize..]);
+        Assert.Equal(42UL, secId);
+        Assert.Equal(1000L, price);
+        Assert.Equal(7L, qty);
+        Assert.Equal(123L, tradeId);
         Assert.Equal(TradeFlags.None, flags);
     }
 
@@ -69,13 +71,14 @@ public class WireFormatTests
         int len = WireFormat.WriteSubscribe(buf, SubscribeFlags.Trades | SubscribeFlags.Info, "PETR4");
 
         Assert.True(WireFormat.TryReadHeader(buf, out var totalLen, out var type));
-        Assert.Equal(len, totalLen);
-        Assert.Equal(WireFormat.MessageType.Subscribe, type);
-        // [flags=0x12][symLen=5][PETR4]
-        Assert.Equal((byte)0x12, buf[4]);
-        Assert.Equal((byte)5, buf[5]);
-        Assert.Equal((byte)'P', buf[6]);
-        Assert.Equal((byte)'4', buf[10]);
+        Assert.Equal((uint)len, totalLen);
+        Assert.Equal(MessageType.Subscribe, type);
+        // Payload @8: [flags u32=0x12][symLen u8=5][PETR4]
+        Assert.Equal((byte)0x12, buf[8]);
+        Assert.Equal((byte)0x00, buf[9]);
+        Assert.Equal((byte)5, buf[12]);
+        Assert.Equal((byte)'P', buf[13]);
+        Assert.Equal((byte)'4', buf[17]);
     }
 
     [Fact]
@@ -87,7 +90,7 @@ public class WireFormatTests
         // header(4) + secId(8) + mask(4) + 2 * i64
         ushort total = 4 + 8 + 4 + 16;
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)WireFormat.MessageType.InfoSnapshot);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)MessageType.InfoSnapshot);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(buf[4..], 99UL);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf[12..], mask);
         System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(buf[16..], 25_5000L); // 25.5000
@@ -123,7 +126,7 @@ public class WireFormatTests
         // header(4) + secId(8) + mask(4) + 4 * i64
         ushort total = 4 + 8 + 4 + 32;
         System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf, total);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)WireFormat.MessageType.InfoSnapshot);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(buf[2..], (ushort)MessageType.InfoSnapshot);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(buf[4..], 7UL);
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf[12..], mask);
         // Bit-order on wire: 7, 8, 9, 24.
@@ -140,14 +143,5 @@ public class WireFormatTests
     }
 
     private static void WriteServerTradeFrame(Span<byte> dest, ulong securityId, long price, long qty, long tradeId, byte flags)
-    {
-        const ushort totalLen = 4 + 8 + 8 + 8 + 8 + 1;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(dest, totalLen);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(dest[2..], (ushort)WireFormat.MessageType.Trade);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(dest[4..], securityId);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(dest[12..], price);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(dest[20..], qty);
-        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(dest[28..], tradeId);
-        dest[36] = flags;
-    }
+        => WireFrame.Write(dest, new TradeFrame(securityId, price, qty, tradeId, flags));
 }

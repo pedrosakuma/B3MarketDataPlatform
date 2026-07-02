@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using B3.Umdf.Book;
 using B3.Umdf.Mbo.Sbe.V16;
+using MessageType = B3.MarketData.Wire.MessageType;
 
 namespace B3.Umdf.Server;
 
@@ -394,7 +395,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             }
         }
 
-        Span<byte> tmp = stackalloc byte[20];
+        Span<byte> tmp = stackalloc byte[24];
         int len = WireProtocol.WriteTradeBust(tmp, securityId, tradeId);
         AppendTradeEventToBatch(securityId, tmp[..len], logicalCount: 1);
         _eventsReceived++;
@@ -983,7 +984,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
         if (_staleStatusBuffer.Count > 0)
         {
-            Span<byte> staleTmp = stackalloc byte[16];
+            Span<byte> staleTmp = stackalloc byte[17];
             foreach (var (secId, isStale) in _staleStatusBuffer)
             {
                 int len = WireProtocol.WriteSymbolStaleStatus(staleTmp, secId, isStale);
