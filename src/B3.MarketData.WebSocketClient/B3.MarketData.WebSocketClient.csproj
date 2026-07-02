@@ -9,7 +9,7 @@
     <PackageId>B3.MarketData.WebSocketClient</PackageId>
     <Version Condition="'$(PackageVersion)' == ''">0.4.0</Version>
     <Authors>pedrosakuma</Authors>
-    <Description>Typed C# subscriber SDK for the B3MarketDataPlatform WebSocket distribution layer (v1: trades, info snapshots, server status). Built-in reconnect with transparent re-subscribe and bounded back-pressure.</Description>
+    <Description>Typed C# subscriber SDK for the B3MarketDataPlatform WebSocket distribution layer (v2 wire protocol: trades, info snapshots, server status). Built-in reconnect with transparent re-subscribe and bounded back-pressure.</Description>
     <PackageTags>b3;marketdata;websocket;sdk;trades;reference-price</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/pedrosakuma/B3MarketDataPlatform</PackageProjectUrl>
@@ -30,9 +30,26 @@
   <ItemGroup>
     <!-- Single canonical wire-protocol definition (neutral protocol assembly).
          Referenced (not the server) so the published SDK stays server-free while
-         both sides share one definition. -->
-    <ProjectReference Include="..\B3.MarketData.Wire\B3.MarketData.Wire.csproj" />
+         both sides share one definition. B3.MarketData.Wire is NOT published as a
+         standalone package, so we bundle its DLL into this package (see the
+         _IncludeWireInPackage target below) and suppress the phantom NuGet
+         dependency with PrivateAssets="all". -->
+    <ProjectReference Include="..\B3.MarketData.Wire\B3.MarketData.Wire.csproj" PrivateAssets="all" />
   </ItemGroup>
+
+  <!-- Bundle the B3.MarketData.Wire build output into lib/ so consumers restore a
+       single self-contained package instead of a missing B3.MarketData.Wire dependency. -->
+  <PropertyGroup>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);_IncludeWireInPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+
+  <Target Name="_IncludeWireInPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage
+        Include="@(ReferenceCopyLocalPaths)"
+        Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' and '%(Extension)' == '.dll'" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
