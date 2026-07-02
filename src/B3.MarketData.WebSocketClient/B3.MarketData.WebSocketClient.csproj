@@ -43,11 +43,9 @@
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);_IncludeWireInPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
 
-  <Target Name="_IncludeWireInPackage" DependsOnTargets="ResolveReferences">
+  <Target Name="_IncludeWireInPackage">
     <ItemGroup>
-      <BuildOutputInPackage
-        Include="@(ReferenceCopyLocalPaths)"
-        Condition="'%(ReferenceCopyLocalPaths.ReferenceSourceTarget)' == 'ProjectReference' and '%(Extension)' == '.dll'" />
+      <BuildOutputInPackage Include="$(OutputPath)B3.MarketData.Wire.dll" />
     </ItemGroup>
   </Target>
 
