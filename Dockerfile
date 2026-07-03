@@ -8,7 +8,9 @@ RUN dotnet tool install --tool-path /tools dotnet-trace \
  && dotnet tool install --tool-path /tools dotnet-gcdump \
  && dotnet tool install --tool-path /tools dotnet-stack
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -16,9 +18,9 @@ COPY Directory.Build.props global.json B3MarketDataPlatform.slnx ./
 COPY schemas/ schemas/
 COPY src/ src/
 
-RUN dotnet restore src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj
+RUN dotnet restore src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj -a $TARGETARCH
 RUN dotnet publish src/B3.Umdf.ConsoleApp/B3.Umdf.ConsoleApp.csproj \
-    -c Release -o /app --no-restore
+    -a $TARGETARCH -c Release -o /app --no-restore
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
 
