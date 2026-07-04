@@ -1,0 +1,28 @@
+apiVersion: v2
+name: b3-marketdata
+description: |
+  UMDF unicast consumer + WebSocket fan-out for the b3-sim deploy topology.
+  Reads matching's unicast UDP (InstrumentDefinition/SnapshotRecovery/Incremental)
+  and fans the book out over WebSocket (8080) to trading-host and browsers.
+type: application
+
+# Chart version (SemVer). Bump this to publish a new chart release — CI only
+# pushes the OCI artifact when this value changes on main (see
+# .github/workflows/helm-chart.yml).
+version: 0.1.0
+
+# appVersion tracks the last b3-marketdata image validated against this chart
+# (see .github/workflows/docker.yml for image tags/digests).
+appVersion: "0.8.0"
+
+home: https://github.com/pedrosakuma/B3MarketDataPlatform
+sources:
+  - https://github.com/pedrosakuma/B3MarketDataPlatform
+keywords:
+  - b3
+  - market-data
+  - umdf
+  - websocket
+maintainers:
+  - name: pedrosakuma
+    url: https://github.com/pedrosakuma

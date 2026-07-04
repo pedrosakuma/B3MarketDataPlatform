@@ -1,0 +1,45 @@
+{{/*
+Headless Service for the UMDF unicast UDP pair + WS fan-out (RFC #557).
+
+matching's UnicastUdpPacketSink resolves this DNS name and emits unicast UDP
+straight to the pod IP — a headless Service (clusterIP: None) hands back the
+pod IP with NO load balancer in the UDP path, satisfying the RFC's
+unicast-UDP / no-multicast / no-LB constraint. The same name also serves the
+WebSocket fan-out (trading-host -> ws://<name>:{{ .Values.wsPort }}/ws).
+
+publishNotReadyAddresses: matching resolves this name at startup and aborts
+if DNS doesn't resolve (UnicastUdpPacketSink), so the A record must exist
+before marketdata reports Ready. This flag is load-bearing — do not remove.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "b3-marketdata.fullname" . }}
+  labels:
+    {{- include "b3-marketdata.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "b3-marketdata.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: umdf-inc-a
+      protocol: UDP
+      port: {{ .Values.udpPorts.incrementalA }}
+      targetPort: umdf-inc-a
+    - name: umdf-inc-b
+      protocol: UDP
+      port: {{ .Values.udpPorts.incrementalB }}
+      targetPort: umdf-inc-b
+    - name: umdf-snapshot
+      protocol: UDP
+      port: {{ .Values.udpPorts.snapshotRecovery }}
+      targetPort: umdf-snap
+    - name: umdf-instdef
+      protocol: UDP
+      port: {{ .Values.udpPorts.instrumentDefinition }}
+      targetPort: umdf-instr
+    - name: ws
+      protocol: TCP
+      port: {{ .Values.wsPort }}
+      targetPort: ws

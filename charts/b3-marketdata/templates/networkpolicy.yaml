@@ -1,0 +1,39 @@
+{{/*
+marketdata ingress: admit only matching (UDP ingest) + trading-host (WS
+reference price). Structurally forbids any stray multicast consumer (only
+unicast UDP from matching is allowed). Mirrors B3Deploy
+envs/prod/network-policy.yaml (marketdata-ingress).
+*/}}
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "b3-marketdata.fullname" . }}-ingress
+  labels:
+    {{- include "b3-marketdata.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "b3-marketdata.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            {{- toYaml .Values.networkPolicy.matchingPodSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: {{ .Values.udpPorts.incrementalA }}
+        - protocol: UDP
+          port: {{ .Values.udpPorts.incrementalB }}
+        - protocol: UDP
+          port: {{ .Values.udpPorts.snapshotRecovery }}
+        - protocol: UDP
+          port: {{ .Values.udpPorts.instrumentDefinition }}
+    - from:
+        - podSelector:
+            {{- toYaml .Values.networkPolicy.tradingHostPodSelector | nindent 12 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.wsPort }}
+{{- end }}

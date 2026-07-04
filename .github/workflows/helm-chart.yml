@@ -1,0 +1,84 @@
+name: Helm chart
+
+# Publishes charts/b3-marketdata as an OCI artifact to GHCR. Gated on a
+# Chart.yaml version bump: on push to main we diff Chart.yaml against the
+# previous commit and only package + push when `version` actually changed,
+# so merging unrelated chart-adjacent changes doesn't cut a spurious release.
+# Manual dispatch can force a (re)publish of the current version, e.g. to
+# backfill after a failed run.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'charts/b3-marketdata/**'
+      - '.github/workflows/helm-chart.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'charts/b3-marketdata/**'
+      - '.github/workflows/helm-chart.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  CHART_DIR: charts/b3-marketdata
+  CHART_NAME: b3-marketdata
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint & template chart
+        run: |
+          helm lint ${{ env.CHART_DIR }}
+          helm template test ${{ env.CHART_DIR }} > /dev/null
+
+      - name: Resolve chart version
+        id: chart
+        run: |
+          version=$(grep -m1 '^version:' ${{ env.CHART_DIR }}/Chart.yaml | awk '{print $2}')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $version"
+
+      - name: Check for version bump
+        id: bump
+        if: github.event_name == 'push'
+        run: |
+          prev_version=$(git show HEAD^:${{ env.CHART_DIR }}/Chart.yaml 2>/dev/null | grep -m1 '^version:' | awk '{print $2}' || echo "")
+          echo "Previous version: ${prev_version:-<none>}"
+          if [ "$prev_version" != "${{ steps.chart.outputs.version }}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package chart
+        if: github.event_name == 'workflow_dispatch' || steps.bump.outputs.changed == 'true'
+        run: helm package ${{ env.CHART_DIR }} --destination ./dist
+
+      - name: Log in to GHCR
+        if: (github.event_name == 'workflow_dispatch' || steps.bump.outputs.changed == 'true') && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push chart to GHCR
+        if: (github.event_name == 'workflow_dispatch' || steps.bump.outputs.changed == 'true') && github.event_name != 'pull_request'
+        run: |
+          helm push ./dist/${{ env.CHART_NAME }}-${{ steps.chart.outputs.version }}.tgz \
+            oci://${{ env.REGISTRY }}/pedrosakuma/charts

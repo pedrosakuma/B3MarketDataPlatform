@@ -1,0 +1,34 @@
+{{/*
+marketdata-transport.json ConfigMap.
+
+Mounted read-only at /app/config/transport.json and selected via
+UMDF_MULTICAST_CONFIG (see templates/deployment.yaml). Default channel
+layout mirrors the validated B3Deploy envs/prod/config/marketdata-transport.json
+(unicast, bind 0.0.0.0 — no IGMP, no multicast group; Azure VNets have no IP
+multicast, see RFC #557).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "b3-marketdata.fullname" . }}-config
+  labels:
+    {{- include "b3-marketdata.labels" . | nindent 4 }}
+data:
+  transport.json: |
+    {{- if .Values.transportConfig }}
+    {{- .Values.transportConfig | nindent 4 }}
+    {{- else }}
+    {
+      "channelGroups": [
+        {
+          "name": "EQT",
+          "channels": [
+            { "channelId":  84, "type": "IncrementalA",         "transport": "unicast", "multicastGroup": "0.0.0.0", "port": {{ .Values.udpPorts.incrementalA }} },
+            { "channelId":  84, "type": "IncrementalB",         "transport": "unicast", "multicastGroup": "0.0.0.0", "port": {{ .Values.udpPorts.incrementalB }} },
+            { "channelId": 184, "type": "InstrumentDefinition", "transport": "unicast", "multicastGroup": "0.0.0.0", "port": {{ .Values.udpPorts.instrumentDefinition }} },
+            { "channelId":  84, "type": "SnapshotRecovery",     "transport": "unicast", "multicastGroup": "0.0.0.0", "port": {{ .Values.udpPorts.snapshotRecovery }} }
+          ]
+        }
+      ]
+    }
+    {{- end }}
