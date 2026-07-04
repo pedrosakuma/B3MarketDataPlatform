@@ -1,0 +1,114 @@
+{{/*
+marketdata — UMDF unicast consumer + WebSocket fan-out (Layer-1, RFC #557).
+
+Stateless Deployment. Reads matching's unicast UDP (binds 0.0.0.0, no IGMP
+join — see the ConfigMap, transport=unicast) and fans the book out over WS
+{{ .Values.wsPort }} to trading-host (IReferencePrice) and any browser.
+
+The Service that fronts these pods is the headless Service in service.yaml —
+matching resolves that DNS name to the pod IP. This file only defines the
+workload; the labels here match that selector.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "b3-marketdata.fullname" . }}
+  labels:
+    {{- include "b3-marketdata.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "b3-marketdata.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "b3-marketdata.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: marketdata
+          image: {{ include "b3-marketdata.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: UMDF_WS_PORT
+              value: {{ .Values.wsPort | quote }}
+            - name: UMDF_MULTICAST_CONFIG
+              value: /app/config/transport.json
+          ports:
+            - name: ws
+              containerPort: {{ .Values.wsPort }}
+              protocol: TCP
+            - name: umdf-inc-a
+              containerPort: {{ .Values.udpPorts.incrementalA }}
+              protocol: UDP
+            - name: umdf-inc-b
+              containerPort: {{ .Values.udpPorts.incrementalB }}
+              protocol: UDP
+            - name: umdf-snap
+              containerPort: {{ .Values.udpPorts.snapshotRecovery }}
+              protocol: UDP
+            - name: umdf-instr
+              containerPort: {{ .Values.udpPorts.instrumentDefinition }}
+              protocol: UDP
+          {{- with .Values.readinessProbe }}
+          # Image is distroless (no curl/wget); probe the WS socket directly.
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: transport-config
+              mountPath: /app/config/transport.json
+              subPath: transport.json
+              readOnly: true
+      volumes:
+        - name: transport-config
+          configMap:
+            name: {{ include "b3-marketdata.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if or .Values.colocation.enabled .Values.affinity }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else if .Values.colocation.enabled }}
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- toYaml .Values.colocation.matchingSelector | nindent 18 }}
+              topologyKey: {{ .Values.colocation.topologyKey }}
+        {{- end }}
+      {{- end }}

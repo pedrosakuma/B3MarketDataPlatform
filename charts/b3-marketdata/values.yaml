@@ -1,0 +1,96 @@
+# Default values for the b3-marketdata chart.
+# This is a YAML-formatted file. Declare variables to be passed into templates.
+
+# -- Number of marketdata replicas. The workload is stateless (no local state
+# survives a restart — the book rebuilds from the next SnapshotRecovery), so
+# this can be scaled, but note every replica independently joins the same
+# unicast UDP ports fanned out by matching.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/pedrosakuma/b3-marketdata
+  # -- Overrides the image tag; defaults to .Chart.AppVersion.
+  tag: ""
+  # -- Pins the image by digest (e.g. "sha256:..."). Takes precedence over
+  # `tag` when set — b3deploy pins `chart@version` next to `image@sha256:`.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- WebSocket / health port (trading-host IReferencePrice + browser clients).
+wsPort: 8080
+
+# -- UMDF unicast UDP ingest ports (matching → marketdata). Keys mirror the
+# channel roles in config/marketdata-transport.json — the ConfigMap below is
+# rendered from these same values so the container ports, Service ports, and
+# transport config never drift apart.
+udpPorts:
+  incrementalA: 30084
+  incrementalB: 30085
+  snapshotRecovery: 30184
+  instrumentDefinition: 31084
+
+resources:
+  requests:
+    cpu: 75m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+readinessProbe:
+  tcpSocket:
+    port: ws
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 6
+
+livenessProbe:
+  tcpSocket:
+    port: ws
+  initialDelaySeconds: 15
+  periodSeconds: 15
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+securityContext: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Co-locate marketdata with matching (same node/subnet/AZ) to keep the
+# unicast UDP hop as cheap as possible. Disabled by default; enable and adjust
+# the selector/topologyKey to match the matching workload's labels.
+colocation:
+  enabled: false
+  topologyKey: kubernetes.io/hostname
+  matchingSelector:
+    app.kubernetes.io/name: matching
+
+# -- NetworkPolicy admitting only matching (UDP) and trading-host (WS:8080).
+# See RFC #557 / B3Deploy envs/prod/network-policy.yaml (marketdata-ingress).
+networkPolicy:
+  enabled: true
+  matchingPodSelector:
+    matchLabels:
+      app.kubernetes.io/name: matching
+  tradingHostPodSelector:
+    matchLabels:
+      app.kubernetes.io/name: trading-host
+
+# -- marketdata-transport.json (mounted at /app/config/transport.json,
+# selected via UMDF_MULTICAST_CONFIG). `transport: unicast` skips the IGMP
+# join and binds 0.0.0.0:<port> as a plain UDP socket — Azure VNets have no
+# IP multicast, so unicast straight to the pod IP is the only supported mode
+# in this chart (RFC #557).
+#
+# Leave empty (default) to render the built-in single-channel-group EQT
+# layout wired to `.Values.udpPorts` (see templates/configmap.yaml). Set this
+# to a raw JSON(C) string to override the channel layout entirely without a
+# chart bump.
+transportConfig: ""

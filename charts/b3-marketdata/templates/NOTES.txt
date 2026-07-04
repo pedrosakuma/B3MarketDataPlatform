@@ -1,0 +1,14 @@
+Marketdata deployed as {{ include "b3-marketdata.fullname" . }} (namespace {{ .Release.Namespace }}).
+
+WebSocket fan-out:
+  ws://{{ include "b3-marketdata.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.wsPort }}/ws
+
+UMDF unicast UDP ingest (matching -> marketdata):
+  {{ include "b3-marketdata.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.udpPorts.incrementalA }}/udp   (IncrementalA)
+  {{ include "b3-marketdata.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.udpPorts.incrementalB }}/udp   (IncrementalB)
+  {{ include "b3-marketdata.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.udpPorts.snapshotRecovery }}/udp   (SnapshotRecovery)
+  {{ include "b3-marketdata.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.udpPorts.instrumentDefinition }}/udp   (InstrumentDefinition)
+
+The Service is headless with publishNotReadyAddresses: true — matching resolves
+this DNS name at startup and aborts if it misses, so the A record exists before
+marketdata reports Ready (by design, do not disable).

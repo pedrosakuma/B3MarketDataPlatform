@@ -201,6 +201,20 @@ consumers, the typed SDK is published on NuGet:
 (`dotnet add package B3.MarketData.WebSocketClient`) — see
 [docs/CLIENT-SDK.md](docs/CLIENT-SDK.md).
 
+### Helm chart (Kubernetes)
+
+The [`charts/b3-marketdata`](charts/b3-marketdata) Helm chart packages the
+Deployment, headless Service (UDP unicast ingest + WS fan-out), ConfigMap,
+and NetworkPolicy for the b3-sim deploy topology. It's published as an OCI
+artifact alongside the image:
+
+```bash
+helm install marketdata oci://ghcr.io/pedrosakuma/charts/b3-marketdata --version <chart-version>
+```
+
+See [charts/b3-marketdata/README.md](charts/b3-marketdata/README.md) for the
+values reference and topology notes.
+
 ## B3 schema
 
 This project uses the [B3 Market Data Messages v2.2.0](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/)
