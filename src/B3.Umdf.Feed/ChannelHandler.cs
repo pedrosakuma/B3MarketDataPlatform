@@ -37,12 +37,28 @@ public sealed class ChannelHandler : IDisposable
     /// </summary>
     public const int MaxReorderDistance = 256;
 
+    /// <summary>
+    /// Wall-clock stall escape valve (issue #71): if <see cref="_expectedSeqNum"/>
+    /// has not advanced for this many milliseconds (measured via the
+    /// packet-supplied <see cref="UmdfPacket.ReceivedTimestampTicks"/>, same
+    /// clock source as <c>FeedHandler.InstrDefStuckTimeoutMs</c>) while a
+    /// future packet is pending, the channel force-declares a real gap
+    /// regardless of how small the SeqNum distance is. Bounds how long a
+    /// low-volume channel (few packets/sec) can be wedged waiting for a
+    /// backlog that will never grow past <see cref="MaxReorderDistance"/>.
+    /// Well above realistic A/B feed jitter (single-digit ms) so legitimate
+    /// short-lived reordering is unaffected.
+    /// </summary>
+    public const long ReorderStallTimeoutMs = 2_000;
+
     private readonly IFeedEventHandler _eventHandler;
     private readonly int _maxReorderDistance;
     private readonly Dictionary<uint, UmdfPacket> _reorderBuffer;
     private readonly ILogger _logger;
 
     private uint _expectedSeqNum = 1;
+    private long _expectedSeqNumAdvancedAtTicks;
+    private bool _stallClockStarted;
 
     /// <summary>
     /// Last observed SequenceVersion from the incremental stream PacketHeader.
@@ -123,6 +139,17 @@ public sealed class ChannelHandler : IDisposable
 
         uint seq = header.SequenceNumber;
 
+        // Start the stall-escape clock on the very first packet this
+        // instance ever sees (any channel type/path), so the timeout is
+        // measured relative to real elapsed time rather than an arbitrary
+        // zero baseline (which could otherwise be far in the past relative
+        // to Environment.TickCount64-based timestamps and fire spuriously).
+        if (!_stallClockStarted)
+        {
+            _expectedSeqNumAdvancedAtTicks = packet.ReceivedTimestampTicks;
+            _stallClockStarted = true;
+        }
+
         // Spec §6.5.5.1: SequenceVersion increments on weekly rollover or
         // failover; SequenceNumber resets to 1 in the new version. Detect
         // the version change before any seq comparison so we don't treat
@@ -152,7 +179,7 @@ public sealed class ChannelHandler : IDisposable
                 _duplicatesSkipped++;
                 return GapResult.Duplicate;
             }
-            HandleSequenceVersionChange(version, seq);
+            HandleSequenceVersionChange(version, seq, packet.ReceivedTimestampTicks);
             // Fall through with the post-reset _expectedSeqNum so this
             // packet (the first of the new version) is processed normally.
         }
@@ -168,6 +195,7 @@ public sealed class ChannelHandler : IDisposable
             && seq - _expectedSeqNum > _maxReorderDistance)
         {
             _expectedSeqNum = seq;
+            _expectedSeqNumAdvancedAtTicks = packet.ReceivedTimestampTicks;
         }
 
         // Already past expected — duplicate from the other feed (or already
@@ -188,9 +216,15 @@ public sealed class ChannelHandler : IDisposable
         }
 
         // Future packet. If within the reorder window, stash and wait for the
-        // hole to fill. Otherwise declare a real gap.
+        // hole to fill. Otherwise declare a real gap — either because the
+        // distance exceeds the window, or because (issue #71) the backlog
+        // has been stalled at the same _expectedSeqNum for longer than
+        // ReorderStallTimeoutMs: at low packet volume the distance alone may
+        // never grow past MaxReorderDistance even though the missing SeqNums
+        // are permanently gone (joined mid-stream, or lost on both A and B).
         uint distance = seq - _expectedSeqNum;
-        if (distance > _maxReorderDistance)
+        bool stalled = packet.ReceivedTimestampTicks - _expectedSeqNumAdvancedAtTicks >= ReorderStallTimeoutMs;
+        if (distance > _maxReorderDistance || stalled)
         {
             _gapsDetected++;
             _lastGapExpected = _expectedSeqNum;
@@ -232,6 +266,7 @@ public sealed class ChannelHandler : IDisposable
         MessageDispatcher.Dispatch(in packet, span, _eventHandler);
         _eventHandler.OnPacketProcessed();
         _expectedSeqNum = seq + 1;
+        _expectedSeqNumAdvancedAtTicks = packet.ReceivedTimestampTicks;
 
         if (_reorderBuffer.Count > 0)
         {
@@ -254,6 +289,7 @@ public sealed class ChannelHandler : IDisposable
                     MessageDispatcher.Dispatch(in p, p.Data.Span, _eventHandler);
                     _eventHandler.OnPacketProcessed();
                     _expectedSeqNum = ph.SequenceNumber + 1;
+                    _expectedSeqNumAdvancedAtTicks = p.ReceivedTimestampTicks;
                 }
                 finally
                 {
@@ -275,11 +311,12 @@ public sealed class ChannelHandler : IDisposable
     /// of the new version. Notifies the event handler so per-symbol /
     /// per-instrument state can be reset by upstream managers.
     /// </summary>
-    private void HandleSequenceVersionChange(ushort newVersion, uint firstSeqOfNewVersion)
+    private void HandleSequenceVersionChange(ushort newVersion, uint firstSeqOfNewVersion, long nowTicks)
     {
         DiscardReorderBuffer();
         _currentSequenceVersion = newVersion;
         _expectedSeqNum = firstSeqOfNewVersion;
+        _expectedSeqNumAdvancedAtTicks = nowTicks;
         Interlocked.Increment(ref _sequenceVersionResets);
         try { _eventHandler.OnSequenceVersionChanged(newVersion); }
         catch (Exception ex)
@@ -298,6 +335,7 @@ public sealed class ChannelHandler : IDisposable
     {
         _packetsProcessed++;
         _expectedSeqNum++;
+        _expectedSeqNumAdvancedAtTicks = packet.ReceivedTimestampTicks;
         MessageDispatcher.Dispatch(in packet, span, _eventHandler);
         _eventHandler.OnPacketProcessed();
     }
@@ -311,6 +349,7 @@ public sealed class ChannelHandler : IDisposable
                 _reorderHits++;
                 _packetsProcessed++;
                 _expectedSeqNum++;
+                _expectedSeqNumAdvancedAtTicks = queued.ReceivedTimestampTicks;
                 MessageDispatcher.Dispatch(in queued, queued.Data.Span, _eventHandler);
                 _eventHandler.OnPacketProcessed();
             }
