@@ -391,6 +391,7 @@ var marketDataManagers = new List<MarketDataManager>();
 var groupHandlers = new List<GroupConflationHandler>();
 var groupFeedHandlers = new Dictionary<int, IFeedEventHandler>();
 var groupMdHandlers = new Dictionary<int, IFeedEventHandler>();
+var epochCoordinators = new Dictionary<int, ChannelEpochCoordinator>();
 
 var bmLogger = loggerFactory.CreateLogger<BookManager>();
 var mdmLogger = loggerFactory.CreateLogger<MarketDataManager>();
@@ -407,6 +408,9 @@ foreach (var gid in groupIds)
 {
     IBookEventHandler bookHandler;
     IMarketDataEventHandler mdHandler = stats;
+    var epochCoordinator = new ChannelEpochCoordinator(
+        loggerFactory.CreateLogger<ChannelEpochCoordinator>());
+    epochCoordinators[gid] = epochCoordinator;
 
     var groupRegistry = new SymbolStateRegistry(registryLogger)
     {
@@ -439,7 +443,8 @@ foreach (var gid in groupIds)
         var gh = subscriptionManager.CreateGroupHandler();
         bookHandler = new CompositeBookEventHandler(stats, gh);
         var bm = new BookManager(bookHandler, bmLogger,
-            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
+            epochCoordinator: epochCoordinator);
         mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm,
             new RecoveryEventLoggerHandler(recoveryEventLog, gid));
         gh.SetBookManager(bm);
@@ -451,7 +456,8 @@ foreach (var gid in groupIds)
     {
         bookHandler = stats;
         var bm = new BookManager(bookHandler, bmLogger,
-            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer);
+            stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
+            epochCoordinator: epochCoordinator);
         mdHandler = new CompositeMarketDataEventHandler(stats, bm,
             new RecoveryEventLoggerHandler(recoveryEventLog, gid));
         bookManagers.Add(bm);
@@ -486,7 +492,8 @@ if (groupIds.Count > 1 || packetSource is null)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            groupRingCapacity: groupRingCapacity)
+            groupRingCapacity: groupRingCapacity,
+            epochCoordinators: epochCoordinators)
         : new MultiFeedManager(
             packetSource,
             groupFeedHandlers,
@@ -494,7 +501,8 @@ if (groupIds.Count > 1 || packetSource is null)
             marketDataHandlers: groupMdHandlers,
             logger: loggerFactory.CreateLogger<MultiFeedManager>(),
             feedChannelCapacity: feedChannelCapacity,
-            groupRingCapacity: groupRingCapacity);
+            groupRingCapacity: groupRingCapacity,
+            epochCoordinators: epochCoordinators);
     if (subscriptionManager is not null)
         multiFeed.AnyGroupReady += () => subscriptionManager.SetReady();
     multiFeed.FlushWindowMs = serverFlushWindowMs;
@@ -503,7 +511,12 @@ else
 {
     // Source-driven single-group: replay path. FeedHandler avoids the per-group
     // dispatcher overhead since there's exactly one source feeding one group.
-    singleFeed = new FeedHandler(packetSource, groupFeedHandlers[groupIds[0]], feedLogger, marketDataHandler: groupMdHandlers[groupIds[0]]);
+    singleFeed = new FeedHandler(
+        packetSource,
+        groupFeedHandlers[groupIds[0]],
+        feedLogger,
+        marketDataHandler: groupMdHandlers[groupIds[0]],
+        epochCoordinator: epochCoordinators[groupIds[0]]);
 }
 
 if (subscriptionManager is not null)

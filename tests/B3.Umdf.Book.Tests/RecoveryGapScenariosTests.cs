@@ -12,10 +12,9 @@ namespace B3.Umdf.Book.Tests;
 ///         abandoned chunks and (b) clear the per-symbol StaleMboBuffer protected
 ///         floor, regardless of the replacement path (normal / Healthy-skip /
 ///         stale-version skip).
-///  - #19: when the channel has observed a SequenceVersion, snapshot Header_30
-///         with an absent or mismatched LastSequenceVersion MUST be rejected
-///         (otherwise an in-flight V1 snapshot can poison V2 baseline and
-///         silently drop subsequent live messages until rptSeq catches up).
+///  - #19/#76: after an epoch is established, absent/zero/older snapshot
+///         versions are rejected while a newer authoritative snapshot advances
+///         the shared epoch before it is applied.
 /// </summary>
 public class RecoveryGapScenariosTests
 {
@@ -167,18 +166,64 @@ public class RecoveryGapScenariosTests
     }
 
     [Fact]
-    public void Bug19_AfterVersionChange_FutureLastSequenceVersion_MustBeRejected()
+    public void Bug19_AfterVersionChange_ZeroLastSequenceVersion_MustBeRejected()
     {
         var (bm, reg, _) = CreatePerSymbol();
-        const ulong secId = 556;
+        const ulong secId = 559;
 
         bm.OnSequenceVersionChanged(newVersion: 2);
-        // A snapshot tagged with a FUTURE version (publisher bug or out-of-order
-        // version transition) cannot be trusted against our current epoch.
-        bm.OnSnapshotHeaderForTest(secId, lastRptSeq: 50, ordersExpected: 0, lastSequenceVersion: 3);
+        bm.OnSnapshotHeaderForTest(secId, lastRptSeq: 100, ordersExpected: 0, lastSequenceVersion: 0);
 
         Assert.Equal(SymbolState.Unknown, reg.GetState(secId, SymbolGapKind.Mbo));
         Assert.Equal(1L, bm.SnapshotsRejectedStaleVersion);
+    }
+
+    [Fact]
+    public void Issue76_FutureLastSequenceVersion_AdvancesEpochAndIsAccepted()
+    {
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var coordinator = new ChannelEpochCoordinator();
+        var bm = new BookManager(
+            stateRegistry: reg,
+            staleBuffer: buf,
+            epochCoordinator: coordinator);
+        coordinator.RegisterEventHandler(bm);
+        const ulong secId = 556;
+
+        bm.OnSequenceVersionChanged(newVersion: 2);
+        bm.OnSnapshotHeaderForTest(secId, lastRptSeq: 50, ordersExpected: 0, lastSequenceVersion: 3);
+
+        Assert.Equal((ushort)3, bm.CurrentSequenceVersion);
+        Assert.Equal(SymbolState.Healthy, reg.GetState(secId, SymbolGapKind.Mbo));
+        Assert.Equal(0L, bm.SnapshotsRejectedStaleVersion);
+        Assert.Equal(1L, bm.SnapshotsHealed);
+    }
+
+    [Fact]
+    public void Issue76_FutureSnapshot_AbortsPreviousEpochStagingBeforeApplying()
+    {
+        var reg = new SymbolStateRegistry(NullLogger.Instance);
+        var buf = new StaleMboBuffer(NullLogger.Instance);
+        var coordinator = new ChannelEpochCoordinator();
+        var bm = new BookManager(
+            stateRegistry: reg,
+            staleBuffer: buf,
+            epochCoordinator: coordinator);
+        coordinator.RegisterEventHandler(bm);
+        const ulong secId = 558;
+
+        bm.OnSequenceVersionChanged(newVersion: 2);
+        bm.OnSnapshotHeaderForTest(secId, lastRptSeq: 100, ordersExpected: 5, lastSequenceVersion: 2);
+        bm.RecordSnapshotChunkForTest(secId, ordersInChunk: 2);
+        Assert.Equal(101u, buf.ProtectedFloorOf(secId));
+
+        bm.OnSnapshotHeaderForTest(secId, lastRptSeq: 7, ordersExpected: 0, lastSequenceVersion: 3);
+
+        Assert.Equal((ushort)3, bm.CurrentSequenceVersion);
+        Assert.Equal(1L, bm.SnapshotsAbortedByEpoch);
+        Assert.Equal(0u, buf.ProtectedFloorOf(secId));
+        Assert.Equal(SymbolState.Healthy, reg.GetState(secId, SymbolGapKind.Mbo));
     }
 
     [Fact]

@@ -54,48 +54,40 @@ public sealed class ChannelHandler : IDisposable
     private readonly IFeedEventHandler _eventHandler;
     private readonly int _maxReorderDistance;
     private readonly Dictionary<uint, UmdfPacket> _reorderBuffer;
-    private readonly ILogger _logger;
+    private readonly ChannelEpochCoordinator _epochCoordinator;
 
     private uint _expectedSeqNum = 1;
     private long _expectedSeqNumAdvancedAtTicks;
     private bool _stallClockStarted;
-
-    /// <summary>
-    /// Last observed SequenceVersion from the incremental stream PacketHeader.
-    /// 0 means "no packet observed yet" (pre-bootstrap). When a packet
-    /// arrives with a different non-zero version, the channel resets
-    /// (B3 spec §6.5.5.1 — weekly rollover or failover).
-    /// </summary>
-    private ushort _currentSequenceVersion;
+    private bool _awaitingFirstPacket;
+    private ushort _awaitingFirstPacketVersion;
 
     private long _packetsProcessed;
     private long _duplicatesSkipped;
     private long _gapsDetected;
     private long _reorderHits;
-    private long _sequenceVersionResets;
-    private long _sequenceResetHandlerExceptionCount;
     private int _maxObservedReorderDepth;
     private volatile uint _lastGapExpected;
     private volatile uint _lastGapReceived;
 
     public uint ExpectedSequenceNumber => _expectedSeqNum;
     /// <summary>Current SequenceVersion observed on this channel; 0 before first packet.</summary>
-    public ushort CurrentSequenceVersion => _currentSequenceVersion;
+    public ushort CurrentSequenceVersion => _epochCoordinator.CurrentVersion;
     public long PacketsProcessed => Volatile.Read(ref _packetsProcessed);
     public long DuplicatesSkipped => Volatile.Read(ref _duplicatesSkipped);
     public long GapsDetected => Volatile.Read(ref _gapsDetected);
     /// <summary>
-    /// Count of channel-wide resets triggered by a SequenceVersion change
-    /// in the PacketHeader (B3 spec §6.5.5.1).
+    /// Count of channel-wide epoch advances observed from either the
+    /// incremental packet header or snapshot LastSequenceVersion.
     /// </summary>
-    public long SequenceVersionResets => Volatile.Read(ref _sequenceVersionResets);
+    public long SequenceVersionResets => _epochCoordinator.EpochAdvances;
     /// <summary>
     /// Number of exceptions thrown by the downstream <see cref="IFeedEventHandler.OnSequenceVersionChanged"/>
     /// callback during a SequenceVersion change. Previously these were silently
     /// swallowed; now we surface a counter and log so a misbehaving handler can
     /// be diagnosed without destabilising the channel.
     /// </summary>
-    public long SequenceResetHandlerExceptionCount => Volatile.Read(ref _sequenceResetHandlerExceptionCount);
+    public long SequenceResetHandlerExceptionCount => _epochCoordinator.HandlerExceptionCount;
     /// <summary>
     /// Count of packets that arrived out-of-order and were later drained from the
     /// reorder buffer (i.e. saved a recovery cycle thanks to A/B arbitration).
@@ -122,13 +114,29 @@ public sealed class ChannelHandler : IDisposable
         : this(eventHandler, maxReorderDistance, NullLogger.Instance) { }
 
     public ChannelHandler(IFeedEventHandler eventHandler, int maxReorderDistance, ILogger logger)
+        : this(eventHandler, maxReorderDistance, logger, new ChannelEpochCoordinator(logger))
+    {
+        _epochCoordinator.RegisterEventHandler(eventHandler);
+    }
+
+    public ChannelHandler(
+        IFeedEventHandler eventHandler,
+        int maxReorderDistance,
+        ILogger logger,
+        ChannelEpochCoordinator epochCoordinator)
     {
         if (maxReorderDistance < 1)
             throw new ArgumentOutOfRangeException(nameof(maxReorderDistance), "Must be ≥ 1.");
         _eventHandler = eventHandler;
         _maxReorderDistance = maxReorderDistance;
         _reorderBuffer = new Dictionary<uint, UmdfPacket>(maxReorderDistance);
-        _logger = logger ?? NullLogger.Instance;
+        _epochCoordinator = epochCoordinator ?? throw new ArgumentNullException(nameof(epochCoordinator));
+        _epochCoordinator.RegisterChannelStateReset(OnEpochAdvanced);
+        if (_epochCoordinator.CurrentVersion != 0)
+        {
+            _awaitingFirstPacket = true;
+            _awaitingFirstPacketVersion = _epochCoordinator.CurrentVersion;
+        }
     }
 
     public GapResult HandlePacket(in UmdfPacket packet)
@@ -150,38 +158,29 @@ public sealed class ChannelHandler : IDisposable
             _stallClockStarted = true;
         }
 
-        // Spec §6.5.5.1: SequenceVersion increments on weekly rollover or
-        // failover; SequenceNumber resets to 1 in the new version. Detect
-        // the version change before any seq comparison so we don't treat
-        // post-rollover seq=1 as a "duplicate" of pre-rollover seq=N.
         ushort version = header.SequenceVersion;
-        if (_currentSequenceVersion == 0)
+        var epochObservation = _epochCoordinator.Observe(version, ChannelEpochSource.Incremental);
+        if (epochObservation == ChannelEpochObservation.Stale)
         {
-            _currentSequenceVersion = version;
+            _duplicatesSkipped++;
+            return GapResult.Duplicate;
         }
-        else if (version != _currentSequenceVersion)
+        if (epochObservation == ChannelEpochObservation.Invalid
+            && _epochCoordinator.CurrentVersion != 0)
         {
-            // Spec §6.5.5.1: SequenceVersion is monotonically increasing per
-            // session. A packet whose version is OLDER than the established
-            // current is a stale reorder-arrival from before the rollover —
-            // upstream (BookManager / SymbolStateRegistry) has already reset
-            // its V1 state. Replaying it would corrupt the V2 epoch. Drop
-            // silently as a duplicate (the other feed delivered the V2
-            // version first).
-            //
-            // ushort comparison would wrap if version actually rolls past
-            // 65535 (impossible in practice — weekly bumps for ~1259 years).
-            // We treat that hypothetical wrap conservatively: only accept
-            // strict-greater within a 16-bit window, which keeps the gate
-            // robust against any single misordered packet.
-            if (version < _currentSequenceVersion)
-            {
-                _duplicatesSkipped++;
-                return GapResult.Duplicate;
-            }
-            HandleSequenceVersionChange(version, seq, packet.ReceivedTimestampTicks);
-            // Fall through with the post-reset _expectedSeqNum so this
-            // packet (the first of the new version) is processed normally.
+            _duplicatesSkipped++;
+            return GapResult.Duplicate;
+        }
+
+        // A snapshot may establish the new epoch before its first incremental
+        // packet arrives. Rebase to that first packet so missing the one-shot
+        // reset packet cannot wedge the reorder buffer.
+        if (_awaitingFirstPacket && _awaitingFirstPacketVersion == version)
+        {
+            _expectedSeqNum = seq;
+            _expectedSeqNumAdvancedAtTicks = packet.ReceivedTimestampTicks;
+            _awaitingFirstPacket = false;
+            _awaitingFirstPacketVersion = 0;
         }
 
         // Cold-start: if the very first packet is far above the initial
@@ -304,31 +303,12 @@ public sealed class ChannelHandler : IDisposable
         DiscardReorderBuffer();
     }
 
-    /// <summary>
-    /// Reset to follow a new SequenceVersion. Discards any reorder-buffered
-    /// packets (they belonged to the previous version's seq space) and
-    /// re-baselines <see cref="_expectedSeqNum"/> to the first observed seq
-    /// of the new version. Notifies the event handler so per-symbol /
-    /// per-instrument state can be reset by upstream managers.
-    /// </summary>
-    private void HandleSequenceVersionChange(ushort newVersion, uint firstSeqOfNewVersion, long nowTicks)
+    private void OnEpochAdvanced(ushort newVersion)
     {
         DiscardReorderBuffer();
-        _currentSequenceVersion = newVersion;
-        _expectedSeqNum = firstSeqOfNewVersion;
-        _expectedSeqNumAdvancedAtTicks = nowTicks;
-        Interlocked.Increment(ref _sequenceVersionResets);
-        try { _eventHandler.OnSequenceVersionChanged(newVersion); }
-        catch (Exception ex)
-        {
-            // Event handler exceptions must not destabilize the channel; counters
-            // still reflect the reset. Track the failure so a misbehaving handler
-            // is observable instead of silently masked.
-            Interlocked.Increment(ref _sequenceResetHandlerExceptionCount);
-            _logger.LogWarning(ex,
-                "Downstream handler threw in OnSequenceVersionChanged(newVersion={NewVersion}); channel state advanced normally",
-                newVersion);
-        }
+        _expectedSeqNum = 1;
+        _awaitingFirstPacket = true;
+        _awaitingFirstPacketVersion = newVersion;
     }
 
     private void ProcessAndAdvance(in UmdfPacket packet, ReadOnlySpan<byte> span)

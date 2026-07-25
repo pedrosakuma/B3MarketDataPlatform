@@ -191,21 +191,21 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
     /// not in <see cref="FeedState.Streaming"/>; pass <c>null</c> if not needed.
     /// </summary>
     /// <param name="feedChannelCapacity">No-op; see single-handler overload.</param>
-    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, groupRingCapacity)
+    public MultiFeedManager(IPacketSource source, IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity, IReadOnlyDictionary<int, ChannelEpochCoordinator>? epochCoordinators = null)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source, groupRingCapacity, epochCoordinators)
     {
         _ = feedChannelCapacity;
     }
 
     /// <summary>Live-push constructor with per-group handlers (no internal dispatcher); see live-push overload above for the push-mode contract.</summary>
     /// <param name="feedChannelCapacity">No-op; see single-handler overload.</param>
-    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity)
-        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, groupRingCapacity)
+    public MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger = null, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers = null, ILogger<MultiFeedManager>? logger = null, int feedChannelCapacity = 0, int groupRingCapacity = DefaultGroupRingCapacity, IReadOnlyDictionary<int, ChannelEpochCoordinator>? epochCoordinators = null)
+        : this(groupHandlers, feedLogger, marketDataHandlers, logger, source: null, groupRingCapacity, epochCoordinators)
     {
         _ = feedChannelCapacity;
     }
 
-    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int groupRingCapacity)
+    private MultiFeedManager(IReadOnlyDictionary<int, IFeedEventHandler> groupHandlers, ILogger<FeedHandler>? feedLogger, IReadOnlyDictionary<int, IFeedEventHandler>? marketDataHandlers, ILogger<MultiFeedManager>? logger, IPacketSource? source, int groupRingCapacity, IReadOnlyDictionary<int, ChannelEpochCoordinator>? epochCoordinators)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(groupRingCapacity, 2);
         _source = source;
@@ -216,7 +216,10 @@ public sealed class MultiFeedManager : IDisposable, IAsyncDisposable
         {
             IFeedEventHandler? mdHandler = null;
             marketDataHandlers?.TryGetValue(gid, out mdHandler);
-            _handlers[gid] = new FeedHandler(handler, feedLogger, marketDataHandler: mdHandler);
+            ChannelEpochCoordinator? epochCoordinator = null;
+            epochCoordinators?.TryGetValue(gid, out epochCoordinator);
+            _handlers[gid] = new FeedHandler(
+                handler, feedLogger, marketDataHandler: mdHandler, epochCoordinator: epochCoordinator);
             _rings[gid] = new MpscPacketRing(_ringCapacity);
             _dispatchExceptionCounts[gid] = 0L;
             _lastLoggedDropMilestone[gid] = 0L;

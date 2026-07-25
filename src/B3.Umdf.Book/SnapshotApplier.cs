@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using B3.Umdf.Feed;
 using B3.Umdf.Mbo.Sbe.V16;
 using Microsoft.Extensions.Logging;
 
@@ -60,7 +61,7 @@ internal sealed class SnapshotApplier
     private readonly IBookEventHandler? _eventHandler;
     private readonly ILogger _logger;
     private readonly Func<ulong, uint, uint, int> _replayDeferredMbo;
-    private readonly Func<ushort> _currentSequenceVersion;
+    private readonly ChannelEpochCoordinator _epochCoordinator;
 
     private readonly Dictionary<ulong, PendingSnapshot> _pendingSnapshots = new();
 
@@ -108,10 +109,9 @@ internal sealed class SnapshotApplier
     /// </summary>
     public long SnapshotsAbortedByEpoch => Volatile.Read(ref _snapshotsAbortedByEpoch);
     /// <summary>
-    /// Snapshots silently skipped because their <c>LastSequenceVersion</c>
-    /// was older than the channel's current SequenceVersion (B3 spec §7.2).
-    /// Chunks for skipped snapshots are absorbed without polluting the
-    /// orphan counter.
+    /// Snapshots skipped because their <c>LastSequenceVersion</c> was older
+    /// than the channel epoch, or missing after an epoch was established.
+    /// Chunks are absorbed without polluting the orphan counter.
     /// </summary>
     public long SnapshotsRejectedStaleVersion => Volatile.Read(ref _snapshotsRejectedStaleVersion);
 
@@ -173,7 +173,7 @@ internal sealed class SnapshotApplier
         IBookEventHandler? eventHandler,
         ILogger logger,
         Func<ulong, uint, uint, int> replayDeferredMbo,
-        Func<ushort>? currentSequenceVersion = null)
+        ChannelEpochCoordinator epochCoordinator)
     {
         _bookStore = bookStore;
         _stateRegistry = stateRegistry;
@@ -181,7 +181,7 @@ internal sealed class SnapshotApplier
         _eventHandler = eventHandler;
         _logger = logger;
         _replayDeferredMbo = replayDeferredMbo;
-        _currentSequenceVersion = currentSequenceVersion ?? (static () => (ushort)0);
+        _epochCoordinator = epochCoordinator;
     }
 
     /// <summary>
@@ -199,9 +199,7 @@ internal sealed class SnapshotApplier
         // snapshot and wait for the updated version to avoid incurring
         // inconsistent state of the internal book." We absorb the chunks
         // silently (Skipped path) so the orphan counter is not polluted.
-        ushort currentVersion = _currentSequenceVersion();
-        if (currentVersion != 0
-            && !IsSnapshotVersionAcceptable(msg.LastSequenceVersion, currentVersion))
+        if (!ObserveSnapshotVersion(msg.LastSequenceVersion))
         {
             ReplacePendingSnapshot(secId, new PendingSnapshot
             {
@@ -392,19 +390,20 @@ internal sealed class SnapshotApplier
     }
 
     /// <summary>
-    /// Spec §7.2 guard, tightened: when the channel has observed a
-    /// SequenceVersion (currentVersion != 0), only snapshots that explicitly
-    /// match that version are processed. Snapshots without
-    /// <c>LastSequenceVersion</c> populated (sentinel null/0) and snapshots from
-    /// a different version are absorbed silently. The previous "snapVer &lt;
-    /// currentVersion" check let in-flight V1 snapshots (which often arrive
-    /// without the field after a rollover) leak through and poison the V2
-    /// baseline with huge V1 rptSeq values, silently dropping subsequent live
-    /// messages until rpt caught up.
+    /// Applies the Binary UMDF §7.2 version rule. Older snapshots are rejected;
+    /// a newer snapshot advances the shared channel epoch before its contents
+    /// are staged, allowing recovery even when the one-shot reset packet was
+    /// lost. Missing versions remain accepted only during initial bootstrap.
     /// </summary>
-    private static bool IsSnapshotVersionAcceptable(ushort? lastSequenceVersion, ushort currentVersion)
+    private bool ObserveSnapshotVersion(ushort? lastSequenceVersion)
     {
-        return lastSequenceVersion is { } v && v != 0 && v == currentVersion;
+        ushort currentVersion = _epochCoordinator.CurrentVersion;
+        if (lastSequenceVersion is not { } version || version == 0)
+            return currentVersion == 0;
+
+        return _epochCoordinator.Observe(version, ChannelEpochSource.Snapshot)
+            is not ChannelEpochObservation.Stale
+            and not ChannelEpochObservation.Invalid;
     }
 
     /// <summary>
@@ -422,6 +421,7 @@ internal sealed class SnapshotApplier
         {
             if (!pending.Skipped && pending.OrdersReceived < pending.OrdersExpected)
                 aborted++;
+            _staleBuffer.ClearProtectedFloor(secId);
         }
         if (aborted > 0)
             Interlocked.Add(ref _snapshotsAbortedByEpoch, aborted);
@@ -567,14 +567,12 @@ internal sealed class SnapshotApplier
 
     /// <summary>
     /// Test helper: mirrors the wire <see cref="OnHeader"/> path, including
-    /// the spec §7.2 stale-version gate. Set <paramref name="lastSequenceVersion"/>
-    /// to null/0 to bypass the version check.
+    /// the spec §7.2 version gate. Null/0 is accepted only before the channel
+    /// has established a non-zero epoch.
     /// </summary>
     internal void OnHeaderForTest(ulong secId, uint lastRptSeq, uint ordersExpected, ushort? lastSequenceVersion)
     {
-        ushort currentVersion = _currentSequenceVersion();
-        if (currentVersion != 0
-            && !IsSnapshotVersionAcceptable(lastSequenceVersion, currentVersion))
+        if (!ObserveSnapshotVersion(lastSequenceVersion))
         {
             ReplacePendingSnapshot(secId, new PendingSnapshot
             {

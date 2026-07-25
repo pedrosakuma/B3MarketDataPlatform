@@ -145,6 +145,60 @@ public class ChannelHandlerSequenceVersionRolloverTests
         Assert.Equal(dupesBefore + 1, ch.DuplicatesSkipped);
     }
 
+    [Fact]
+    public void SnapshotDrivenVersionAdvance_DiscardsOldReorderAndRebasesFirstIncremental()
+    {
+        var tracker = new TrackingHandler();
+        var coordinator = new ChannelEpochCoordinator();
+        coordinator.RegisterEventHandler(tracker);
+        var ch = new ChannelHandler(
+            tracker,
+            ChannelHandler.MaxReorderDistance,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance,
+            coordinator);
+
+        ch.HandlePacket(Pkt(seqNum: 1, seqVer: 1));
+        ch.HandlePacket(Pkt(seqNum: 3, seqVer: 1));
+        Assert.Equal(1, ch.ReorderBufferDepth);
+
+        Assert.Equal(
+            ChannelEpochObservation.Advanced,
+            coordinator.Observe(version: 2, ChannelEpochSource.Snapshot));
+
+        Assert.Equal(0, ch.ReorderBufferDepth);
+        Assert.Equal(2, ch.CurrentSequenceVersion);
+        Assert.Equal(1, tracker.SequenceVersionChangedCount);
+
+        long duplicatesBefore = ch.DuplicatesSkipped;
+        Assert.Equal(GapResult.Duplicate, ch.HandlePacket(Pkt(seqNum: 4, seqVer: 1)));
+        Assert.Equal(duplicatesBefore + 1, ch.DuplicatesSkipped);
+
+        // The reset packet (typically seq=1) was missed. The first visible V2
+        // incremental establishes the sequence baseline without a second reset.
+        Assert.Equal(GapResult.InSequence, ch.HandlePacket(Pkt(seqNum: 5, seqVer: 2)));
+        Assert.Equal(6u, ch.ExpectedSequenceNumber);
+        Assert.Equal(1, tracker.SequenceVersionChangedCount);
+        Assert.Equal(1, ch.SequenceVersionResets);
+    }
+
+    [Fact]
+    public void EstablishedEpoch_ZeroVersionPacket_IsDroppedWithoutRebasing()
+    {
+        var tracker = new TrackingHandler();
+        var ch = new ChannelHandler(tracker);
+
+        ch.HandlePacket(Pkt(seqNum: 1, seqVer: 5));
+        ch.HandlePacket(Pkt(seqNum: 2, seqVer: 5));
+        uint expectedBefore = ch.ExpectedSequenceNumber;
+        long duplicatesBefore = ch.DuplicatesSkipped;
+
+        Assert.Equal(GapResult.Duplicate, ch.HandlePacket(Pkt(seqNum: 999_999, seqVer: 0)));
+
+        Assert.Equal(expectedBefore, ch.ExpectedSequenceNumber);
+        Assert.Equal(duplicatesBefore + 1, ch.DuplicatesSkipped);
+        Assert.Equal((ushort)5, ch.CurrentSequenceVersion);
+    }
+
     private sealed class TrackingHandler : IFeedEventHandler
     {
         public int PacketProcessedCount;

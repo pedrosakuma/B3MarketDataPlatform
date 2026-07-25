@@ -188,7 +188,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
 
     public BookManager(IBookEventHandler? eventHandler = null, ILogger<BookManager>? logger = null,
         SymbolStateRegistry? stateRegistry = null,
-        StaleMboBuffer? staleBuffer = null)
+        StaleMboBuffer? staleBuffer = null,
+        ChannelEpochCoordinator? epochCoordinator = null)
     {
         _eventHandler = eventHandler;
         _logger = logger ?? NullLogger<BookManager>.Instance;
@@ -197,6 +198,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             "SymbolStateRegistry is required.");
         _staleBuffer = staleBuffer ?? throw new ArgumentNullException(nameof(staleBuffer),
             "StaleMboBuffer is required.");
+        _epochCoordinator = epochCoordinator ?? new ChannelEpochCoordinator(_logger);
         // Wire the registry's Mbo state-change callback so OnSymbolStaleStatusChanged
         // surfaces regardless of which kind exposed the global gap (MBO or stat).
         // Last-writer-wins on the registry: if multiple BookManagers shared a registry
@@ -213,12 +215,13 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             _eventHandler,
             _logger,
             ReplayDeferredMbo,
-            () => CurrentSequenceVersion);
+            _epochCoordinator);
     }
 
     private readonly SymbolStateRegistry _stateRegistry;
     private readonly StaleMboBuffer _staleBuffer;
     private readonly SnapshotApplier _snapshotApplier;
+    private readonly ChannelEpochCoordinator _epochCoordinator;
     private long _bufferedMboMessages;
     private long _replayedMboMessages;
     private long _mboStaleTransitions;
@@ -613,12 +616,10 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// </summary>
     public void OnSequenceVersionChanged(ushort newVersion)
     {
-        Volatile.Write(ref _currentSequenceVersion, newVersion);
+        _epochCoordinator.SynchronizeFromNotification(newVersion);
         ClearAllBooks();
         ResetPerSymbolEpoch($"SequenceVersionChanged → {newVersion}", SnapshotClearReason.SequenceVersionChanged);
     }
-
-    private int _currentSequenceVersion;
 
     /// <summary>
     /// Last SequenceVersion observed on the incremental stream and propagated
@@ -626,7 +627,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// <see cref="SnapshotApplier"/> to gate stale-version snapshots.
     /// 0 means "no version observed yet"; in that case no gating is applied.
     /// </summary>
-    internal ushort CurrentSequenceVersion => (ushort)Volatile.Read(ref _currentSequenceVersion);
+    internal ushort CurrentSequenceVersion => _epochCoordinator.CurrentVersion;
 
     // Feed thread is the sole writer for all book mutations — no locks needed.
     // Callbacks are inline (same thread) so no race condition exists.
@@ -1156,7 +1157,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotsRejectedTooOld => _snapshotApplier.SnapshotsRejectedTooOld;
     /// <summary>Snapshots ignored at Header_30 because the symbol is already Healthy with a more recent baseline.</summary>
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
-    /// <summary>Snapshots silently skipped because their LastSequenceVersion is older than the channel's current SequenceVersion (B3 spec §7.2).</summary>
+    /// <summary>Snapshots skipped because LastSequenceVersion is stale or missing after the channel epoch is established.</summary>
     public long SnapshotsRejectedStaleVersion => _snapshotApplier.SnapshotsRejectedStaleVersion;
     /// <summary>
     /// Pending snapshots overwritten by a new <c>Header_30</c> for the same

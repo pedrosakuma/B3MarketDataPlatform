@@ -76,26 +76,41 @@ public sealed class FeedHandler : IDisposable
     /// <summary>TickCount64 (milliseconds since process start) of the last packet processed. 0 if none yet.</summary>
     public long LastPacketTicks => Volatile.Read(ref _lastPacketTicks);
 
-    public FeedHandler(IPacketSource source, IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
+    public FeedHandler(
+        IPacketSource source,
+        IFeedEventHandler eventHandler,
+        ILogger<FeedHandler>? logger = null,
+        IFeedEventHandler? marketDataHandler = null,
+        ChannelEpochCoordinator? epochCoordinator = null)
     {
         _source = source;
         _eventHandler = eventHandler;
         _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
-        _incrementalHandler = new ChannelHandler(eventHandler);
+        var coordinator = epochCoordinator ?? new ChannelEpochCoordinator(_logger);
+        coordinator.RegisterEventHandler(eventHandler);
+        _incrementalHandler = new ChannelHandler(
+            eventHandler, ChannelHandler.MaxReorderDistance, _logger, coordinator);
     }
 
     /// <summary>
     /// Creates a FeedHandler for external feeding (no owned source).
     /// Use FeedPacket() to push packets from an external loop.
     /// </summary>
-    public FeedHandler(IFeedEventHandler eventHandler, ILogger<FeedHandler>? logger = null, IFeedEventHandler? marketDataHandler = null)
+    public FeedHandler(
+        IFeedEventHandler eventHandler,
+        ILogger<FeedHandler>? logger = null,
+        IFeedEventHandler? marketDataHandler = null,
+        ChannelEpochCoordinator? epochCoordinator = null)
     {
         _source = null;
         _eventHandler = eventHandler;
         _marketDataHandler = marketDataHandler;
         _logger = logger ?? NullLogger<FeedHandler>.Instance;
-        _incrementalHandler = new ChannelHandler(eventHandler);
+        var coordinator = epochCoordinator ?? new ChannelEpochCoordinator(_logger);
+        coordinator.RegisterEventHandler(eventHandler);
+        _incrementalHandler = new ChannelHandler(
+            eventHandler, ChannelHandler.MaxReorderDistance, _logger, coordinator);
     }
 
     private long _perSymbolGapsAbsorbed;
