@@ -451,6 +451,18 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotsRejectedStaleVersion),
             unit: "{snapshots}", description: "Snapshots rejected because they belong to an older SequenceVersion than the active epoch (post-rollover stragglers)");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_semantic_mismatch",
+            () => PerGroupBook(bm => bm.SnapshotsSemanticMismatch),
+            unit: "{snapshots}", description: "Healthy books whose bid/offer counts disagreed with an authoritative compatible snapshot");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_semantic_repair",
+            () => PerGroupBook(bm => bm.SnapshotsSemanticRepair),
+            unit: "{snapshots}", description: "Healthy books atomically repaired after an authoritative bid/offer count disagreement");
+
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_side_count_mismatch",
+            () => PerGroupBook(bm => bm.SnapshotsRejectedSideCountMismatch),
+            unit: "{snapshots}", description: "Snapshot assemblies rejected because received bid/offer counts contradicted Header_30");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_abandoned",
             () => PerGroupBook(bm => bm.SnapshotsAbandoned),
             unit: "{snapshots}", description: "Snapshots abandoned mid-flight (e.g. truncated before CompleteSnapshot, replaced by a newer snapshot for the same symbol)");

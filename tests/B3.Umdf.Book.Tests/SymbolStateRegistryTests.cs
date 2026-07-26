@@ -5,6 +5,38 @@ namespace B3.Umdf.Book.Tests;
 
 public class SymbolStateRegistryTests
 {
+    [Fact]
+    public void EmptySnapshotBaseline_FirstVisibleRptSeqTwo_ForcesMboStale()
+    {
+        var r = NewRegistry();
+        const ulong securityId = 75;
+
+        r.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq: 0);
+
+        var result = r.Observe(securityId, SymbolGapKind.Mbo, receivedRptSeq: 2);
+
+        Assert.Equal(SymbolState.Stale, result.NewState);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Buffer, result.Action);
+        Assert.True(result.TransitionedToStale);
+        Assert.Equal(1u, result.GapSize);
+        Assert.Equal(SymbolState.Stale, r.GetState(securityId, SymbolGapKind.Mbo));
+    }
+
+    [Fact]
+    public void EmptySnapshotBaseline_FirstVisibleRptSeqOne_RemainsHealthy()
+    {
+        var r = NewRegistry();
+        const ulong securityId = 76;
+
+        r.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq: 0);
+
+        var result = r.Observe(securityId, SymbolGapKind.Mbo, receivedRptSeq: 1);
+
+        Assert.Equal(SymbolState.Healthy, result.NewState);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, result.Action);
+        Assert.False(result.TransitionedToStale);
+    }
+
     private static SymbolStateRegistry NewRegistry() => new(NullLogger.Instance);
 
     // ---- BootstrapPolicy.AcceptFirst (stats) ----

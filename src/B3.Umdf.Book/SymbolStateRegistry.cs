@@ -295,11 +295,12 @@ public sealed class SymbolStateRegistry
     /// </summary>
     private GapInfo DetectAndApplyGlobalGap(SymbolEntry entry, SymbolGapKind triggerKind, uint receivedRptSeq, uint observed)
     {
-        bool globalGap = observed > 0 && receivedRptSeq > observed + 1;
+        const int mboIdx = (int)SymbolGapKind.Mbo;
+        bool hasEstablishedBaseline = observed > 0 || entry.States[mboIdx] == SymbolState.Healthy;
+        bool globalGap = hasEstablishedBaseline && receivedRptSeq > observed + 1;
         if (!globalGap) return default;
 
         uint gapSize = receivedRptSeq - observed - 1;
-        const int mboIdx = (int)SymbolGapKind.Mbo;
         if (entry.States[mboIdx] != SymbolState.Healthy)
             return new GapInfo(true, gapSize, false);
 
@@ -378,6 +379,42 @@ public sealed class SymbolStateRegistry
     private readonly record struct GapInfo(bool GlobalGap, uint Size, bool MboForcedStale);
 
     /// <summary>
+    /// Temporarily moves a Healthy MBO symbol to Stale while an authoritative
+    /// semantic-repair snapshot is assembled. Incrementals arriving during the
+    /// staging window are then buffered and replayed after the atomic swap.
+    /// </summary>
+    public bool BeginSnapshotReconciliation(ulong securityId, uint snapshotRptSeq)
+    {
+        var entry = GetOrAddEntry(securityId);
+        const int mboIdx = (int)SymbolGapKind.Mbo;
+        bool transitioned = false;
+
+        lock (entry.Sync)
+        {
+            if (entry.States[mboIdx] != SymbolState.Healthy)
+                return false;
+
+            uint priorHighWater = entry.LastRptSeq[mboIdx];
+            if (snapshotRptSeq < priorHighWater)
+                return false;
+
+            int prevMask = entry.StaleKindMask;
+            entry.States[mboIdx] = SymbolState.Stale;
+            entry.StaleSinceTicks[mboIdx] = _clock.NowTicks;
+            entry.StaleKindMask |= 1 << mboIdx;
+            if (priorHighWater > entry.MinHealRptSeq[mboIdx])
+                entry.MinHealRptSeq[mboIdx] = priorHighWater;
+            if (prevMask == 0)
+                Interlocked.Increment(ref _staleSymbolCount);
+            transitioned = true;
+        }
+
+        if (transitioned)
+            _onMboStaleStatusChanged?.Invoke(securityId, true);
+        return transitioned;
+    }
+
+    /// <summary>
     /// Outcome of <see cref="HealFromSnapshot"/>.
     /// <see cref="Accepted"/> is false when the snapshot was rejected because its
     /// <see cref="SnapshotRptSeq"/> is older than the symbol's
@@ -425,8 +462,7 @@ public sealed class SymbolStateRegistry
             // or our last good rptSeq before going Stale (mid-session gap). Healing
             // anyway would leave a hole in the book — corrupt state that surfaces
             // as crossed BBOs and ghost orders. Symbol stays in its current state;
-            // caller leaves the snapshot bytes already applied to the book in place
-            // (book state == snapshot state) and continues buffering live
+            // caller discards the staged snapshot and continues buffering live
             // incrementals until a fresher snapshot arrives.
             //
             // Escape valve: if the symbol has been Stale longer than

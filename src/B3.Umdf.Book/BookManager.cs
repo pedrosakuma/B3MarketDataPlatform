@@ -1159,6 +1159,12 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
     /// <summary>Snapshots skipped because LastSequenceVersion is stale or missing after the channel epoch is established.</summary>
     public long SnapshotsRejectedStaleVersion => _snapshotApplier.SnapshotsRejectedStaleVersion;
+    /// <summary>Healthy snapshots whose authoritative side counts disagreed with the live book.</summary>
+    public long SnapshotsSemanticMismatch => _snapshotApplier.SnapshotsSemanticMismatch;
+    /// <summary>Healthy books atomically repaired after an authoritative side-count disagreement.</summary>
+    public long SnapshotsSemanticRepair => _snapshotApplier.SnapshotsSemanticRepair;
+    /// <summary>Snapshot assemblies rejected because received bid/offer counts contradicted Header_30.</summary>
+    public long SnapshotsRejectedSideCountMismatch => _snapshotApplier.SnapshotsRejectedSideCountMismatch;
     /// <summary>
     /// Pending snapshots overwritten by a new <c>Header_30</c> for the same
     /// instrument before completion (incomplete-then-replaced pattern). See
@@ -1198,6 +1204,14 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     // without forging raw SBE bytes.
     internal void OnSnapshotHeaderForTest(ulong securityId, uint lastRptSeq, uint ordersExpected, ushort? lastSequenceVersion)
         => _snapshotApplier.OnHeaderForTest(securityId, lastRptSeq, ordersExpected, lastSequenceVersion);
+    internal void OnSnapshotHeaderForTest(
+        ulong securityId,
+        uint lastRptSeq,
+        uint expectedBids,
+        uint expectedOffers,
+        ushort? lastSequenceVersion)
+        => _snapshotApplier.OnHeaderForTest(
+            securityId, lastRptSeq, expectedBids, expectedOffers, lastSequenceVersion);
     internal void StageSnapshotEntryForTest(ulong securityId, BookSideType side, ulong orderId, long price, long quantity)
         => _snapshotApplier.StageSnapshotEntryForTest(securityId, side, orderId, price, quantity);
     internal void StageSnapshotMarketOrderForTest(ulong securityId, BookSideType side, ulong orderId, long quantity, uint enteringFirm = 0)
