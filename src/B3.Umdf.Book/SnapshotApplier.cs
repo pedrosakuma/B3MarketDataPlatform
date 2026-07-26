@@ -47,8 +47,14 @@ internal sealed class SnapshotApplier
         public uint LastRptSeq;        // 0 if no usable rptSeq baseline
         public uint OrdersExpected;    // TotNumBids + TotNumOffers from Header_30
         public uint OrdersReceived;    // accumulated across Orders_71 chunks
+        public uint BidsExpected;
+        public uint OffersExpected;
+        public uint BidsReceived;
+        public uint OffersReceived;
         public bool HasRptSeq;         // whether LastRptSeq is usable
         public bool Skipped;           // Header_30 saw the symbol Healthy + ahead of snap; chunks must be dropped silently
+        public bool ValidateSideCounts;
+        public bool SemanticRepair;
         public readonly List<OrderBookEntry> StagedBids = new();
         public readonly List<OrderBookEntry> StagedAsks = new();
         public readonly List<MarketOrder> StagedMarketBids = new();
@@ -80,6 +86,9 @@ internal sealed class SnapshotApplier
     private long _snapshotsOrphanChunk;
     private long _snapshotsReplacedHeader;
     private long _snapshotsAborted;
+    private long _snapshotsSemanticMismatch;
+    private long _snapshotsSemanticRepair;
+    private long _snapshotsRejectedSideCountMismatch;
 
     public long SnapshotsHealed => Volatile.Read(ref _snapshotsHealed);
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
@@ -165,6 +174,9 @@ internal sealed class SnapshotApplier
     /// pre-snapshot state until the next snapshot rotation.
     /// </summary>
     public long SnapshotsAborted => Volatile.Read(ref _snapshotsAborted);
+    public long SnapshotsSemanticMismatch => Volatile.Read(ref _snapshotsSemanticMismatch);
+    public long SnapshotsSemanticRepair => Volatile.Read(ref _snapshotsSemanticRepair);
+    public long SnapshotsRejectedSideCountMismatch => Volatile.Read(ref _snapshotsRejectedSideCountMismatch);
 
     public SnapshotApplier(
         BookStore bookStore,
@@ -191,7 +203,9 @@ internal sealed class SnapshotApplier
     {
         ref readonly var msg = ref reader.Data;
         ulong secId = (ulong)msg.SecurityID;
-        uint expected = msg.TotNumBids + msg.TotNumOffers;
+        uint expectedBids = msg.TotNumBids;
+        uint expectedOffers = msg.TotNumOffers;
+        uint expected = expectedBids + expectedOffers;
 
         // Spec §7.2: "If a client encounters a snapshot whose
         // lastSequenceVersion is less than the sequence version coming from
@@ -206,6 +220,9 @@ internal sealed class SnapshotApplier
                 State = SnapshotAssemblyState.Skipped,
                 OrdersExpected = expected,
                 OrdersReceived = 0,
+                BidsExpected = expectedBids,
+                OffersExpected = expectedOffers,
+                ValidateSideCounts = true,
                 Skipped = true,
             });
             Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
@@ -215,7 +232,7 @@ internal sealed class SnapshotApplier
         bool hasRpt = msg.LastRptSeq is { } v && v > 0;
         uint lastRpt = hasRpt ? msg.LastRptSeq!.Value : 0u;
 
-        BeginHeader(secId, lastRpt, hasRpt, expected);
+        BeginHeader(secId, lastRpt, hasRpt, expectedBids, expectedOffers, validateSideCounts: true);
     }
 
     /// <summary>
@@ -223,30 +240,71 @@ internal sealed class SnapshotApplier
     /// the wire-decode path and tests.
     /// </summary>
     public void BeginHeader(ulong secId, uint lastRptSeq, bool hasRptSeq, uint ordersExpected)
+        => BeginHeader(secId, lastRptSeq, hasRptSeq, ordersExpected, 0, validateSideCounts: false);
+
+    private void BeginHeader(
+        ulong secId,
+        uint lastRptSeq,
+        bool hasRptSeq,
+        uint expectedBids,
+        uint expectedOffers,
+        bool validateSideCounts)
     {
         var book = _bookStore.GetOrCreate(secId);
+        uint ordersExpected = expectedBids + expectedOffers;
+        bool semanticRepair = false;
 
-        // GUARD: never apply a snapshot to an already-Healthy symbol. The B3
-        // always-on snapshot stream rotates through every instrument
-        // periodically and does not target our consumer's specific state — its
-        // payload reflects state-as-of some snapshot moment T, which may be
-        // either behind or ahead of where we are. Applying would either
-        // clobber in-flight live messages or leave a hole between our last
-        // applied rptSeq and the snapshot baseline.
         var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
         if (state == SymbolState.Healthy)
         {
-            ReplacePendingSnapshot(secId, new PendingSnapshot
+            int liveBids = book.Bids.OrderCount + book.MarketOrderCount(BookSideType.Bid);
+            int liveOffers = book.Asks.OrderCount + book.MarketOrderCount(BookSideType.Ask);
+            bool countsMatch = !validateSideCounts
+                || ((uint)liveBids == expectedBids && (uint)liveOffers == expectedOffers);
+
+            // Preserve the cheap fast path when the authoritative header agrees
+            // with the live book. If it disagrees, a same/newer-rpt snapshot is
+            // allowed to stage an atomic semantic repair.
+            if (countsMatch || !hasRptSeq || lastRptSeq < book.LastRptSeq)
             {
-                State = SnapshotAssemblyState.Skipped,
-                LastRptSeq = lastRptSeq,
-                OrdersExpected = ordersExpected,
-                OrdersReceived = 0,
-                HasRptSeq = hasRptSeq,
-                Skipped = true,
-            });
-            Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
-            return;
+                ReplacePendingSnapshot(secId, new PendingSnapshot
+                {
+                    State = SnapshotAssemblyState.Skipped,
+                    LastRptSeq = lastRptSeq,
+                    OrdersExpected = ordersExpected,
+                    OrdersReceived = 0,
+                    BidsExpected = expectedBids,
+                    OffersExpected = expectedOffers,
+                    HasRptSeq = hasRptSeq,
+                    Skipped = true,
+                    ValidateSideCounts = validateSideCounts,
+                });
+                Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
+                return;
+            }
+
+            // Older snapshots can legitimately describe a different side
+            // composition. Count only actionable disagreements at the current
+            // or a newer rptSeq as semantic mismatches.
+            Interlocked.Increment(ref _snapshotsSemanticMismatch);
+
+            if (!_stateRegistry.BeginSnapshotReconciliation(secId, lastRptSeq))
+            {
+                ReplacePendingSnapshot(secId, new PendingSnapshot
+                {
+                    State = SnapshotAssemblyState.Skipped,
+                    LastRptSeq = lastRptSeq,
+                    OrdersExpected = ordersExpected,
+                    BidsExpected = expectedBids,
+                    OffersExpected = expectedOffers,
+                    HasRptSeq = hasRptSeq,
+                    Skipped = true,
+                    ValidateSideCounts = validateSideCounts,
+                });
+                Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
+                return;
+            }
+            semanticRepair = true;
         }
 
         // Begin a fresh snapshot for this instrument: stage in a parallel buffer.
@@ -258,7 +316,11 @@ internal sealed class SnapshotApplier
             LastRptSeq = lastRptSeq,
             OrdersExpected = ordersExpected,
             OrdersReceived = 0,
+            BidsExpected = expectedBids,
+            OffersExpected = expectedOffers,
             HasRptSeq = hasRptSeq,
+            ValidateSideCounts = validateSideCounts,
+            SemanticRepair = semanticRepair,
         });
 
         // Floor pin: while this snapshot is in flight (Begin → Orders_71 chunks → End),
@@ -316,6 +378,10 @@ internal sealed class SnapshotApplier
             added++;
             long? rawPrice = entry.MDEntryPx.Mantissa;
             var side = entry.MDEntryType == MDEntryType.BID ? BookSideType.Bid : BookSideType.Ask;
+            if (side == BookSideType.Bid)
+                pending.BidsReceived++;
+            else
+                pending.OffersReceived++;
             long quantity = (long)entry.MDEntrySize;
             ulong orderId = (ulong)entry.SecondaryOrderID;
             uint enteringFirm = entry.EnteringFirm.Value ?? 0;
@@ -355,7 +421,13 @@ internal sealed class SnapshotApplier
 
         pending.OrdersReceived += added;
 
-        if (pending.OrdersReceived >= pending.OrdersExpected)
+        if (HasSideCountOverflow(pending))
+        {
+            RejectSideCountMismatch(securityId);
+            return;
+        }
+
+        if (IsSnapshotComplete(pending))
         {
             var book = _bookStore.GetOrCreate(securityId);
             CompleteSnapshot(securityId, book);
@@ -440,6 +512,13 @@ internal sealed class SnapshotApplier
             return;
         }
 
+        if (pending.ValidateSideCounts && !HasExactSideCounts(pending))
+        {
+            _staleBuffer.ClearProtectedFloor(securityId);
+            Interlocked.Increment(ref _snapshotsRejectedSideCountMismatch);
+            return;
+        }
+
         if (!pending.HasRptSeq)
             CompleteIlliquidSnapshot(securityId, book, pending);
         else
@@ -511,6 +590,8 @@ internal sealed class SnapshotApplier
         if (heal.TransitionedToHealthy)
             Interlocked.Increment(ref _snapshotsHealed);
         Interlocked.Increment(ref _snapshotsCompleted);
+        if (pending.SemanticRepair)
+            Interlocked.Increment(ref _snapshotsSemanticRepair);
         if (pending.OrdersExpected == 0)
             Interlocked.Increment(ref _snapshotsZeroOrder);
 
@@ -563,6 +644,29 @@ internal sealed class SnapshotApplier
             book.MarketOrderCount(side));
     }
 
+    private static bool HasExactSideCounts(PendingSnapshot pending)
+        => pending.BidsReceived == pending.BidsExpected
+            && pending.OffersReceived == pending.OffersExpected;
+
+    private static bool HasSideCountOverflow(PendingSnapshot pending)
+        => pending.ValidateSideCounts
+            && (pending.BidsReceived > pending.BidsExpected
+                || pending.OffersReceived > pending.OffersExpected);
+
+    private static bool IsSnapshotComplete(PendingSnapshot pending)
+        => pending.ValidateSideCounts
+            ? HasExactSideCounts(pending)
+            : pending.OrdersReceived >= pending.OrdersExpected;
+
+    private void RejectSideCountMismatch(ulong securityId)
+    {
+        if (!_pendingSnapshots.Remove(securityId, out _))
+            return;
+        _staleBuffer.ClearProtectedFloor(securityId);
+        Interlocked.Increment(ref _snapshotsRejectedSideCountMismatch);
+        Interlocked.Increment(ref _snapshotsAborted);
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────────────
 
     /// <summary>
@@ -585,6 +689,37 @@ internal sealed class SnapshotApplier
             return;
         }
         BeginHeader(secId, lastRptSeq, lastRptSeq > 0, ordersExpected);
+    }
+
+    internal void OnHeaderForTest(
+        ulong secId,
+        uint lastRptSeq,
+        uint expectedBids,
+        uint expectedOffers,
+        ushort? lastSequenceVersion)
+    {
+        if (!ObserveSnapshotVersion(lastSequenceVersion))
+        {
+            ReplacePendingSnapshot(secId, new PendingSnapshot
+            {
+                State = SnapshotAssemblyState.Skipped,
+                OrdersExpected = expectedBids + expectedOffers,
+                BidsExpected = expectedBids,
+                OffersExpected = expectedOffers,
+                ValidateSideCounts = true,
+                Skipped = true,
+            });
+            Interlocked.Increment(ref _snapshotsRejectedStaleVersion);
+            return;
+        }
+
+        BeginHeader(
+            secId,
+            lastRptSeq,
+            lastRptSeq > 0,
+            expectedBids,
+            expectedOffers,
+            validateSideCounts: true);
     }
 
     /// <summary>
@@ -635,11 +770,22 @@ internal sealed class SnapshotApplier
             Side = side,
         };
         if (side == BookSideType.Bid)
+        {
             pending.StagedBids.Add(entry);
+            if (pending.ValidateSideCounts) pending.BidsReceived++;
+        }
         else
+        {
             pending.StagedAsks.Add(entry);
+            if (pending.ValidateSideCounts) pending.OffersReceived++;
+        }
         pending.OrdersReceived++;
-        if (pending.OrdersReceived >= pending.OrdersExpected)
+        if (HasSideCountOverflow(pending))
+        {
+            RejectSideCountMismatch(securityId);
+            return;
+        }
+        if (IsSnapshotComplete(pending))
         {
             var book = _bookStore.GetOrCreate(securityId);
             CompleteSnapshot(securityId, book);
@@ -659,11 +805,22 @@ internal sealed class SnapshotApplier
             SecurityId = securityId,
         };
         if (side == BookSideType.Bid)
+        {
             pending.StagedMarketBids.Add(order);
+            if (pending.ValidateSideCounts) pending.BidsReceived++;
+        }
         else
+        {
             pending.StagedMarketAsks.Add(order);
+            if (pending.ValidateSideCounts) pending.OffersReceived++;
+        }
         pending.OrdersReceived++;
-        if (pending.OrdersReceived >= pending.OrdersExpected)
+        if (HasSideCountOverflow(pending))
+        {
+            RejectSideCountMismatch(securityId);
+            return;
+        }
+        if (IsSnapshotComplete(pending))
         {
             var book = _bookStore.GetOrCreate(securityId);
             CompleteSnapshot(securityId, book);
