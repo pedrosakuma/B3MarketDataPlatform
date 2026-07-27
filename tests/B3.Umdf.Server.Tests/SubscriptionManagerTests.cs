@@ -273,7 +273,8 @@ public class SubscriptionManagerTests
         var update = new InstrumentStatusUpdate(
             PreviousStatus: 17,
             NewStatus: 17,
-            ReasonCode: InstrumentStatusDecoder.InstrumentHaltedReasonCode,
+            TransitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
+            HaltReasonCode: null,
             SourceTimestampNanos: 123,
             RptSeq: 9);
         sm.PublishInstrumentStatus(securityId, "PETR4", in update);

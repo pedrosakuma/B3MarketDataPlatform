@@ -718,14 +718,28 @@ public sealed class AuctionEvent
 }
 
 /// <summary>
-/// Proprietary <c>securityTradingEvent</c> markers carried by the existing
-/// UMDF <c>SecurityStatus_3</c> template for administrative halt/resume.
+/// Administrative state transition carried by the proprietary
+/// <c>SecurityStatus_3.securityTradingEvent</c> extension.
 /// </summary>
-public enum InstrumentStatusReason : byte
+public enum InstrumentStatusTransitionKind : byte
 {
     Unknown = 0,
-    InstrumentHalted = 1,
-    InstrumentResumed = 2,
+    Halted = 1,
+    Resumed = 2,
+}
+
+/// <summary>
+/// Operator-supplied administrative halt reason. The current upstream UMDF
+/// contract does not transmit this value, so <see cref="InstrumentStatusEvent.HaltReason"/>
+/// remains null until B3MatchingPlatform issue #581 supplies it.
+/// </summary>
+public enum InstrumentHaltReason : byte
+{
+    Unknown = 0,
+    RegulatoryHalt = 1,
+    VolatilityCircuitBreaker = 2,
+    NewsHold = 3,
+    PendingDisclosure = 4,
 }
 
 /// <summary>
@@ -749,14 +763,22 @@ public sealed class InstrumentStatusEvent
     public int NewStatus { get; init; }
 
     /// <summary>
-    /// Halt/resume marker from <c>SecurityStatus_3.securityTradingEvent</c>.
-    /// The current source frame does not carry the operator's detailed
-    /// RegulatoryHalt/NewsHold/etc. reason.
+    /// Halt/resume transition marker from
+    /// <c>SecurityStatus_3.securityTradingEvent</c>.
     /// </summary>
-    public InstrumentStatusReason Reason { get; init; }
+    public InstrumentStatusTransitionKind Transition { get; init; }
 
-    /// <summary>Unmodified <c>securityTradingEvent</c> marker for forward compatibility.</summary>
-    public byte RawReasonCode { get; init; }
+    /// <summary>Unmodified transition marker for forward compatibility.</summary>
+    public byte RawTransitionCode { get; init; }
+
+    /// <summary>
+    /// Detailed operator halt reason, or null because the current upstream
+    /// <c>SecurityStatus_3</c> frame does not carry one.
+    /// </summary>
+    public InstrumentHaltReason? HaltReason { get; init; }
+
+    /// <summary>Unmodified detailed reason code, or null when absent on the wire.</summary>
+    public byte? RawHaltReasonCode { get; init; }
 
     /// <summary>Exchange source timestamp, UTC nanoseconds since Unix epoch.</summary>
     public ulong SourceTimestampNanos { get; init; }
@@ -764,5 +786,5 @@ public sealed class InstrumentStatusEvent
     /// <summary>Per-instrument UMDF sequence, or null for snapshot/zero.</summary>
     public uint? RptSeq { get; init; }
 
-    public bool IsHalted => Reason == InstrumentStatusReason.InstrumentHalted;
+    public bool IsHalted => Transition == InstrumentStatusTransitionKind.Halted;
 }

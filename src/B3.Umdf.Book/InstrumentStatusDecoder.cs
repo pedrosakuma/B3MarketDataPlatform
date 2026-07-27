@@ -9,9 +9,13 @@ namespace B3.Umdf.Book;
 public readonly record struct InstrumentStatusUpdate(
     int? PreviousStatus,
     int NewStatus,
-    byte ReasonCode,
+    byte TransitionCode,
+    byte? HaltReasonCode,
     ulong SourceTimestampNanos,
-    uint? RptSeq);
+    uint? RptSeq)
+{
+    public bool IsHalted => TransitionCode == InstrumentStatusDecoder.InstrumentHaltedTransitionCode;
+}
 
 /// <summary>
 /// Decodes the proprietary halt/resume markers emitted by B3MatchingPlatform
@@ -19,8 +23,8 @@ public readonly record struct InstrumentStatusUpdate(
 /// </summary>
 public static class InstrumentStatusDecoder
 {
-    public const byte InstrumentHaltedReasonCode = 1;
-    public const byte InstrumentResumedReasonCode = 2;
+    public const byte InstrumentHaltedTransitionCode = 1;
+    public const byte InstrumentResumedTransitionCode = 2;
 
     public static bool TryDecode(
         in SecurityStatus_3DataReader reader,
@@ -28,11 +32,11 @@ public static class InstrumentStatusDecoder
         out InstrumentStatusUpdate update)
     {
         ref readonly var message = ref reader.Data;
-        byte reasonCode = message.SecurityTradingEvent is { } tradingEvent
+        byte transitionCode = message.SecurityTradingEvent is { } tradingEvent
             ? (byte)tradingEvent
             : byte.MaxValue;
 
-        if (reasonCode is not (InstrumentHaltedReasonCode or InstrumentResumedReasonCode))
+        if (transitionCode is not (InstrumentHaltedTransitionCode or InstrumentResumedTransitionCode))
         {
             update = default;
             return false;
@@ -41,7 +45,8 @@ public static class InstrumentStatusDecoder
         update = new InstrumentStatusUpdate(
             previousStatus,
             (int)message.SecurityTradingStatus,
-            reasonCode,
+            transitionCode,
+            null,
             message.TransactTime.Time ?? 0,
             message.RptSeq);
         return true;

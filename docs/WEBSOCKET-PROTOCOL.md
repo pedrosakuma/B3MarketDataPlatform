@@ -258,7 +258,7 @@ unrecognised combinations map to `Unknown`.
 
 | Message | Type | Payload |
 |---------|------|---------|
-| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][reason u8][sourceTimestampNanos u64][rptSeq u32]` |
+| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]` |
 
 This is the dedicated, non-conflated transition surface for administrative
 single-instrument halt/resume. It is decoded from the existing schema-generated
@@ -268,17 +268,40 @@ otherwise schema-reserved `securityTradingEvent` values `1` (halt) and `2`
 (resume), while `securityTradingStatus`, `transactTime`, and `rptSeq` supply
 `newStatus`, `sourceTimestampNanos`, and `rptSeq`.
 
-`previousStatus=255` means the platform had no prior status cached. `rptSeq=0`
-means absent/snapshot. The venue preserves the underlying trading phase during
-an administrative halt, so `previousStatus` and `newStatus` may both be `17`
-(OPEN); consumers should use `reason`/the SDK's `IsHalted` property to identify
-the transition.
+`previousStatus=255` means the platform had no prior status cached,
+`haltReason=255` means the upstream frame supplied no detailed operator reason,
+and `rptSeq=0` means absent/snapshot. The venue preserves the underlying trading
+phase during an administrative halt, so `previousStatus` and `newStatus` may
+both be `17` (OPEN); consumers should use `transition`/the SDK's `IsHalted`
+property to identify the current administrative state.
 
 The current source frame does **not** carry the operator's detailed halt reason
-(`RegulatoryHalt`, `NewsHold`, etc.). `reason` therefore exposes the exact
-available marker: `1` = instrument halted, `2` = instrument resumed. The normal
-`InfoSnapshot.TradingStatus` update remains unchanged for compatibility, and
-older clients safely skip the additive `0x00B3` opcode.
+(`RegulatoryHalt`, `NewsHold`, etc.). `transition` exposes the exact available
+marker (`1` = halted, `2` = resumed), while `haltReason` is null/255. Transition
+kind is deliberately not presented as a reason.
+
+Authoritative upstream evidence (B3MatchingPlatform commit
+`0d423c8f6cecf647d57adf85ebdd6f539b0c8214`):
+
+- [`InstrumentHaltedEvent`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Matching/Events.cs)
+  carries `HaltReason`, but
+  [`ChannelDispatcher.Sinks.OnInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Core/ChannelDispatcher.Sinks.cs)
+  does not pass it to the encoder.
+- [`UmdfFrameBuilder.WriteInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Umdf.WireEncoder/UmdfFrameBuilder.cs)
+  emits `SecurityStatus_3` with only `securityTradingEvent=1`.
+- Schema 2.2.0 defines no detailed halt-reason field and repository code search
+  finds no `InstrumentStatus_NN` template.
+
+The missing upstream contract is tracked by
+[`B3MatchingPlatform#581`](https://github.com/pedrosakuma/B3MatchingPlatform/issues/581);
+until it lands, this frame cannot satisfy the detailed-reason portion of
+`B3MarketDataPlatform#73`.
+
+The current state is cached and emitted after `InfoSnapshot` on every Info
+subscribe/re-subscribe. The normal `InfoSnapshot.TradingStatus` update remains
+unchanged for compatibility, and older clients safely skip the additive
+`0x00B3` opcode. SDK decoders validate the minimum payload and symbol length;
+malformed frames are logged and skipped without tearing down the connection.
 
 ### SecurityDefinition (opt-in via `DataFlags.SecurityDefinition`)
 

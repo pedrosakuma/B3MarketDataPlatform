@@ -41,7 +41,7 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 client.Trade        += t => Console.WriteLine($"{t.Symbol} @ {t.Price} x {t.Qty}{(t.Flags.HasFlag(TradeFlags.AuctionPrint) ? " (auction)" : "")}");
 client.InfoSnapshot += i => Console.WriteLine($"{i.Symbol} last={i.LastTradePrice} top={i.TheoreticalOpeningPrice} imb={i.AuctionImbalanceCondition}");
 client.InstrumentStatus += s => Console.WriteLine(
-    $"{s.Symbol} {(s.IsHalted ? "halted" : "resumed")} status={s.NewStatus} reason={s.Reason}");
+    $"{s.Symbol} transition={s.Transition} status={s.NewStatus} haltReason={s.HaltReason?.ToString() ?? "unavailable"}");
 client.ServerStatus += s => Console.WriteLine($"server ready={s.Ready}");
 client.SubscribeError += e => Console.WriteLine($"{e.Symbol} -> {e.ErrorCode}");
 
@@ -236,12 +236,20 @@ The platform decodes the existing schema-generated UMDF
 `SecurityStatus_3` template (id 3), not a separate `InstrumentStatus_NN`
 template. B3MatchingPlatform marks halt with `securityTradingEvent=1` and
 resume with `securityTradingEvent=2`; these map to
-`InstrumentStatusReason.InstrumentHalted` and `InstrumentResumed`.
+`InstrumentStatusTransitionKind.Halted` and `Resumed`.
 `PreviousStatus` is null on first sight, `NewStatus` is the frame's
 `securityTradingStatus`, and `SourceTimestampNanos` is its `transactTime`.
 
 The source currently preserves the underlying trading phase during halt and
 does not encode the operator's detailed `RegulatoryHalt`/`NewsHold` reason.
-Consequently previous/new status can both be `OPEN`, and `Reason` exposes the
-exact halt/resume marker available on the wire. Existing `InfoSnapshot`
-delivery remains unchanged for compatibility.
+Consequently previous/new status can both be `OPEN`; `Transition` identifies
+halt vs. resume while `HaltReason` remains null. This upstream prerequisite is
+tracked by
+[`B3MatchingPlatform#581`](https://github.com/pedrosakuma/B3MatchingPlatform/issues/581).
+The APIs intentionally keep transition kind and detailed halt reason separate
+instead of inventing a reason from the marker.
+
+The latest administrative state is retained in the server's `InstrumentInfo`
+cache. Every new `Info` subscribe — including automatic re-subscribe after a
+WebSocket reconnect — receives the cached typed status after `InfoSnapshot`.
+Existing `InfoSnapshot` delivery remains unchanged for compatibility.

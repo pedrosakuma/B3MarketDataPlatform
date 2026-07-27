@@ -172,6 +172,22 @@ internal static class SnapshotEmitter
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 
+    /// <summary>
+    /// Send the cached current administrative halt/resume state to a late or
+    /// reconnecting Info subscriber. No-op until a source transition was observed.
+    /// </summary>
+    public static bool SendInstrumentStatusSnapshot(
+        ClientSession session,
+        ulong securityId,
+        InstrumentInfo info)
+    {
+        if (info.AdministrativeStatus is not { } status) return true;
+        var buf = new byte[WireProtocol.InstrumentStatusMaxSize];
+        int len = WireProtocol.WriteInstrumentStatus(
+            buf, securityId, info.Symbol, in status);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
     /// <summary>Send the cached <see cref="MessageType.SecurityDefinition"/> frame
     /// for one security. Used for the bootstrap push on Subscribe when the
     /// caller already asserted <see cref="DataFlags.SecurityDefinition"/> is set.</summary>

@@ -8,15 +8,15 @@ namespace B3.Umdf.Book.Tests;
 public class InstrumentStatusDecoderTests
 {
     [Theory]
-    [InlineData(InstrumentStatusDecoder.InstrumentHaltedReasonCode)]
-    [InlineData(InstrumentStatusDecoder.InstrumentResumedReasonCode)]
-    public void TryDecode_SecurityStatusExtension_PreservesExactFields(byte reasonCode)
+    [InlineData(InstrumentStatusDecoder.InstrumentHaltedTransitionCode)]
+    [InlineData(InstrumentStatusDecoder.InstrumentResumedTransitionCode)]
+    public void TryDecode_SecurityStatusExtension_PreservesExactFields(byte transitionCode)
     {
         const ulong sourceTimestamp = 1_750_000_000_123_456_789;
         var body = BuildBody(
             securityId: 12345,
             status: SecurityTradingStatus.OPEN,
-            eventCode: reasonCode,
+            eventCode: transitionCode,
             sourceTimestamp,
             rptSeq: 77);
 
@@ -25,7 +25,8 @@ public class InstrumentStatusDecoderTests
 
         Assert.Equal(21, update.PreviousStatus);
         Assert.Equal((int)SecurityTradingStatus.OPEN, update.NewStatus);
-        Assert.Equal(reasonCode, update.ReasonCode);
+        Assert.Equal(transitionCode, update.TransitionCode);
+        Assert.Null(update.HaltReasonCode);
         Assert.Equal(sourceTimestamp, update.SourceTimestampNanos);
         Assert.Equal(77u, update.RptSeq);
     }
@@ -60,16 +61,23 @@ public class InstrumentStatusDecoderTests
         manager.OnPacket(
             in EmptyPacket,
             BuildFrame(42, SecurityTradingStatus.OPEN,
-                InstrumentStatusDecoder.InstrumentHaltedReasonCode, 200, 2),
+                InstrumentStatusDecoder.InstrumentHaltedTransitionCode, 200, 2),
+            SecurityStatus_3Data.MESSAGE_ID);
+        manager.OnPacket(
+            in EmptyPacket,
+            BuildFrame(42, SecurityTradingStatus.OPEN,
+                (byte)SecurityTradingEvent.SECURITY_STATUS_CHANGE, 300, 3),
             SecurityStatus_3Data.MESSAGE_ID);
 
         Assert.Equal(1, handler.Count);
         Assert.Equal(42UL, handler.SecurityId);
         Assert.Equal((int)SecurityTradingStatus.RESERVED, handler.Update.PreviousStatus);
         Assert.Equal((int)SecurityTradingStatus.OPEN, handler.Update.NewStatus);
-        Assert.Equal(InstrumentStatusDecoder.InstrumentHaltedReasonCode, handler.Update.ReasonCode);
+        Assert.Equal(InstrumentStatusDecoder.InstrumentHaltedTransitionCode, handler.Update.TransitionCode);
+        Assert.Null(handler.Update.HaltReasonCode);
         Assert.Equal(200UL, handler.Update.SourceTimestampNanos);
         Assert.Equal(2u, handler.Update.RptSeq);
+        Assert.Equal(handler.Update, manager.InstrumentData[42].AdministrativeStatus);
     }
 
     private static byte[] BuildFrame(

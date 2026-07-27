@@ -752,6 +752,8 @@ public sealed class SubscriptionManager : IDisposable
                     {
                         if (!SnapshotEmitter.SendInfoSnapshot(session, securityId, info))
                             return false;
+                        if (!SnapshotEmitter.SendInstrumentStatusSnapshot(session, securityId, info))
+                            return false;
                         break;
                     }
                 }

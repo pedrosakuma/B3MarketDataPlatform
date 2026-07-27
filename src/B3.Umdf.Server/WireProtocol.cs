@@ -1007,14 +1007,15 @@ public static class WireProtocol
 
     public const byte InstrumentStatusUnavailable = byte.MaxValue;
     public const int InstrumentStatusMaxSize =
-        FramingHeaderSize + 8 + 1 + 255 + 1 + 1 + 1 + 8 + 4;
+        FramingHeaderSize + 8 + 1 + 255 + 1 + 1 + 1 + 1 + 8 + 4;
 
     /// <summary>
     /// Serialize a halt/resume transition decoded from <c>SecurityStatus_3</c>.
     /// Layout:
     /// <c>[secId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
-    /// [reason u8][sourceTimestampNanos u64][rptSeq u32]</c>.
-    /// A previous status or RptSeq that was unavailable is encoded as 255 or 0.
+    /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]</c>.
+    /// Unavailable previous status / halt reason / RptSeq are encoded as
+    /// 255 / 255 / 0 respectively.
     /// </summary>
     public static int WriteInstrumentStatus(
         Span<byte> dest,
@@ -1035,7 +1036,8 @@ public static class WireProtocol
             ? checked((byte)previous)
             : InstrumentStatusUnavailable;
         dest[offset++] = checked((byte)update.NewStatus);
-        dest[offset++] = update.ReasonCode;
+        dest[offset++] = update.TransitionCode;
+        dest[offset++] = update.HaltReasonCode ?? InstrumentStatusUnavailable;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], update.SourceTimestampNanos); offset += 8;
         BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], update.RptSeq ?? 0); offset += 4;
 

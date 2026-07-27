@@ -486,7 +486,10 @@ public sealed class MarketDataManager : IFeedEventHandler
 
         info.BumpVersion();
         if (InstrumentStatusDecoder.TryDecode(in reader, previousStatus, out var instrumentStatus))
+        {
+            info.AdministrativeStatus = instrumentStatus;
             _eventHandler?.OnInstrumentStatusChanged(securityId, info, in instrumentStatus);
+        }
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
     }
 

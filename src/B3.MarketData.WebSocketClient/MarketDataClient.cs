@@ -562,7 +562,13 @@ public sealed class MarketDataClient : IAsyncDisposable
             }
             case MessageType.InstrumentStatus:
             {
-                var ev = WireFormat.ReadInstrumentStatus(payload, receivedUtc);
+                if (!WireFormat.TryReadInstrumentStatus(payload, receivedUtc, out var ev))
+                {
+                    _logger.LogWarning(
+                        "Malformed InstrumentStatus payload ({Length} bytes); dropping frame.",
+                        payload.Length);
+                    break;
+                }
                 Enqueue(() => InstrumentStatus?.Invoke(ev));
                 break;
             }
