@@ -12,8 +12,8 @@ namespace B3.Umdf.Server;
 ///     containing <c>Dictionary&lt;string, SubscriptionState&gt;</c> under <c>_subLock</c>.
 ///     This preserves the snapshot model for membership and flag identity — readers
 ///     iterating a captured dictionary snapshot see a consistent flag set.</description></item>
-///   <item><description>The book broadcast cutoff (<see cref="MinBroadcastSequenceExclusive"/>)
-///     is a mutable cell, advanced lock-free via <see cref="AdvanceMinBroadcastSequence"/>.
+///   <item><description>The book/MBP and trade broadcast cutoffs are independent
+///     mutable cells, advanced lock-free via CAS-max helpers.
 ///     CoW snapshots share the same <c>SubscriptionState</c> reference for unchanged
 ///     subscriptions, so a cutoff advance is intentionally visible to broadcasters
 ///     iterating any snapshot. This is required for the cutoff to act as a sequence
@@ -25,19 +25,26 @@ internal sealed class SubscriptionState
     public DataFlags Flags { get; }
     public ushort ConflationIntervalMs { get; }
 
-    private long _minBroadcastSequenceExclusive;
+    private long _minBookBroadcastSequenceExclusive;
+    private long _minTradeBroadcastSequenceExclusive;
 
     public SubscriptionState(
         DataFlags flags,
-        long minBroadcastSequenceExclusive,
+        long minBookBroadcastSequenceExclusive,
+        long minTradeBroadcastSequenceExclusive = 0,
         ushort conflationIntervalMs = 0)
     {
         Flags = flags;
-        _minBroadcastSequenceExclusive = minBroadcastSequenceExclusive;
+        _minBookBroadcastSequenceExclusive = minBookBroadcastSequenceExclusive;
+        _minTradeBroadcastSequenceExclusive = minTradeBroadcastSequenceExclusive;
         ConflationIntervalMs = conflationIntervalMs;
     }
 
-    public long MinBroadcastSequenceExclusive => Volatile.Read(ref _minBroadcastSequenceExclusive);
+    public long MinBookBroadcastSequenceExclusive =>
+        Volatile.Read(ref _minBookBroadcastSequenceExclusive);
+
+    public long MinTradeBroadcastSequenceExclusive =>
+        Volatile.Read(ref _minTradeBroadcastSequenceExclusive);
 
     /// <summary>
     /// Monotonically advance the broadcast cutoff. Lock-free CAS-max: only updates if
@@ -47,25 +54,33 @@ internal sealed class SubscriptionState
     /// thread, but the CAS-max keeps the contract robust against accidental concurrent
     /// updates from new code paths.
     /// </summary>
-    public void AdvanceMinBroadcastSequence(long sequence)
+    public void AdvanceBookMinBroadcastSequence(long sequence) =>
+        AdvanceMax(ref _minBookBroadcastSequenceExclusive, sequence);
+
+    public void AdvanceTradeMinBroadcastSequence(long sequence) =>
+        AdvanceMax(ref _minTradeBroadcastSequenceExclusive, sequence);
+
+    private static void AdvanceMax(ref long target, long sequence)
     {
         while (true)
         {
-            long current = Volatile.Read(ref _minBroadcastSequenceExclusive);
+            long current = Volatile.Read(ref target);
             if (sequence <= current) return;
-            if (Interlocked.CompareExchange(ref _minBroadcastSequenceExclusive, sequence, current) == current)
+            if (Interlocked.CompareExchange(ref target, sequence, current) == current)
                 return;
         }
     }
 
     public bool WantsBookBatch(long batchSequence) =>
-        (Flags & DataFlags.Book) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
+        (Flags & DataFlags.Book) != 0 &&
+        batchSequence > Volatile.Read(ref _minBookBroadcastSequenceExclusive);
 
     /// <summary>True iff this subscription wants the MBP (price-level) stream and the
     /// given batch is past the snapshot cutoff. MBP shares the same broadcast cutoff
     /// as Book — both originate from the same per-packet batch sequence.</summary>
     public bool WantsMbpBatch(long batchSequence) =>
-        (Flags & DataFlags.Mbp) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
+        (Flags & DataFlags.Mbp) != 0 &&
+        batchSequence > Volatile.Read(ref _minBookBroadcastSequenceExclusive);
 
     public bool WantsMbp => (Flags & DataFlags.Mbp) != 0;
 
@@ -74,7 +89,7 @@ internal sealed class SubscriptionState
     public bool WantsConflatedMbpBatch(long batchSequence, int cadenceMs) =>
         WantsConflatedMbp &&
         ConflationIntervalMs == cadenceMs &&
-        batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
+        batchSequence > Volatile.Read(ref _minBookBroadcastSequenceExclusive);
 
     public bool WantsInfo => (Flags & DataFlags.Info) != 0;
 
@@ -103,7 +118,8 @@ internal sealed class SubscriptionState
     public bool WantsAuction => (Flags & DataFlags.Auction) != 0;
 
     /// <summary>True iff this subscription wants live trades and the given batch is
-    /// past the snapshot cutoff. Trades share the same broadcast cutoff as Book/Mbp.</summary>
+    /// past the independent trade-history snapshot cutoff.</summary>
     public bool WantsTradesBatch(long batchSequence) =>
-        (Flags & DataFlags.Trades) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
+        (Flags & DataFlags.Trades) != 0 &&
+        batchSequence > Volatile.Read(ref _minTradeBroadcastSequenceExclusive);
 }

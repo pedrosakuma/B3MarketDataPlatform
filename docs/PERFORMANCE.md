@@ -109,7 +109,10 @@ requests), trade-bust ordering boundaries, and shutdown.
 The opt-in cadence tier is independent of the process-wide flush window. It
 consumes the already-serialized MBP/book-context frames, retains one latest
 value per semantic key per allowed cadence, then fans that shared result out.
-Trades are not cadence-buffered or replaced by a bespoke summary frame.
+Per-security copy-on-write routing indexes separate immediate MBP recipients
+from each active cadence: event-time work is O(active cadence set), not
+O(conflated consumers), and consumers are enumerated only when a cadence
+releases. Trades are not cadence-buffered or replaced by a bespoke summary frame.
 
 Empirically, raising the per-client window from 0 → 10 ms reduces total
 syscalls by ~6× without measurably increasing client-perceived latency for

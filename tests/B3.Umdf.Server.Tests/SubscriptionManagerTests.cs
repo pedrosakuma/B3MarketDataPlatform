@@ -316,6 +316,31 @@ public class SubscriptionManagerTests
     }
 
     [Fact]
+    public void RoutingIndexes_SeparateImmediateAndCadenceMbpConsumers()
+    {
+        using var manager = new SubscriptionManager();
+        const ulong securityId = 5001;
+
+        for (int i = 0; i < 128; i++)
+            manager.AddSubscriptionForTest(
+                $"cadence-{i}",
+                securityId,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 250);
+        manager.AddSubscriptionForTest("immediate", securityId, DataFlags.Mbp);
+
+        var immediate = manager.GetImmediateMbpSubscribers(securityId);
+        var cadence = manager.GetConflatedMbpSubscribers(securityId, 250);
+
+        Assert.NotNull(immediate);
+        Assert.Single(immediate);
+        Assert.True(immediate.ContainsKey("immediate"));
+        Assert.NotNull(cadence);
+        Assert.Equal(128, cadence.Count);
+        Assert.Null(manager.GetConflatedMbpSubscribers(securityId, 500));
+    }
+
+    [Fact]
     public void AppSettings_ApplyEnvironment_ParsesReplayToMulticastFlag()
     {
         const string key = "UMDF_REPLAY_TO_MULTICAST";

@@ -399,6 +399,130 @@ public class GroupConflationHandlerMbpTests
         }
     }
 
+    [Fact]
+    public async Task ConflatedMbp_EventTimeBuffering_IsPerCadenceNotPerConsumer()
+    {
+        var w = NewWiring([500]);
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            for (int i = 0; i < 256; i++)
+            {
+                w.Manager.AddSubscriptionForTest(
+                    $"cadence-{i}",
+                    SecurityId,
+                    DataFlags.ConflatedMbp,
+                    conflationIntervalMs: 500);
+            }
+
+            Assert.Null(w.Manager.GetImmediateMbpSubscribers(SecurityId));
+            Assert.Equal(
+                256,
+                w.Manager.GetConflatedMbpSubscribers(SecurityId, 500)!.Count);
+
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
+            w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+            w.Group.OnBatchComplete();
+
+            await WaitUntil(() => w.Group.CadenceFramesBuffered > 0, TimeSpan.FromSeconds(1));
+            Assert.Equal(1, w.Group.CadenceFramesBuffered);
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task GetConflatedMbp_DoesNotAdvanceTradeCutoff()
+    {
+        var w = NewWiring([500]);
+        try
+        {
+            w.BookManager.GetOrCreateBook(SecurityId);
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 64);
+            w.Manager.RegisterClient(session);
+            _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp | DataFlags.Trades,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            w.Group.OnTrade(SecurityId, price: 1000, quantity: 2, tradeId: 9, sendingTimeNs: 0);
+            w.Group.OnBatchComplete(); // queued batch sequence 1; broadcaster is not started yet
+
+            w.Manager.HandleGet(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 1);
+
+            w.Group.StartBroadcaster(0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.Trade), TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_BootstrapIncludesMarketTierAndStaleStatus()
+    {
+        var w = NewWiring([500]);
+        var book = w.BookManager.GetOrCreateBook(SecurityId);
+        book.UpsertMarketOrder(
+            orderId: 900,
+            side: BookSideType.Bid,
+            quantity: 123,
+            enteringFirm: 7);
+        w.BookManager.StateRegistry.HealFromSnapshot(SecurityId, SymbolGapKind.Mbo, 100);
+        w.BookManager.StateRegistry.Observe(SecurityId, SymbolGapKind.Mbo, 102);
+        Assert.True(w.BookManager.StateRegistry.IsAnyStale(SecurityId));
+
+        var rec = new RecordingWebSocket();
+        var session = new ClientSession(rec, channelCapacity: 64);
+        w.Manager.RegisterClient(session);
+        _ = Task.Run(() => session.RunWriteLoopAsync());
+        w.Manager.HandleSubscribe(
+            session.Id,
+            Symbol,
+            DataFlags.ConflatedMbp,
+            conflationIntervalMs: 500,
+            w.BookManager,
+            w.Group,
+            bookBatchCutoffSequence: 0);
+
+        await WaitUntil(
+            () => rec.HasMessageType(MessageType.LevelSnapshot) &&
+                  rec.HasMessageType(MessageType.MarketTierUpdate) &&
+                  rec.HasMessageType(MessageType.SymbolStaleStatus),
+            TimeSpan.FromSeconds(2));
+
+        var tiers = rec.AllFrames(MessageType.MarketTierUpdate);
+        Assert.Equal(2, tiers.Count);
+        var bidTier = Assert.Single(tiers, frame => frame[28] == (byte)BookSideType.Bid);
+        var askTier = Assert.Single(tiers, frame => frame[28] == (byte)BookSideType.Ask);
+        Assert.Equal(123L, BinaryPrimitives.ReadInt64LittleEndian(bidTier.AsSpan(16)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(bidTier.AsSpan(24)));
+        Assert.Equal(0L, BinaryPrimitives.ReadInt64LittleEndian(askTier.AsSpan(16)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(askTier.AsSpan(24)));
+        Assert.Equal(1, rec.LastFrame(MessageType.SymbolStaleStatus)![16]);
+        w.Manager.Dispose();
+    }
+
     // ── helpers ──
 
     private static OrderBookEntry NewEntry(ulong orderId, long price, long qty,

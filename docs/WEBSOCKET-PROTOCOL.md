@@ -165,7 +165,9 @@ hard minimum is **100 ms**. The server rejects unsupported values with
 `InvalidCadence`; clients cannot request arbitrary intervals such as 1 ms.
 
 - Snapshot-on-subscribe is unchanged: `LevelSnapshot` is sent immediately and
-  establishes the same batch-sequence barrier as ordinary `Mbp`.
+  establishes the same batch-sequence barrier as ordinary `Mbp`. Bootstrap also
+  emits both current `MarketTierUpdate` sides (including explicit zero values)
+  and the current `SymbolStaleStatus`, so a resnapshot clears stale client context.
 - Within each cadence window, level updates are last-value-wins by
   `(securityId, side, price)`. `BookCleared` is retained as a reset boundary;
   post-clear updates follow it. Shared `MarketTierUpdate`, `CandleUpdate`, and

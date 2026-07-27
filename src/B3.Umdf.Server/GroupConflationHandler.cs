@@ -1517,7 +1517,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
 
     private void AppendForBookSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
     {
-        var subs = _parent.GetSubscribers(securityId);
+        var subs = _parent.GetBookSubscribers(securityId);
         if (subs is null || bytes.Length == 0) return;
 
         foreach (var (clientId, state) in subs)
@@ -1534,7 +1534,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     /// in-flight batches at or below the snapshot barrier are skipped.</summary>
     private void AppendForMbpSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
     {
-        var subs = _parent.GetSubscribers(securityId);
+        var subs = _parent.GetImmediateMbpSubscribers(securityId);
         if (subs is null || bytes.Length == 0) return;
 
         foreach (var (clientId, state) in subs)
@@ -1611,7 +1611,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         int cadenceMs)
     {
         if (epoch != Volatile.Read(ref _cadenceEpoch)) return;
-        var subs = _parent.GetSubscribers(securityId);
+        var subs = _parent.GetConflatedMbpSubscribers(securityId, cadenceMs);
         if (subs is null || bytes.Length == 0) return;
         foreach (var (clientId, state) in subs)
         {
@@ -1630,7 +1630,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     /// already covered by their snapshot.</summary>
     private void AppendForBookOrMbpSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
     {
-        var subs = _parent.GetSubscribers(securityId);
+        var subs = _parent.GetBookOrImmediateMbpSubscribers(securityId);
         if (subs is null || bytes.Length == 0) return;
 
         foreach (var (clientId, state) in subs)
@@ -1647,7 +1647,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     /// freshly-subscribed clients don't see trades that predate their snapshot.</summary>
     private void AppendForTradeSubscribers(ulong securityId, ReadOnlySpan<byte> bytes, int logicalCount, long batchSequence)
     {
-        var subs = _parent.GetSubscribers(securityId);
+        var subs = _parent.GetTradeSubscribers(securityId);
         if (subs is null || bytes.Length == 0) return;
 
         foreach (var (clientId, state) in subs)

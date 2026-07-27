@@ -299,15 +299,19 @@ public sealed class MarketDataClient : IAsyncDisposable
             throw new ArgumentException(
                 "SubscribeFlags.ConflatedMbp requires ConflationInterval.", nameof(options));
 
-        double cadenceTotalMs = wantsCadence
-            ? options.ConflationInterval!.Value.TotalMilliseconds
-            : 0;
-        if (cadenceTotalMs != Math.Truncate(cadenceTotalMs))
-            throw new ArgumentException(
-                "ConflationInterval must be a whole number of milliseconds.", nameof(options));
-        int cadenceMs = checked((int)cadenceTotalMs);
-        if (cadenceMs is <= 0 or > ushort.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(options), "ConflationInterval must fit in 1..65535 ms.");
+        int cadenceMs = 0;
+        if (wantsCadence)
+        {
+            double cadenceTotalMs = options.ConflationInterval!.Value.TotalMilliseconds;
+            if (cadenceTotalMs != Math.Truncate(cadenceTotalMs))
+                throw new ArgumentException(
+                    "ConflationInterval must be a whole number of milliseconds.", nameof(options));
+            cadenceMs = checked((int)cadenceTotalMs);
+            if (cadenceMs is <= 0 or > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(
+                    nameof(options),
+                    "ConflationInterval must fit in 1..65535 ms.");
+        }
 
         var record = new SubscriptionRecord(symbol, options.Flags, checked((ushort)cadenceMs));
         _subscriptions[symbol] = record;

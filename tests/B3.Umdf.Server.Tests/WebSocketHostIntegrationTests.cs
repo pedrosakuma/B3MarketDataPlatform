@@ -266,6 +266,7 @@ public class WebSocketHostIntegrationTests
             Assert.True(capabilities.HasFlag(ServerCapabilities.SnapshotOnSubscribe));
             Assert.True(capabilities.HasFlag(ServerCapabilities.SymbolDelistedNotification));
             Assert.True(capabilities.HasFlag(ServerCapabilities.InstrumentStatus));
+            Assert.True(capabilities.HasFlag(ServerCapabilities.ConflatedMbpCadence));
 
             await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
         }

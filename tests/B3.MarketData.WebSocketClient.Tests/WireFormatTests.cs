@@ -139,6 +139,17 @@ public class WireFormatTests
     }
 
     [Fact]
+    public void SubscriptionOptions_DefaultOrdinarySubscription_DoesNotRequireCadence()
+    {
+        var client = new MarketDataClient(new MarketDataClientOptions());
+
+        var send = client.SubscribeAsync("PETR4", new SubscriptionOptions());
+
+        Assert.True(send.IsCompletedSuccessfully);
+        Assert.Contains("PETR4", client.ActiveSubscriptions);
+    }
+
+    [Fact]
     public void InfoSnapshot_DecodesOnlySetFields_AndAppliesPriceScale()
     {
         // Set bits: LastTradePrice (4) and LastTradeSize (5).
