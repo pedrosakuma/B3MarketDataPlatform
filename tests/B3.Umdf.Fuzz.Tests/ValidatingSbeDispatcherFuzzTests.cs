@@ -1,6 +1,6 @@
 using System;
 using System.Buffers.Binary;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Sbe;
 
 namespace B3.Umdf.Fuzz.Tests;
@@ -223,6 +223,7 @@ public class ValidatingSbeDispatcherFuzzTests
         public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) { }
         public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) { }
         public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) { }
+        public void OnInstrumentStatus_58(in InstrumentStatus_58DataReader reader, int blockLength, int version) { }
         public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) { }
         public void OnSecurityDefinition_12(in SecurityDefinition_12DataReader reader, int blockLength, int version) { }
         public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { }

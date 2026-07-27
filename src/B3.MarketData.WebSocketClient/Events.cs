@@ -730,8 +730,8 @@ public sealed class AuctionEvent
 }
 
 /// <summary>
-/// Administrative state transition carried by the proprietary
-/// <c>SecurityStatus_3.securityTradingEvent</c> extension.
+/// Administrative transition carried by authoritative
+/// <c>InstrumentStatus_58</c> or the legacy template 3 fallback.
 /// </summary>
 public enum InstrumentStatusTransitionKind : byte
 {
@@ -741,9 +741,18 @@ public enum InstrumentStatusTransitionKind : byte
 }
 
 /// <summary>
-/// Operator-supplied administrative halt reason. The current upstream UMDF
-/// contract does not transmit this value, so <see cref="InstrumentStatusEvent.HaltReason"/>
-/// remains null until B3MatchingPlatform issue #581 supplies it.
+/// Current administrative halt overlay.
+/// </summary>
+public enum InstrumentAdministrativeState : byte
+{
+    Unknown = byte.MaxValue,
+    Active = 0,
+    Halted = 1,
+}
+
+/// <summary>
+/// Operator-supplied administrative halt reason from
+/// <c>InstrumentStatus_58.haltReason</c>.
 /// </summary>
 public enum InstrumentHaltReason : byte
 {
@@ -766,8 +775,8 @@ public enum InstrumentStatusDeliveryKind : byte
 }
 
 /// <summary>
-/// A non-conflated instrument halt/resume transition decoded from UMDF
-/// <c>SecurityStatus_3</c>.
+/// Administrative instrument state decoded from UMDF. Live updates are
+/// non-conflated transitions; recovery and reconnect deliveries are snapshots.
 /// </summary>
 public sealed class InstrumentStatusEvent
 {
@@ -779,15 +788,15 @@ public sealed class InstrumentStatusEvent
     public int? PreviousStatus { get; init; }
 
     /// <summary>
-    /// <c>SecurityStatus_3.securityTradingStatus</c>. The matching venue preserves
+    /// UMDF <c>securityTradingStatus</c>. The matching venue preserves
     /// the underlying trading phase during an administrative halt, so halt/open
     /// can legitimately report the same previous and new status.
     /// </summary>
     public int NewStatus { get; init; }
 
     /// <summary>
-    /// Halt/resume transition marker from
-    /// <c>SecurityStatus_3.securityTradingEvent</c>.
+    /// Halt/resume transition marker. Snapshot state has no transition and maps
+    /// to <see cref="InstrumentStatusTransitionKind.Unknown"/>.
     /// </summary>
     public InstrumentStatusTransitionKind Transition { get; init; }
 
@@ -795,13 +804,25 @@ public sealed class InstrumentStatusEvent
     public byte RawTransitionCode { get; init; }
 
     /// <summary>
-    /// Detailed operator halt reason, or null because the current upstream
-    /// <c>SecurityStatus_3</c> frame does not carry one.
+    /// Detailed operator halt reason. Null while active or when received from
+    /// the legacy template 3 fallback.
     /// </summary>
     public InstrumentHaltReason? HaltReason { get; init; }
 
     /// <summary>Unmodified detailed reason code, or null when absent on the wire.</summary>
     public byte? RawHaltReasonCode { get; init; }
+
+    /// <summary>Current administrative overlay after applying the update.</summary>
+    public InstrumentAdministrativeState AdministrativeState { get; init; }
+
+    /// <summary>Unmodified state code, or null when absent on an older frame.</summary>
+    public byte? RawAdministrativeStateCode { get; init; }
+
+    /// <summary>
+    /// UMDF trading session identifier, or null for legacy template 3 and older
+    /// WebSocket frames.
+    /// </summary>
+    public byte? TradingSessionId { get; init; }
 
     /// <summary>Exchange source timestamp, UTC nanoseconds since Unix epoch.</summary>
     public ulong SourceTimestampNanos { get; init; }
@@ -822,6 +843,11 @@ public sealed class InstrumentStatusEvent
     /// <summary>Unmodified delivery-kind byte for forward compatibility.</summary>
     public byte RawDeliveryKind { get; init; }
 
-    public bool IsHalted => Transition == InstrumentStatusTransitionKind.Halted;
+    public bool IsHalted => AdministrativeState switch
+    {
+        InstrumentAdministrativeState.Halted => true,
+        InstrumentAdministrativeState.Active => false,
+        _ => Transition == InstrumentStatusTransitionKind.Halted,
+    };
     public bool IsSnapshot => DeliveryKind == InstrumentStatusDeliveryKind.Snapshot;
 }

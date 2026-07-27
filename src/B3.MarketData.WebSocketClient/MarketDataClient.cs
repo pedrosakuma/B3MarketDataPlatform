@@ -91,8 +91,9 @@ public sealed class MarketDataClient : IAsyncDisposable
     /// </summary>
     public event Action<AuctionEvent>? Auction;
     /// <summary>
-    /// Administrative instrument halt/resume transitions decoded from UMDF
-    /// <c>SecurityStatus_3</c>. Delivered to subscriptions that include
+    /// Administrative instrument state decoded from authoritative UMDF
+    /// <c>InstrumentStatus_58</c> or the legacy template 3 fallback. Delivered
+    /// to subscriptions that include
     /// <see cref="SubscribeFlags.Info"/> when
     /// <see cref="ServerCapabilities.InstrumentStatus"/> is advertised.
     /// Inspect <see cref="InstrumentStatusEvent.IsSnapshot"/> before running

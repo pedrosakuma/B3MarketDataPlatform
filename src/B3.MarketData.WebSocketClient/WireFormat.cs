@@ -571,8 +571,8 @@ internal static class WireFormat
     /// Layout:
     /// <c>[securityId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
     /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]
-    /// [deliveryKind u8?]</c>. A missing trailing delivery kind is treated as
-    /// <see cref="InstrumentStatusDeliveryKind.LiveTransition"/> for compatibility.
+    /// [deliveryKind u8?][administrativeState u8?][tradingSessionId u8?]</c>.
+    /// Trailing fields are append-only and default from legacy transition data.
     /// </summary>
     public static bool TryReadInstrumentStatus(
         ReadOnlySpan<byte> payload,
@@ -610,8 +610,22 @@ internal static class WireFormat
         uint rptSeq = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
         offset += 4;
         byte deliveryKind = payload.Length > offset
-            ? payload[offset]
+            ? payload[offset++]
             : (byte)InstrumentStatusDeliveryKind.LiveTransition;
+        bool hasAdministrativeState = payload.Length > offset;
+        byte administrativeState = hasAdministrativeState
+            ? payload[offset++]
+            : transition switch
+            {
+                (byte)InstrumentStatusTransitionKind.Halted =>
+                    (byte)InstrumentAdministrativeState.Halted,
+                (byte)InstrumentStatusTransitionKind.Resumed =>
+                    (byte)InstrumentAdministrativeState.Active,
+                _ => byte.MaxValue,
+            };
+        byte tradingSessionId = payload.Length > offset
+            ? payload[offset]
+            : byte.MaxValue;
 
         status = new InstrumentStatusEvent
         {
@@ -630,6 +644,18 @@ internal static class WireFormat
                     ? (InstrumentHaltReason)haltReason
                     : InstrumentHaltReason.Unknown,
             RawHaltReasonCode = haltReason == byte.MaxValue ? null : haltReason,
+            AdministrativeState = administrativeState == byte.MaxValue
+                ? InstrumentAdministrativeState.Unknown
+                : Enum.IsDefined(typeof(InstrumentAdministrativeState), administrativeState)
+                    ? (InstrumentAdministrativeState)administrativeState
+                    : InstrumentAdministrativeState.Unknown,
+            RawAdministrativeStateCode = !hasAdministrativeState
+                || administrativeState == byte.MaxValue
+                ? null
+                : administrativeState,
+            TradingSessionId = tradingSessionId == byte.MaxValue
+                ? null
+                : tradingSessionId,
             SourceTimestampNanos = sourceTimestampNanos,
             RptSeq = rptSeq == 0 ? null : rptSeq,
             DeliveryKind = Enum.IsDefined(typeof(InstrumentStatusDeliveryKind), deliveryKind)

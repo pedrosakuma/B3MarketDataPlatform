@@ -1,6 +1,6 @@
 using B3.Umdf.Book;
 using B3.Umdf.Feed;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Book.Tests;

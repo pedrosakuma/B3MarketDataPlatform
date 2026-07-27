@@ -81,8 +81,9 @@ public sealed class InstrumentInfo
     public int? TradingEvent { get; set; }
     public ulong? TradSesOpenTime { get; set; }
     /// <summary>
-    /// Last administrative halt/resume state decoded from the proprietary
-    /// <c>SecurityStatus_3.securityTradingEvent</c> extension. Retained so
+    /// Last administrative halt state decoded from authoritative
+    /// <c>InstrumentStatus_58</c> or the rolling-deployment
+    /// <c>SecurityStatus_3</c> fallback. Retains detailed reason and session so
     /// late/reconnecting Info subscribers can bootstrap current state.
     /// </summary>
     public InstrumentStatusUpdate? AdministrativeStatus { get; set; }
@@ -201,6 +202,7 @@ public sealed class InstrumentInfo
     public uint LastRptSeqOpenInterest;            // tpl 29
     public uint LastRptSeqExecutionStatistics;     // tpl 56
     public uint LastRptSeqSecurityStatus;          // tpl 3
+    public uint LastRptSeqInstrumentStatus;        // tpl 58
 
     // SecurityDefinition repeating groups
     public string? SecurityDescription { get; set; }
@@ -275,6 +277,7 @@ public sealed class InstrumentInfo
         LastRptSeqOpenInterest = 0;
         LastRptSeqExecutionStatistics = 0;
         LastRptSeqSecurityStatus = 0;
+        LastRptSeqInstrumentStatus = 0;
         SecurityDescription = null;
         Underlyings = null;
         Legs = null;

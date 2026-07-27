@@ -1025,23 +1025,24 @@ public static class WireProtocol
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    //  InstrumentStatus frame (0x00B3) — SecurityStatus_3 halt/resume marker
+    //  InstrumentStatus frame (0x00B3)
     // ───────────────────────────────────────────────────────────────────────
 
     public const byte InstrumentStatusUnavailable = byte.MaxValue;
     public const byte InstrumentStatusDeliveryLiveTransition = 0;
     public const byte InstrumentStatusDeliverySnapshot = 1;
     public const int InstrumentStatusMaxSize =
-        FramingHeaderSize + 8 + 1 + 255 + 1 + 1 + 1 + 1 + 8 + 4 + 1;
+        FramingHeaderSize + 8 + 1 + 255 + 1 + 1 + 1 + 1 + 8 + 4 + 1 + 1 + 1;
 
     /// <summary>
-    /// Serialize a halt/resume transition decoded from <c>SecurityStatus_3</c>.
+    /// Serialize administrative instrument state decoded from
+    /// <c>InstrumentStatus_58</c> or legacy <c>SecurityStatus_3</c>.
     /// Layout:
     /// <c>[secId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
     /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]
-    /// [deliveryKind u8]</c>.
-    /// Unavailable previous status / halt reason / RptSeq are encoded as
-    /// 255 / 255 / 0 respectively.
+    /// [deliveryKind u8][administrativeState u8][tradingSessionId u8]</c>.
+    /// The last two bytes are append-only V17 fields. Unavailable byte fields
+    /// use 255; unavailable RptSeq uses 0.
     /// </summary>
     public static int WriteInstrumentStatus(
         Span<byte> dest,
@@ -1067,9 +1068,19 @@ public static class WireProtocol
         dest[offset++] = update.HaltReasonCode ?? InstrumentStatusUnavailable;
         BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], update.SourceTimestampNanos); offset += 8;
         BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], update.RptSeq ?? 0); offset += 4;
-        dest[offset++] = isSnapshot
+        dest[offset++] = isSnapshot || update.IsRecovery
             ? InstrumentStatusDeliverySnapshot
             : InstrumentStatusDeliveryLiveTransition;
+        dest[offset++] = update.AdministrativeStateCode
+            ?? (update.TransitionCode switch
+            {
+                InstrumentStatusDecoder.InstrumentHaltedTransitionCode =>
+                    InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+                InstrumentStatusDecoder.InstrumentResumedTransitionCode =>
+                    InstrumentStatusDecoder.AdministrativeActiveStateCode,
+                _ => InstrumentStatusUnavailable,
+            });
+        dest[offset++] = update.TradingSessionId ?? InstrumentStatusUnavailable;
 
         WriteFramingHeader(dest, offset, MessageType.InstrumentStatus);
         return offset;

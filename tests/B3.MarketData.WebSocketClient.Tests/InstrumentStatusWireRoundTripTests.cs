@@ -14,9 +14,11 @@ public class InstrumentStatusWireRoundTripTests
             PreviousStatus: 21,
             NewStatus: 17,
             TransitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
-            HaltReasonCode: null,
+            HaltReasonCode: (byte)InstrumentHaltReason.RegulatoryHalt,
             SourceTimestampNanos: 1_750_000_000_123_456_789,
-            RptSeq: 77);
+            RptSeq: 77,
+            AdministrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+            TradingSessionId: 1);
         var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
 
         int length = WireProtocol.WriteInstrumentStatus(
@@ -38,8 +40,11 @@ public class InstrumentStatusWireRoundTripTests
         Assert.Equal(17, decoded.NewStatus);
         Assert.Equal(InstrumentStatusTransitionKind.Halted, decoded.Transition);
         Assert.Equal(1, decoded.RawTransitionCode);
-        Assert.Null(decoded.HaltReason);
-        Assert.Null(decoded.RawHaltReasonCode);
+        Assert.Equal(InstrumentHaltReason.RegulatoryHalt, decoded.HaltReason);
+        Assert.Equal((byte?)InstrumentHaltReason.RegulatoryHalt, decoded.RawHaltReasonCode);
+        Assert.Equal(InstrumentAdministrativeState.Halted, decoded.AdministrativeState);
+        Assert.Equal((byte?)InstrumentStatusDecoder.AdministrativeHaltedStateCode, decoded.RawAdministrativeStateCode);
+        Assert.Equal((byte?)1, decoded.TradingSessionId);
         Assert.True(decoded.IsHalted);
         Assert.Equal(InstrumentStatusDeliveryKind.LiveTransition, decoded.DeliveryKind);
         Assert.False(decoded.IsSnapshot);
@@ -56,7 +61,9 @@ public class InstrumentStatusWireRoundTripTests
             TransitionCode: InstrumentStatusDecoder.InstrumentResumedTransitionCode,
             HaltReasonCode: null,
             SourceTimestampNanos: 123,
-            RptSeq: null);
+            RptSeq: null,
+            AdministrativeStateCode: InstrumentStatusDecoder.AdministrativeActiveStateCode,
+            TradingSessionId: 1);
         var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
         int length = WireProtocol.WriteInstrumentStatus(
             buffer, securityId: 7, symbol: "VALE3", in update, isSnapshot: true);
@@ -69,13 +76,14 @@ public class InstrumentStatusWireRoundTripTests
         Assert.Null(decoded.PreviousStatus);
         Assert.Equal(InstrumentStatusTransitionKind.Resumed, decoded.Transition);
         Assert.False(decoded.IsHalted);
+        Assert.Equal(InstrumentAdministrativeState.Active, decoded.AdministrativeState);
         Assert.Equal(InstrumentStatusDeliveryKind.Snapshot, decoded.DeliveryKind);
         Assert.True(decoded.IsSnapshot);
         Assert.Null(decoded.RptSeq);
     }
 
     [Fact]
-    public void Roundtrip_FutureDetailedReason_IsSeparateFromTransition()
+    public void Roundtrip_DetailedReason_IsSeparateFromTransition()
     {
         var update = new InstrumentStatusUpdate(
             PreviousStatus: 17,
@@ -83,7 +91,9 @@ public class InstrumentStatusWireRoundTripTests
             TransitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
             HaltReasonCode: (byte)InstrumentHaltReason.NewsHold,
             SourceTimestampNanos: 123,
-            RptSeq: 1);
+            RptSeq: 1,
+            AdministrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+            TradingSessionId: 1);
         var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
         int length = WireProtocol.WriteInstrumentStatus(
             buffer, securityId: 7, symbol: "VALE3", in update);
@@ -113,12 +123,73 @@ public class InstrumentStatusWireRoundTripTests
             buffer, securityId: 7, symbol: "VALE3", in update, isSnapshot: true);
         var payload = buffer.AsSpan(
             WireFormat.FramingHeaderSize,
-            length - WireFormat.FramingHeaderSize - 1);
+            length - WireFormat.FramingHeaderSize - 3);
 
         Assert.True(WireFormat.TryReadInstrumentStatus(
             payload, DateTime.UnixEpoch, out var decoded));
         Assert.Equal(InstrumentStatusDeliveryKind.LiveTransition, decoded.DeliveryKind);
         Assert.False(decoded.IsSnapshot);
+        Assert.Equal(InstrumentAdministrativeState.Halted, decoded.AdministrativeState);
+        Assert.Null(decoded.RawAdministrativeStateCode);
+        Assert.Null(decoded.TradingSessionId);
+    }
+
+    [Fact]
+    public void Roundtrip_RecoveryMarkedUpdate_IsSnapshotWithNullTransition()
+    {
+        var update = new InstrumentStatusUpdate(
+            PreviousStatus: null,
+            NewStatus: 17,
+            TransitionCode: InstrumentStatusDecoder.UnavailableCode,
+            HaltReasonCode: (byte)InstrumentHaltReason.VolatilityCircuitBreaker,
+            SourceTimestampNanos: 123,
+            RptSeq: null,
+            AdministrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+            TradingSessionId: 1,
+            IsRecovery: true);
+        var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
+        int length = WireProtocol.WriteInstrumentStatus(
+            buffer, securityId: 7, symbol: "VALE3", in update);
+
+        Assert.True(WireFormat.TryReadInstrumentStatus(
+            buffer.AsSpan(WireFormat.FramingHeaderSize, length - WireFormat.FramingHeaderSize),
+            DateTime.UnixEpoch,
+            out var decoded));
+
+        Assert.True(decoded.IsSnapshot);
+        Assert.True(decoded.IsHalted);
+        Assert.Equal(InstrumentStatusTransitionKind.Unknown, decoded.Transition);
+        Assert.Equal(InstrumentHaltReason.VolatilityCircuitBreaker, decoded.HaltReason);
+    }
+
+    [Fact]
+    public void Roundtrip_UnknownV17Codes_PreserveRawValues()
+    {
+        var update = new InstrumentStatusUpdate(
+            PreviousStatus: null,
+            NewStatus: 17,
+            TransitionCode: 9,
+            HaltReasonCode: 77,
+            SourceTimestampNanos: 123,
+            RptSeq: 1,
+            AdministrativeStateCode: 8,
+            TradingSessionId: 6);
+        var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
+        int length = WireProtocol.WriteInstrumentStatus(
+            buffer, securityId: 7, symbol: "VALE3", in update);
+
+        Assert.True(WireFormat.TryReadInstrumentStatus(
+            buffer.AsSpan(WireFormat.FramingHeaderSize, length - WireFormat.FramingHeaderSize),
+            DateTime.UnixEpoch,
+            out var decoded));
+
+        Assert.Equal(InstrumentStatusTransitionKind.Unknown, decoded.Transition);
+        Assert.Equal(9, decoded.RawTransitionCode);
+        Assert.Equal(InstrumentHaltReason.Unknown, decoded.HaltReason);
+        Assert.Equal((byte?)77, decoded.RawHaltReasonCode);
+        Assert.Equal(InstrumentAdministrativeState.Unknown, decoded.AdministrativeState);
+        Assert.Equal((byte?)8, decoded.RawAdministrativeStateCode);
+        Assert.Equal((byte?)6, decoded.TradingSessionId);
     }
 
     [Fact]

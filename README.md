@@ -217,10 +217,9 @@ values reference and topology notes.
 
 ## B3 schema
 
-This project uses the [B3 Market Data Messages v2.2.0](https://www.b3.com.br/en_us/solutions/platforms/puma-trading-system/for-developers-and-vendors/binary-umdf/)
-SBE XML schema. The schema's `<!DOCTYPE xml>` declaration is removed
-because .NET's `XmlReader` prohibits DTD processing by default. This is
-the only modification to the original B3 schema.
+This project uses the B3 Market Data Messages v2.3.0 / schema V17 SBE XML
+contract mirrored from the matching venue. It includes the authoritative
+`InstrumentStatus_58` administrative halt state and reason extension.
 
 ## Documentation
 

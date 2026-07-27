@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Text;
 using B3.Umdf.Feed;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Transport;
 
 namespace B3.Umdf.Book;

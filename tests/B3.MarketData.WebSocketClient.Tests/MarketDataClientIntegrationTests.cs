@@ -81,6 +81,9 @@ public class MarketDataClientIntegrationTests
             await TestWsServer.SendInstrumentStatusAsync(
                 ws, 12345, symbol, previousStatus: 17, newStatus: 17,
                 transitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
+                haltReasonCode: (byte)InstrumentHaltReason.NewsHold,
+                administrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+                tradingSessionId: 1,
                 sourceTimestamp, rptSeq: 9, isSnapshot: false, ct: ct);
             await Task.Delay(Timeout.Infinite, ct);
         });
@@ -102,7 +105,9 @@ public class MarketDataClientIntegrationTests
         Assert.Equal(17, status.PreviousStatus);
         Assert.Equal(17, status.NewStatus);
         Assert.Equal(InstrumentStatusTransitionKind.Halted, status.Transition);
-        Assert.Null(status.HaltReason);
+        Assert.Equal(InstrumentHaltReason.NewsHold, status.HaltReason);
+        Assert.Equal(InstrumentAdministrativeState.Halted, status.AdministrativeState);
+        Assert.Equal((byte?)1, status.TradingSessionId);
         Assert.True(status.IsHalted);
         Assert.False(status.IsSnapshot);
         Assert.Equal(sourceTimestamp, status.SourceTimestampNanos);
@@ -121,8 +126,11 @@ public class MarketDataClientIntegrationTests
             await TestWsServer.SendSubscribeOkAsync(ws, securityId: 42, symbol, ct);
             await TestWsServer.SendInstrumentStatusAsync(
                 ws, 42, symbol, previousStatus: 17, newStatus: 17,
-                transitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
-                sourceTimestamp: 123, rptSeq: 9, isSnapshot: true, ct: ct);
+                transitionCode: InstrumentStatusDecoder.UnavailableCode,
+                haltReasonCode: (byte)InstrumentHaltReason.PendingDisclosure,
+                administrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+                tradingSessionId: 1,
+                sourceTimestamp: 123, rptSeq: null, isSnapshot: true, ct: ct);
 
             if (subscribeNumber == 1)
             {
@@ -162,7 +170,10 @@ public class MarketDataClientIntegrationTests
         Assert.All(statuses, status =>
         {
             Assert.True(status.IsHalted);
-            Assert.Null(status.HaltReason);
+            Assert.Equal(InstrumentHaltReason.PendingDisclosure, status.HaltReason);
+            Assert.Equal(InstrumentAdministrativeState.Halted, status.AdministrativeState);
+            Assert.Equal(InstrumentStatusTransitionKind.Unknown, status.Transition);
+            Assert.Equal((byte?)1, status.TradingSessionId);
             Assert.True(status.IsSnapshot);
         });
     }
@@ -568,14 +579,17 @@ internal sealed class TestWsServer : IAsyncDisposable
         int? previousStatus,
         int newStatus,
         byte transitionCode,
+        byte? haltReasonCode,
+        byte? administrativeStateCode,
+        byte? tradingSessionId,
         ulong sourceTimestamp,
         uint? rptSeq,
         bool isSnapshot,
         CancellationToken ct)
     {
         var update = new InstrumentStatusUpdate(
-            previousStatus, newStatus, transitionCode, null,
-            sourceTimestamp, rptSeq);
+            previousStatus, newStatus, transitionCode, haltReasonCode,
+            sourceTimestamp, rptSeq, administrativeStateCode, tradingSessionId);
         var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
         int length = WireProtocol.WriteInstrumentStatus(
             buffer, securityId, symbol, in update, isSnapshot);

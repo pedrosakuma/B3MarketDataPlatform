@@ -1,6 +1,6 @@
 using System.Buffers.Binary;
 using B3.Umdf.Book;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Transport;
 using BenchmarkDotNet.Attributes;
 using Microsoft.Extensions.Logging.Abstractions;

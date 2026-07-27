@@ -2,7 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Reflection;
 using B3.Umdf.Book;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using MessageType = B3.MarketData.Wire.MessageType;
 using B3.Umdf.Server;
 using Microsoft.Extensions.Logging.Abstractions;

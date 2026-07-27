@@ -41,7 +41,7 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 client.Trade        += t => Console.WriteLine($"{t.Symbol} @ {t.Price} x {t.Qty}{(t.Flags.HasFlag(TradeFlags.AuctionPrint) ? " (auction)" : "")}");
 client.InfoSnapshot += i => Console.WriteLine($"{i.Symbol} last={i.LastTradePrice} top={i.TheoreticalOpeningPrice} imb={i.AuctionImbalanceCondition}");
 client.InstrumentStatus += s => Console.WriteLine(
-    $"{s.Symbol} transition={s.Transition} status={s.NewStatus} haltReason={s.HaltReason?.ToString() ?? "unavailable"}");
+    $"{s.Symbol} state={s.AdministrativeState} transition={s.Transition} haltReason={s.HaltReason?.ToString() ?? "none"} snapshot={s.IsSnapshot}");
 client.ServerStatus += s => Console.WriteLine($"server ready={s.Ready}");
 client.SubscribeError += e => Console.WriteLine($"{e.Symbol} -> {e.ErrorCode}");
 
@@ -247,42 +247,41 @@ client.InstrumentStatus += status =>
 {
     if (status.IsSnapshot)
     {
-        Console.WriteLine($"{status.Symbol}: bootstrapped halted={status.IsHalted}");
+        Console.WriteLine(
+            $"{status.Symbol}: bootstrapped state={status.AdministrativeState} reason={status.HaltReason}");
         return;
     }
 
     Console.WriteLine(
         $"{status.Symbol}: {(status.IsHalted ? "HALTED" : "RESUMED")} " +
         $"phase {status.PreviousStatus?.ToString() ?? "unknown"} -> {status.NewStatus}, " +
+        $"reason={status.HaltReason}, session={status.TradingSessionId}, " +
         $"sourceNs={status.SourceTimestampNanos}");
 };
 
 await client.SubscribeAsync("PETR4", SubscribeFlags.Info);
 ```
 
-The platform decodes the existing schema-generated UMDF
-`SecurityStatus_3` template (id 3), not a separate `InstrumentStatus_NN`
-template. B3MatchingPlatform marks halt with `securityTradingEvent=1` and
-resume with `securityTradingEvent=2`; these map to
-`InstrumentStatusTransitionKind.Halted` and `Resumed`.
-`PreviousStatus` is null on first sight, `NewStatus` is the frame's
-`securityTradingStatus`, and `SourceTimestampNanos` is its `transactTime`.
+The platform decodes schema 2.3.0 / V17 `InstrumentStatus_58` as the
+authoritative contract. `AdministrativeState` is the resulting current state;
+`Transition` is `Halted`/`Resumed` for live changes and `Unknown` for recovery
+snapshots; `HaltReason` carries the operator reason while halted.
+`TradingSessionId`, `SourceTimestampNanos`, and `RptSeq` preserve the remaining
+source metadata. Unknown future state/transition/reason codes map to typed
+`Unknown` values while their `Raw*` properties preserve the byte.
 
-The source currently preserves the underlying trading phase during halt and
-does not encode the operator's detailed `RegulatoryHalt`/`NewsHold` reason.
-Consequently previous/new status can both be `OPEN`; `Transition` identifies
-halt vs. resume while `HaltReason` remains null. This upstream prerequisite is
-tracked by
-[`B3MatchingPlatform#581`](https://github.com/pedrosakuma/B3MatchingPlatform/issues/581).
-The APIs intentionally keep transition kind and detailed halt reason separate
-instead of inventing a reason from the marker.
+The legacy `SecurityStatus_3` halt/resume markers remain supported during
+rolling deployment. They do not carry a reason or trading session. When both
+templates occur in one rollout packet, template 58 wins and only one client
+event is emitted.
 
 The latest administrative state is retained in the server's `InstrumentInfo`
 cache. Every new `Info` subscribe — including automatic re-subscribe after a
 WebSocket reconnect — receives the cached typed status after `InfoSnapshot`
-with `DeliveryKind=Snapshot` / `IsSnapshot=true`. It retains the original
-source timestamp and RptSeq for provenance; do not repeat live transition side
-effects for snapshot delivery. Live source changes use
+with `DeliveryKind=Snapshot` / `IsSnapshot=true`, including state learned from
+UMDF recovery. It retains source timestamp, detailed reason, session, and
+RptSeq when available; do not repeat live transition side effects for snapshot
+delivery. Live source changes use
 `DeliveryKind=LiveTransition`.
 
 Check `client.LastServerHello?.Capabilities` for

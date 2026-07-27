@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 using B3.Umdf.Feed;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -583,6 +583,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         public void OnSequenceReset_1(in SequenceReset_1DataReader reader, int blockLength, int version) { }
         public void OnSequence_2(in Sequence_2DataReader reader, int blockLength, int version) { }
         public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) { }
+        public void OnInstrumentStatus_58(in InstrumentStatus_58DataReader reader, int blockLength, int version) { }
         public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { }
         public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) { }
         public void OnOpeningPrice_15(in OpeningPrice_15DataReader reader, int blockLength, int version) { }

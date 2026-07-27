@@ -4,8 +4,8 @@ public interface IMarketDataEventHandler
 {
     void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info) { }
     /// <summary>
-    /// Fired for the halt/resume extension carried by <c>SecurityStatus_3</c>
-    /// (<c>securityTradingEvent</c> values 1 and 2).
+    /// Fired for authoritative <c>InstrumentStatus_58</c> state or the legacy
+    /// <c>SecurityStatus_3</c> rollout fallback.
     /// </summary>
     void OnInstrumentStatusChanged(
         ulong securityId,

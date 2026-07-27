@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Frozen;
 using System.Text;
 using B3.Umdf.Feed;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Transport;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -181,7 +181,7 @@ public sealed class MarketDataManager : IFeedEventHandler
     {
         try
         {
-            var handler = new MarketDataSbeHandler { Owner = this };
+            var handler = new MarketDataSbeHandler { Owner = this, Packet = packet };
             SbeDispatcher.Dispatch(sbePayload, ref handler);
         }
         catch (Exception ex)
@@ -199,9 +199,11 @@ public sealed class MarketDataManager : IFeedEventHandler
     private struct MarketDataSbeHandler : ISbeMessageHandler
     {
         public MarketDataManager Owner;
+        public UmdfPacket Packet;
 
         public void OnSecurityDefinition_12(in SecurityDefinition_12DataReader reader, int blockLength, int version) => Owner.HandleSecurityDefinition(in reader);
-        public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) => Owner.HandleSecurityStatus(in reader);
+        public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) => Owner.HandleSecurityStatus(in reader, in Packet);
+        public void OnInstrumentStatus_58(in InstrumentStatus_58DataReader reader, int blockLength, int version) => Owner.HandleInstrumentStatus(in reader);
         public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) => Owner.HandleSecurityGroupPhase(in reader);
         public void OnOpeningPrice_15(in OpeningPrice_15DataReader reader, int blockLength, int version) => Owner.HandleOpeningPrice(in reader);
         public void OnTheoreticalOpeningPrice_16(in TheoreticalOpeningPrice_16DataReader reader, int blockLength, int version) => Owner.HandleTheoreticalOpeningPrice(in reader);
@@ -273,6 +275,7 @@ public sealed class MarketDataManager : IFeedEventHandler
             info.LastRptSeqOpenInterest = 0;
             info.LastRptSeqExecutionStatistics = 0;
             info.LastRptSeqSecurityStatus = 0;
+            info.LastRptSeqInstrumentStatus = 0;
         }
     }
     public void OnInstrumentDefinitionsComplete(int instrumentCount) { FreezeData(); }
@@ -436,10 +439,18 @@ public sealed class MarketDataManager : IFeedEventHandler
         _eventHandler?.OnSecurityDefinitionChanged(securityId, info);
     }
 
-    private void HandleSecurityStatus(in SecurityStatus_3DataReader reader)
+    private void HandleSecurityStatus(in SecurityStatus_3DataReader reader, in UmdfPacket packet)
     {
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
+
+        // During rollout the venue places legacy template 3 first and
+        // authoritative template 58 second in the same packet with the same
+        // SecurityID/RptSeq. Ignore the legacy copy so clients receive exactly
+        // one event and the detailed reason cannot be overwritten.
+        if (PacketContainsAuthoritativeStatus(in packet, securityId, msg.RptSeq))
+            return;
+
         var info = GetOrCreateInfo(securityId);
         int? previousStatus = info.TradingStatus;
 
@@ -491,6 +502,87 @@ public sealed class MarketDataManager : IFeedEventHandler
             _eventHandler?.OnInstrumentStatusChanged(securityId, info, in instrumentStatus);
         }
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
+    }
+
+    private void HandleInstrumentStatus(in InstrumentStatus_58DataReader reader)
+    {
+        ref readonly var msg = ref reader.Data;
+        ulong securityId = (ulong)msg.SecurityID;
+        var info = GetOrCreateInfo(securityId);
+
+        if (!InstrumentStatusDecoder.TryDecode(
+                in reader, info.TradingStatus, out var instrumentStatus))
+            return;
+
+        if (instrumentStatus.RptSeq is { } rptSeq)
+        {
+            if (!RouteStat(
+                    securityId,
+                    SymbolGapKind.SecurityStatus,
+                    rptSeq,
+                    info.LastRptSeqInstrumentStatus))
+                return;
+            info.LastRptSeqInstrumentStatus = rptSeq;
+        }
+
+        info.TradingStatus = instrumentStatus.NewStatus;
+        info.TradingEvent = instrumentStatus.TransitionCode
+            == InstrumentStatusDecoder.UnavailableCode
+                ? null
+                : instrumentStatus.TransitionCode;
+        info.LastUpdateTimestamp = instrumentStatus.SourceTimestampNanos;
+        info.AdministrativeStatus = instrumentStatus;
+        info.BumpVersion();
+
+        _eventHandler?.OnInstrumentStatusChanged(
+            securityId, info, in instrumentStatus);
+        _eventHandler?.OnSecurityStatusChanged(securityId, info);
+    }
+
+    private static bool PacketContainsAuthoritativeStatus(
+        in UmdfPacket packet,
+        ulong securityId,
+        uint? rptSeq)
+    {
+        ReadOnlySpan<byte> span = packet.Data.Span;
+        int offset = UmdfPacketHeader.Size;
+        int minimumFrameSize = FramingHeader.MESSAGE_SIZE + MessageHeader.MESSAGE_SIZE;
+
+        while (offset + minimumFrameSize <= span.Length)
+        {
+            if (!FramingHeader.TryParse(span[offset..], out var framing, out _)
+                || framing.MessageLength < minimumFrameSize
+                || offset + framing.MessageLength > span.Length)
+                return false;
+
+            ReadOnlySpan<byte> sbe = span.Slice(
+                offset + FramingHeader.MESSAGE_SIZE,
+                framing.MessageLength - FramingHeader.MESSAGE_SIZE);
+            if (!MessageHeader.TryReadHeader(
+                    sbe,
+                    out ushort blockLength,
+                    out ushort templateId,
+                    out ushort schemaId,
+                    out ushort version))
+                return false;
+
+            if (templateId == InstrumentStatus_58Data.MESSAGE_ID
+                && schemaId == 2
+                && version >= 17
+                && InstrumentStatus_58Data.TryParse(
+                    sbe[MessageHeader.MESSAGE_SIZE..],
+                    blockLength,
+                    out var status)
+                && (ulong)status.Data.SecurityID == securityId
+                && status.Data.RptSeq == rptSeq
+                && InstrumentStatusDecoder.TryDecode(
+                    in status, previousStatus: null, out _))
+                return true;
+
+            offset += framing.MessageLength;
+        }
+
+        return false;
     }
 
     private void HandleSecurityGroupPhase(in SecurityGroupPhase_10DataReader reader)

@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using B3.Umdf.Book;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using MessageType = B3.MarketData.Wire.MessageType;
 
 namespace B3.Umdf.Server;

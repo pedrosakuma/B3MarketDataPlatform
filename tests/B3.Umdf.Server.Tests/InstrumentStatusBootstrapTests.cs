@@ -29,9 +29,11 @@ public class InstrumentStatusBootstrapTests
             PreviousStatus: 17,
             NewStatus: 17,
             TransitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
-            HaltReasonCode: null,
+            HaltReasonCode: 4,
             SourceTimestampNanos: 123,
-            RptSeq: 9);
+            RptSeq: 9,
+            AdministrativeStateCode: InstrumentStatusDecoder.AdministrativeHaltedStateCode,
+            TradingSessionId: 1);
 
         var symbols = new SymbolRegistry();
         RegisterSymbol(symbols, Symbol, SecurityId);
@@ -59,7 +61,9 @@ public class InstrumentStatusBootstrapTests
         Assert.NotNull(frame);
         Assert.Equal(
             WireProtocol.InstrumentStatusDeliverySnapshot,
-            frame![^1]);
+            frame![^3]);
+        Assert.Equal(InstrumentStatusDecoder.AdministrativeHaltedStateCode, frame[^2]);
+        Assert.Equal(1, frame[^1]);
 
         session.Dispose();
         await writeTask.WaitAsync(TimeSpan.FromSeconds(2));

@@ -289,51 +289,37 @@ unrecognised combinations map to `Unknown`.
 
 | Message | Type | Payload |
 |---------|------|---------|
-| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32][deliveryKind u8]` |
+| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32][deliveryKind u8][administrativeState u8][tradingSessionId u8]` |
 
 This is the dedicated, non-conflated transition surface for administrative
-single-instrument halt/resume. It is decoded from the existing schema-generated
-UMDF **`SecurityStatus_3` template (id 3)**; there is no separate
-`InstrumentStatus_NN` template in B3 schema 2.2.0. The matching venue uses the
-otherwise schema-reserved `securityTradingEvent` values `1` (halt) and `2`
-(resume), while `securityTradingStatus`, `transactTime`, and `rptSeq` supply
-`newStatus`, `sourceTimestampNanos`, and `rptSeq`.
+single-instrument halt/resume. Schema 2.3.0 / V17
+**`InstrumentStatus_58` (id 58)** is authoritative and supplies current
+administrative state, optional live transition, detailed halt reason, source
+timestamp, RptSeq, trading session, and the UMDF `RecoveryMsg` marker.
+`SecurityStatus_3` remains decoded as a rolling-deployment fallback.
 
 `previousStatus=255` means the platform had no prior status cached,
-`haltReason=255` means the upstream frame supplied no detailed operator reason,
-and `rptSeq=0` means unavailable. The venue preserves the underlying trading
-phase during an administrative halt, so `previousStatus` and `newStatus` may
-both be `17` (OPEN); consumers should use `transition`/the SDK's `IsHalted`
-property to identify the current administrative state.
+`transition=255` means a state-only snapshot, `haltReason=255` means absent,
+and `rptSeq=0` means unavailable. `administrativeState` is `0` (active), `1`
+(halted), or `255` (absent on an older frame). Halt reasons are `1` regulatory,
+`2` volatility circuit breaker, `3` news hold, and `4` pending disclosure.
+The venue preserves the underlying trading phase during an administrative
+halt, so previous/new status may both be `17` (OPEN); use
+`administrativeState` / `InstrumentStatusEvent.IsHalted`.
 
-`deliveryKind` is append-only: `0` = live source transition, `1` = cached
-subscribe/reconnect snapshot. Snapshot frames deliberately retain the original
-source timestamp and RptSeq for provenance; consumers MUST check
+`deliveryKind`, `administrativeState`, and `tradingSessionId` are append-only.
+Delivery `0` is a live source transition; `1` is a recovery, subscribe, or
+reconnect snapshot. Cached snapshots retain source timestamp and RptSeq when
+available; recovery snapshots normally carry null/zero RptSeq. Consumers MUST check
 `deliveryKind`/`InstrumentStatusEvent.IsSnapshot` before running one-shot
-transition side effects. SDKs decoding a legacy frame without this trailing
-byte default it to live transition.
+transition side effects. SDKs decoding older frames derive state from the
+legacy transition marker and leave trading session null.
 
-The current source frame does **not** carry the operator's detailed halt reason
-(`RegulatoryHalt`, `NewsHold`, etc.). `transition` exposes the exact available
-marker (`1` = halted, `2` = resumed), while `haltReason` is null/255. Transition
-kind is deliberately not presented as a reason.
-
-Authoritative upstream evidence (B3MatchingPlatform commit
-`0d423c8f6cecf647d57adf85ebdd6f539b0c8214`):
-
-- [`InstrumentHaltedEvent`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Matching/Events.cs)
-  carries `HaltReason`, but
-  [`ChannelDispatcher.Sinks.OnInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Core/ChannelDispatcher.Sinks.cs)
-  does not pass it to the encoder.
-- [`UmdfFrameBuilder.WriteInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Umdf.WireEncoder/UmdfFrameBuilder.cs)
-  emits `SecurityStatus_3` with only `securityTradingEvent=1`.
-- Schema 2.2.0 defines no detailed halt-reason field and repository code search
-  finds no `InstrumentStatus_NN` template.
-
-The missing upstream contract is tracked by
-[`B3MatchingPlatform#581`](https://github.com/pedrosakuma/B3MatchingPlatform/issues/581);
-until it lands, this frame cannot satisfy the detailed-reason portion of
-`B3MarketDataPlatform#73`.
+Upstream authoritative contract:
+[`B3MatchingPlatform` merge commit `8212925`](https://github.com/pedrosakuma/B3MatchingPlatform/commit/8212925a45baf52b1ee004419cadfab84063847d).
+During rollout, a live packet may contain legacy template 3 first and template
+58 second with the same SecurityID/RptSeq. The platform suppresses the legacy
+copy so clients receive one authoritative event with the detailed reason.
 
 The current state is cached and emitted with `deliveryKind=1` after
 `InfoSnapshot` on every Info subscribe/re-subscribe. Live frames use

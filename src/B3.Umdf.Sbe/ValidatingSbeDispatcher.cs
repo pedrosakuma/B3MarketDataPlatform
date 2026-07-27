@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Frozen;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 
 namespace B3.Umdf.Sbe;
 
@@ -48,14 +48,14 @@ public readonly record struct SbeHeaderRejection(
 /// </summary>
 public sealed class ValidatingSbeDispatcher
 {
-    /// <summary>SBE schema id for the B3 UMDF schema (b3-market-data-messages-2.2.0.xml, <c>id="2"</c>).</summary>
+    /// <summary>SBE schema id for the B3 UMDF schema (b3-market-data-messages-2.3.0.xml, <c>id="2"</c>).</summary>
     public const ushort DefaultSchemaId = 2;
     /// <summary>Highest <c>sinceVersion</c> that the bundled <c>SbeSourceGenerator</c> generates code for.</summary>
-    public const ushort DefaultMaxSupportedVersion = 16;
+    public const ushort DefaultMaxSupportedVersion = 17;
 
     /// <summary>
     /// Curated set of template ids the bundled SBE source generator emits decoders for in
-    /// <c>b3-market-data-messages-2.2.0.xml</c>. Mirrors the cases in the generated
+    /// <c>b3-market-data-messages-2.3.0.xml</c>. Mirrors the cases in the generated
     /// <c>SbeDispatcher.Dispatch</c> switch — kept here as data so we can detect
     /// "unsupported template" BEFORE handing the buffer off and bump the
     /// <see cref="SbeValidationMetrics.UnsupportedTemplateCount"/> counter exactly once per packet.
@@ -64,7 +64,7 @@ public sealed class ValidatingSbeDispatcher
     public static readonly FrozenSet<ushort> KnownTemplateIds = new ushort[]
     {
         0, 1, 2, 3, 5, 9, 10, 11, 12, 15, 16, 17, 19, 21, 22, 24, 25, 27, 28, 29, 30,
-        50, 51, 52, 53, 54, 55, 56, 57, 71,
+        50, 51, 52, 53, 54, 55, 56, 57, 58, 71,
     }.ToFrozenSet();
 
     /// <summary>

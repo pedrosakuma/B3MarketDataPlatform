@@ -1,5 +1,5 @@
 using System.Buffers.Binary;
-using B3.Umdf.Mbo.Sbe.V16;
+using B3.Umdf.Mbo.Sbe.V17;
 using B3.Umdf.Sbe;
 
 namespace B3.Umdf.Sbe.Tests;
@@ -7,7 +7,7 @@ namespace B3.Umdf.Sbe.Tests;
 public class ValidatingSbeDispatcherTests
 {
     private const ushort SchemaId = 2;
-    private const ushort SupportedVersion = 16;
+    private const ushort SupportedVersion = 17;
 
     /// <summary>Builds an 8-byte SBE message header followed by <paramref name="extraPayload"/> bytes.</summary>
     private static byte[] BuildHeader(ushort templateId, ushort schemaId, ushort version, ushort blockLength, int extraPayload = 0)
@@ -38,6 +38,25 @@ public class ValidatingSbeDispatcherTests
         Assert.Null(rejection);
         Assert.Equal(1, handler.DispatchCount);
         Assert.Equal(1, handler.LastTemplateId);
+    }
+
+    [Fact]
+    public void Dispatch_V17InstrumentStatus_DispatchesTemplate58()
+    {
+        var buf = BuildHeader(
+            templateId: InstrumentStatus_58Data.MESSAGE_ID,
+            schemaId: SchemaId,
+            version: SupportedVersion,
+            blockLength: InstrumentStatus_58Data.BLOCK_LENGTH,
+            extraPayload: InstrumentStatus_58Data.MESSAGE_SIZE);
+        var dispatcher = new ValidatingSbeDispatcher();
+        var handler = new CountingHandler();
+
+        bool dispatched = dispatcher.Dispatch(buf, ref handler);
+
+        Assert.True(dispatched);
+        Assert.Equal(1, handler.DispatchCount);
+        Assert.Equal(58, handler.LastTemplateId);
     }
 
     [Fact]
@@ -145,6 +164,7 @@ public class ValidatingSbeDispatcherTests
         public void OnEmptyBook_9(in EmptyBook_9DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 9; }
         public void OnChannelReset_11(in ChannelReset_11DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 11; }
         public void OnSecurityStatus_3(in SecurityStatus_3DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 3; }
+        public void OnInstrumentStatus_58(in InstrumentStatus_58DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 58; }
         public void OnSecurityGroupPhase_10(in SecurityGroupPhase_10DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 10; }
         public void OnSecurityDefinition_12(in SecurityDefinition_12DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 12; }
         public void OnNews_5(in News_5DataReader reader, int blockLength, int version) { DispatchCount++; LastTemplateId = 5; }

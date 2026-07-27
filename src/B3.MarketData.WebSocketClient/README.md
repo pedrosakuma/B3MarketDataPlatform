@@ -27,7 +27,7 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 client.Trade += t => Console.WriteLine($"{t.Symbol}  {t.Price:F4} x {t.Qty}");
 client.LevelUpdate += l => Console.WriteLine($"{l.Symbol} {l.Side} {l.Price} qty={l.TotalQty}");
 client.InstrumentStatus += s => Console.WriteLine(
-    $"{s.Symbol} transition={s.Transition} snapshot={s.IsSnapshot} status={s.NewStatus} haltReason={s.HaltReason?.ToString() ?? "unavailable"}");
+    $"{s.Symbol} state={s.AdministrativeState} transition={s.Transition} snapshot={s.IsSnapshot} haltReason={s.HaltReason?.ToString() ?? "none"}");
 
 await client.ConnectAsync();
 await client.SubscribeAsync("PETR4", SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Mbp);
