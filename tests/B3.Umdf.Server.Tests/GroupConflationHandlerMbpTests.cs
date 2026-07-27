@@ -436,6 +436,71 @@ public class GroupConflationHandlerMbpTests
     }
 
     [Fact]
+    public async Task ConflatedMbp_SustainedBacklog_ReleasesCadenceBeforeRingDrains()
+    {
+        var w = NewWiring([100]);
+        try
+        {
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
+
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 256);
+            w.Manager.RegisterClient(session);
+            _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 100,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            // Seed a pending cadence frame and force its deadline due before starting
+            // the broadcaster. This avoids timing races while the queued batches model
+            // a producer that keeps the ring continuously non-empty.
+            var cadenceBuffer = GetCadenceBuffer(w.Group);
+            byte[] frame = new byte[WireProtocol.LevelUpdateSize];
+            int frameLength = WireProtocol.WriteLevelUpdate(
+                frame,
+                SecurityId,
+                (byte)BookSideType.Bid,
+                price: 1000,
+                totalQty: 7,
+                orderCount: 1);
+            cadenceBuffer.Buffer(SecurityId, frame.AsSpan(0, frameLength), batchSequence: 1, epoch: 0);
+            typeof(CadenceConflationBuffer)
+                .GetField("_nextFlushTicks", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(cadenceBuffer, Environment.TickCount64 - 1);
+
+            const int queuedBatches = 128;
+            for (int i = 0; i < queuedBatches; i++)
+            {
+                w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+                w.Group.OnBatchComplete();
+            }
+            Assert.Equal(queuedBatches, w.Group.BroadcastRingDepth);
+
+            w.Group.StartBroadcaster(0);
+
+            await WaitUntil(
+                () => w.Group.CadenceFlushesWhileBacklogged > 0,
+                TimeSpan.FromSeconds(2));
+            await WaitUntil(
+                () => rec.HasMessageType(MessageType.LevelUpdate),
+                TimeSpan.FromSeconds(1));
+            Assert.True(w.Group.CadenceFramesEmitted > 0);
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task GetConflatedMbp_DoesNotAdvanceTradeCutoff()
     {
         var w = NewWiring([500]);
@@ -556,6 +621,14 @@ public class GroupConflationHandlerMbpTests
         manager.SetReady();
 
         return (manager, group, book);
+    }
+
+    private static CadenceConflationBuffer GetCadenceBuffer(GroupConflationHandler group)
+    {
+        var buffers = (CadenceConflationBuffer[])typeof(GroupConflationHandler)
+            .GetField("_cadenceBuffers", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(group)!;
+        return Assert.Single(buffers);
     }
 
     private static void RegisterSymbol(SymbolRegistry registry, string symbol, ulong securityId)

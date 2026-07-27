@@ -52,6 +52,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     // Cadence deadlines remain anchored to each bucket's requested interval;
     // this timer only wakes the parked broadcaster to check them.
     private const int CadenceTimerResolutionMs = 50;
+    // Bound consecutive batch fan-out so a continuously non-empty ring cannot
+    // starve cadence releases. The feed/dispatch producer remains unaffected.
+    private const int CadenceCheckBatchBudget = 64;
 
     // Broadcaster-thread local: per-client coalesced output buffer. Accumulates across
     // events within one batch (one packet) so each client receives at most one
@@ -63,6 +66,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private long _cadenceEpoch;
     private long _cadenceFramesBuffered;
     private long _cadenceFramesEmitted;
+    private long _cadenceFlushesWhileBacklogged;
 
     private struct ClientBatchAccumulator
     {
@@ -109,6 +113,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public long TradesEmittedTotal => Volatile.Read(ref _tradesEmittedTotal);
     public long CadenceFramesBuffered => Volatile.Read(ref _cadenceFramesBuffered);
     public long CadenceFramesEmitted => Volatile.Read(ref _cadenceFramesEmitted);
+    internal long CadenceFlushesWhileBacklogged =>
+        Volatile.Read(ref _cadenceFlushesWhileBacklogged);
 
     // Recent trades per security.
     // ConcurrentDictionary because HandleSubscribe may read from another group's thread
@@ -1354,12 +1360,19 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             while (!ct.IsCancellationRequested)
             {
                 bool drained = false;
+                int batchesSinceCadenceCheck = 0;
                 BroadcastWorkBatch? batch;
                 while (_broadcastRing.TryDequeue(out batch))
                 {
                     FanoutBatch(batch!);
                     BroadcastWorkBatch.Return(batch!);
                     drained = true;
+                    if (++batchesSinceCadenceCheck < CadenceCheckBatchBudget)
+                        continue;
+
+                    if (FlushDueCadenceBuffers() && _broadcastRing.ApproximateDepth > 0)
+                        Interlocked.Increment(ref _cadenceFlushesWhileBacklogged);
+                    batchesSinceCadenceCheck = 0;
                 }
 
                 FlushDueCadenceBuffers();
@@ -1562,18 +1575,20 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         }
     }
 
-    private void FlushDueCadenceBuffers()
+    private bool FlushDueCadenceBuffers()
     {
         long now = Environment.TickCount64;
         if (_suppressFanout)
         {
             foreach (var buffer in _cadenceBuffers)
                 buffer.Discard();
-            return;
+            return false;
         }
+        bool flushed = false;
         foreach (var buffer in _cadenceBuffers)
         {
             if (!buffer.IsDue(now)) continue;
+            flushed = true;
             int cadenceMs = buffer.CadenceMs;
             buffer.Flush(now, (securityId, bytes, sequence, epoch) =>
                 AppendForConflatedMbpSubscribers(
@@ -1583,7 +1598,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                     epoch,
                     cadenceMs));
         }
-        FlushClientBatches();
+        if (flushed)
+            FlushClientBatches();
+        return flushed;
     }
 
     private void FlushAllCadenceBuffers()
