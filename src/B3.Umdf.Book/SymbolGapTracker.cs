@@ -3,15 +3,12 @@ using Microsoft.Extensions.Logging;
 namespace B3.Umdf.Book;
 
 /// <summary>
-/// Per-symbol gap kind. Each value corresponds to an SBE message family that
-/// carries its own independent <c>rptSeq</c> counter per security in the B3
-/// UMDF v16 schema.
+/// Per-symbol recovery/telemetry kind. B3 uses one global <c>rptSeq</c> per
+/// security across templates; these values classify the affected semantics.
 /// </summary>
 public enum SymbolGapKind
 {
     Mbo = 0,                       // Order_MBO_50, DeleteOrder_MBO_51, MassDeleteOrders_MBO_52
-                                   // + Trade_53/ForwardTrade_54/ExecutionSummary_55/TradeBust_57
-                                   // (B3 shares one rptSeq stream between book + trade)
     OpeningPrice,                  // tpl 15
     TheoreticalOpeningPrice,       // tpl 16
     ClosingPrice,                  // tpl 17

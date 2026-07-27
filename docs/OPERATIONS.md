@@ -257,6 +257,7 @@ automatically.
 | `b3.umdf.book.active` | Gauge | `group` | Active order books |
 | `b3.umdf.persymbol.snapshots_healed` | Counter | `group` | Per-symbol snapshots accepted and applied |
 | `b3.umdf.persymbol.snapshots_rejected_too_old` | Counter | `group` | Snapshots rejected (snapshot.rptSeq < MinHeal). Sustained growth = recovery loop |
+| `b3.umdf.persymbol.snapshots_rejected_replay_gap` | Counter | `group` | Snapshots rejected because retained MBO plus proven non-MBO sequences leave a replay hole |
 | `b3.umdf.persymbol.snapshots_skipped_healthy_ahead` | Counter | `group` | Snapshots skipped because symbol is already ahead |
 | `b3.umdf.persymbol.snapshots_missing_rptseq` | Counter | `group` | Snapshots missing rptSeq metadata |
 | `b3.umdf.persymbol.channel_gaps_absorbed` | Counter | `group` | Channel-level gaps absorbed via per-symbol heal (no Recovery escalation) |

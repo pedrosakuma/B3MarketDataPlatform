@@ -113,7 +113,7 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long TradesFilteredNonReportable => Volatile.Read(ref _tradesFilteredNonReportable);
     /// <summary>Number of Trade_53 SBE messages observed by HandleTrade entry (pre-routing/filter).</summary>
     public long TradeSbeEntries => Volatile.Read(ref _tradeSbeEntries);
-    /// <summary>Trade_53 messages rejected by RouteMbo (gap/stale path).</summary>
+    /// <summary>Trade_53 messages rejected as duplicate or reordered semantics.</summary>
     public long TradeRouteRejected => Volatile.Read(ref _tradeRouteRejected);
     /// <summary>ExecutionSummary_55 SBE messages observed by HandleExecutionSummary entry (pre-routing).</summary>
     public long ExecutionSummaryEntries => Volatile.Read(ref _executionSummaryEntries);
@@ -252,19 +252,22 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public SymbolGapTracker GapTracker { get; }
 
     /// <summary>
-    /// Records the per-symbol rptSeq gap (if any) and updates the book's
+    /// Updates the book's global per-symbol
     /// <see cref="OrderBook.LastRptSeq"/>. Called from every MBO/Trade
-    /// handler instead of writing <c>LastRptSeq</c> directly.
+    /// handler instead of writing <c>LastRptSeq</c> directly. The published
+    /// watermark is monotonic so delayed semantic messages cannot regress a
+    /// snapshot or later global sequence baseline.
     /// The registry is the source of truth, so we skip the shadow tracker
     /// (which would double-count gaps).
     /// </summary>
     private void TrackMboRptSeq(OrderBook book, uint received)
     {
-        book.LastRptSeq = received;
+        if (received > book.LastRptSeq)
+            book.LastRptSeq = received;
     }
 
     /// <summary>
-    /// Per-symbol routing decision for an incoming MBO/Trade message.
+    /// Per-symbol routing decision for an incoming stateful MBO mutation.
     /// Consults the registry: Apply lets the caller proceed; Buffer copies
     /// the body into <see cref="_staleBuffer"/> for later replay; Drop
     /// returns silently.
@@ -274,26 +277,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     {
         if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true; // can't gap-track without rptSeq
         var result = _stateRegistry.Observe(securityId, SymbolGapKind.Mbo, rptSeq);
-        if (result.TransitionedToStale)
-        {
-            Interlocked.Increment(ref _mboStaleTransitions);
-            long gap = (long)result.GapSize;
-            Interlocked.Add(ref _mboStaleGapSizeSum, gap);
-            // Lock-free max update.
-            long currentMax;
-            do
-            {
-                currentMax = Volatile.Read(ref _mboStaleGapSizeMax);
-                if (gap <= currentMax) break;
-            } while (Interlocked.CompareExchange(ref _mboStaleGapSizeMax, gap, currentMax) != currentMax);
-            if (_logger.IsEnabled(LogLevel.Debug))
-                _logger.LogDebug(
-                    "PerSymbol Healthy→Stale secId={SecurityId} templateId={TemplateId} rptSeq={RptSeq} gap={Gap}",
-                    securityId, templateId, rptSeq, gap);
-            // Note: OnSymbolStaleStatusChanged is fired from the SymbolStateRegistry
-            // callback (wired in BookManager's constructor), so it surfaces regardless
-            // of which kind triggered the global gap (MBO or stat).
-        }
+        RecordMboStaleTransition(
+            securityId, templateId, rptSeq, result.TransitionedToStale, result.GapSize);
         switch (result.Action)
         {
             case SymbolStateRegistry.ObserveAction.Apply:
@@ -319,6 +304,49 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
             default:
                 return false;
         }
+    }
+
+    /// <summary>
+    /// Routes trade-family semantics independently from MBO recovery. The shared
+    /// global watermark still detects loss and may force MBO stale, while the
+    /// irreplaceable semantic effect is delivered exactly once immediately.
+    /// </summary>
+    private bool RouteTradeSemantic(ulong securityId, ushort templateId, uint? rptSeqOpt)
+    {
+        if (rptSeqOpt is not { } rptSeq || rptSeq == 0) return true;
+
+        var result = _stateRegistry.ObserveSemantic(
+            securityId,
+            SymbolSemanticKind.Trade,
+            rptSeq);
+        RecordMboStaleTransition(
+            securityId, templateId, rptSeq, result.MboTransitionedToStale, result.GapSize);
+        return result.Action == SymbolStateRegistry.ObserveAction.Apply;
+    }
+
+    private void RecordMboStaleTransition(
+        ulong securityId,
+        ushort templateId,
+        uint rptSeq,
+        bool transitionedToStale,
+        uint gapSize)
+    {
+        if (!transitionedToStale) return;
+
+        Interlocked.Increment(ref _mboStaleTransitions);
+        long gap = gapSize;
+        Interlocked.Add(ref _mboStaleGapSizeSum, gap);
+        long currentMax;
+        do
+        {
+            currentMax = Volatile.Read(ref _mboStaleGapSizeMax);
+            if (gap <= currentMax) break;
+        } while (Interlocked.CompareExchange(ref _mboStaleGapSizeMax, gap, currentMax) != currentMax);
+
+        if (_logger.IsEnabled(LogLevel.Debug))
+            _logger.LogDebug(
+                "PerSymbol Healthy→Stale secId={SecurityId} templateId={TemplateId} rptSeq={RptSeq} gap={Gap}",
+                securityId, templateId, rptSeq, gap);
     }
 
     /// <summary>
@@ -349,22 +377,6 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
                 case MassDeleteOrders_MBO_52Data.MESSAGE_ID:
                     if (MassDeleteOrders_MBO_52Data.TryParse(m.Span, m.BlockLength, out var mdReader))
                         HandleMassDelete(in mdReader);
-                    break;
-                case Trade_53Data.MESSAGE_ID:
-                    if (Trade_53Data.TryParse(m.Span, m.BlockLength, out var trReader))
-                        HandleTrade(in trReader);
-                    break;
-                case ForwardTrade_54Data.MESSAGE_ID:
-                    if (ForwardTrade_54Data.TryParse(m.Span, m.BlockLength, out var fwdReader))
-                        HandleForwardTrade(in fwdReader);
-                    break;
-                case ExecutionSummary_55Data.MESSAGE_ID:
-                    if (ExecutionSummary_55Data.TryParse(m.Span, m.BlockLength, out var exReader))
-                        HandleExecutionSummary(in exReader);
-                    break;
-                case TradeBust_57Data.MESSAGE_ID:
-                    if (TradeBust_57Data.TryParse(m.Span, m.BlockLength, out var tbReader))
-                        HandleTradeBust(in tbReader);
                     break;
             }
             Interlocked.Increment(ref _replayedMboMessages);
@@ -872,8 +884,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!RouteMbo(securityId, Trade_53Data.MESSAGE_ID,
-                msg.RptSeq is { } trRs ? (uint)trRs : null, reader.Block, reader.BlockLength))
+        if (!RouteTradeSemantic(securityId, Trade_53Data.MESSAGE_ID,
+                msg.RptSeq is { } trRs ? (uint)trRs : null))
         {
             Interlocked.Increment(ref _tradeRouteRejected);
             return;
@@ -934,8 +946,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!RouteMbo(securityId, ForwardTrade_54Data.MESSAGE_ID,
-                msg.RptSeq is { } fwdRs ? (uint)fwdRs : null, reader.Block, reader.BlockLength))
+        if (!RouteTradeSemantic(securityId, ForwardTrade_54Data.MESSAGE_ID,
+                msg.RptSeq is { } fwdRs ? (uint)fwdRs : null))
             return;
 
         long price = msg.MDEntryPx.Mantissa;
@@ -969,8 +981,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!RouteMbo(securityId, ExecutionSummary_55Data.MESSAGE_ID,
-                msg.RptSeq is { } exRs ? (uint)exRs : null, reader.Block, reader.BlockLength))
+        if (!RouteTradeSemantic(securityId, ExecutionSummary_55Data.MESSAGE_ID,
+                msg.RptSeq is { } exRs ? (uint)exRs : null))
             return;
 
         long lastPx = msg.LastPx.Mantissa;
@@ -991,8 +1003,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
 
-        if (!RouteMbo(securityId, TradeBust_57Data.MESSAGE_ID,
-                msg.RptSeq is { } tbRs ? (uint)tbRs : null, reader.Block, reader.BlockLength))
+        if (!RouteTradeSemantic(securityId, TradeBust_57Data.MESSAGE_ID,
+                msg.RptSeq is { } tbRs ? (uint)tbRs : null))
             return;
 
         long price = msg.MDEntryPx.Mantissa;
@@ -1155,6 +1167,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotChunksOrphaned => _snapshotApplier.SnapshotChunksOrphaned;
     /// <summary>Snapshots rejected because their LastRptSeq is older than the symbol's MinHealRptSeq.</summary>
     public long SnapshotsRejectedTooOld => _snapshotApplier.SnapshotsRejectedTooOld;
+    /// <summary>Snapshots rejected because retained MBO replay plus proven non-MBO coverage contained a hole.</summary>
+    public long SnapshotsRejectedReplayGap => _snapshotApplier.SnapshotsRejectedReplayGap;
     /// <summary>Snapshots ignored at Header_30 because the symbol is already Healthy with a more recent baseline.</summary>
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
     /// <summary>Snapshots skipped because LastSequenceVersion is stale or missing after the channel epoch is established.</summary>

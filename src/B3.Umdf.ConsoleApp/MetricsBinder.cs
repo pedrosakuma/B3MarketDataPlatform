@@ -447,6 +447,10 @@ static class MetricsBinder
             () => PerGroupBook(bm => bm.SnapshotsRejectedTooOld),
             unit: "{snapshots}", description: "Snapshots rejected because LastRptSeq is older than the symbol's MinHealRptSeq (would leave a hole)");
 
+        Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_replay_gap",
+            () => PerGroupBook(bm => bm.SnapshotsRejectedReplayGap),
+            unit: "{snapshots}", description: "Snapshots rejected because retained MBO replay and proven non-MBO sequences did not cover the full post-snapshot window");
+
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_rejected_stale_version",
             () => PerGroupBook(bm => bm.SnapshotsRejectedStaleVersion),
             unit: "{snapshots}", description: "Snapshots rejected because they belong to an older SequenceVersion than the active epoch (post-rollover stragglers)");

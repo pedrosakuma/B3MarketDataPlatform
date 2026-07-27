@@ -97,14 +97,14 @@ public class SnapshotApplierCompletionStatesTests
         Assert.Equal(0, bm.Books[4004].Bids.OrderCount); // staging only — book untouched.
 
         // Replacement header: old staging discarded.
-        bm.BeginChunkedSnapshotForTest(4004, lastRptSeq: 9, ordersExpected: 2);
+        bm.BeginChunkedSnapshotForTest(4004, lastRptSeq: 10, ordersExpected: 2);
         bm.StageSnapshotEntryForTest(4004, BookSideType.Bid, orderId: 92, price: 101, quantity: 2);
         bm.StageSnapshotEntryForTest(4004, BookSideType.Ask, orderId: 93, price: 105, quantity: 3);
 
         Assert.Equal(1, bm.SnapshotsReplacedHeader);
         Assert.Equal(1, bm.SnapshotsAbandoned); // legacy parallel counter still ticks.
         Assert.Equal(1, bm.SnapshotsCompleted);
-        Assert.Equal(9u, bm.Books[4004].LastRptSeq);
+        Assert.Equal(10u, bm.Books[4004].LastRptSeq);
         Assert.Equal(1, bm.Books[4004].Bids.OrderCount);
         Assert.Equal(1, bm.Books[4004].Asks.OrderCount);
         // Discarded predecessor's order 91 must not appear.
@@ -122,14 +122,14 @@ public class SnapshotApplierCompletionStatesTests
             reg.Observe(securityId: 5005, SymbolGapKind.Mbo, r);
 
         // First, heal the book to a known baseline.
-        bm.BeginChunkedSnapshotForTest(5005, lastRptSeq: 10, ordersExpected: 1);
+        bm.BeginChunkedSnapshotForTest(5005, lastRptSeq: 20, ordersExpected: 1);
         bm.StageSnapshotEntryForTest(5005, BookSideType.Bid, orderId: 1, price: 99, quantity: 7);
         Assert.Equal(1, bm.SnapshotsCompleted);
-        Assert.Equal(10u, bm.Books[5005].LastRptSeq);
+        Assert.Equal(20u, bm.Books[5005].LastRptSeq);
         Assert.Equal(1, bm.Books[5005].Bids.OrderCount);
 
         // Begin a second assembly and stage a partial chunk.
-        bm.BeginChunkedSnapshotForTest(5005, lastRptSeq: 18, ordersExpected: 5);
+        bm.BeginChunkedSnapshotForTest(5005, lastRptSeq: 20, ordersExpected: 5);
         bm.StageSnapshotEntryForTest(5005, BookSideType.Bid, orderId: 2, price: 100, quantity: 3);
         bm.StageSnapshotEntryForTest(5005, BookSideType.Ask, orderId: 3, price: 110, quantity: 4);
 
@@ -139,7 +139,7 @@ public class SnapshotApplierCompletionStatesTests
         Assert.True(aborted);
         Assert.Equal(1, bm.SnapshotsAborted);
         // Live book MUST be untouched: still the post-first-snapshot baseline.
-        Assert.Equal(10u, bm.Books[5005].LastRptSeq);
+        Assert.Equal(20u, bm.Books[5005].LastRptSeq);
         Assert.Equal(1, bm.Books[5005].Bids.OrderCount);
         Assert.Equal(0, bm.Books[5005].Asks.OrderCount);
         Assert.True(bm.Books[5005].Bids.TryGetOrder(1, out _));

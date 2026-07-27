@@ -75,6 +75,7 @@ internal sealed class SnapshotApplier
     private long _snapshotsMissingRptSeq;
     private long _snapshotChunksOrphaned;
     private long _snapshotsRejectedTooOld;
+    private long _snapshotsRejectedReplayGap;
     private long _snapshotsSkippedHealthyAhead;
     private long _snapshotsRejectedStaleVersion;
     private long _snapshotMarketOrderAdds;
@@ -94,6 +95,7 @@ internal sealed class SnapshotApplier
     public long SnapshotsMissingRptSeq => Volatile.Read(ref _snapshotsMissingRptSeq);
     public long SnapshotChunksOrphaned => Volatile.Read(ref _snapshotChunksOrphaned);
     public long SnapshotsRejectedTooOld => Volatile.Read(ref _snapshotsRejectedTooOld);
+    public long SnapshotsRejectedReplayGap => Volatile.Read(ref _snapshotsRejectedReplayGap);
     public long SnapshotsSkippedHealthyAhead => Volatile.Read(ref _snapshotsSkippedHealthyAhead);
     public long SnapshotMarketOrderAdds => Volatile.Read(ref _snapshotMarketOrderAdds);
     /// <summary>
@@ -610,6 +612,33 @@ internal sealed class SnapshotApplier
     private void CompleteNormalSnapshot(ulong securityId, OrderBook book, PendingSnapshot pending)
     {
         uint snapshotRptSeq = pending.LastRptSeq;
+        uint replayFrom = snapshotRptSeq == uint.MaxValue
+            ? uint.MaxValue
+            : snapshotRptSeq + 1;
+        uint[] bufferedRptSeqs = _staleBuffer.SnapshotRptSeqs(
+            securityId,
+            replayFrom,
+            uint.MaxValue);
+        if (!_stateRegistry.ValidateMboReplayCoverage(
+                securityId,
+                snapshotRptSeq,
+                bufferedRptSeqs,
+                out uint missingRptSeq))
+        {
+            _stateRegistry.BumpMinHeal(
+                securityId,
+                SymbolGapKind.Mbo,
+                missingRptSeq);
+            _staleBuffer.ClearProtectedFloor(securityId);
+            Interlocked.Increment(ref _snapshotsRejectedReplayGap);
+            _logger.LogWarning(
+                "PerSymbol snapshot rejected: sparse MBO replay would bridge missing rptSeq. secId={SecurityId} snapshotRptSeq={SnapshotRptSeq} missingRptSeq={MissingRptSeq}",
+                securityId,
+                snapshotRptSeq,
+                missingRptSeq);
+            return;
+        }
+
         var heal = _stateRegistry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq);
 
         if (!heal.Accepted)

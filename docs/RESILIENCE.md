@@ -49,8 +49,10 @@ The consumer enforces this invariant in `SymbolStateRegistry`.
 For each `SecurityID` the registry tracks:
 
 - `ObservedRptSeq` — max `rptSeq` ever seen on **any** kind. Wire-truth.
-- `LastRptSeq[kind]` — last applied `rptSeq` per bucket (one shared `Mbo`
-  bucket; one bucket per stat template — SecurityStatus, PriceBand, etc.).
+- `LastRptSeq[kind]` — last applied `rptSeq` per recovery bucket (`Mbo`
+  plus one bucket per stat template — SecurityStatus, PriceBand, etc.).
+- `LastSemanticRptSeq[Trade]` — exactly-once watermark for irreplaceable
+  trade-family semantics that remain live while MBO awaits a snapshot.
 - `States[kind]` ∈ {Unknown, Healthy, Stale}.
 - `MinHealRptSeq[Mbo]` — lower bound for an acceptable snapshot.
 - `StaleKindMask` — bitmask of kinds currently Stale (drives the symbol-level
@@ -72,10 +74,11 @@ globalGap = ObservedRptSeq > 0 && receivedRptSeq > ObservedRptSeq + 1
 - **No global gap** → per-kind dispatch proceeds: duplicate is dropped,
   forward delivery is applied, and the kind is rebaselined to `received`.
 
-The shared `Mbo` bucket means seven templates (`Order_50`, `DeleteOrder_51`,
-`MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecSummary_55`,
-`TradeBust_57`) share one state — without this, a Trade between two MBOs
-would otherwise expose an artificial per-kind gap.
+The stateful `Mbo` bucket contains `Order_50`, `DeleteOrder_51`, and
+`MassDelete_52`. `Trade_53`, `ForwardTrade_54`, `ExecSummary_55`, and
+`TradeBust_57` use the explicit `Trade` semantic watermark: they still
+participate in the same global gap detection, but their irreplaceable
+downstream effects are delivered once even while MBO is Stale.
 
 ### 2.3 Why global-gap dispatch matters
 
@@ -107,7 +110,9 @@ stateDiagram-v2
     Stale --> Stale: snapshot.Begin<br/>SetProtectedFloor(snap+1)
     Stale --> Stale: hot-cap eviction (safe)<br/>oldest.rptSeq < ProtectedFloor<br/>MinHeal NOT bumped<br/>+stale_buffer_evicted_safe_below_floor
     Stale --> Stale: hot-cap eviction (unsafe)<br/>oldest.rptSeq ≥ ProtectedFloor<br/>MinHeal bumped (fail-safe)<br/>+stale_buffer_evicted_unsafe
+    Stale --> Stale: later global gap<br/>MinHeal := max(MinHeal, received - 1)
     Stale --> Stale: snapshot.Complete REJECT<br/>snap < MinHeal<br/>staging discarded; live book intact<br/>+snapshots_rejected_too_old
+    Stale --> Stale: snapshot.Complete REJECT<br/>post-snapshot replay has uncovered rptSeq<br/>staging discarded; live book intact<br/>+snapshots_rejected_replay_gap
 
     Stale --> Healthy: snapshot.Complete ACCEPT<br/>snap ≥ MinHeal<br/>ApplySnapshotStaging (atomic swap)<br/>replay buffer [snap+1, high-water]<br/>+snapshots_healed<br/>fires OnSymbolStaleStatusChanged(false)<br/>if StaleKindMask = 0
 
@@ -166,7 +171,12 @@ Snapshot arrives → BookManager.CompleteSnapshot
     ├── snapshotRptSeq < MinHeal → REJECT (lagging snapshot, stays Stale,
     │                              counts b3.umdf.persymbol.snapshots_rejected_too_old)
     │
-    └── snapshotRptSeq >= MinHeal → ACCEPT
+    ├── replay window contains an rptSeq that is neither retained MBO nor
+    │   proven delivered non-MBO semantics → REJECT (stays Stale, tightens
+    │   MinHeal to the first missing sequence, counts
+    │   b3.umdf.persymbol.snapshots_rejected_replay_gap)
+    │
+    └── snapshotRptSeq >= MinHeal and replay coverage is complete → ACCEPT
             │
             ▼
         ApplySnapshotStaging → live book swapped
@@ -232,6 +242,7 @@ b3.umdf.feed.channel_gaps_absorbed                  # gaps absorbed without leav
 b3.umdf.persymbol.stale_symbols                     # per-symbol Stale gauge by kind
 b3.umdf.persymbol.snapshots_healed
 b3.umdf.persymbol.snapshots_rejected_too_old        # ALERT if growing monotonically
+b3.umdf.persymbol.snapshots_rejected_replay_gap     # ALERT: retained replay has an uncovered sequence
 b3.umdf.persymbol.stale_buffer_hot_promotions       # symbols at hot cap (65 536)
 b3.umdf.persymbol.stale_buffer_evicted_safe_below_floor
 b3.umdf.persymbol.stale_buffer_evicted_unsafe       # ALERT if growing — pathological loss
@@ -257,20 +268,23 @@ snapshot rebuilds it.
 
 #### 2.7.2 Per-symbol scope of staleness
 
-The 14 `SymbolGapKind` values are tracked **independently** per
-`(securityId, kind)`. A gap on one kind does not stale the others:
+The 14 `SymbolGapKind` recovery states are tracked per `(securityId, kind)`.
+Their value state is independent, but every template advances the same global
+watermark, so any detected global gap conservatively stales `Mbo`:
 
 | Kind | What it carries (SBE templates) | Affected client surface |
 |---|---|---|
-| `Mbo` | `Order_50`, `DeleteOrder_51`, `MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecutionSummary_55`, `TradeBust_57` | Order book + Trades tape + Chart (candles derive from trades) |
+| `Mbo` | `Order_50`, `DeleteOrder_51`, `MassDelete_52` | Order book |
+| `Trade` semantic watermark | `Trade_53`, `ForwardTrade_54`, `ExecutionSummary_55`, `TradeBust_57` | Trades tape + Chart + execution/bust event fanout |
 | `SecurityStatus` | `tpl 3` | Auction/halt banner, trading-phase indicators |
 | `OpeningPrice` / `ClosingPrice` / `LastTradePrice` / `HighPrice` / `LowPrice` / `SettlementPrice` / `TheoreticalOpeningPrice` / `OpenInterest` / `AuctionImbalance` / `PriceBand` / `QuantityBand` / `ExecutionStatistics` | individual stat templates | Subscriptions-table columns (Info side) |
 
-Trades and the order book share the `Mbo` bucket because the wire mixes
-them under the same `rptSeq` stream — losing one byte of incremental
-traffic invalidates both consistently. Stat fields are independent
-streams: e.g. an `OpeningPrice` gap leaves the book and trades fully
-live; only that single field freezes until live-resync or snapshot.
+All templates share one per-security `ObservedRptSeq`. Any gap therefore
+conservatively invalidates MBO, regardless of which template exposes it.
+Trade, forward-trade, and execution-summary payloads are self-contained;
+trade bust is a best-effort correction against retained trade state. All four
+are irreplaceable semantic events, so they continue exactly-once fanout while
+only stateful MBO mutations wait for snapshot recovery.
 
 #### 2.7.3 Per-symbol behavior while a kind is Stale
 
@@ -320,12 +334,19 @@ Per-symbol stale buffers (`StaleMboBuffer`) cap at **8 192** messages
 (normal) / **65 536** (hot list — mini-index futures). When the cap is
 hit the buffer drops the **oldest** queued incremental, not the newest:
 keeping the freshest tail maximises the chance that an arriving snapshot
-covers the gap. Each eviction calls
-`SymbolStateRegistry.BumpMinHeal(secId, evictedRptSeq + 1)` so the
+covers the gap. Each unsafe eviction calls
+`SymbolStateRegistry.BumpMinHeal(secId, evictedRptSeq)` so the
 acceptance floor for the next snapshot stays monotonic with the buffer's
 earliest retained sequence — a snapshot older than the bumped floor is
 rejected immediately, with no risk of replaying stale data over a fresher
 book.
+
+While MBO is stale, every delivered non-MBO sequence is retained as compact
+coverage ranges. Before swapping a completed snapshot into the live book,
+the recovery path proves every `rptSeq` in the MBO replay window is either a
+retained MBO mutation or a delivered non-MBO semantic. This permits valid
+interleaving such as MBO 13, Trade 14, ExecSummary 15, MBO 16 while rejecting
+sparse replay that would bridge an unknown book mutation.
 
 ### 2.9 Forced-heal escape valve for hot symbols
 
