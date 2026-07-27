@@ -49,8 +49,10 @@ The consumer enforces this invariant in `SymbolStateRegistry`.
 For each `SecurityID` the registry tracks:
 
 - `ObservedRptSeq` — max `rptSeq` ever seen on **any** kind. Wire-truth.
-- `LastRptSeq[kind]` — last applied `rptSeq` per bucket (one shared `Mbo`
-  bucket; one bucket per stat template — SecurityStatus, PriceBand, etc.).
+- `LastRptSeq[kind]` — last applied `rptSeq` per recovery bucket (`Mbo`
+  plus one bucket per stat template — SecurityStatus, PriceBand, etc.).
+- `LastSemanticRptSeq[Trade]` — exactly-once watermark for irreplaceable
+  trade-family semantics that remain live while MBO awaits a snapshot.
 - `States[kind]` ∈ {Unknown, Healthy, Stale}.
 - `MinHealRptSeq[Mbo]` — lower bound for an acceptable snapshot.
 - `StaleKindMask` — bitmask of kinds currently Stale (drives the symbol-level
@@ -72,10 +74,11 @@ globalGap = ObservedRptSeq > 0 && receivedRptSeq > ObservedRptSeq + 1
 - **No global gap** → per-kind dispatch proceeds: duplicate is dropped,
   forward delivery is applied, and the kind is rebaselined to `received`.
 
-The shared `Mbo` bucket means seven templates (`Order_50`, `DeleteOrder_51`,
-`MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecSummary_55`,
-`TradeBust_57`) share one state — without this, a Trade between two MBOs
-would otherwise expose an artificial per-kind gap.
+The stateful `Mbo` bucket contains `Order_50`, `DeleteOrder_51`, and
+`MassDelete_52`. `Trade_53`, `ForwardTrade_54`, `ExecSummary_55`, and
+`TradeBust_57` use the explicit `Trade` semantic watermark: they still
+participate in the same global gap detection, but their irreplaceable
+downstream effects are delivered once even while MBO is Stale.
 
 ### 2.3 Why global-gap dispatch matters
 
@@ -257,20 +260,23 @@ snapshot rebuilds it.
 
 #### 2.7.2 Per-symbol scope of staleness
 
-The 14 `SymbolGapKind` values are tracked **independently** per
-`(securityId, kind)`. A gap on one kind does not stale the others:
+The 14 `SymbolGapKind` recovery states are tracked per `(securityId, kind)`.
+Their value state is independent, but every template advances the same global
+watermark, so any detected global gap conservatively stales `Mbo`:
 
 | Kind | What it carries (SBE templates) | Affected client surface |
 |---|---|---|
-| `Mbo` | `Order_50`, `DeleteOrder_51`, `MassDelete_52`, `Trade_53`, `ForwardTrade_54`, `ExecutionSummary_55`, `TradeBust_57` | Order book + Trades tape + Chart (candles derive from trades) |
+| `Mbo` | `Order_50`, `DeleteOrder_51`, `MassDelete_52` | Order book |
+| `Trade` semantic watermark | `Trade_53`, `ForwardTrade_54`, `ExecutionSummary_55`, `TradeBust_57` | Trades tape + Chart + execution/bust event fanout |
 | `SecurityStatus` | `tpl 3` | Auction/halt banner, trading-phase indicators |
 | `OpeningPrice` / `ClosingPrice` / `LastTradePrice` / `HighPrice` / `LowPrice` / `SettlementPrice` / `TheoreticalOpeningPrice` / `OpenInterest` / `AuctionImbalance` / `PriceBand` / `QuantityBand` / `ExecutionStatistics` | individual stat templates | Subscriptions-table columns (Info side) |
 
-Trades and the order book share the `Mbo` bucket because the wire mixes
-them under the same `rptSeq` stream — losing one byte of incremental
-traffic invalidates both consistently. Stat fields are independent
-streams: e.g. an `OpeningPrice` gap leaves the book and trades fully
-live; only that single field freezes until live-resync or snapshot.
+All templates share one per-security `ObservedRptSeq`. Any gap therefore
+conservatively invalidates MBO, regardless of which template exposes it.
+Trade, forward-trade, and execution-summary payloads are self-contained;
+trade bust is a best-effort correction against retained trade state. All four
+are irreplaceable semantic events, so they continue exactly-once fanout while
+only stateful MBO mutations wait for snapshot recovery.
 
 #### 2.7.3 Per-symbol behavior while a kind is Stale
 

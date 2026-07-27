@@ -14,7 +14,7 @@ namespace B3.Umdf.Book;
 /// changes.</para>
 /// <para><b>Per-kind defaults.</b> Mbo uses <see cref="BootstrapPolicy.RequireSnapshot"/>
 /// + <see cref="LiveResyncPolicy.SnapshotOnly"/> (book is stateful — applying a
-/// delete or trade without a built book corrupts state silently). Every stat kind
+/// delete without a built book corrupts state silently). Every stat kind
 /// uses <see cref="BootstrapPolicy.AcceptFirst"/> + <see cref="LiveResyncPolicy.NextMessage"/>
 /// (each stat update fully replaces the field; partial loss is preferable to
 /// perpetual stale-ness).</para>

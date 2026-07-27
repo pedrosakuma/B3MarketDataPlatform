@@ -16,8 +16,8 @@ public enum BootstrapPolicy : byte
     /// Bootstrap requires snapshot: an Unknown→Healthy transition can only
     /// happen via <see cref="SymbolStateRegistry.HealFromSnapshot"/>. The
     /// first incremental for an Unknown symbol is buffered (caller must hold
-    /// it for replay). Used for MBO/Trade messages where applying a delete
-    /// or trade without a built book causes silent corruption.
+    /// it for replay). Used for stateful MBO mutations where applying a delete
+    /// without a built book causes silent corruption.
     /// </summary>
     RequireSnapshot,
 
@@ -54,6 +54,20 @@ public enum LiveResyncPolicy : byte
 }
 
 /// <summary>
+/// Trade-family semantics that share the per-security wire <c>rptSeq</c>
+/// but do not require MBO snapshot recovery before delivery.
+/// </summary>
+internal enum SymbolSemanticKind : byte
+{
+    /// <summary>
+    /// Trade, forward-trade, execution-summary, and trade-bust semantics.
+    /// The first three are self-contained; a bust is a best-effort correction
+    /// against retained trade state. None can be reconstructed by an MBO snapshot.
+    /// </summary>
+    Trade = 0,
+}
+
+/// <summary>
 /// Centralized per-(SecurityID, <see cref="SymbolGapKind"/>) state machine.
 /// Single source of truth for per-symbol recovery state across BookManager,
 /// MarketDataManager, fanout, and metrics — replaces the channel-level
@@ -82,6 +96,7 @@ public enum LiveResyncPolicy : byte
 public sealed class SymbolStateRegistry
 {
     private const int KindCount = (int)SymbolGapKind.SecurityStatus + 1;
+    private const int SemanticKindCount = (int)SymbolSemanticKind.Trade + 1;
 
     private readonly ConcurrentDictionary<ulong, SymbolEntry> _entries = new();
     private readonly ILogger _logger;
@@ -174,6 +189,7 @@ public sealed class SymbolStateRegistry
         internal readonly Lock Sync = new();
         internal readonly SymbolState[] States = new SymbolState[KindCount];
         internal readonly uint[] LastRptSeq = new uint[KindCount];
+        internal readonly uint[] LastSemanticRptSeq = new uint[SemanticKindCount];
         internal readonly long[] StaleSinceTicks = new long[KindCount];
 
         // Lower bound for snapshot rptSeq accepted by HealFromSnapshot. Set whenever
@@ -221,6 +237,15 @@ public sealed class SymbolStateRegistry
         public static readonly ObserveResult ApplyHealthy =
             new(SymbolState.Healthy, ObserveAction.Apply, false, false, 0);
     }
+
+    /// <summary>
+    /// Outcome of observing a self-contained semantic message. The message may
+    /// force MBO stale through the global watermark while still being applied.
+    /// </summary>
+    internal readonly record struct SemanticObserveResult(
+        ObserveAction Action,
+        bool MboTransitionedToStale,
+        uint GapSize);
 
     /// <summary>What the caller should do with the message that triggered <see cref="Observe"/>.</summary>
     public enum ObserveAction : byte
@@ -279,6 +304,54 @@ public sealed class SymbolStateRegistry
         if (fireMboStaleCallback) _onMboStaleStatusChanged?.Invoke(securityId, true);
 
         return result;
+    }
+
+    /// <summary>
+    /// Observes an incremental whose semantic effect is independent of MBO
+    /// snapshot recovery. Global gap detection still runs first and may force
+    /// the MBO bucket stale, but a forward semantic message is applied immediately.
+    /// Duplicate and reordered semantics are suppressed by both the dedicated
+    /// semantic watermark and the shared per-security observed watermark.
+    /// </summary>
+    internal SemanticObserveResult ObserveSemantic(
+        ulong securityId,
+        SymbolSemanticKind kind,
+        uint receivedRptSeq)
+    {
+        if (receivedRptSeq == 0)
+            return new SemanticObserveResult(ObserveAction.Drop, false, 0);
+
+        var entry = GetOrAddEntry(securityId);
+        int idx = (int)kind;
+        GapInfo gap;
+        bool drop;
+
+        lock (entry.Sync)
+        {
+            uint observed = entry.ObservedRptSeq;
+            uint lastSemantic = entry.LastSemanticRptSeq[idx];
+
+            gap = DetectAndApplyGlobalGap(
+                entry,
+                SymbolGapKind.Mbo,
+                receivedRptSeq,
+                observed);
+
+            drop = receivedRptSeq <= lastSemantic || receivedRptSeq <= observed;
+            if (!drop)
+            {
+                entry.LastSemanticRptSeq[idx] = receivedRptSeq;
+                entry.ObservedRptSeq = receivedRptSeq;
+            }
+        }
+
+        if (gap.MboForcedStale)
+            _onMboStaleStatusChanged?.Invoke(securityId, true);
+
+        return new SemanticObserveResult(
+            drop ? ObserveAction.Drop : ObserveAction.Apply,
+            gap.MboForcedStale,
+            gap.GlobalGap ? gap.Size : 0);
     }
 
     /// <summary>
@@ -723,6 +796,7 @@ public sealed class SymbolStateRegistry
                     entry.StaleSinceTicks[i] = 0;
                     entry.MinHealRptSeq[i] = 0;
                 }
+                Array.Clear(entry.LastSemanticRptSeq);
                 entry.StaleKindMask = 0;
                 entry.MboSemanticReconciliation = false;
                 // Wire counter restarts on a catastrophic reset (SequenceReset_1 /
@@ -806,6 +880,7 @@ public sealed class SymbolStateRegistry
             // (per spec). Clear ObservedRptSeq so the next incremental at rpt=1
             // doesn't trigger a spurious global gap against the pre-reset watermark.
             entry.ObservedRptSeq = 0;
+            Array.Clear(entry.LastSemanticRptSeq);
         }
     }
 

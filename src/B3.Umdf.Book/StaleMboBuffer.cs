@@ -5,7 +5,7 @@ using Microsoft.Extensions.Logging;
 namespace B3.Umdf.Book;
 
 /// <summary>
-/// Per-symbol payload buffer for MBO/Trade messages received while
+/// Per-symbol payload buffer for stateful MBO messages received while
 /// <see cref="SymbolStateRegistry"/> reports the symbol as
 /// <see cref="SymbolState.Stale"/> or <see cref="SymbolState.Unknown"/>.
 /// On heal, the caller drains the entries in the window returned by
