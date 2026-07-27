@@ -116,9 +116,9 @@ Get               0x0003        Unsubscribed        0x0012
 | Message | Type | Payload |
 |---------|------|---------|
 | **ClientHello** | `0x00A1` | `[protocolVersion u32][clientCapabilities u32]` |
-| **Subscribe**   | `0x0001` | `[flags u32][symLen u8][symbol UTF-8…]` |
+| **Subscribe**   | `0x0001` | `[flags u32][symLen u8][symbol UTF-8…][conflationIntervalMs u16?]` |
 | **Unsubscribe** | `0x0002` | `[securityId u64]` |
-| **Get**         | `0x0003` | `[flags u32][symLen u8][symbol UTF-8…]` |
+| **Get**         | `0x0003` | `[flags u32][symLen u8][symbol UTF-8…][conflationIntervalMs u16?]` |
 
 **ClientHello** is optional. The server sends `ServerHello` first on connect; a
 client MAY reply with `ClientHello` to declare the `protocolVersion` it speaks
@@ -142,9 +142,10 @@ two known `u32` fields are ignored (min-length rule).
 | `0x20` | SecurityDefinition | `SecurityDefinition` frame (tick size, lot size, ISIN, CFI code, and the full static metadata projection from UMDF `SecurityDefinition_12`). Bootstrap snapshot on subscribe + push on every real definition change (idempotent re-broadcasts upstream are suppressed). Opt-in so legacy clients keep their bandwidth profile. |
 | `0x40` | PriceBand | `PriceBand` frame (dynamic per-symbol price + quantity limits from UMDF `PriceBand_22` + `QuantityBand_21`). Includes low/high price limits, limit-type, midpoint-type, trading reference price, plus `AvgDailyTradedQty` and `MaxOrderQty` for quantity-based fat-finger guards. Bootstrap snapshot on subscribe + push on every real band change. Opt-in; required by pre-trade guards that want the venue-authoritative bands instead of a static config. |
 | `0x80` | Auction | `Auction` frame (aggregated auction state from UMDF `AuctionImbalance_19` + `SecurityGroupPhase_10`). Imbalance qty/side + trading phase + TradSesOpenTime. Bootstrap snapshot on subscribe + push on every real delta. Opt-in for clients needing pre-open/auction-phase state or imbalance-aware algo logic. |
-| `0x000000FF` | AllKnown | Every channel this build knows about: `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction`. **This is NOT all-ones** — new channels are added to `AllKnown` explicitly, so unknown/future bits stay unrequested. |
+| `0x100` | ConflatedMbp | Alternative fixed-cadence MBP tier. Sends an immediate `LevelSnapshot`, then coalesces existing `LevelUpdate`/`LevelDeleted` and shared book-context frames at the accepted cadence. Requires trailing `conflationIntervalMs`; cannot be combined with `Mbp`. |
+| `0x000000FF` | AllKnown | Every additive channel: `Book` + `Info` + `News` + `Mbp` + `Trades` + `SecurityDefinition` + `PriceBand` + `Auction`. `ConflatedMbp` is intentionally excluded because it is an alternative tier requiring an interval. |
 
-> **`flags` is a `u32`.** The high 24 bits are currently unused. The server
+> **`flags` is a `u32`.** Bits above `0x100` are currently unused. The server
 > **masks off any bit it does not recognise** and echoes only the accepted set
 > back in `SubscribeOk.flags`, so a client can inspect the reply to learn which
 > channels it actually got. Do **not** send `0xFFFFFFFF` to mean "everything" —
@@ -155,7 +156,29 @@ two known `u32` fields are ignored (min-length rule).
 > **News and Trades are opt-in.** Existing clients that send `0x03` (or
 > `0x00`) keep the legacy behaviour and never receive news or trade frames.
 > Set the `News` / `Trades` bits explicitly to enable.
->
+
+### Fixed-cadence MBP tier
+
+`ConflatedMbp` is an incremental, opt-in delivery tier for high-fan-out
+consumers. The default server allow-list is **100, 250, or 500 ms** and the
+hard minimum is **100 ms**. The server rejects unsupported values with
+`InvalidCadence`; clients cannot request arbitrary intervals such as 1 ms.
+
+- Snapshot-on-subscribe is unchanged: `LevelSnapshot` is sent immediately and
+  establishes the same batch-sequence barrier as ordinary `Mbp`.
+- Within each cadence window, level updates are last-value-wins by
+  `(securityId, side, price)`. `BookCleared` is retained as a reset boundary;
+  post-clear updates follow it. Shared `MarketTierUpdate`, `CandleUpdate`, and
+  `SymbolStaleStatus` values are also coalesced.
+- Existing `Book` and `Mbp` subscriptions remain per-packet and are not delayed.
+- Trades are deliberately **not** summarized into a new schema. Add `Trades`
+  when required; `Trade`/`TradeBust` retain their existing semantics and are
+  not held by the cadence timer (the process-wide server flush window may still
+  perform its existing same-price trade conflation).
+- The C# SDK sets the ordinary `Mbp` bit as an old-server fallback on the wire.
+  A capable server normalizes `Mbp|ConflatedMbp` to the cadence tier and echoes
+  only `ConflatedMbp` plus the accepted trailing cadence in `SubscribeOk`.
+
 > ⚠️ **Breaking change (Trades opt-in)**: prior to this version, `Book` and
 > `Mbp` subscribers automatically received `Trade`/`TradeBust` as "shared"
 > frames. They no longer do. Clients that want the trade tape must set the
@@ -188,7 +211,7 @@ Total length = 18 bytes (8 header + 4 flags + 1 symLen + 5 symbol).
 |---------|------|---------|
 | **ServerHello**    | `0x00A0` | `[protocolVersion u32][serverCapabilities u32][buildLen u8][build UTF-8…]` |
 | **ServerStatus**   | `0x0050` | `[ready u8]` |
-| **SubscribeOk**    | `0x0010` | `[securityId u64][flags u32][symLen u8][symbol UTF-8…]` |
+| **SubscribeOk**    | `0x0010` | `[securityId u64][flags u32][symLen u8][symbol UTF-8…][conflationIntervalMs u16?]` |
 | **SubscribeError** | `0x0011` | `[errorCode u8][symLen u8][symbol UTF-8…]` |
 | **Unsubscribed**   | `0x0012` | `[securityId u64]` |
 
@@ -197,7 +220,8 @@ advertises the server's `protocolVersion` and a `serverCapabilities` bitmask
 (`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification,
 `0x04` InstrumentStatus; append-only). Clients use the InstrumentStatus bit to
 distinguish an older server that cannot emit `0x00B3` from a capable server that
-has simply not observed an administrative status yet.
+has simply not observed an administrative status yet. `0x08` advertises
+ConflatedMbpCadence.
 `SubscribeOk.flags` echoes the **accepted** `DataFlags` (`u32`) after the server
 masks off unknown/unimplemented bits requested by the client.
 
@@ -212,6 +236,8 @@ do not consume incrementals" and re-subscribe on the rising edge.
 |------|------|---------|
 | `0x01` | `UnknownSymbol` | Symbol is not registered in `SymbolRegistry` |
 | `0x02` | `NotReady`      | Server has not reached `RealTime` for the owning group |
+| `0x03` | `InvalidCadence` | Missing or unsupported fixed cadence |
+| `0x04` | `InvalidFlags` | Invalid tier combination or cadence supplied without `ConflatedMbp` |
 
 ### Snapshots
 
@@ -219,7 +245,7 @@ do not consume incrementals" and re-subscribe on the rising edge.
 |---------|------|---------|
 | **BookSnapshot** | `0x0020` | `[secId u64][rptSeq u32][bidCount u16][askCount u16][level × N]` |
 | **InfoSnapshot** | `0x0021` | `[secId u64][fieldMask u32][value i64 × popcount(mask)]` |
-| **LevelSnapshot** | `0x0022` | `[secId u64][bidCount u16][askCount u16][bid × bidCount][ask × askCount]` — each level is `[price i64][totalQty i64][orderCount u32]` (20 bytes). Sent only when `DataFlags.Mbp` is set. |
+| **LevelSnapshot** | `0x0022` | `[secId u64][bidCount u16][askCount u16][bid × bidCount][ask × askCount]` — each level is `[price i64][totalQty i64][orderCount u32]` (20 bytes). Sent for `Mbp` or `ConflatedMbp`. |
 
 Each price level is **18 bytes**: `[price i64][totalQty i64][orderCount u16]`.
 The current server uses `BookSnapshot` as a reset marker (`bidCount=0`,

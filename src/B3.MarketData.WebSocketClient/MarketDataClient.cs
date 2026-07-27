@@ -103,6 +103,7 @@ public sealed class MarketDataClient : IAsyncDisposable
     public event Action<ServerHelloEvent>? ServerHello;
     public event Action<SymbolDelistedEvent>? SymbolDelisted;
     public event Action<SubscribeErrorEvent>? SubscribeError;
+    public event Action<SubscriptionAcceptedEvent>? SubscriptionAccepted;
     public event Action<ConnectionStateChangedEvent>? ConnectionStateChanged;
 
     /// <summary>
@@ -267,7 +268,48 @@ public sealed class MarketDataClient : IAsyncDisposable
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrEmpty(symbol);
-        var record = new SubscriptionRecord(symbol, flags);
+        if ((flags & SubscribeFlags.ConflatedMbp) != 0)
+            throw new ArgumentException(
+                "Use the SubscriptionOptions overload to provide a conflation interval.",
+                nameof(flags));
+        var record = new SubscriptionRecord(symbol, flags, 0);
+        _subscriptions[symbol] = record;
+        return SendSubscribeAsync(record, ct);
+    }
+
+    /// <summary>
+    /// Subscribe with channel and fixed-cadence options. A conflation interval
+    /// requires <see cref="SubscribeFlags.ConflatedMbp"/>; ordinary
+    /// <see cref="SubscribeFlags.Mbp"/> remains per-packet.
+    /// </summary>
+    public ValueTask SubscribeAsync(string symbol, SubscriptionOptions options, CancellationToken ct = default)
+    {
+        ThrowIfDisposed();
+        ArgumentException.ThrowIfNullOrEmpty(symbol);
+        ArgumentNullException.ThrowIfNull(options);
+
+        bool wantsCadence = (options.Flags & SubscribeFlags.ConflatedMbp) != 0;
+        if (wantsCadence && (options.Flags & SubscribeFlags.Mbp) != 0)
+            throw new ArgumentException(
+                "SubscribeFlags.Mbp and ConflatedMbp are alternative tiers.", nameof(options));
+        if (!wantsCadence && options.ConflationInterval is not null)
+            throw new ArgumentException(
+                "ConflationInterval requires SubscribeFlags.ConflatedMbp.", nameof(options));
+        if (wantsCadence && options.ConflationInterval is null)
+            throw new ArgumentException(
+                "SubscribeFlags.ConflatedMbp requires ConflationInterval.", nameof(options));
+
+        double cadenceTotalMs = wantsCadence
+            ? options.ConflationInterval!.Value.TotalMilliseconds
+            : 0;
+        if (cadenceTotalMs != Math.Truncate(cadenceTotalMs))
+            throw new ArgumentException(
+                "ConflationInterval must be a whole number of milliseconds.", nameof(options));
+        int cadenceMs = checked((int)cadenceTotalMs);
+        if (cadenceMs is <= 0 or > ushort.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(options), "ConflationInterval must fit in 1..65535 ms.");
+
+        var record = new SubscriptionRecord(symbol, options.Flags, checked((ushort)cadenceMs));
         _subscriptions[symbol] = record;
         return SendSubscribeAsync(record, ct);
     }
@@ -497,10 +539,17 @@ public sealed class MarketDataClient : IAsyncDisposable
             }
             case MessageType.SubscribeOk:
             {
-                var (secId, _, sym) = WireFormat.ReadSubscribeOk(payload);
+                var (secId, rawFlags, sym, cadenceMs) = WireFormat.ReadSubscribeOkDetails(payload);
                 _securityIdToSymbol[secId] = sym;
                 if (_subscriptions.TryGetValue(sym, out var rec))
                     rec.SecurityId = secId;
+                var accepted = new SubscriptionAcceptedEvent(
+                    secId,
+                    sym,
+                    (SubscribeFlags)rawFlags,
+                    cadenceMs == 0 ? null : TimeSpan.FromMilliseconds(cadenceMs),
+                    receivedUtc);
+                Enqueue(() => SubscriptionAccepted?.Invoke(accepted));
                 break;
             }
             case MessageType.SubscribeError:
@@ -805,10 +854,10 @@ public sealed class MarketDataClient : IAsyncDisposable
         var socket = _socket;
         if (socket is null || socket.State != WebSocketState.Open)
             return; // will be replayed by ResubscribeAllAsync after reconnect
-        var buffer = ArrayPool<byte>.Shared.Rent(4 + 1 + 1 + 256);
+        var buffer = ArrayPool<byte>.Shared.Rent(WireFormat.FramingHeaderSize + 4 + 1 + 256 + 2);
         try
         {
-            int len = WireFormat.WriteSubscribe(buffer, record.Flags, record.Symbol);
+            int len = WireFormat.WriteSubscribe(buffer, record.Flags, record.Symbol, record.ConflationIntervalMs);
             await socket.SendAsync(new ArraySegment<byte>(buffer, 0, len), WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
@@ -873,12 +922,14 @@ public sealed class MarketDataClient : IAsyncDisposable
     {
         public string Symbol { get; }
         public SubscribeFlags Flags { get; }
+        public ushort ConflationIntervalMs { get; }
         public ulong SecurityId; // populated on SubscribeOk; 0 until then
 
-        public SubscriptionRecord(string symbol, SubscribeFlags flags)
+        public SubscriptionRecord(string symbol, SubscribeFlags flags, ushort conflationIntervalMs)
         {
             Symbol = symbol;
             Flags = flags;
+            ConflationIntervalMs = conflationIntervalMs;
         }
     }
 

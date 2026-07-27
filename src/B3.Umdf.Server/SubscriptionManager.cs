@@ -17,6 +17,8 @@ namespace B3.Umdf.Server;
 /// </summary>
 public sealed class SubscriptionManager : IDisposable
 {
+    public const int MinimumConflatedCadenceMs = 100;
+    private static readonly int[] DefaultConflatedCadences = [100, 250, 500];
     private volatile BookManager[]? _bookManagers;
     private volatile MarketDataManager[]? _marketDataManagers;
     private SymbolRegistry? _symbolRegistry;
@@ -56,6 +58,7 @@ public sealed class SubscriptionManager : IDisposable
     private volatile bool _ready;
     private readonly int _maxSnapshotRequestsPerBatch;
     private readonly int _serverFlushWindowMs;
+    private readonly int[] _allowedConflatedCadencesMs;
 
     private readonly long _clientMaxPendingBytes;
     private readonly OutlierSweeper _outlierSweeper;
@@ -70,12 +73,14 @@ public sealed class SubscriptionManager : IDisposable
         long outlierMinBytes = 256L * 1024,
         double outlierPressurePct = 0.50,
         int outlierIntervalMs = 1000,
-        int serverFlushWindowMs = 0)
+        int serverFlushWindowMs = 0,
+        IReadOnlyCollection<int>? allowedConflatedCadencesMs = null)
     {
         if (serverFlushWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(serverFlushWindowMs));
         _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
         _serverFlushWindowMs = serverFlushWindowMs;
+        _allowedConflatedCadencesMs = ValidateConflatedCadences(allowedConflatedCadencesMs);
         _clientMaxPendingBytes = clientMaxPendingBytes;
         _outlierSweeper = new OutlierSweeper(
             _clients,
@@ -94,6 +99,25 @@ public sealed class SubscriptionManager : IDisposable
             () => _bookManagers,
             _clients,
             _logger);
+    }
+
+    public IReadOnlyList<int> AllowedConflatedCadencesMs => _allowedConflatedCadencesMs;
+
+    private static int[] ValidateConflatedCadences(IReadOnlyCollection<int>? configured)
+    {
+        var values = configured is null
+            ? (int[])DefaultConflatedCadences.Clone()
+            : configured.Distinct().Order().ToArray();
+        if (values.Length == 0)
+            throw new ArgumentException("At least one conflated cadence must be configured.", nameof(configured));
+        foreach (int cadence in values)
+        {
+            if (cadence < MinimumConflatedCadenceMs || cadence > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(
+                    nameof(configured),
+                    $"Conflated cadences must be between {MinimumConflatedCadenceMs} and {ushort.MaxValue} ms.");
+        }
+        return values;
     }
 
     public bool IsReady => _ready;
@@ -254,17 +278,25 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     /// <summary>Called from WebSocket read thread to request a subscription.</summary>
-    public void RequestSubscribe(string clientId, string symbol, DataFlags flags)
+    public void RequestSubscribe(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs = 0)
     {
-        var req = SubscriptionRequest.Subscribe(clientId, symbol, flags);
+        var req = SubscriptionRequest.Subscribe(clientId, symbol, flags, conflationIntervalMs);
         if (!RouteToGroup(req))
             SendRouteFailureError(clientId, symbol);
     }
 
     /// <summary>Called from WebSocket read thread to request a one-shot snapshot.</summary>
-    public void RequestGet(string clientId, string symbol, DataFlags flags)
+    public void RequestGet(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs = 0)
     {
-        var req = SubscriptionRequest.Get(clientId, symbol, flags);
+        var req = SubscriptionRequest.Get(clientId, symbol, flags, conflationIntervalMs);
         if (!RouteToGroup(req))
             SendRouteFailureError(clientId, symbol);
     }
@@ -299,8 +331,12 @@ public sealed class SubscriptionManager : IDisposable
         {
             if (gh.BookManager.Books.ContainsKey(secId))
             {
-                gh.EnqueueRequest(req.ClientId, req.Symbol, req.Flags,
-                    req.Kind == SubscriptionRequestKind.Get);
+                gh.EnqueueRequest(
+                    req.ClientId,
+                    req.Symbol,
+                    req.Flags,
+                    req.Kind == SubscriptionRequestKind.Get,
+                    req.ConflationIntervalMs);
                 return true;
             }
         }
@@ -337,6 +373,18 @@ public sealed class SubscriptionManager : IDisposable
     /// Lock-free; intended for observability gauges (low-cardinality, scrape-time only).
     /// </summary>
     public int ActiveSymbolCount => _subscriptions.Count;
+
+    public int ActiveConflatedSubscriptionCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var subscriptions in _subscriptions.Values)
+                foreach (var state in subscriptions.Values)
+                    if (state.WantsConflatedMbp) count++;
+            return count;
+        }
+    }
 
     /// <summary>Broadcast pre-serialized bytes to all Book subscribers for a security.</summary>
     internal void BroadcastToSubscribers(ulong securityId, ReadOnlyMemory<byte> payload)
@@ -412,7 +460,15 @@ public sealed class SubscriptionManager : IDisposable
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
         foreach (var (_, state) in clients)
-            if ((state.Flags & DataFlags.Mbp) != 0) return true;
+            if ((state.Flags & (DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0) return true;
+        return false;
+    }
+
+    internal bool HasAnyConflatedMbpSubscriber(ulong securityId, int cadenceMs)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
+        foreach (var (_, state) in clients)
+            if (state.WantsConflatedMbp && state.ConflationIntervalMs == cadenceMs) return true;
         return false;
     }
 
@@ -444,9 +500,14 @@ public sealed class SubscriptionManager : IDisposable
         if (group is null) return false;
         foreach (var (clientId, state) in clients)
         {
-            var resyncFlags = state.Flags & (DataFlags.Book | DataFlags.Mbp);
+            var resyncFlags = state.Flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp);
             if (resyncFlags == 0) continue;
-            group.EnqueueRequest(clientId, symbol, resyncFlags, isGet: true);
+            group.EnqueueRequest(
+                clientId,
+                symbol,
+                resyncFlags,
+                isGet: true,
+                state.ConflationIntervalMs);
             any = true;
         }
         return any;
@@ -587,13 +648,27 @@ public sealed class SubscriptionManager : IDisposable
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
+        => HandleSubscribe(clientId, symbol, flags, 0, bookManager, group, bookBatchCutoffSequence);
+
+    internal void HandleSubscribe(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs,
+        BookManager bookManager,
+        GroupConflationHandler group,
+        long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
+        if (!ValidateSubscriptionOptions(session, symbol, flags, conflationIntervalMs))
+            return;
 
         // Send SubscribeOk
-        var okBuf = new byte[WireProtocol.FramingHeaderSize + 8 + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
-        int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol);
+        var okBuf = new byte[
+            WireProtocol.FramingHeaderSize + 8 + 4 + 1 +
+            System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length) + 2];
+        int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol, conflationIntervalMs);
         if (!session.TryEnqueue(new ReadOnlyMemory<byte>(okBuf, 0, okLen)))
             return;
 
@@ -601,7 +676,14 @@ public sealed class SubscriptionManager : IDisposable
         // a sequence barrier. The broadcaster will skip every queued/current batch
         // at or below bookBatchCutoffSequence for this subscription, so the snapshot
         // remains the client's baseline and future incrementals start after it.
-        if (!ActivateSubscription(session, clientId, securityId, flags, bookBatchCutoffSequence, out var activation))
+        if (!ActivateSubscription(
+                session,
+                clientId,
+                securityId,
+                flags,
+                conflationIntervalMs,
+                bookBatchCutoffSequence,
+                out var activation))
             return;
 
         if (!SendSnapshots(session, securityId, flags, bookManager, group))
@@ -616,14 +698,51 @@ public sealed class SubscriptionManager : IDisposable
 
     internal void HandleGet(string clientId, string symbol, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
+        => HandleGet(clientId, symbol, flags, 0, bookManager, group, bookBatchCutoffSequence);
+
+    internal void HandleGet(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs,
+        BookManager bookManager,
+        GroupConflationHandler group,
+        long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
+        if (!ValidateSubscriptionOptions(session, symbol, flags, conflationIntervalMs))
+            return;
 
-        if (flags.HasFlag(DataFlags.Book) || flags.HasFlag(DataFlags.Mbp))
+        if ((flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0)
             UpdateBookCutoffIfSubscribed(clientId, securityId, bookBatchCutoffSequence);
 
         SendSnapshots(session, securityId, flags, bookManager, group);
+    }
+
+    private bool ValidateSubscriptionOptions(
+        ClientSession session,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs)
+    {
+        bool conflated = (flags & DataFlags.ConflatedMbp) != 0;
+        if (conflated && (flags & DataFlags.Mbp) != 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidFlags, symbol);
+            return false;
+        }
+        if (!conflated && conflationIntervalMs != 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidFlags, symbol);
+            return false;
+        }
+        if (conflated && Array.BinarySearch(_allowedConflatedCadencesMs, (int)conflationIntervalMs) < 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidCadence, symbol);
+            return false;
+        }
+        return true;
     }
 
     /// <summary>Validate client, readiness, and symbol resolution. Sends error responses on failure.</summary>
@@ -681,7 +800,7 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
-        if (flags.HasFlag(DataFlags.Mbp))
+        if ((flags & (DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0)
         {
             if (bookManager.Books.TryGetValue(securityId, out var mbpBook))
             {
@@ -726,7 +845,8 @@ public sealed class SubscriptionManager : IDisposable
             // Trades-only subscribers (no Book/Mbp) still need candles for the
             // chart panel. Book and Mbp already send candles above, so only
             // emit here if neither is set.
-            if (!flags.HasFlag(DataFlags.Book) && !flags.HasFlag(DataFlags.Mbp))
+            if (!flags.HasFlag(DataFlags.Book) &&
+                (flags & (DataFlags.Mbp | DataFlags.ConflatedMbp)) == 0)
             {
                 if (group.Candles.TryGetValue(securityId, out var agg))
                 {
@@ -832,6 +952,7 @@ public sealed class SubscriptionManager : IDisposable
         string clientId,
         ulong securityId,
         DataFlags flags,
+        ushort conflationIntervalMs,
         long bookBatchCutoffSequence,
         out SubscriptionActivation activation)
     {
@@ -883,7 +1004,7 @@ public sealed class SubscriptionManager : IDisposable
                 var next = current is not null
                     ? new Dictionary<string, SubscriptionState>(current)
                     : new Dictionary<string, SubscriptionState>();
-                next[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
+                next[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence, conflationIntervalMs);
                 return next;
             });
             activation = new SubscriptionActivation(
@@ -980,7 +1101,7 @@ public sealed class SubscriptionManager : IDisposable
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
         if (!clients.TryGetValue(clientId, out var state)) return;
-        if ((state.Flags & DataFlags.Book) == 0) return;
+        if ((state.Flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp)) == 0) return;
         state.AdvanceMinBroadcastSequence(bookBatchCutoffSequence);
     }
 

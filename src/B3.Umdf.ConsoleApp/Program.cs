@@ -34,6 +34,7 @@ long clientMaxPendingBytes = settings.ClientMaxPendingBytes;
 int clientCoalesceWindowMs = settings.ClientCoalesceWindowMs;
 int maxSnapshotRequestsPerBatch = settings.MaxSnapshotRequestsPerBatch;
 int serverFlushWindowMs = settings.ServerFlushWindowMs;
+int[] conflatedCadencesMs = settings.ConflatedCadencesMs;
 int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
@@ -383,7 +384,8 @@ if (wsPort is not null)
         outlierMinBytes: settings.ClientOutlierMinBytes,
         outlierPressurePct: settings.ClientOutlierPressurePct,
         outlierIntervalMs: settings.ClientOutlierIntervalMs,
-        serverFlushWindowMs: serverFlushWindowMs);
+        serverFlushWindowMs: serverFlushWindowMs,
+        allowedConflatedCadencesMs: conflatedCadencesMs);
 
 // Create per-group BookManager + MarketDataManager + FeedHandler
 var bookManagers = new List<BookManager>();
@@ -584,6 +586,7 @@ if (subscriptionManager is not null)
     // SubscriptionManager outlives the host.
     var sm = subscriptionManager;
     MetricsRegistry.ActiveSubscribedSymbolsProvider = () => sm.ActiveSymbolCount;
+    MetricsRegistry.ActiveConflatedSubscriptionsProvider = () => sm.ActiveConflatedSubscriptionCount;
 
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
 }

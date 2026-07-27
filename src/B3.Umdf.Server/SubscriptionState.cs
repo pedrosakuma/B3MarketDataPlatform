@@ -23,13 +23,18 @@ namespace B3.Umdf.Server;
 internal sealed class SubscriptionState
 {
     public DataFlags Flags { get; }
+    public ushort ConflationIntervalMs { get; }
 
     private long _minBroadcastSequenceExclusive;
 
-    public SubscriptionState(DataFlags flags, long minBroadcastSequenceExclusive)
+    public SubscriptionState(
+        DataFlags flags,
+        long minBroadcastSequenceExclusive,
+        ushort conflationIntervalMs = 0)
     {
         Flags = flags;
         _minBroadcastSequenceExclusive = minBroadcastSequenceExclusive;
+        ConflationIntervalMs = conflationIntervalMs;
     }
 
     public long MinBroadcastSequenceExclusive => Volatile.Read(ref _minBroadcastSequenceExclusive);
@@ -63,6 +68,13 @@ internal sealed class SubscriptionState
         (Flags & DataFlags.Mbp) != 0 && batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
 
     public bool WantsMbp => (Flags & DataFlags.Mbp) != 0;
+
+    public bool WantsConflatedMbp => (Flags & DataFlags.ConflatedMbp) != 0;
+
+    public bool WantsConflatedMbpBatch(long batchSequence, int cadenceMs) =>
+        WantsConflatedMbp &&
+        ConflationIntervalMs == cadenceMs &&
+        batchSequence > Volatile.Read(ref _minBroadcastSequenceExclusive);
 
     public bool WantsInfo => (Flags & DataFlags.Info) != 0;
 

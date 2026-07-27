@@ -33,6 +33,20 @@ await client.ConnectAsync();
 await client.SubscribeAsync("PETR4", SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Mbp);
 ```
 
+For a bounded public-consumer feed, request the fixed-cadence MBP tier:
+
+```csharp
+await client.SubscribeAsync("PETR4", new SubscriptionOptions
+{
+    Flags = SubscribeFlags.ConflatedMbp | SubscribeFlags.Info,
+    ConflationInterval = TimeSpan.FromMilliseconds(250),
+});
+```
+
+The server allow-list defaults to 100/250/500 ms (hard minimum 100 ms).
+Snapshot-on-subscribe remains immediate. Trades are not cadence-summarized;
+add `SubscribeFlags.Trades` to receive the existing live tape.
+
 Includes:
 
 - Transparent reconnect with exponential back-off + automatic

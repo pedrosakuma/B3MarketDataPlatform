@@ -31,7 +31,8 @@ internal static class SnapshotEmitter
     internal const ServerCapabilities AdvertisedCapabilities =
         ServerCapabilities.SnapshotOnSubscribe
         | ServerCapabilities.SymbolDelistedNotification
-        | ServerCapabilities.InstrumentStatus;
+        | ServerCapabilities.InstrumentStatus
+        | ServerCapabilities.ConflatedMbpCadence;
 
     /// <summary>
     /// Send a <see cref="MessageType.ServerHello"/> as the very first server-initiated

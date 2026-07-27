@@ -53,6 +53,8 @@ spec:
               value: {{ .Values.wsPort | quote }}
             - name: UMDF_MULTICAST_CONFIG
               value: /app/config/transport.json
+            - name: UMDF_CONFLATED_CADENCES_MS
+              value: {{ .Values.conflatedCadencesMs | quote }}
           ports:
             - name: ws
               containerPort: {{ .Values.wsPort }}

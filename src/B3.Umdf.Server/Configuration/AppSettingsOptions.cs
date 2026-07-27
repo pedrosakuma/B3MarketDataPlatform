@@ -39,6 +39,7 @@ public sealed record BufferingOptions(
     int GroupRingCapacity,
     int MulticastMergeCapacity,
     int ServerFlushWindowMs,
+    int[] ConflatedCadencesMs,
     int MaxSnapshotRequestsPerBatch,
     int StaleBufferGlobalMib,
     int[] StaleBufferCapLevels,

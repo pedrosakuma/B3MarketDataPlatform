@@ -122,15 +122,15 @@ internal sealed class WebSocketConnectionHandler
 
                     case MessageType.Subscribe:
                     {
-                        var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
-                        _subscriptionManager.RequestSubscribe(session.Id, symbol, flags);
+                        var (symbol, flags, cadenceMs) = WireProtocol.ReadSubscribe(payload.Span);
+                        _subscriptionManager.RequestSubscribe(session.Id, symbol, flags, cadenceMs);
                         break;
                     }
 
                     case MessageType.Get:
                     {
-                        var (symbol, flags) = WireProtocol.ReadSubscribe(payload.Span);
-                        _subscriptionManager.RequestGet(session.Id, symbol, flags);
+                        var (symbol, flags, cadenceMs) = WireProtocol.ReadSubscribe(payload.Span);
+                        _subscriptionManager.RequestGet(session.Id, symbol, flags, cadenceMs);
                         break;
                     }
 

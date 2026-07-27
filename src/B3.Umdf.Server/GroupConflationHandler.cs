@@ -48,6 +48,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private readonly BroadcastRing _broadcastRing;
     private Thread? _broadcasterThread;
     private CancellationTokenSource? _broadcasterCts;
+    private Timer? _cadenceTimer;
+    // Cadence deadlines remain anchored to each bucket's requested interval;
+    // this timer only wakes the parked broadcaster to check them.
+    private const int CadenceTimerResolutionMs = 50;
 
     // Broadcaster-thread local: per-client coalesced output buffer. Accumulates across
     // events within one batch (one packet) so each client receives at most one
@@ -55,6 +59,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     // across batches (Dictionary instance) but the byte[] payloads are rented per flush
     // and handed off to the session's write loop.
     private readonly Dictionary<ClientSession, ClientBatchAccumulator> _clientBatches = new();
+    private readonly CadenceConflationBuffer[] _cadenceBuffers;
+    private long _cadenceEpoch;
+    private long _cadenceFramesBuffered;
+    private long _cadenceFramesEmitted;
 
     private struct ClientBatchAccumulator
     {
@@ -99,6 +107,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     private long _tradesEmittedTotal;
     public long TradesReceivedTotal => Volatile.Read(ref _tradesReceivedTotal);
     public long TradesEmittedTotal => Volatile.Read(ref _tradesEmittedTotal);
+    public long CadenceFramesBuffered => Volatile.Read(ref _cadenceFramesBuffered);
+    public long CadenceFramesEmitted => Volatile.Read(ref _cadenceFramesEmitted);
 
     // Recent trades per security.
     // ConcurrentDictionary because HandleSubscribe may read from another group's thread
@@ -142,11 +152,16 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
     public Action? PreBatchEvaluator { get; set; }
 
     /// <summary>Enqueue a subscribe/get request routed to this group.</summary>
-    internal void EnqueueRequest(string clientId, string? symbol, DataFlags flags, bool isGet)
+    internal void EnqueueRequest(
+        string clientId,
+        string? symbol,
+        DataFlags flags,
+        bool isGet,
+        ushort conflationIntervalMs = 0)
     {
         var req = isGet
-            ? SubscriptionRequest.Get(clientId, symbol!, flags)
-            : SubscriptionRequest.Subscribe(clientId, symbol!, flags);
+            ? SubscriptionRequest.Get(clientId, symbol!, flags, conflationIntervalMs)
+            : SubscriptionRequest.Subscribe(clientId, symbol!, flags, conflationIntervalMs);
         _pendingSubscribeRequests.Enqueue(req);
     }
 
@@ -179,6 +194,9 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _broadcastRing = new BroadcastRing(broadcastRingCapacity);
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
         _flushWindowMs = flushWindowMs;
+        _cadenceBuffers = parent.AllowedConflatedCadencesMs
+            .Select(static cadence => new CadenceConflationBuffer(cadence))
+            .ToArray();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -219,14 +237,26 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         };
         _broadcasterThread = t;
         t.Start();
+        _cadenceTimer = new Timer(
+            static state =>
+            {
+                var handler = (GroupConflationHandler)state!;
+                try { handler._broadcastRing.SignalConsumer(); }
+                catch (ObjectDisposedException) { }
+            },
+            this,
+            CadenceTimerResolutionMs,
+            CadenceTimerResolutionMs);
     }
 
     /// <summary>Signals the broadcaster thread to stop and waits for it to exit.</summary>
     public void StopBroadcaster()
     {
         if (_broadcasterCts is null) return;
+        _cadenceTimer?.Dispose();
+        _cadenceTimer = null;
         _broadcasterCts.Cancel();
-        _broadcastRing.SignalShutdown();
+        _broadcastRing.SignalConsumer();
         _broadcasterThread?.Join(TimeSpan.FromSeconds(2));
         _broadcastRing.Dispose();
         _broadcasterCts.Dispose();
@@ -785,6 +815,7 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         // thread (see XML doc on SetFanoutSuppressed).
         if (prev == SuppressionSource.None && next != SuppressionSource.None)
         {
+            Interlocked.Increment(ref _cadenceEpoch);
             if (BuffersDirty())
             {
                 DiscardConflationBuffers();
@@ -792,7 +823,10 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             }
         }
         if (prev != SuppressionSource.None && next == SuppressionSource.None)
+        {
+            Interlocked.Increment(ref _cadenceEpoch);
             _parent.RequestResyncForAllSubscribersInGroup(this);
+        }
     }
 
     /// <summary>True while OnBatchComplete is dropping wire events instead of fanning out.</summary>
@@ -839,10 +873,24 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             switch (req.Kind)
             {
                 case SubscriptionRequestKind.Subscribe:
-                    _parent.HandleSubscribe(req.ClientId, req.Symbol!, req.Flags, BookManager, this, bookBatchCutoffSequence);
+                    _parent.HandleSubscribe(
+                        req.ClientId,
+                        req.Symbol!,
+                        req.Flags,
+                        req.ConflationIntervalMs,
+                        BookManager,
+                        this,
+                        bookBatchCutoffSequence);
                     break;
                 case SubscriptionRequestKind.Get:
-                    _parent.HandleGet(req.ClientId, req.Symbol!, req.Flags, BookManager, this, bookBatchCutoffSequence);
+                    _parent.HandleGet(
+                        req.ClientId,
+                        req.Symbol!,
+                        req.Flags,
+                        req.ConflationIntervalMs,
+                        BookManager,
+                        this,
+                        bookBatchCutoffSequence);
                     break;
             }
         }
@@ -1305,12 +1353,17 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         {
             while (!ct.IsCancellationRequested)
             {
-                if (_broadcastRing.TryDequeue(out var batch))
+                bool drained = false;
+                BroadcastWorkBatch? batch;
+                while (_broadcastRing.TryDequeue(out batch))
                 {
                     FanoutBatch(batch!);
                     BroadcastWorkBatch.Return(batch!);
-                    continue;
+                    drained = true;
                 }
+
+                FlushDueCadenceBuffers();
+                if (drained) continue;
 
                 bool gotItem = false;
                 for (int i = 0; i < spinIterations; i++)
@@ -1337,6 +1390,8 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             // Drain remaining batches on shutdown so pool doesn't leak.
             while (_broadcastRing.TryDequeue(out var batch))
                 BroadcastWorkBatch.Return(batch!);
+            FlushAllCadenceBuffers();
+            FlushClientBatches();
         }
     }
 
@@ -1365,9 +1420,11 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
                     break;
                 case BroadcastWorkBatch.EventKind.MbpSubscribers:
                     AppendForMbpSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    BufferForConflatedMbpSubscribers(ev.SecId, bytes, batch.Sequence);
                     break;
                 case BroadcastWorkBatch.EventKind.BookOrMbpSubscribers:
                     AppendForBookOrMbpSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
+                    BufferForConflatedMbpSubscribers(ev.SecId, bytes, batch.Sequence);
                     break;
                 case BroadcastWorkBatch.EventKind.TradeSubscribers:
                     AppendForTradeSubscribers(ev.SecId, bytes, ev.LogicalCount, batch.Sequence);
@@ -1486,6 +1543,83 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
             var session = _parent.GetClient(clientId);
             if (session is null) continue;
             AppendToClient(session, bytes, logicalCount);
+        }
+    }
+
+    private void BufferForConflatedMbpSubscribers(
+        ulong securityId,
+        ReadOnlySpan<byte> bytes,
+        long batchSequence)
+    {
+        if (_suppressFanout || bytes.Length == 0) return;
+        long epoch = Volatile.Read(ref _cadenceEpoch);
+        foreach (var buffer in _cadenceBuffers)
+        {
+            if (!_parent.HasAnyConflatedMbpSubscriber(securityId, buffer.CadenceMs))
+                continue;
+            buffer.Buffer(securityId, bytes, batchSequence, epoch);
+            Interlocked.Increment(ref _cadenceFramesBuffered);
+        }
+    }
+
+    private void FlushDueCadenceBuffers()
+    {
+        long now = Environment.TickCount64;
+        if (_suppressFanout)
+        {
+            foreach (var buffer in _cadenceBuffers)
+                buffer.Discard();
+            return;
+        }
+        foreach (var buffer in _cadenceBuffers)
+        {
+            if (!buffer.IsDue(now)) continue;
+            int cadenceMs = buffer.CadenceMs;
+            buffer.Flush(now, (securityId, bytes, sequence, epoch) =>
+                AppendForConflatedMbpSubscribers(
+                    securityId,
+                    bytes,
+                    sequence,
+                    epoch,
+                    cadenceMs));
+        }
+        FlushClientBatches();
+    }
+
+    private void FlushAllCadenceBuffers()
+    {
+        long now = Environment.TickCount64;
+        foreach (var buffer in _cadenceBuffers)
+        {
+            if (!buffer.HasPending) continue;
+            int cadenceMs = buffer.CadenceMs;
+            buffer.Flush(now, (securityId, bytes, sequence, epoch) =>
+                AppendForConflatedMbpSubscribers(
+                    securityId,
+                    bytes,
+                    sequence,
+                    epoch,
+                    cadenceMs));
+        }
+    }
+
+    private void AppendForConflatedMbpSubscribers(
+        ulong securityId,
+        ReadOnlySpan<byte> bytes,
+        long batchSequence,
+        long epoch,
+        int cadenceMs)
+    {
+        if (epoch != Volatile.Read(ref _cadenceEpoch)) return;
+        var subs = _parent.GetSubscribers(securityId);
+        if (subs is null || bytes.Length == 0) return;
+        foreach (var (clientId, state) in subs)
+        {
+            if (!state.WantsConflatedMbpBatch(batchSequence, cadenceMs)) continue;
+            var session = _parent.GetClient(clientId);
+            if (session is null) continue;
+            AppendToClient(session, bytes, logicalCount: 1);
+            Interlocked.Increment(ref _cadenceFramesEmitted);
         }
     }
 

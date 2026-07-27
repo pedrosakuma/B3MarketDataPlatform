@@ -52,6 +52,29 @@ await client.SubscribeAsync("PETR4", SubscribeFlags.Trades | SubscribeFlags.Info
 `Price` is delivered as `decimal` already scaled by the SBE exponent
 (`-4` for trades and info fields) — no manual divide is needed.
 
+### Fixed-cadence MBP
+
+Use `SubscriptionOptions` for the high-fan-out cadence tier:
+
+```csharp
+await client.SubscribeAsync("PETR4", new SubscriptionOptions
+{
+    Flags = SubscribeFlags.ConflatedMbp | SubscribeFlags.Info,
+    ConflationInterval = TimeSpan.FromMilliseconds(250),
+});
+```
+
+The server accepts only its configured safe set (100/250/500 ms by default,
+hard minimum 100 ms). `LevelSnapshot` is immediate; incremental levels and
+shared book context are last-value-wins at the cadence. Ordinary
+`SubscribeFlags.Mbp` remains unchanged. Trades are separate: add
+`SubscribeFlags.Trades` for the existing live trade/correction stream; they are
+not cadence-summarized. `SubscribeFlags.AllKnown` intentionally excludes
+`ConflatedMbp` because the tier is an alternative to `Mbp` and needs an interval.
+Inspect `ServerHello.Capabilities` for `ConflatedMbpCadence` and/or handle
+`SubscriptionAccepted` to verify the echoed flags and accepted interval. On an
+older server the SDK's wire fallback safely degrades to ordinary `Mbp`.
+
 ## Dependency injection
 
 ```csharp
@@ -214,7 +237,6 @@ scheduled opening time (UTC epoch nanos); null otherwise.
 The two UMDF templates can fire independently — each bump yields a push
 with whatever is currently populated. Null fields mean "not yet received
 from UMDF" or "not applicable to the current phase".
-
 ## Instrument halt/resume transitions
 
 `MarketDataClient.InstrumentStatus` is included with

@@ -299,10 +299,20 @@ public class SubscriptionManagerTests
         Assert.Equal(0.50, settings.ClientOutlierPressurePct);
         Assert.Equal(1000, settings.ClientOutlierIntervalMs);
         Assert.Equal(10, settings.ClientCoalesceWindowMs);
+        Assert.Equal([100, 250, 500], settings.ConflatedCadencesMs);
         Assert.Equal(5, settings.ShutdownDrainSeconds);
         Assert.Equal(1_000_000, settings.MulticastMergeCapacity);
         Assert.Equal(250_000, settings.FeedChannelCapacity);
         Assert.Equal("Information", settings.LogLevel);
+    }
+
+    [Fact]
+    public void ConflatedCadenceConfiguration_EnforcesHardMinimum()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SubscriptionManager(allowedConflatedCadencesMs: [1, 100]));
+        using var manager = new SubscriptionManager(allowedConflatedCadencesMs: [500, 100, 250, 250]);
+        Assert.Equal([100, 250, 500], manager.AllowedConflatedCadencesMs);
     }
 
     [Fact]

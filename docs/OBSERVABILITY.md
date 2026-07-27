@@ -52,6 +52,9 @@ ground truth. Every metric here is currently emitted on `/metrics`.
 | `umdf_ws_subscriptions_total` | Counter | — | Cumulative `Subscribe` accepts (negative deltas applied on bulk disconnect; treat as activity not a level). |
 | `umdf_ws_messages_sent_total` | Counter | — | Total frames pushed to clients across all sessions. |
 | `umdf_ws_messages_conflated_total` | Counter | — | Frames collapsed by per-symbol conflation before send. |
+| `umdf_ws_conflated_cadence_subscriptions` | Gauge | — | Active fixed-cadence MBP subscriptions. |
+| `umdf_ws_conflated_cadence_frames_buffered_total` | Counter | — | MBP/book-context frames admitted to cadence buffers. |
+| `umdf_ws_conflated_cadence_frames_emitted_total` | Counter | — | Last-value frames released when cadence windows close. |
 | `umdf_ws_slow_disconnects_total` | Counter | — | Sessions terminated for back-pressure violation (1008 close, slow-consumer policy). |
 | `umdf_packets_received_total` | Counter | — | Raw UMDF packets observed by the server-side counters. |
 | `umdf_gaps_detected_total` | Counter | — | Sequence gaps observed (server-local view). |

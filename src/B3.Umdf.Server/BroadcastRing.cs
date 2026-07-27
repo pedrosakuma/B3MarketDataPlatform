@@ -122,7 +122,7 @@ internal sealed class BroadcastRing
         return seq - (pos + 1) == 0;
     }
 
-    public void SignalShutdown() => _itemsAvailable.Set();
+    public void SignalConsumer() => _itemsAvailable.Set();
     public void Dispose() => _itemsAvailable.Dispose();
 
     private static int NextPow2(int v)

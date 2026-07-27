@@ -83,12 +83,24 @@ public enum SubscribeFlags : uint
     /// </summary>
     Auction = 0x80,
 
+    /// <summary>
+    /// Fixed-cadence MBP: immediate <see cref="MarketDataClient.LevelSnapshot"/>
+    /// on subscribe, then last-value-wins level/book-context updates at the
+    /// requested server-approved cadence. Use the
+    /// <see cref="SubscriptionOptions.ConflationInterval"/> overload.
+    /// Trades remain a separate opt-in via <see cref="Trades"/>.
+    /// </summary>
+    ConflatedMbp = 0x100,
+
     /// <summary>Legacy convenience: <see cref="Book"/> + <see cref="Info"/>.
     /// Mirrors the server's <c>DataFlags.All</c> — does NOT include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction.</summary>
     All = Book | Info,
 
-    /// <summary>Every data class this SDK build knows about: Book + Info + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.
-    /// NOT all-ones — future channels are added here explicitly so unknown bits stay unrequested.</summary>
+    /// <summary>Every additive data class this SDK build knows about: Book + Info
+    /// + News + MBP + Trades + SecurityDefinition + PriceBand + Auction.
+    /// Parameterized alternative tiers are excluded.</summary>
+    /// <remarks><see cref="ConflatedMbp"/> is intentionally excluded because it
+    /// is an alternative to <see cref="Mbp"/> and requires a cadence option.</remarks>
     AllKnown = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
 
     /// <summary>Deprecated alias for <see cref="AllKnown"/>. Prefer <see cref="AllKnown"/>.</summary>
