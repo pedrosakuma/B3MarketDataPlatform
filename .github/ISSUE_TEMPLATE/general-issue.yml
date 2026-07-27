@@ -1,0 +1,30 @@
+name: General issue (non-protocol)
+description: Bugs, docs, operations, UI, performance, or maintenance work with no wire-contract change.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this route for non-protocol work. If the request changes Binary
+        UMDF/SBE decoding, cross-repo wire dependencies, or WebSocket projection
+        of upstream data, use a protocol template instead.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What needs to change or be investigated?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Links, logs, screenshots, repro steps, or other relevant details.
+    validations:
+      required: false
+  - type: textarea
+    id: validation
+    attributes:
+      label: Expected validation
+      description: What would prove this issue is fixed or complete?
+    validations:
+      required: false

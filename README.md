@@ -232,6 +232,7 @@ the only modification to the original B3 schema.
 | [docs/WEBSOCKET_API.md](docs/WEBSOCKET_API.md) | **Consumer-facing landing for the WebSocket distribution layer**: stability label, breaking-change policy, "reference price" quickstart for downstream apps (e.g. risk modules) |
 | [docs/CLIENT-SDK.md](docs/CLIENT-SDK.md) | **Typed C# SDK** (`B3.MarketData.WebSocketClient` NuGet): API, DI extension, reconnect+replay, back-pressure policies |
 | [docs/WEBSOCKET-PROTOCOL.md](docs/WEBSOCKET-PROTOCOL.md) | Wire framing, message catalog, hex examples, subscription / reconnect / slow-consumer flows, candle chunking |
+| [docs/PROTOCOL-CONTRACTS.md](docs/PROTOCOL-CONTRACTS.md) | Contribution gate for UMDF/SBE wire-contract evidence, protocol research blockers, and WebSocket-vs-UMDF terminology |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook |
 | [docs/NOISY-NEIGHBOUR.md](docs/NOISY-NEIGHBOUR.md) | Behaviour under host-level resource contention, scheduler jitter probe, deployment hardening (cpuset, k8s static CPU manager, NIC IRQ pinning, sysctls) |
