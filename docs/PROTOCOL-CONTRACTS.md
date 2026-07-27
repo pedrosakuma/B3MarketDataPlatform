@@ -18,6 +18,16 @@ contracts distinct.
   from supported data, but those frames must be described as MarketData WebSocket
   messages, never as official UMDF templates.
 
+## Relationship to the CI schema guard
+
+The issue forms, PR checklist, and rules above are review-time discipline: they
+are not read or validated by CI. The only deterministically enforced backstop
+in this repo is the **Vendored schema guard** job (`.github/workflows/ci.yml`),
+which fails any PR that touches `schemas/` unless it carries the
+`schema-upgrade` label — this is what actually blocks an unreviewed hand-edit
+of a vendored schema file, independent of what an issue or PR description
+claims.
+
 ## Issue routes
 
 Use **Protocol implementation (contract proven)** only when the merged upstream
