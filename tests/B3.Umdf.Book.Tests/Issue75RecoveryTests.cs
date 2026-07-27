@@ -143,7 +143,7 @@ public class Issue75RecoveryTests
     }
 
     [Fact]
-    public void HealthyBook_OlderSnapshotWithDifferentCounts_DoesNotReportSemanticMismatch()
+    public void HealthyBook_OlderSnapshotWithDifferentCounts_IsReportedAndLaterCompatibleSnapshotRepairs()
     {
         var (bookManager, _) = Create();
         const ulong securityId = 7506;
@@ -159,9 +159,263 @@ public class Issue75RecoveryTests
             expectedOffers: 1,
             lastSequenceVersion: null);
 
-        Assert.Equal(1L, bookManager.SnapshotsSkippedHealthyAhead);
-        Assert.Equal(0L, bookManager.SnapshotsSemanticMismatch);
+        Assert.Equal(0L, bookManager.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(1L, bookManager.SnapshotsSemanticMismatch);
         Assert.Equal(0L, bookManager.SnapshotsSemanticRepair);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 3,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 21, price: 100, quantity: 10);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Ask, orderId: 22, price: 101, quantity: 10);
+
+        Assert.Equal(2L, bookManager.SnapshotsSemanticMismatch);
+        Assert.Equal(1L, bookManager.SnapshotsSemanticRepair);
+        Assert.Equal(1, bookManager.Books[securityId].Asks.OrderCount);
+    }
+
+    [Fact]
+    public void HealthyBook_NoRptSemanticMismatch_IsNotClassifiedAsHealthySkip()
+    {
+        var (bookManager, registry) = Create();
+        const ulong securityId = 7507;
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 3, ordersExpected: 1);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 23, price: 100, quantity: 10);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 0,
+            expectedBids: 0,
+            expectedOffers: 0,
+            lastSequenceVersion: null);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+        Assert.Equal(0L, bookManager.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(1L, bookManager.SnapshotsSemanticMismatch);
+        Assert.Equal(0L, bookManager.SnapshotsSemanticRepair);
+        Assert.Equal(1L, bookManager.SnapshotsMissingRptSeq);
+        Assert.Equal(1, bookManager.Books[securityId].Bids.OrderCount);
+    }
+
+    [Fact]
+    public void HealthyBook_FutureSemanticSnapshot_DoesNotAdvancePastObservedWatermark()
+    {
+        var (bookManager, registry) = Create();
+        const ulong securityId = 7508;
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 3, ordersExpected: 1);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 24, price: 100, quantity: 10);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 4,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+        Assert.Equal(0L, bookManager.SnapshotsSkippedHealthyAhead);
+        Assert.Equal(1L, bookManager.SnapshotsSemanticMismatch);
+        Assert.Equal(0L, bookManager.SnapshotsSemanticRepair);
+
+        var next = registry.Observe(securityId, SymbolGapKind.Mbo, receivedRptSeq: 4);
+        Assert.Equal(SymbolStateRegistry.ObserveAction.Apply, next.Action);
+    }
+
+    [Fact]
+    public void SemanticRepair_FutureReplacementRemainsWatermarkGuarded()
+    {
+        var (bookManager, registry) = Create();
+        const ulong securityId = 7510;
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 3, ordersExpected: 1);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 27, price: 100, quantity: 10);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 3,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        Assert.Equal(SymbolState.Stale, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 100,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        Assert.Equal(SymbolState.Stale, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 3,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 27, price: 100, quantity: 10);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Ask, orderId: 28, price: 101, quantity: 10);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+        Assert.Equal(1L, bookManager.SnapshotsSemanticRepair);
+        Assert.Equal(3u, bookManager.Books[securityId].LastRptSeq);
+    }
+
+    [Fact]
+    public void RejectedSemanticRepair_FutureSnapshotRemainsWatermarkGuarded()
+    {
+        var (bookManager, registry) = Create();
+        const ulong securityId = 7511;
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 3, ordersExpected: 1);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 29, price: 100, quantity: 10);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 3,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 29, price: 100, quantity: 10);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 30, price: 99, quantity: 10);
+        Assert.Equal(1L, bookManager.SnapshotsRejectedSideCountMismatch);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 100,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        Assert.Equal(SymbolState.Stale, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 3,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 29, price: 100, quantity: 10);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Ask, orderId: 31, price: 101, quantity: 10);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+        Assert.Equal(1L, bookManager.SnapshotsSemanticRepair);
+        Assert.Equal(3u, bookManager.Books[securityId].LastRptSeq);
+    }
+
+    [Fact]
+    public void SideCountRejection_PreservesProtectedFloorCoverage()
+    {
+        var registry = new SymbolStateRegistry(NullLogger.Instance);
+        var buffer = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        var bookManager = new BookManager(stateRegistry: registry, staleBuffer: buffer);
+        const ulong securityId = 7509;
+
+        registry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq: 10);
+        registry.Observe(securityId, SymbolGapKind.Mbo, receivedRptSeq: 100);
+        foreach (uint rptSeq in new uint[] { 100, 101 })
+            Enqueue(rptSeq);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 105,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        foreach (uint rptSeq in new uint[] { 102, 103, 104, 105, 106, 107 })
+            Enqueue(rptSeq);
+
+        Assert.True(buffer.SafeEvictedBelowFloorCount > 0);
+
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 25, price: 100, quantity: 10);
+        bookManager.StageSnapshotEntryForTest(
+            securityId, BookSideType.Bid, orderId: 26, price: 99, quantity: 10);
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 104, ordersExpected: 0);
+        Assert.Equal(1L, bookManager.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Stale, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 105, ordersExpected: 0);
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        void Enqueue(uint rptSeq)
+        {
+            buffer.Enqueue(
+                securityId,
+                templateId: Order_MBO_50Data.MESSAGE_ID,
+                rptSeq,
+                sendingTimeNs: 0,
+                body: new byte[] { (byte)rptSeq },
+                onEvictedOldest: evicted =>
+                    registry.BumpMinHeal(securityId, SymbolGapKind.Mbo, evicted));
+        }
+    }
+
+    [Fact]
+    public void ReplacedSnapshot_PreservesProtectedFloorCoverage()
+    {
+        var registry = new SymbolStateRegistry(NullLogger.Instance);
+        var buffer = new StaleMboBuffer(NullLogger.Instance, perSymbolCap: 2, hotPerSymbolCap: 4);
+        var bookManager = new BookManager(stateRegistry: registry, staleBuffer: buffer);
+        const ulong securityId = 7512;
+
+        registry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, snapshotRptSeq: 10);
+        registry.Observe(securityId, SymbolGapKind.Mbo, receivedRptSeq: 100);
+        foreach (uint rptSeq in new uint[] { 100, 101 })
+            Enqueue(rptSeq);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 105,
+            expectedBids: 1,
+            expectedOffers: 1,
+            lastSequenceVersion: null);
+        foreach (uint rptSeq in new uint[] { 102, 103, 104, 105, 106, 107 })
+            Enqueue(rptSeq);
+
+        Assert.True(buffer.SafeEvictedBelowFloorCount > 0);
+
+        bookManager.OnSnapshotHeaderForTest(
+            securityId,
+            lastRptSeq: 104,
+            expectedBids: 0,
+            expectedOffers: 0,
+            lastSequenceVersion: null);
+
+        Assert.Equal(1L, bookManager.SnapshotsAbandoned);
+        Assert.Equal(1L, bookManager.SnapshotsRejectedTooOld);
+        Assert.Equal(SymbolState.Stale, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        bookManager.BeginChunkedSnapshotForTest(securityId, lastRptSeq: 105, ordersExpected: 0);
+        Assert.Equal(SymbolState.Healthy, registry.GetState(securityId, SymbolGapKind.Mbo));
+
+        void Enqueue(uint rptSeq)
+        {
+            buffer.Enqueue(
+                securityId,
+                templateId: Order_MBO_50Data.MESSAGE_ID,
+                rptSeq,
+                sendingTimeNs: 0,
+                body: new byte[] { (byte)rptSeq },
+                onEvictedOldest: evicted =>
+                    registry.BumpMinHeal(securityId, SymbolGapKind.Mbo, evicted));
+        }
     }
 
     [Fact]

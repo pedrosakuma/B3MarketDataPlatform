@@ -453,7 +453,7 @@ static class MetricsBinder
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_semantic_mismatch",
             () => PerGroupBook(bm => bm.SnapshotsSemanticMismatch),
-            unit: "{snapshots}", description: "Healthy books whose bid/offer counts disagreed with an authoritative compatible snapshot");
+            unit: "{snapshots}", description: "Sequence-healthy books whose bid/offer counts disagreed with an authoritative snapshot header");
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_semantic_repair",
             () => PerGroupBook(bm => bm.SnapshotsSemanticRepair),
@@ -510,7 +510,7 @@ static class MetricsBinder
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.snapshots_skipped_healthy_ahead",
             () => PerGroupBook(bm => bm.SnapshotsSkippedHealthyAhead),
-            unit: "{snapshots}", description: "Snapshots ignored because symbol is already Healthy with a more recent book.LastRptSeq than the snapshot baseline (always-on snapshot stream noise)");
+            unit: "{snapshots}", description: "Snapshots ignored because the symbol is sequence-healthy and authoritative bid/offer counts agree");
 
         Meter.CreateObservableCounter("b3.umdf.persymbol.mbo_buffered",
             () => PerGroupBook(bm => bm.BufferedMboMessages),

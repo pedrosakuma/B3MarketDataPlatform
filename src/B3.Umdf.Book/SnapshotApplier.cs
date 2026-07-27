@@ -52,7 +52,7 @@ internal sealed class SnapshotApplier
         public uint BidsReceived;
         public uint OffersReceived;
         public bool HasRptSeq;         // whether LastRptSeq is usable
-        public bool Skipped;           // Header_30 saw the symbol Healthy + ahead of snap; chunks must be dropped silently
+        public bool Skipped;           // Snapshot is being absorbed without mutating the live book
         public bool ValidateSideCounts;
         public bool SemanticRepair;
         public readonly List<OrderBookEntry> StagedBids = new();
@@ -252,9 +252,27 @@ internal sealed class SnapshotApplier
     {
         var book = _bookStore.GetOrCreate(secId);
         uint ordersExpected = expectedBids + expectedOffers;
-        bool semanticRepair = false;
+        bool semanticRepair = _stateRegistry.TryGetSemanticReconciliationWatermark(
+            secId,
+            out uint semanticObservedRptSeq);
 
         var state = _stateRegistry.GetState(secId, SymbolGapKind.Mbo);
+        if (state != SymbolState.Healthy
+            && semanticRepair
+            && (!hasRptSeq || lastRptSeq > semanticObservedRptSeq))
+        {
+            AbsorbSnapshot(
+                secId,
+                lastRptSeq,
+                hasRptSeq,
+                expectedBids,
+                expectedOffers,
+                validateSideCounts);
+            if (!hasRptSeq)
+                Interlocked.Increment(ref _snapshotsMissingRptSeq);
+            return;
+        }
+
         if (state == SymbolState.Healthy)
         {
             int liveBids = book.Bids.OrderCount + book.MarketOrderCount(BookSideType.Bid);
@@ -262,46 +280,39 @@ internal sealed class SnapshotApplier
             bool countsMatch = !validateSideCounts
                 || ((uint)liveBids == expectedBids && (uint)liveOffers == expectedOffers);
 
-            // Preserve the cheap fast path when the authoritative header agrees
-            // with the live book. If it disagrees, a same/newer-rpt snapshot is
-            // allowed to stage an atomic semantic repair.
-            if (countsMatch || !hasRptSeq || lastRptSeq < book.LastRptSeq)
+            // Preserve the cheap fast path only when sequence health and the
+            // authoritative per-side counts agree.
+            if (countsMatch)
             {
-                ReplacePendingSnapshot(secId, new PendingSnapshot
-                {
-                    State = SnapshotAssemblyState.Skipped,
-                    LastRptSeq = lastRptSeq,
-                    OrdersExpected = ordersExpected,
-                    OrdersReceived = 0,
-                    BidsExpected = expectedBids,
-                    OffersExpected = expectedOffers,
-                    HasRptSeq = hasRptSeq,
-                    Skipped = true,
-                    ValidateSideCounts = validateSideCounts,
-                });
+                AbsorbSnapshot(
+                    secId,
+                    lastRptSeq,
+                    hasRptSeq,
+                    expectedBids,
+                    expectedOffers,
+                    validateSideCounts);
                 Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
                 return;
             }
 
-            // Older snapshots can legitimately describe a different side
-            // composition. Count only actionable disagreements at the current
-            // or a newer rptSeq as semantic mismatches.
+            // Sequence continuity does not prove semantic completeness. Count
+            // every authoritative disagreement, even when its watermark cannot
+            // safely repair the current book.
             Interlocked.Increment(ref _snapshotsSemanticMismatch);
 
-            if (!_stateRegistry.BeginSnapshotReconciliation(secId, lastRptSeq))
+            if (!hasRptSeq
+                || lastRptSeq < book.LastRptSeq
+                || !_stateRegistry.BeginSnapshotReconciliation(secId, lastRptSeq))
             {
-                ReplacePendingSnapshot(secId, new PendingSnapshot
-                {
-                    State = SnapshotAssemblyState.Skipped,
-                    LastRptSeq = lastRptSeq,
-                    OrdersExpected = ordersExpected,
-                    BidsExpected = expectedBids,
-                    OffersExpected = expectedOffers,
-                    HasRptSeq = hasRptSeq,
-                    Skipped = true,
-                    ValidateSideCounts = validateSideCounts,
-                });
-                Interlocked.Increment(ref _snapshotsSkippedHealthyAhead);
+                AbsorbSnapshot(
+                    secId,
+                    lastRptSeq,
+                    hasRptSeq,
+                    expectedBids,
+                    expectedOffers,
+                    validateSideCounts);
+                if (!hasRptSeq)
+                    Interlocked.Increment(ref _snapshotsMissingRptSeq);
                 return;
             }
             semanticRepair = true;
@@ -338,6 +349,30 @@ internal sealed class SnapshotApplier
         // Empty book snapshot (no Orders_71 chunks will follow): heal immediately.
         if (ordersExpected == 0)
             CompleteSnapshot(secId, book);
+    }
+
+    private void AbsorbSnapshot(
+        ulong securityId,
+        uint lastRptSeq,
+        bool hasRptSeq,
+        uint expectedBids,
+        uint expectedOffers,
+        bool validateSideCounts)
+    {
+        uint ordersExpected = expectedBids + expectedOffers;
+        ReplacePendingSnapshot(securityId, new PendingSnapshot
+        {
+            State = SnapshotAssemblyState.Skipped,
+            LastRptSeq = lastRptSeq,
+            OrdersExpected = ordersExpected,
+            BidsExpected = expectedBids,
+            OffersExpected = expectedOffers,
+            HasRptSeq = hasRptSeq,
+            Skipped = true,
+            ValidateSideCounts = validateSideCounts,
+        });
+        if (ordersExpected == 0)
+            _pendingSnapshots.Remove(securityId);
     }
 
     /// <summary>
@@ -452,6 +487,8 @@ internal sealed class SnapshotApplier
             {
                 Interlocked.Increment(ref _snapshotsAbandoned);
                 Interlocked.Increment(ref _snapshotsReplacedHeader);
+                if (existing.HasRptSeq)
+                    _stateRegistry.BumpMinHeal(secId, SymbolGapKind.Mbo, existing.LastRptSeq);
             }
             // Always release any protected floor that the predecessor pinned —
             // skipped replacements never call CompleteSnapshot, so without this
@@ -514,8 +551,7 @@ internal sealed class SnapshotApplier
 
         if (pending.ValidateSideCounts && !HasExactSideCounts(pending))
         {
-            _staleBuffer.ClearProtectedFloor(securityId);
-            Interlocked.Increment(ref _snapshotsRejectedSideCountMismatch);
+            RejectSideCountMismatch(securityId, pending);
             return;
         }
 
@@ -660,8 +696,18 @@ internal sealed class SnapshotApplier
 
     private void RejectSideCountMismatch(ulong securityId)
     {
-        if (!_pendingSnapshots.Remove(securityId, out _))
+        if (!_pendingSnapshots.Remove(securityId, out var pending))
             return;
+        RejectSideCountMismatch(securityId, pending);
+    }
+
+    private void RejectSideCountMismatch(ulong securityId, PendingSnapshot pending)
+    {
+        // Messages at-or-below LastRptSeq may have been evicted as covered by
+        // the protected snapshot floor. Once the assembly is rejected, preserve
+        // that coverage requirement in MinHeal before releasing the floor.
+        if (pending.HasRptSeq)
+            _stateRegistry.BumpMinHeal(securityId, SymbolGapKind.Mbo, pending.LastRptSeq);
         _staleBuffer.ClearProtectedFloor(securityId);
         Interlocked.Increment(ref _snapshotsRejectedSideCountMismatch);
         Interlocked.Increment(ref _snapshotsAborted);

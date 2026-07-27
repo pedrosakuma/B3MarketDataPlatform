@@ -203,6 +203,7 @@ public sealed class SymbolStateRegistry
         // message. This eliminates false-positive Stales caused by per-kind tracking
         // (where a stat advancing the global counter made the next MBO look like a gap).
         internal uint ObservedRptSeq;
+        internal bool MboSemanticReconciliation;
     }
 
     /// <summary>
@@ -297,7 +298,9 @@ public sealed class SymbolStateRegistry
     {
         const int mboIdx = (int)SymbolGapKind.Mbo;
         bool hasEstablishedBaseline = observed > 0 || entry.States[mboIdx] == SymbolState.Healthy;
-        bool globalGap = hasEstablishedBaseline && receivedRptSeq > observed + 1;
+        bool globalGap = hasEstablishedBaseline
+            && receivedRptSeq > observed
+            && receivedRptSeq - observed > 1;
         if (!globalGap) return default;
 
         uint gapSize = receivedRptSeq - observed - 1;
@@ -395,13 +398,14 @@ public sealed class SymbolStateRegistry
                 return false;
 
             uint priorHighWater = entry.LastRptSeq[mboIdx];
-            if (snapshotRptSeq < priorHighWater)
+            if (snapshotRptSeq < priorHighWater || snapshotRptSeq > entry.ObservedRptSeq)
                 return false;
 
             int prevMask = entry.StaleKindMask;
             entry.States[mboIdx] = SymbolState.Stale;
             entry.StaleSinceTicks[mboIdx] = _clock.NowTicks;
             entry.StaleKindMask |= 1 << mboIdx;
+            entry.MboSemanticReconciliation = true;
             if (priorHighWater > entry.MinHealRptSeq[mboIdx])
                 entry.MinHealRptSeq[mboIdx] = priorHighWater;
             if (prevMask == 0)
@@ -412,6 +416,23 @@ public sealed class SymbolStateRegistry
         if (transitioned)
             _onMboStaleStatusChanged?.Invoke(securityId, true);
         return transitioned;
+    }
+
+    internal bool TryGetSemanticReconciliationWatermark(
+        ulong securityId,
+        out uint observedRptSeq)
+    {
+        if (!_entries.TryGetValue(securityId, out var entry))
+        {
+            observedRptSeq = 0;
+            return false;
+        }
+
+        lock (entry.Sync)
+        {
+            observedRptSeq = entry.ObservedRptSeq;
+            return entry.MboSemanticReconciliation;
+        }
     }
 
     /// <summary>
@@ -559,6 +580,8 @@ public sealed class SymbolStateRegistry
             entry.LastRptSeq[idx] = snapshotRptSeq;
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0; // baseline restored — no constraint until next stale event
+            if (kind == SymbolGapKind.Mbo)
+                entry.MboSemanticReconciliation = false;
 
             // Bump observed to at least snapshotRptSeq. Snapshots are an authoritative
             // "instrument is at rptSeq=N" signal from the wire (lower bound — live may
@@ -651,6 +674,8 @@ public sealed class SymbolStateRegistry
             entry.LastRptSeq[idx] = anchor;
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0;
+            if (kind == SymbolGapKind.Mbo)
+                entry.MboSemanticReconciliation = false;
             if (anchor > entry.ObservedRptSeq) entry.ObservedRptSeq = anchor;
 
             bool transitioned = prev != SymbolState.Healthy;
@@ -699,6 +724,7 @@ public sealed class SymbolStateRegistry
                     entry.MinHealRptSeq[i] = 0;
                 }
                 entry.StaleKindMask = 0;
+                entry.MboSemanticReconciliation = false;
                 // Wire counter restarts on a catastrophic reset (SequenceReset_1 /
                 // ChannelReset_11) — clear the observed-rptSeq watermark so the next
                 // message at lower rptSeq doesn't trigger a spurious global gap.
@@ -772,6 +798,8 @@ public sealed class SymbolStateRegistry
             entry.StaleSinceTicks[idx] = 0;
             entry.MinHealRptSeq[idx] = 0;
             entry.StaleKindMask &= ~(1 << idx);
+            if (kind == SymbolGapKind.Mbo)
+                entry.MboSemanticReconciliation = false;
             if (prevMask != 0 && entry.StaleKindMask == 0)
                 Interlocked.Decrement(ref _staleSymbolCount);
             // EmptyBook resets the wire-level rptSeq counter for this instrument
