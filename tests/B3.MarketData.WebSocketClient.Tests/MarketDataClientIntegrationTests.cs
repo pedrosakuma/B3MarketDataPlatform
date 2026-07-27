@@ -3,6 +3,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
+using B3.Umdf.Book;
+using B3.Umdf.Server;
 using B3.MarketData.WebSocketClient;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -64,6 +66,44 @@ public class MarketDataClientIntegrationTests
         Assert.Equal(1L, trade.TradeId);
         Assert.True(client.TryGetSecurityId("PETR4", out var resolved));
         Assert.Equal(12345UL, resolved);
+    }
+
+    [Fact]
+    public async Task InstrumentStatus_IsSurfacedAsTypedInfoEvent()
+    {
+        const ulong sourceTimestamp = 1_750_000_000_123_456_789;
+        var port = FindFreePort();
+        await using var server = await TestWsServer.StartAsync(port, async (ws, ct) =>
+        {
+            var symbol = await TestWsServer.ReadSubscribeAsync(ws, ct);
+            await TestWsServer.SendSubscribeOkAsync(ws, securityId: 12345, symbol, ct);
+            await TestWsServer.SendInstrumentStatusAsync(
+                ws, 12345, symbol, previousStatus: 17, newStatus: 17,
+                reasonCode: InstrumentStatusDecoder.InstrumentHaltedReasonCode,
+                sourceTimestamp, rptSeq: 9, ct);
+            await Task.Delay(Timeout.Infinite, ct);
+        });
+
+        var received = new TaskCompletionSource<InstrumentStatusEvent>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var client = new MarketDataClient(new MarketDataClientOptions
+        {
+            Endpoint = new Uri($"ws://127.0.0.1:{port}/ws"),
+        });
+        client.InstrumentStatus += status => received.TrySetResult(status);
+
+        await client.ConnectAsync();
+        await WaitUntil(() => client.State == ConnectionState.Connected, TimeSpan.FromSeconds(5));
+        await client.SubscribeAsync("PETR4", SubscribeFlags.Info);
+
+        var status = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("PETR4", status.Symbol);
+        Assert.Equal(17, status.PreviousStatus);
+        Assert.Equal(17, status.NewStatus);
+        Assert.Equal(InstrumentStatusReason.InstrumentHalted, status.Reason);
+        Assert.True(status.IsHalted);
+        Assert.Equal(sourceTimestamp, status.SourceTimestampNanos);
+        Assert.Equal(9u, status.RptSeq);
     }
 
     [Fact]
@@ -415,6 +455,26 @@ internal sealed class TestWsServer : IAsyncDisposable
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(24), qty);
         BinaryPrimitives.WriteInt64LittleEndian(buf.AsSpan(32), tradeId);
         return ws.SendAsync(buf, WebSocketMessageType.Binary, true, ct);
+    }
+
+    public static Task SendInstrumentStatusAsync(
+        WebSocket ws,
+        ulong securityId,
+        string symbol,
+        int? previousStatus,
+        int newStatus,
+        byte reasonCode,
+        ulong sourceTimestamp,
+        uint? rptSeq,
+        CancellationToken ct)
+    {
+        var update = new InstrumentStatusUpdate(
+            previousStatus, newStatus, reasonCode, sourceTimestamp, rptSeq);
+        var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
+        int length = WireProtocol.WriteInstrumentStatus(
+            buffer, securityId, symbol, in update);
+        return ws.SendAsync(
+            buffer.AsMemory(0, length), WebSocketMessageType.Binary, true, ct).AsTask();
     }
 
     /// <summary>

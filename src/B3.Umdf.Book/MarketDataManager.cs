@@ -441,6 +441,7 @@ public sealed class MarketDataManager : IFeedEventHandler
         ref readonly var msg = ref reader.Data;
         ulong securityId = (ulong)msg.SecurityID;
         var info = GetOrCreateInfo(securityId);
+        int? previousStatus = info.TradingStatus;
 
         if (msg.RptSeq is { } rs)
         {
@@ -484,6 +485,8 @@ public sealed class MarketDataManager : IFeedEventHandler
         }
 
         info.BumpVersion();
+        if (InstrumentStatusDecoder.TryDecode(in reader, previousStatus, out var instrumentStatus))
+            _eventHandler?.OnInstrumentStatusChanged(securityId, info, in instrumentStatus);
         _eventHandler?.OnSecurityStatusChanged(securityId, info);
     }
 

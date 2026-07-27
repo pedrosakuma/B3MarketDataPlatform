@@ -501,6 +501,36 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     /// <summary>
+    /// Publishes a non-conflated halt/resume transition to existing Info
+    /// subscribers. The dedicated frame is additive: legacy clients skip its
+    /// unknown opcode and continue receiving the normal InfoSnapshot update.
+    /// </summary>
+    internal void PublishInstrumentStatus(
+        ulong securityId,
+        string? symbol,
+        in InstrumentStatusUpdate update)
+    {
+        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
+
+        byte[]? buffer = null;
+        int length = 0;
+        foreach (var (clientId, state) in clients)
+        {
+            if (!state.WantsInfo || !_clients.TryGetValue(clientId, out var session))
+                continue;
+
+            if (buffer is null)
+            {
+                buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
+                length = WireProtocol.WriteInstrumentStatus(
+                    buffer, securityId, symbol, in update);
+            }
+
+            session.TryEnqueue(new ReadOnlyMemory<byte>(buffer, 0, length));
+        }
+    }
+
+    /// <summary>
     /// Wake <see cref="DataFlags.SecurityDefinition"/> subscribers for a security
     /// so their write loop emits a fresh <see cref="MessageType.SecurityDefinition"/>
     /// frame on the next cycle. Called by <c>GroupConflationHandler.OnSecurityDefinitionChanged</c>

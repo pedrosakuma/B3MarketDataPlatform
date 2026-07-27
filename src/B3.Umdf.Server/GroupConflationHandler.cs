@@ -480,6 +480,14 @@ public sealed class GroupConflationHandler : IBookEventHandler, IMarketDataEvent
         _parent.NotifyInfoUpdated(securityId);
     }
 
+    public void OnInstrumentStatusChanged(
+        ulong securityId,
+        InstrumentInfo info,
+        in InstrumentStatusUpdate update)
+    {
+        _parent.PublishInstrumentStatus(securityId, info.Symbol, in update);
+    }
+
     public void OnMarketDataUpdated(ulong securityId, InstrumentInfo info)
     {
         if (info.TradingStatus is { } status)

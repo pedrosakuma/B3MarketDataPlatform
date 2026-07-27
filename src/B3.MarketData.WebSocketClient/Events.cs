@@ -716,3 +716,53 @@ public sealed class AuctionEvent
     /// either source. Null when not provided.</summary>
     public long? RptSeq { get; init; }
 }
+
+/// <summary>
+/// Proprietary <c>securityTradingEvent</c> markers carried by the existing
+/// UMDF <c>SecurityStatus_3</c> template for administrative halt/resume.
+/// </summary>
+public enum InstrumentStatusReason : byte
+{
+    Unknown = 0,
+    InstrumentHalted = 1,
+    InstrumentResumed = 2,
+}
+
+/// <summary>
+/// A non-conflated instrument halt/resume transition decoded from UMDF
+/// <c>SecurityStatus_3</c>.
+/// </summary>
+public sealed class InstrumentStatusEvent
+{
+    public ulong SecurityId { get; init; }
+    public string Symbol { get; init; } = "";
+    public DateTime ReceivedUtc { get; init; }
+
+    /// <summary>Status cached before this source frame, or null on first sight.</summary>
+    public int? PreviousStatus { get; init; }
+
+    /// <summary>
+    /// <c>SecurityStatus_3.securityTradingStatus</c>. The matching venue preserves
+    /// the underlying trading phase during an administrative halt, so halt/open
+    /// can legitimately report the same previous and new status.
+    /// </summary>
+    public int NewStatus { get; init; }
+
+    /// <summary>
+    /// Halt/resume marker from <c>SecurityStatus_3.securityTradingEvent</c>.
+    /// The current source frame does not carry the operator's detailed
+    /// RegulatoryHalt/NewsHold/etc. reason.
+    /// </summary>
+    public InstrumentStatusReason Reason { get; init; }
+
+    /// <summary>Unmodified <c>securityTradingEvent</c> marker for forward compatibility.</summary>
+    public byte RawReasonCode { get; init; }
+
+    /// <summary>Exchange source timestamp, UTC nanoseconds since Unix epoch.</summary>
+    public ulong SourceTimestampNanos { get; init; }
+
+    /// <summary>Per-instrument UMDF sequence, or null for snapshot/zero.</summary>
+    public uint? RptSeq { get; init; }
+
+    public bool IsHalted => Reason == InstrumentStatusReason.InstrumentHalted;
+}

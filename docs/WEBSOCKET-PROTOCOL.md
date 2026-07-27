@@ -108,6 +108,7 @@ Get               0x0003        Unsubscribed        0x0012
                                 SecurityDefinition  0x00B0
                                 PriceBand           0x00B1
                                 Auction             0x00B2
+                                InstrumentStatus    0x00B3
 ```
 
 ## Client → Server
@@ -133,7 +134,7 @@ two known `u32` fields are ignored (min-length rule).
 |-------|------|---------|
 | `0x00` | None | Treated as `All` |
 | `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `BookCleared`). **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
-| `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
+| `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates, including non-conflated `InstrumentStatus` halt/resume transitions |
 | `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction) |
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
@@ -252,6 +253,32 @@ bitfield from `AuctionImbalance_19` (low 16 bits): `0x0100` =
 `Balanced`. The SDK decodes it into the
 `B3.MarketData.WebSocketClient.AuctionImbalanceCondition` enum;
 unrecognised combinations map to `Unknown`.
+
+### InstrumentStatus (included in `DataFlags.Info`)
+
+| Message | Type | Payload |
+|---------|------|---------|
+| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][reason u8][sourceTimestampNanos u64][rptSeq u32]` |
+
+This is the dedicated, non-conflated transition surface for administrative
+single-instrument halt/resume. It is decoded from the existing schema-generated
+UMDF **`SecurityStatus_3` template (id 3)**; there is no separate
+`InstrumentStatus_NN` template in B3 schema 2.2.0. The matching venue uses the
+otherwise schema-reserved `securityTradingEvent` values `1` (halt) and `2`
+(resume), while `securityTradingStatus`, `transactTime`, and `rptSeq` supply
+`newStatus`, `sourceTimestampNanos`, and `rptSeq`.
+
+`previousStatus=255` means the platform had no prior status cached. `rptSeq=0`
+means absent/snapshot. The venue preserves the underlying trading phase during
+an administrative halt, so `previousStatus` and `newStatus` may both be `17`
+(OPEN); consumers should use `reason`/the SDK's `IsHalted` property to identify
+the transition.
+
+The current source frame does **not** carry the operator's detailed halt reason
+(`RegulatoryHalt`, `NewsHold`, etc.). `reason` therefore exposes the exact
+available marker: `1` = instrument halted, `2` = instrument resumed. The normal
+`InfoSnapshot.TradingStatus` update remains unchanged for compatibility, and
+older clients safely skip the additive `0x00B3` opcode.
 
 ### SecurityDefinition (opt-in via `DataFlags.SecurityDefinition`)
 

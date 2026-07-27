@@ -3,6 +3,14 @@ namespace B3.Umdf.Book;
 public interface IMarketDataEventHandler
 {
     void OnSecurityStatusChanged(ulong securityId, InstrumentInfo info) { }
+    /// <summary>
+    /// Fired for the halt/resume extension carried by <c>SecurityStatus_3</c>
+    /// (<c>securityTradingEvent</c> values 1 and 2).
+    /// </summary>
+    void OnInstrumentStatusChanged(
+        ulong securityId,
+        InstrumentInfo info,
+        in InstrumentStatusUpdate update) { }
     void OnMarketDataUpdated(ulong securityId, InstrumentInfo info) { }
 
     /// <summary>

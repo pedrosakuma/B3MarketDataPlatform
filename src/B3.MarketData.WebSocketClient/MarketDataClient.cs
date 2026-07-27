@@ -90,6 +90,12 @@ public sealed class MarketDataClient : IAsyncDisposable
     /// Requires opt-in via <see cref="SubscribeFlags.Auction"/>.
     /// </summary>
     public event Action<AuctionEvent>? Auction;
+    /// <summary>
+    /// Administrative instrument halt/resume transitions decoded from UMDF
+    /// <c>SecurityStatus_3</c>. Delivered to subscriptions that include
+    /// <see cref="SubscribeFlags.Info"/>.
+    /// </summary>
+    public event Action<InstrumentStatusEvent>? InstrumentStatus;
     public event Action<ServerStatusEvent>? ServerStatus;
     public event Action<ServerHelloEvent>? ServerHello;
     public event Action<SymbolDelistedEvent>? SymbolDelisted;
@@ -552,6 +558,12 @@ public sealed class MarketDataClient : IAsyncDisposable
                 // Auction embeds Symbol on the wire — no _securityIdToSymbol needed.
                 var ev = WireFormat.ReadAuction(payload, receivedUtc);
                 Enqueue(() => Auction?.Invoke(ev));
+                break;
+            }
+            case MessageType.InstrumentStatus:
+            {
+                var ev = WireFormat.ReadInstrumentStatus(payload, receivedUtc);
+                Enqueue(() => InstrumentStatus?.Invoke(ev));
                 break;
             }
             // ── L3 / order-by-order (MBO) ─────────────────────────

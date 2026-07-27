@@ -97,6 +97,7 @@ public enum MessageType : ushort
     SecurityDefinition = 0x00B0,
     PriceBand = 0x00B1,
     Auction = 0x00B2,
+    InstrumentStatus = 0x00B3,
 
     // Server -> Client: news (fragmented)
     NewsBegin = 0x0090,

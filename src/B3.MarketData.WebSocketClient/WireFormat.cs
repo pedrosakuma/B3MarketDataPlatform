@@ -539,6 +539,47 @@ internal static class WireFormat
         };
     }
 
+    /// <summary>
+    /// Parse an <see cref="MessageType.InstrumentStatus"/> frame.
+    /// Layout:
+    /// <c>[securityId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
+    /// [reason u8][sourceTimestampNanos u64][rptSeq u32]</c>.
+    /// </summary>
+    public static InstrumentStatusEvent ReadInstrumentStatus(
+        ReadOnlySpan<byte> payload,
+        DateTime receivedUtc)
+    {
+        ulong securityId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        int offset = 8;
+        int symbolLength = payload[offset++];
+        string symbol = symbolLength == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(payload.Slice(offset, symbolLength));
+        offset += symbolLength;
+
+        byte previousStatus = payload[offset++];
+        byte newStatus = payload[offset++];
+        byte reason = payload[offset++];
+        ulong sourceTimestampNanos = BinaryPrimitives.ReadUInt64LittleEndian(payload[offset..]);
+        offset += 8;
+        uint rptSeq = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+
+        return new InstrumentStatusEvent
+        {
+            SecurityId = securityId,
+            Symbol = symbol,
+            ReceivedUtc = receivedUtc,
+            PreviousStatus = previousStatus == byte.MaxValue ? null : previousStatus,
+            NewStatus = newStatus,
+            Reason = Enum.IsDefined(typeof(InstrumentStatusReason), reason)
+                ? (InstrumentStatusReason)reason
+                : InstrumentStatusReason.Unknown,
+            RawReasonCode = reason,
+            SourceTimestampNanos = sourceTimestampNanos,
+            RptSeq = rptSeq == 0 ? null : rptSeq,
+        };
+    }
+
     // SBE ImbalanceCondition bit positions (uint16):
     //   bit 8 (0x0100) = ImbalanceMoreBuyers
     //   bit 9 (0x0200) = ImbalanceMoreSellers

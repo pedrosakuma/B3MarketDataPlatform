@@ -40,6 +40,8 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 
 client.Trade        += t => Console.WriteLine($"{t.Symbol} @ {t.Price} x {t.Qty}{(t.Flags.HasFlag(TradeFlags.AuctionPrint) ? " (auction)" : "")}");
 client.InfoSnapshot += i => Console.WriteLine($"{i.Symbol} last={i.LastTradePrice} top={i.TheoreticalOpeningPrice} imb={i.AuctionImbalanceCondition}");
+client.InstrumentStatus += s => Console.WriteLine(
+    $"{s.Symbol} {(s.IsHalted ? "halted" : "resumed")} status={s.NewStatus} reason={s.Reason}");
 client.ServerStatus += s => Console.WriteLine($"server ready={s.Ready}");
 client.SubscribeError += e => Console.WriteLine($"{e.Symbol} -> {e.ErrorCode}");
 
@@ -93,8 +95,9 @@ also enforces its own queue limits described in
 
 ## Scope of v1
 
-In: `Trade`, `TradeBust`, `InfoSnapshot`, `SecurityDefinition`, `PriceBand`,
-`Auction`, `ServerStatus`, `SubscribeError`, `ConnectionStateChanged`,
+In: `Trade`, `TradeBust`, `InfoSnapshot`, `InstrumentStatus`,
+`SecurityDefinition`, `PriceBand`, `Auction`, `ServerStatus`,
+`SubscribeError`, `ConnectionStateChanged`,
 reconnect+replay, DI extension, bounded back-pressure.
 
 Out (intentional): MBO/MBP order-book streams, recovery REST, auth
@@ -212,3 +215,33 @@ The two UMDF templates can fire independently — each bump yields a push
 with whatever is currently populated. Null fields mean "not yet received
 from UMDF" or "not applicable to the current phase".
 
+## Instrument halt/resume transitions
+
+`MarketDataClient.InstrumentStatus` is included with
+`SubscribeFlags.Info`; no new subscription bit is required:
+
+```csharp
+client.InstrumentStatus += status =>
+{
+    Console.WriteLine(
+        $"{status.Symbol}: {(status.IsHalted ? "HALTED" : "RESUMED")} " +
+        $"phase {status.PreviousStatus?.ToString() ?? "unknown"} -> {status.NewStatus}, " +
+        $"sourceNs={status.SourceTimestampNanos}");
+};
+
+await client.SubscribeAsync("PETR4", SubscribeFlags.Info);
+```
+
+The platform decodes the existing schema-generated UMDF
+`SecurityStatus_3` template (id 3), not a separate `InstrumentStatus_NN`
+template. B3MatchingPlatform marks halt with `securityTradingEvent=1` and
+resume with `securityTradingEvent=2`; these map to
+`InstrumentStatusReason.InstrumentHalted` and `InstrumentResumed`.
+`PreviousStatus` is null on first sight, `NewStatus` is the frame's
+`securityTradingStatus`, and `SourceTimestampNanos` is its `transactTime`.
+
+The source currently preserves the underlying trading phase during halt and
+does not encode the operator's detailed `RegulatoryHalt`/`NewsHold` reason.
+Consequently previous/new status can both be `OPEN`, and `Reason` exposes the
+exact halt/resume marker available on the wire. Existing `InfoSnapshot`
+delivery remains unchanged for compatibility.
