@@ -7,45 +7,110 @@ namespace B3.Umdf.Transport.Tests;
 
 /// <summary>
 /// Tests for the oversized-datagram detection path in <see cref="MulticastPacketSource"/>.
-/// Covers the in-process truncation-flag helper directly, plus a loopback-multicast
-/// integration test that exercises the kernel MSG_TRUNC path end-to-end.
+/// Covers the policy helper directly plus real loopback UDP delivery at and above
+/// a configured cap.
 /// </summary>
 public class MulticastPacketSourceTruncationTests
 {
     [Fact]
-    public void IsKernelTruncated_DirectMsgTruncFlag_ReturnsTrue()
+    public void IsOversizedOrTruncated_DirectMsgTruncFlag_ReturnsTrue()
     {
         // Direct flag: regardless of length vs cap, the kernel told us the datagram was truncated.
-        Assert.True(MulticastPacketSource.IsKernelTruncated(LinuxNative.MSG_TRUNC, receivedLen: 100, bufferCap: 9216));
+        Assert.True(MulticastPacketSource.IsOversizedOrTruncated(
+            LinuxNative.MSG_TRUNC, receivedLen: 100, maxDatagramBytes: 9216));
     }
 
     [Fact]
-    public void IsKernelTruncated_NoFlagAndShortDatagram_ReturnsFalse()
+    public void IsOversizedOrTruncated_NoFlagAndShortDatagram_ReturnsFalse()
     {
-        Assert.False(MulticastPacketSource.IsKernelTruncated(msgFlags: 0, receivedLen: 1500, bufferCap: 9216));
+        Assert.False(MulticastPacketSource.IsOversizedOrTruncated(
+            msgFlags: 0, receivedLen: 1500, maxDatagramBytes: 9216));
     }
 
     [Fact]
-    public void IsKernelTruncated_NoFlagButReceivedAtCap_HeuristicReturnsTrue()
+    public void IsOversizedOrTruncated_NoFlagAndExactlyAtCap_ReturnsFalse()
     {
-        // Heuristic fallback for kernels that don't propagate per-message MSG_TRUNC through recvmmsg.
-        Assert.True(MulticastPacketSource.IsKernelTruncated(msgFlags: 0, receivedLen: 9216, bufferCap: 9216));
+        Assert.False(MulticastPacketSource.IsOversizedOrTruncated(
+            msgFlags: 0, receivedLen: 9216, maxDatagramBytes: 9216));
     }
 
     [Fact]
-    public void IsKernelTruncated_OtherFlagsDoNotTrigger()
+    public void IsOversizedOrTruncated_NoFlagAndAboveCap_ReturnsTrue()
+    {
+        Assert.True(MulticastPacketSource.IsOversizedOrTruncated(
+            msgFlags: 0, receivedLen: 9217, maxDatagramBytes: 9216));
+    }
+
+    [Fact]
+    public void IsOversizedOrTruncated_OtherFlagsDoNotTrigger()
     {
         // Flags unrelated to truncation (e.g. MSG_WAITFORONE) must not be misread.
-        Assert.False(MulticastPacketSource.IsKernelTruncated(LinuxNative.MSG_WAITFORONE, receivedLen: 100, bufferCap: 9216));
+        Assert.False(MulticastPacketSource.IsOversizedOrTruncated(
+            LinuxNative.MSG_WAITFORONE, receivedLen: 100, maxDatagramBytes: 9216));
     }
 
     [Fact]
-    public void IsKernelTruncated_MaximumUdpPayloadAtCap_IsValid()
+    public void IsOversizedOrTruncated_MaximumUdpPayloadAtCap_IsValid()
     {
-        Assert.False(MulticastPacketSource.IsKernelTruncated(
+        Assert.False(MulticastPacketSource.IsOversizedOrTruncated(
             msgFlags: 0,
             receivedLen: MulticastPacketSource.MaximumUdpPayloadBytes,
-            bufferCap: MulticastPacketSource.MaximumUdpPayloadBytes));
+            maxDatagramBytes: MulticastPacketSource.MaximumUdpPayloadBytes));
+    }
+
+    [Fact]
+    public void ReceiveBatch_ExactConfiguredCap_RealSocketDeliversIntact()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+
+        const int cap = 1024;
+        int port = GetEphemeralPort();
+        using var src = NewSource(ChannelType.IncrementalA, cap, port);
+        using var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        var expected = Enumerable.Range(0, cap).Select(i => (byte)(i % 251)).ToArray();
+        sender.SendTo(expected, new IPEndPoint(IPAddress.Loopback, port));
+
+        var batch = new UmdfPacket[1];
+        Assert.Equal(1, src.ReceiveBatch(batch));
+        try
+        {
+            Assert.Equal(expected, batch[0].Data.ToArray());
+            Assert.Equal(0, src.TruncatedDatagramCount);
+        }
+        finally
+        {
+            batch[0].Release();
+        }
+    }
+
+    [Fact]
+    public void ReceiveBatch_CapPlusOne_RealSocketDropsThenAcceptsValidTraffic()
+    {
+        if (!OperatingSystem.IsLinux()) return;
+
+        const int cap = 1024;
+        int port = GetEphemeralPort();
+        using var src = NewSource(ChannelType.IncrementalA, cap, port);
+        using var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+        sender.SendTo(new byte[cap + 1], endpoint);
+
+        var batch = new UmdfPacket[1];
+        Assert.Equal(0, src.ReceiveBatch(batch));
+        Assert.Equal(1, src.TruncatedDatagramCount);
+
+        byte[] valid = [0x11, 0x22, 0x33];
+        sender.SendTo(valid, endpoint);
+        Assert.Equal(1, src.ReceiveBatch(batch));
+        try
+        {
+            Assert.Equal(valid, batch[0].Data.ToArray());
+            Assert.Equal(1, src.TruncatedDatagramCount);
+        }
+        finally
+        {
+            batch[0].Release();
+        }
     }
 
     [Fact]
@@ -118,17 +183,27 @@ public class MulticastPacketSourceTruncationTests
         }
     }
 
-    private static MulticastPacketSource NewSource(ChannelType type, int maxDatagramBytes = 0)
+    private static MulticastPacketSource NewSource(
+        ChannelType type,
+        int maxDatagramBytes = 0,
+        int port = 0)
     {
         var config = new ChannelConfig(
             ChannelId: 99,
             Type: type,
-            MulticastGroup: IPAddress.Any,
-            Port: 0,
+            MulticastGroup: IPAddress.Loopback,
+            Port: port,
             ReceiveBufferBytes: 1 * 1024 * 1024,
             Transport: TransportKind.Unicast,
             MaxDatagramBytes: maxDatagramBytes);
         return new MulticastPacketSource(config, NullLogger<MulticastPacketSource>.Instance);
+    }
+
+    private static int GetEphemeralPort()
+    {
+        using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        probe.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        return ((IPEndPoint)probe.LocalEndPoint!).Port;
     }
 
     private static void WriteDatagram(IntPtr msgvec, byte[] payload, SocketFlags flags)

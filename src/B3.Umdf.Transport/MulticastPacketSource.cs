@@ -19,6 +19,7 @@ public sealed class MulticastPacketSource : IPacketSource
     private readonly int _channelGroup;
     private readonly TransportKind _transport;
     private readonly int _maxDatagramBytes;
+    private readonly int _receiveCapacityBytes;
     private readonly bool _copyBatchPayloads;
     private readonly ILogger _logger;
 
@@ -56,9 +57,8 @@ public sealed class MulticastPacketSource : IPacketSource
     /// <summary>Count of successful multicast membership leaves.</summary>
     public long MembershipLeaves => Volatile.Read(ref _membershipLeaves);
     /// <summary>
-    /// Number of datagrams the kernel reported as truncated to the per-datagram buffer
-    /// (MSG_TRUNC in the recvmmsg path). These are dropped — never delivered downstream —
-    /// because a partial UDP datagram cannot be parsed safely.
+    /// Number of datagrams dropped because they exceeded <see cref="MaxDatagramBytes"/>
+    /// or the kernel reported MSG_TRUNC. They are never delivered partially downstream.
     /// </summary>
     public long TruncatedDatagramCount => Volatile.Read(ref _truncatedDatagramCount);
 
@@ -119,6 +119,11 @@ public sealed class MulticastPacketSource : IPacketSource
         _channelGroup = config.ChannelGroup;
         _transport = config.Transport;
         _maxDatagramBytes = maxDatagramBytes;
+        // A one-byte lookahead distinguishes a valid datagram exactly at the configured
+        // cap from an oversized datagram without relying on MSG_TRUNC propagation.
+        _receiveCapacityBytes = maxDatagramBytes < MaximumUdpPayloadBytes
+            ? maxDatagramBytes + 1
+            : MaximumUdpPayloadBytes;
         // Large receive slots remain scratch buffers. Copying only the bytes actually
         // received prevents every in-flight snapshot from retaining a 64 KiB pinned
         // array while preserving the existing zero-copy path for hot UMDF channels.
@@ -338,15 +343,15 @@ public sealed class MulticastPacketSource : IPacketSource
     {
         while (true)
         {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(_maxDatagramBytes);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(_receiveCapacityBytes);
             try
             {
                 var result = await _socket.ReceiveMessageFromAsync(
-                    buffer.AsMemory(0, _maxDatagramBytes),
+                    buffer.AsMemory(0, _receiveCapacityBytes),
                     SocketFlags.None,
                     new IPEndPoint(IPAddress.Any, 0),
                     ct);
-                if (IsKernelTruncated((int)result.SocketFlags, result.ReceivedBytes, _maxDatagramBytes))
+                if (IsOversizedOrTruncated((int)result.SocketFlags, result.ReceivedBytes, _maxDatagramBytes))
                 {
                     long tn = Interlocked.Increment(ref _truncatedDatagramCount);
                     LogTruncatedRateLimited(tn, result.ReceivedBytes);
@@ -374,14 +379,14 @@ public sealed class MulticastPacketSource : IPacketSource
     {
         while (true)
         {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(_maxDatagramBytes);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(_receiveCapacityBytes);
             try
             {
                 SocketFlags flags = SocketFlags.None;
                 EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
                 int received = _socket.ReceiveMessageFrom(
-                    buffer, 0, _maxDatagramBytes, ref flags, ref remote, out _);
-                if (IsKernelTruncated((int)flags, received, _maxDatagramBytes))
+                    buffer, 0, _receiveCapacityBytes, ref flags, ref remote, out _);
+                if (IsOversizedOrTruncated((int)flags, received, _maxDatagramBytes))
                 {
                     long tn = Interlocked.Increment(ref _truncatedDatagramCount);
                     LogTruncatedRateLimited(tn, received);
@@ -457,12 +462,11 @@ public sealed class MulticastPacketSource : IPacketSource
             int received = (int)mmsghdrs[i].msg_len;
             int msgFlags = mmsghdrs[i].msg_hdr.msg_flags;
 
-            if (IsKernelTruncated(msgFlags, received, _maxDatagramBytes))
+            if (IsOversizedOrTruncated(msgFlags, received, _maxDatagramBytes))
             {
-                // Datagram exceeded our per-datagram buffer — kernel truncated it.
-                // Dropping is the only safe option: a partial UMDF SBE message would
-                // mis-parse downstream. Reuse the buffer in-place (no rent/return)
-                // since no lease is created and the iovec is still bound to it.
+                // Datagram exceeded the configured cap or the kernel truncated it.
+                // Drop the whole datagram: partial UMDF data would mis-parse downstream.
+                // Reuse the buffer in-place since no lease is created.
                 long tn = Interlocked.Increment(ref _truncatedDatagramCount);
                 LogTruncatedRateLimited(tn, received);
                 continue;
@@ -511,34 +515,25 @@ public sealed class MulticastPacketSource : IPacketSource
     }
 
     /// <summary>
-    /// True if the kernel signalled that the datagram was truncated to the per-datagram buffer.
-    /// Prefers the direct MSG_TRUNC flag (<see cref="LinuxNative.MSG_TRUNC"/>) when set in
-    /// <paramref name="msgFlags"/>; otherwise falls back to a heuristic on older kernels /
-    /// libc combinations that don't propagate per-message flags through recvmmsg: the
-    /// returned length being exactly a configured sub-maximum cap is suspect.
-    /// Exposed as internal so the truncation policy can be unit-tested with synthetic flags.
+    /// True when a datagram exceeded the configured policy cap or the kernel explicitly
+    /// reported truncation. Receive buffers use one byte of lookahead below the protocol
+    /// maximum, so a length exactly equal to <paramref name="maxDatagramBytes"/> is valid.
     /// </summary>
-    internal static bool IsKernelTruncated(int msgFlags, int receivedLen, int bufferCap)
-    {
-        if ((msgFlags & LinuxNative.MSG_TRUNC) != 0) return true;
-        // At the IPv4 UDP protocol maximum, equality is a valid complete datagram;
-        // no larger payload can exist. For smaller configured caps, equality remains
-        // a conservative fallback for platforms that fail to surface MSG_TRUNC.
-        return bufferCap < MaximumUdpPayloadBytes && receivedLen >= bufferCap;
-    }
+    internal static bool IsOversizedOrTruncated(int msgFlags, int receivedLen, int maxDatagramBytes) =>
+        (msgFlags & LinuxNative.MSG_TRUNC) != 0 || receivedLen > maxDatagramBytes;
 
     private void LogTruncatedRateLimited(long counter, int receivedLen)
     {
         if (counter == 1 || (counter & 63) == 0)
             _logger.LogWarning(
-                "Dropped truncated UDP datagram on {ChannelType} (group {ChannelGroup}): kernel truncated to {ReceivedLen} bytes (maxDatagramBytes={Cap}); upstream sender exceeds the configured per-datagram cap (TruncatedDatagramCount={Count}).",
+                "Dropped oversized or truncated UDP datagram on {ChannelType} (group {ChannelGroup}): received {ReceivedLen} bytes (maxDatagramBytes={Cap}); upstream sender exceeds the configured per-datagram cap (TruncatedDatagramCount={Count}).",
                 _channelType, _channelGroup, receivedLen, _maxDatagramBytes, counter);
     }
 
     private void EnsureBatchStateInitialized()
     {
         if (_batchBufferPool is not null) return;
-        _batchBufferPool = new PinnedBufferPool(_maxDatagramBytes);
+        _batchBufferPool = new PinnedBufferPool(_receiveCapacityBytes);
         _batchIovecs = new LinuxNative.Iovec[MaxBatchSize];
         _batchMmsghdrs = new LinuxNative.Mmsghdr[MaxBatchSize];
         _batchPendingBuffers = new byte[MaxBatchSize][];
@@ -565,7 +560,7 @@ public sealed class MulticastPacketSource : IPacketSource
                     _batchIovecs[i].iov_base = (IntPtr)p;
                 }
             }
-            _batchIovecs[i].iov_len = (nuint)_maxDatagramBytes;
+            _batchIovecs[i].iov_len = (nuint)_receiveCapacityBytes;
         }
     }
 
