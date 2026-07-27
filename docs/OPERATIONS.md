@@ -241,6 +241,12 @@ automatically.
 | `b3.umdf.feed.last_packet_age` | Gauge | `group` | Milliseconds since last packet (stale feed) |
 | `b3.umdf.feed.queue_depth` | Gauge | `group` | Pending packets in feed queue |
 
+### Transport
+
+| Metric | Type | Tags | Description |
+|--------|------|------|-------------|
+| `b3.umdf.transport.datagrams.truncated` | Counter | `group`, `channel` | UDP datagrams dropped whole after exceeding `maxDatagramBytes`; any increase indicates sender/config mismatch |
+
 ### Book
 
 | Metric | Type | Tags | Description |

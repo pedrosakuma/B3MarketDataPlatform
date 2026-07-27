@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.Transport.Tests;
@@ -39,104 +40,105 @@ public class MulticastPacketSourceTruncationTests
     }
 
     [Fact]
-    public void ReceiveBatch_OversizedMulticastDatagram_DropsAndIncrementsCounter()
+    public void IsKernelTruncated_MaximumUdpPayloadAtCap_IsValid()
+    {
+        Assert.False(MulticastPacketSource.IsKernelTruncated(
+            msgFlags: 0,
+            receivedLen: MulticastPacketSource.MaximumUdpPayloadBytes,
+            bufferCap: MulticastPacketSource.MaximumUdpPayloadBytes));
+    }
+
+    [Fact]
+    public void ReceiveBatch_SnapshotDatagramAboveLegacyCap_IsDeliveredIntact()
     {
         if (!OperatingSystem.IsLinux()) return;
 
-        var group = IPAddress.Parse("239.99.99.101");
-        int port = GetEphemeralPort();
-        var loopback = IPAddress.Loopback;
+        using var src = NewSource(ChannelType.SnapshotRecovery);
+        const int payloadLength = 32 * 1024;
+        var expected = new byte[payloadLength];
+        for (int i = 0; i < expected.Length; i++)
+            expected[i] = (byte)(i % 251);
 
-        var config = new ChannelConfig(
-            ChannelId: 99,
-            Type: ChannelType.IncrementalA,
-            MulticastGroup: group,
-            Port: port,
-            SourceAddress: null,
-            LocalAddress: loopback,
-            ReceiveBufferBytes: 1 * 1024 * 1024,
-            ChannelGroup: 0,
-            ReceiveSocketCount: 1);
+        src._recvmmsgInvoker = (int fd, IntPtr msgvec, uint vlen, int flags, out int errno) =>
+        {
+            errno = 0;
+            WriteDatagram(msgvec, expected, SocketFlags.None);
+            return 1;
+        };
 
-        MulticastPacketSource src;
+        var batch = new UmdfPacket[1];
+        Assert.Equal(1, src.ReceiveBatch(batch));
         try
         {
-            src = new MulticastPacketSource(config, NullLogger<MulticastPacketSource>.Instance);
+            Assert.Equal(payloadLength, batch[0].Data.Length);
+            Assert.Equal(expected, batch[0].Data.ToArray());
+            Assert.Equal(0, src.TruncatedDatagramCount);
         }
-        catch (SocketException)
+        finally
         {
-            // Environment may not allow binding loopback multicast (e.g. some sandboxes).
-            return;
-        }
-
-        using (src)
-        using (var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
-        {
-            sender.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, loopback.GetAddressBytes());
-            sender.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, 1);
-            // Increase the sender's send buffer so the kernel does not reject the oversized payload.
-            sender.SendBufferSize = 256 * 1024;
-
-            var dest = new IPEndPoint(group, port);
-
-            // 1) A normal-sized datagram for the receiver to drain — proves end-to-end works.
-            var smallPayload = new byte[] { 0xAA, 0xBB };
-            sender.SendTo(smallPayload, dest);
-
-            // 2) An oversized datagram, well beyond the receive buffer cap (9 KiB).
-            // We need it to physically fit in a UDP datagram (≤65507 bytes after IP+UDP headers)
-            // AND exceed MaxDatagramSize. 32 KiB satisfies both.
-            var bigPayload = new byte[32 * 1024];
-            for (int i = 0; i < bigPayload.Length; i++) bigPayload[i] = 0x55;
-            try
-            {
-                sender.SendTo(bigPayload, dest);
-            }
-            catch (SocketException)
-            {
-                // If the kernel rejects the big send (loopback MTU or similar), we can't exercise
-                // the integration path on this host; the unit-level helper tests above still cover
-                // the truncation policy.
-                return;
-            }
-
-            // 3) Another normal datagram so we're guaranteed to dequeue the truncated one too.
-            sender.SendTo(smallPayload, dest);
-
-            Thread.Sleep(150);
-
-            var batch = new UmdfPacket[MulticastPacketSource.MaxBatchSize];
-            int delivered = 0;
-            int rounds = 0;
-            // Drain a few batches; the truncated one shouldn't appear in destination,
-            // but should bump the counter exactly once.
-            while (rounds++ < 5 && delivered < 2)
-            {
-                int n = src.ReceiveBatch(batch);
-                for (int i = 0; i < n; i++)
-                {
-                    // Only small payloads should ever be delivered.
-                    Assert.Equal(2, batch[i].Data.Length);
-                    batch[i].Lease?.Release();
-                }
-                delivered += n;
-            }
-
-            // Whether MSG_TRUNC was set or the heuristic fired, the counter should be ≥1.
-            // If the kernel silently dropped the oversized datagram before recvmmsg ever saw it
-            // (e.g. discarded at socket buffer enqueue), the counter may stay at 0; in that case
-            // the integration path isn't observable on this host but no test failure should result.
-            // Skip assertion in that environmental case.
-            if (src.TruncatedDatagramCount == 0) return;
-            Assert.True(src.TruncatedDatagramCount >= 1,
-                $"Expected at least one truncated datagram, got {src.TruncatedDatagramCount}");
+            batch[0].Release();
         }
     }
 
-    private static int GetEphemeralPort()
+    [Fact]
+    public void ReceiveBatch_TruncatedDatagramThenValidTraffic_RecoversWithoutRestart()
     {
-        using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        probe.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        return ((IPEndPoint)probe.LocalEndPoint!).Port;
+        if (!OperatingSystem.IsLinux()) return;
+
+        using var src = NewSource(ChannelType.IncrementalA, maxDatagramBytes: 1024);
+        int invocation = 0;
+        byte[] valid = [0x11, 0x22, 0x33, 0x44];
+        src._recvmmsgInvoker = (int fd, IntPtr msgvec, uint vlen, int flags, out int errno) =>
+        {
+            errno = 0;
+            invocation++;
+            if (invocation == 1)
+            {
+                WriteDatagram(msgvec, new byte[1024], (SocketFlags)LinuxNative.MSG_TRUNC);
+                return 1;
+            }
+
+            WriteDatagram(msgvec, valid, SocketFlags.None);
+            return 1;
+        };
+
+        var batch = new UmdfPacket[1];
+        Assert.Equal(0, src.ReceiveBatch(batch));
+        Assert.Equal(1, src.TruncatedDatagramCount);
+
+        Assert.Equal(1, src.ReceiveBatch(batch));
+        try
+        {
+            Assert.Equal(valid, batch[0].Data.ToArray());
+            Assert.Equal(1, src.TruncatedDatagramCount);
+        }
+        finally
+        {
+            batch[0].Release();
+        }
+    }
+
+    private static MulticastPacketSource NewSource(ChannelType type, int maxDatagramBytes = 0)
+    {
+        var config = new ChannelConfig(
+            ChannelId: 99,
+            Type: type,
+            MulticastGroup: IPAddress.Any,
+            Port: 0,
+            ReceiveBufferBytes: 1 * 1024 * 1024,
+            Transport: TransportKind.Unicast,
+            MaxDatagramBytes: maxDatagramBytes);
+        return new MulticastPacketSource(config, NullLogger<MulticastPacketSource>.Instance);
+    }
+
+    private static void WriteDatagram(IntPtr msgvec, byte[] payload, SocketFlags flags)
+    {
+        var header = Marshal.PtrToStructure<LinuxNative.Mmsghdr>(msgvec);
+        var iovec = Marshal.PtrToStructure<LinuxNative.Iovec>(header.msg_hdr.msg_iov);
+        Assert.True((nuint)payload.Length <= iovec.iov_len);
+        Marshal.Copy(payload, 0, iovec.iov_base, payload.Length);
+        header.msg_len = (uint)payload.Length;
+        header.msg_hdr.msg_flags = (int)flags;
+        Marshal.StructureToPtr(header, msgvec, fDeleteOld: false);
     }
 }

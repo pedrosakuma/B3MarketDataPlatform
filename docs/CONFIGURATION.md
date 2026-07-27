@@ -116,6 +116,7 @@ Optional channel fields:
 - `sourceAddress` — enables source-specific multicast (SSM), receiving only from the given sender IP.
 - `localAddress` — selects the local NIC/IP used for the multicast membership join (ASM or SSM).
 - `receiveBufferBytes` — per-socket UDP receive buffer size. When omitted, the consumer picks per-channel-type defaults: **16 MiB** for `IncrementalA`/`IncrementalB`, **8 MiB** for `SnapshotRecovery`, **2 MiB** for `InstrumentDefinition`. All values are still capped by `net.core.rmem_max`.
+- `maxDatagramBytes` — maximum size of one atomic UDP payload, distinct from the kernel queue sized by `receiveBufferBytes`. The default is the full IPv4 UDP payload maximum (**65,507 bytes**) for `SnapshotRecovery`, and **9,216 bytes** for other channel types. Datagrams above an explicitly lower cap are dropped whole and counted; they are never passed downstream partially. The consumer does not reassemble application-level fragments because the UMDF sender protocol defines each received UDP datagram as an atomic packet.
 
 Example — unicast (Docker Compose bridge):
 

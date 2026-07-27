@@ -221,6 +221,10 @@ static class MetricsBinder
                 () => PerSource(s => s.BatchedDatagrams),
                 unit: "{datagrams}", description: "Datagrams received via recvmmsg batched receive (avg batch = datagrams / syscalls)");
 
+            Meter.CreateObservableCounter("b3.umdf.transport.datagrams.truncated",
+                () => PerSource(s => s.TruncatedDatagramCount),
+                unit: "{datagrams}", description: "UDP datagrams dropped because they exceeded the configured per-datagram receive cap");
+
             Meter.CreateObservableCounter("b3.umdf.transport.membership.joins",
                 () => PerSource(s => s.MembershipJoins),
                 unit: "{events}", description: "IGMP joins on multicast sources (initial + recovery rejoins)");
