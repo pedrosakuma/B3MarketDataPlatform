@@ -83,16 +83,39 @@ public class Issue80TradeGapRecoveryTests
         SendOrder(bookManager, rptSeq: 13, orderId: 100);
         bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 14, ordersExpected: 0);
         Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(14u, bookManager.Books[SecurityId].LastRptSeq);
 
-        SendTrade(bookManager, rptSeq: 14, tradeId: 1);
-        SendTrade(bookManager, rptSeq: 14, tradeId: 1);
-        SendTrade(bookManager, rptSeq: 13, tradeId: 2);
+        SendTrade(bookManager, rptSeq: 13, tradeId: 1);
+        SendTrade(bookManager, rptSeq: 13, tradeId: 1);
+        SendTrade(bookManager, rptSeq: 12, tradeId: 2);
 
         Assert.Equal(1, recorder.TradeCount);
         Assert.Equal(2, bookManager.TradeRouteRejected);
+        Assert.Equal(14u, bookManager.Books[SecurityId].LastRptSeq);
         Assert.True(bookManager.TryGetTradeState(SecurityId, out var tradeState));
         Assert.Single(tradeState!.Ring.AsSpan());
         Assert.Equal(35_3400L, tradeState.LastTradePrice);
+    }
+
+    [Fact]
+    public void ColdStartNonMboHighWater_RejectsSnapshotWithUncoveredMboWindow()
+    {
+        var (bookManager, registry, _, recorder) = Create();
+
+        SendTrade(bookManager, rptSeq: 100, tradeId: 1);
+        Assert.Equal(SymbolState.Unknown, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, recorder.TradeCount);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 50, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Unknown, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, bookManager.SnapshotsRejectedReplayGap);
+        Assert.Equal(0u, bookManager.Books[SecurityId].LastRptSeq);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 99, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(99u, bookManager.Books[SecurityId].LastRptSeq);
     }
 
     [Fact]

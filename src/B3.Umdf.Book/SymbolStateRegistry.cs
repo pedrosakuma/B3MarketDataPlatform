@@ -492,7 +492,12 @@ public sealed class SymbolStateRegistry
             if (minHeal > 0 && snapshotRptSeq < minHeal)
                 return true;
 
-            uint drainTo = entry.LastRptSeq[mboIdx];
+            // Coverage must extend through the global wire high-water, not only
+            // the last observed MBO message. On cold start, a non-MBO message at
+            // rptSeq=N proves that any unknown sequences before N could have
+            // contained MBO mutations; a snapshot below that window is safe only
+            // when buffered MBO or observed non-MBO messages cover every sequence.
+            uint drainTo = entry.ObservedRptSeq;
             if (snapshotRptSeq >= drainTo)
                 return true;
 

@@ -254,13 +254,16 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     /// <summary>
     /// Updates the book's global per-symbol
     /// <see cref="OrderBook.LastRptSeq"/>. Called from every MBO/Trade
-    /// handler instead of writing <c>LastRptSeq</c> directly.
+    /// handler instead of writing <c>LastRptSeq</c> directly. The published
+    /// watermark is monotonic so delayed semantic messages cannot regress a
+    /// snapshot or later global sequence baseline.
     /// The registry is the source of truth, so we skip the shadow tracker
     /// (which would double-count gaps).
     /// </summary>
     private void TrackMboRptSeq(OrderBook book, uint received)
     {
-        book.LastRptSeq = received;
+        if (received > book.LastRptSeq)
+            book.LastRptSeq = received;
     }
 
     /// <summary>
