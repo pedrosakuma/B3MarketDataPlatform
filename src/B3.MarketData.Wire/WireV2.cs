@@ -97,6 +97,7 @@ public enum MessageType : ushort
     SecurityDefinition = 0x00B0,
     PriceBand = 0x00B1,
     Auction = 0x00B2,
+    InstrumentStatus = 0x00B3,
 
     // Server -> Client: news (fragmented)
     NewsBegin = 0x0090,
@@ -139,6 +140,7 @@ public enum ServerCapabilities : uint
     None = 0,
     SnapshotOnSubscribe = 0x0001,
     SymbolDelistedNotification = 0x0002,
+    InstrumentStatus = 0x0004,
 }
 
 /// <summary>Optional client features advertised in <see cref="MessageType.ClientHello"/>. Append-only; 0 today.</summary>

@@ -108,6 +108,7 @@ Get               0x0003        Unsubscribed        0x0012
                                 SecurityDefinition  0x00B0
                                 PriceBand           0x00B1
                                 Auction             0x00B2
+                                InstrumentStatus    0x00B3
 ```
 
 ## Client → Server
@@ -133,7 +134,7 @@ two known `u32` fields are ignored (min-length rule).
 |-------|------|---------|
 | `0x00` | None | Treated as `All` |
 | `0x01` | Book | `BookSnapshot` + order incrementals (`OrderAdded`/`Updated`/`Deleted`, `MarketTierUpdate`, `BookCleared`). **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
-| `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates |
+| `0x02` | Info | `InfoSnapshot` + incremental market-data / status updates, including non-conflated `InstrumentStatus` halt/resume transitions |
 | `0x03` | All  | `Book` + `Info` (legacy default; **does not** include News, MBP, Trades, SecurityDefinition, PriceBand, or Auction) |
 | `0x04` | News | `NewsBegin` / `NewsChunk` / `NewsEnd` reassembled news deliveries (per-symbol *and* global) |
 | `0x08` | Mbp | `LevelSnapshot` + `LevelUpdate`/`LevelDeleted` aggregated price-level stream (conflated by `(secId, side, price)`). See [`docs/perf/mbp-stream.md`](perf/mbp-stream.md). Shared frames (`BookCleared`, `MarketTierUpdate`, `CandleUpdate`) are also delivered. **Does NOT include `Trade`/`TradeBust`** — those require `Trades` (`0x10`). |
@@ -193,7 +194,10 @@ Total length = 18 bytes (8 header + 4 flags + 1 symLen + 5 symbol).
 
 **ServerHello** is the **first** server-initiated frame on every connection. It
 advertises the server's `protocolVersion` and a `serverCapabilities` bitmask
-(`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification; append-only).
+(`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification,
+`0x04` InstrumentStatus; append-only). Clients use the InstrumentStatus bit to
+distinguish an older server that cannot emit `0x00B3` from a capable server that
+has simply not observed an administrative status yet.
 `SubscribeOk.flags` echoes the **accepted** `DataFlags` (`u32`) after the server
 masks off unknown/unimplemented bits requested by the client.
 
@@ -252,6 +256,63 @@ bitfield from `AuctionImbalance_19` (low 16 bits): `0x0100` =
 `Balanced`. The SDK decodes it into the
 `B3.MarketData.WebSocketClient.AuctionImbalanceCondition` enum;
 unrecognised combinations map to `Unknown`.
+
+### InstrumentStatus (included in `DataFlags.Info`)
+
+| Message | Type | Payload |
+|---------|------|---------|
+| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32][deliveryKind u8]` |
+
+This is the dedicated, non-conflated transition surface for administrative
+single-instrument halt/resume. It is decoded from the existing schema-generated
+UMDF **`SecurityStatus_3` template (id 3)**; there is no separate
+`InstrumentStatus_NN` template in B3 schema 2.2.0. The matching venue uses the
+otherwise schema-reserved `securityTradingEvent` values `1` (halt) and `2`
+(resume), while `securityTradingStatus`, `transactTime`, and `rptSeq` supply
+`newStatus`, `sourceTimestampNanos`, and `rptSeq`.
+
+`previousStatus=255` means the platform had no prior status cached,
+`haltReason=255` means the upstream frame supplied no detailed operator reason,
+and `rptSeq=0` means unavailable. The venue preserves the underlying trading
+phase during an administrative halt, so `previousStatus` and `newStatus` may
+both be `17` (OPEN); consumers should use `transition`/the SDK's `IsHalted`
+property to identify the current administrative state.
+
+`deliveryKind` is append-only: `0` = live source transition, `1` = cached
+subscribe/reconnect snapshot. Snapshot frames deliberately retain the original
+source timestamp and RptSeq for provenance; consumers MUST check
+`deliveryKind`/`InstrumentStatusEvent.IsSnapshot` before running one-shot
+transition side effects. SDKs decoding a legacy frame without this trailing
+byte default it to live transition.
+
+The current source frame does **not** carry the operator's detailed halt reason
+(`RegulatoryHalt`, `NewsHold`, etc.). `transition` exposes the exact available
+marker (`1` = halted, `2` = resumed), while `haltReason` is null/255. Transition
+kind is deliberately not presented as a reason.
+
+Authoritative upstream evidence (B3MatchingPlatform commit
+`0d423c8f6cecf647d57adf85ebdd6f539b0c8214`):
+
+- [`InstrumentHaltedEvent`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Matching/Events.cs)
+  carries `HaltReason`, but
+  [`ChannelDispatcher.Sinks.OnInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Exchange.Core/ChannelDispatcher.Sinks.cs)
+  does not pass it to the encoder.
+- [`UmdfFrameBuilder.WriteInstrumentHalted`](https://github.com/pedrosakuma/B3MatchingPlatform/blob/0d423c8f6cecf647d57adf85ebdd6f539b0c8214/src/B3.Umdf.WireEncoder/UmdfFrameBuilder.cs)
+  emits `SecurityStatus_3` with only `securityTradingEvent=1`.
+- Schema 2.2.0 defines no detailed halt-reason field and repository code search
+  finds no `InstrumentStatus_NN` template.
+
+The missing upstream contract is tracked by
+[`B3MatchingPlatform#581`](https://github.com/pedrosakuma/B3MatchingPlatform/issues/581);
+until it lands, this frame cannot satisfy the detailed-reason portion of
+`B3MarketDataPlatform#73`.
+
+The current state is cached and emitted with `deliveryKind=1` after
+`InfoSnapshot` on every Info subscribe/re-subscribe. Live frames use
+`deliveryKind=0`. The normal `InfoSnapshot.TradingStatus` update remains
+unchanged for compatibility, and older clients safely skip the additive
+`0x00B3` opcode. SDK decoders validate the minimum payload and symbol length;
+malformed frames are logged and skipped without tearing down the connection.
 
 ### SecurityDefinition (opt-in via `DataFlags.SecurityDefinition`)
 

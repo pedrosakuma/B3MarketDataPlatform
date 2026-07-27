@@ -265,6 +265,7 @@ public class WebSocketHostIntegrationTests
             Assert.False(string.IsNullOrEmpty(buildVersion), "ServerHello.buildVersion must be non-empty");
             Assert.True(capabilities.HasFlag(ServerCapabilities.SnapshotOnSubscribe));
             Assert.True(capabilities.HasFlag(ServerCapabilities.SymbolDelistedNotification));
+            Assert.True(capabilities.HasFlag(ServerCapabilities.InstrumentStatus));
 
             await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
         }

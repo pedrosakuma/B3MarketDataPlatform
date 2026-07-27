@@ -80,6 +80,12 @@ public sealed class InstrumentInfo
     public int? TradingStatus { get; set; }
     public int? TradingEvent { get; set; }
     public ulong? TradSesOpenTime { get; set; }
+    /// <summary>
+    /// Last administrative halt/resume state decoded from the proprietary
+    /// <c>SecurityStatus_3.securityTradingEvent</c> extension. Retained so
+    /// late/reconnecting Info subscribers can bootstrap current state.
+    /// </summary>
+    public InstrumentStatusUpdate? AdministrativeStatus { get; set; }
 
     // SecurityDefinition / group tracking
     public string? SecurityGroup { get; set; }
@@ -208,6 +214,7 @@ public sealed class InstrumentInfo
         TradingStatus = null;
         TradingEvent = null;
         TradSesOpenTime = null;
+        AdministrativeStatus = null;
         SecurityGroup = null;
         FollowsGroupStatus = true;
         Symbol = null;

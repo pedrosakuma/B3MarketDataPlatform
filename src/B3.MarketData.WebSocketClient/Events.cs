@@ -12,6 +12,7 @@ public enum ServerCapabilities : uint
     None = 0,
     SnapshotOnSubscribe = 0x0001,
     SymbolDelistedNotification = 0x0002,
+    InstrumentStatus = 0x0004,
 }
 
 /// <summary>Connection state surfaced via <see cref="MarketDataClient.ConnectionStateChanged"/>.</summary>
@@ -715,4 +716,101 @@ public sealed class AuctionEvent
     /// <summary>Latest <c>RptSeq</c> (widened to <see cref="long"/>) from
     /// either source. Null when not provided.</summary>
     public long? RptSeq { get; init; }
+}
+
+/// <summary>
+/// Administrative state transition carried by the proprietary
+/// <c>SecurityStatus_3.securityTradingEvent</c> extension.
+/// </summary>
+public enum InstrumentStatusTransitionKind : byte
+{
+    Unknown = 0,
+    Halted = 1,
+    Resumed = 2,
+}
+
+/// <summary>
+/// Operator-supplied administrative halt reason. The current upstream UMDF
+/// contract does not transmit this value, so <see cref="InstrumentStatusEvent.HaltReason"/>
+/// remains null until B3MatchingPlatform issue #581 supplies it.
+/// </summary>
+public enum InstrumentHaltReason : byte
+{
+    Unknown = 0,
+    RegulatoryHalt = 1,
+    VolatilityCircuitBreaker = 2,
+    NewsHold = 3,
+    PendingDisclosure = 4,
+}
+
+/// <summary>
+/// Distinguishes a live source transition from cached state replayed during
+/// subscribe/reconnect bootstrap.
+/// </summary>
+public enum InstrumentStatusDeliveryKind : byte
+{
+    LiveTransition = 0,
+    Snapshot = 1,
+    Unknown = byte.MaxValue,
+}
+
+/// <summary>
+/// A non-conflated instrument halt/resume transition decoded from UMDF
+/// <c>SecurityStatus_3</c>.
+/// </summary>
+public sealed class InstrumentStatusEvent
+{
+    public ulong SecurityId { get; init; }
+    public string Symbol { get; init; } = "";
+    public DateTime ReceivedUtc { get; init; }
+
+    /// <summary>Status cached before this source frame, or null on first sight.</summary>
+    public int? PreviousStatus { get; init; }
+
+    /// <summary>
+    /// <c>SecurityStatus_3.securityTradingStatus</c>. The matching venue preserves
+    /// the underlying trading phase during an administrative halt, so halt/open
+    /// can legitimately report the same previous and new status.
+    /// </summary>
+    public int NewStatus { get; init; }
+
+    /// <summary>
+    /// Halt/resume transition marker from
+    /// <c>SecurityStatus_3.securityTradingEvent</c>.
+    /// </summary>
+    public InstrumentStatusTransitionKind Transition { get; init; }
+
+    /// <summary>Unmodified transition marker for forward compatibility.</summary>
+    public byte RawTransitionCode { get; init; }
+
+    /// <summary>
+    /// Detailed operator halt reason, or null because the current upstream
+    /// <c>SecurityStatus_3</c> frame does not carry one.
+    /// </summary>
+    public InstrumentHaltReason? HaltReason { get; init; }
+
+    /// <summary>Unmodified detailed reason code, or null when absent on the wire.</summary>
+    public byte? RawHaltReasonCode { get; init; }
+
+    /// <summary>Exchange source timestamp, UTC nanoseconds since Unix epoch.</summary>
+    public ulong SourceTimestampNanos { get; init; }
+
+    /// <summary>
+    /// Original per-instrument UMDF sequence, or null when unavailable.
+    /// Snapshot delivery may replay the original non-zero value; use
+    /// <see cref="IsSnapshot"/> before triggering transition side effects.
+    /// </summary>
+    public uint? RptSeq { get; init; }
+
+    /// <summary>
+    /// Delivery context. Snapshot events describe already-known current state;
+    /// consumers must not repeat one-shot transition side effects for them.
+    /// </summary>
+    public InstrumentStatusDeliveryKind DeliveryKind { get; init; }
+
+    /// <summary>Unmodified delivery-kind byte for forward compatibility.</summary>
+    public byte RawDeliveryKind { get; init; }
+
+    public bool IsHalted => Transition == InstrumentStatusTransitionKind.Halted;
+    public bool IsSnapshot => DeliveryKind == InstrumentStatusDeliveryKind.Snapshot;
 }

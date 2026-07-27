@@ -256,6 +256,34 @@ public class SubscriptionManagerTests
     }
 
     [Fact]
+    public void PublishInstrumentStatus_RoutesOnlyToInfoSubscribers()
+    {
+        using var sm = new SubscriptionManager();
+        using var infoSubscriber = new ClientSession(new FakeWebSocket(), channelCapacity: 16);
+        using var bookOnlySubscriber = new ClientSession(new FakeWebSocket(), channelCapacity: 16);
+        sm.RegisterClient(infoSubscriber);
+        sm.RegisterClient(bookOnlySubscriber);
+
+        const ulong securityId = 42;
+        sm.AddSubscriptionForTest(infoSubscriber.Id, securityId, DataFlags.Info);
+        sm.AddSubscriptionForTest(bookOnlySubscriber.Id, securityId, DataFlags.Book);
+        int infoBefore = infoSubscriber.QueueDepth;
+        int bookBefore = bookOnlySubscriber.QueueDepth;
+
+        var update = new InstrumentStatusUpdate(
+            PreviousStatus: 17,
+            NewStatus: 17,
+            TransitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
+            HaltReasonCode: null,
+            SourceTimestampNanos: 123,
+            RptSeq: 9);
+        sm.PublishInstrumentStatus(securityId, "PETR4", in update);
+
+        Assert.Equal(infoBefore + 1, infoSubscriber.QueueDepth);
+        Assert.Equal(bookBefore, bookOnlySubscriber.QueueDepth);
+    }
+
+    [Fact]
     public void AppSettings_DefaultValues()
     {
         var settings = new AppSettings();

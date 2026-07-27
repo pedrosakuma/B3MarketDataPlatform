@@ -29,7 +29,9 @@ internal static class SnapshotEmitter
     /// tests can assert against it without re-deriving the bitmask.
     /// </summary>
     internal const ServerCapabilities AdvertisedCapabilities =
-        ServerCapabilities.SnapshotOnSubscribe | ServerCapabilities.SymbolDelistedNotification;
+        ServerCapabilities.SnapshotOnSubscribe
+        | ServerCapabilities.SymbolDelistedNotification
+        | ServerCapabilities.InstrumentStatus;
 
     /// <summary>
     /// Send a <see cref="MessageType.ServerHello"/> as the very first server-initiated
@@ -169,6 +171,22 @@ internal static class SnapshotEmitter
     {
         var buf = new byte[WireProtocol.InfoSnapshotMaxSize];
         int len = WireProtocol.WriteInfoSnapshot(buf, securityId, info);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
+    }
+
+    /// <summary>
+    /// Send the cached current administrative halt/resume state to a late or
+    /// reconnecting Info subscriber. No-op until a source transition was observed.
+    /// </summary>
+    public static bool SendInstrumentStatusSnapshot(
+        ClientSession session,
+        ulong securityId,
+        InstrumentInfo info)
+    {
+        if (info.AdministrativeStatus is not { } status) return true;
+        var buf = new byte[WireProtocol.InstrumentStatusMaxSize];
+        int len = WireProtocol.WriteInstrumentStatus(
+            buf, securityId, info.Symbol, in status, isSnapshot: true);
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf, 0, len));
     }
 

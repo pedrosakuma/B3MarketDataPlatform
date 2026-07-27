@@ -21,7 +21,9 @@ public enum SubscribeFlags : uint
 
     /// <summary>
     /// <c>InfoSnapshot</c> + incremental info updates (carries
-    /// <c>LastTradePrice</c>, <c>LastTradeSize</c>, status, etc.).
+    /// <c>LastTradePrice</c>, <c>LastTradeSize</c>, status, etc.), including
+    /// dedicated <see cref="MarketDataClient.InstrumentStatus"/> halt/resume
+    /// transitions.
     /// </summary>
     Info = 0x02,
 

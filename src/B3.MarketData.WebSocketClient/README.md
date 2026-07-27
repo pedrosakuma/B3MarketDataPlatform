@@ -26,6 +26,8 @@ await using var client = new MarketDataClient(new MarketDataClientOptions
 
 client.Trade += t => Console.WriteLine($"{t.Symbol}  {t.Price:F4} x {t.Qty}");
 client.LevelUpdate += l => Console.WriteLine($"{l.Symbol} {l.Side} {l.Price} qty={l.TotalQty}");
+client.InstrumentStatus += s => Console.WriteLine(
+    $"{s.Symbol} transition={s.Transition} snapshot={s.IsSnapshot} status={s.NewStatus} haltReason={s.HaltReason?.ToString() ?? "unavailable"}");
 
 await client.ConnectAsync();
 await client.SubscribeAsync("PETR4", SubscribeFlags.Trades | SubscribeFlags.Info | SubscribeFlags.Mbp);
@@ -42,7 +44,8 @@ Includes:
   (`BookSnapshot`, `OrderAdded/Updated/Deleted`, `BookCleared`,
   `MarketTierUpdate`), MBP (`LevelSnapshot`, `LevelUpdate`,
   `LevelDeleted`), candles (snapshot + update), rankings, per-symbol
-  stale status, recovery progress, and reassembled news.
+  stale status, instrument halt/resume transitions, recovery progress, and
+  reassembled news.
 - **Opt-in materialized book layer (`IBookFeed`/`IBookView`)** —
   maintains an in-memory L3 book per symbol from the MBO event stream
   and exposes derived top-of-book. Stale-flag bridged from the

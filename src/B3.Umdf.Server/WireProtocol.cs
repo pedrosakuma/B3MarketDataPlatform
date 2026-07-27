@@ -1001,6 +1001,57 @@ public static class WireProtocol
         return totalLen;
     }
 
+    // ───────────────────────────────────────────────────────────────────────
+    //  InstrumentStatus frame (0x00B3) — SecurityStatus_3 halt/resume marker
+    // ───────────────────────────────────────────────────────────────────────
+
+    public const byte InstrumentStatusUnavailable = byte.MaxValue;
+    public const byte InstrumentStatusDeliveryLiveTransition = 0;
+    public const byte InstrumentStatusDeliverySnapshot = 1;
+    public const int InstrumentStatusMaxSize =
+        FramingHeaderSize + 8 + 1 + 255 + 1 + 1 + 1 + 1 + 8 + 4 + 1;
+
+    /// <summary>
+    /// Serialize a halt/resume transition decoded from <c>SecurityStatus_3</c>.
+    /// Layout:
+    /// <c>[secId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
+    /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]
+    /// [deliveryKind u8]</c>.
+    /// Unavailable previous status / halt reason / RptSeq are encoded as
+    /// 255 / 255 / 0 respectively.
+    /// </summary>
+    public static int WriteInstrumentStatus(
+        Span<byte> dest,
+        ulong securityId,
+        string? symbol,
+        in InstrumentStatusUpdate update,
+        bool isSnapshot = false)
+    {
+        int offset = FramingHeaderSize;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], securityId); offset += 8;
+
+        var symBytes = Encoding.UTF8.GetBytes(symbol ?? string.Empty);
+        if (symBytes.Length > 255)
+            symBytes = symBytes[..255];
+        dest[offset++] = (byte)symBytes.Length;
+        symBytes.CopyTo(dest[offset..]); offset += symBytes.Length;
+
+        dest[offset++] = update.PreviousStatus is { } previous
+            ? checked((byte)previous)
+            : InstrumentStatusUnavailable;
+        dest[offset++] = checked((byte)update.NewStatus);
+        dest[offset++] = update.TransitionCode;
+        dest[offset++] = update.HaltReasonCode ?? InstrumentStatusUnavailable;
+        BinaryPrimitives.WriteUInt64LittleEndian(dest[offset..], update.SourceTimestampNanos); offset += 8;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[offset..], update.RptSeq ?? 0); offset += 4;
+        dest[offset++] = isSnapshot
+            ? InstrumentStatusDeliverySnapshot
+            : InstrumentStatusDeliveryLiveTransition;
+
+        WriteFramingHeader(dest, offset, MessageType.InstrumentStatus);
+        return offset;
+    }
+
 }
 
 public readonly struct RankingEntry

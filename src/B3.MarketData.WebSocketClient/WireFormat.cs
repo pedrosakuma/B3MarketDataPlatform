@@ -539,6 +539,80 @@ internal static class WireFormat
         };
     }
 
+    /// <summary>
+    /// Safely parse an <see cref="MessageType.InstrumentStatus"/> frame.
+    /// Layout:
+    /// <c>[securityId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
+    /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]
+    /// [deliveryKind u8?]</c>. A missing trailing delivery kind is treated as
+    /// <see cref="InstrumentStatusDeliveryKind.LiveTransition"/> for compatibility.
+    /// </summary>
+    public static bool TryReadInstrumentStatus(
+        ReadOnlySpan<byte> payload,
+        DateTime receivedUtc,
+        out InstrumentStatusEvent status)
+    {
+        const int prefixSize = 8 + 1;
+        const int fixedTailSize = 1 + 1 + 1 + 1 + 8 + 4;
+        if (payload.Length < prefixSize + fixedTailSize)
+        {
+            status = null!;
+            return false;
+        }
+
+        ulong securityId = BinaryPrimitives.ReadUInt64LittleEndian(payload);
+        int offset = 8;
+        int symbolLength = payload[offset++];
+        if (symbolLength > payload.Length - offset - fixedTailSize)
+        {
+            status = null!;
+            return false;
+        }
+
+        string symbol = symbolLength == 0
+            ? string.Empty
+            : Encoding.UTF8.GetString(payload.Slice(offset, symbolLength));
+        offset += symbolLength;
+
+        byte previousStatus = payload[offset++];
+        byte newStatus = payload[offset++];
+        byte transition = payload[offset++];
+        byte haltReason = payload[offset++];
+        ulong sourceTimestampNanos = BinaryPrimitives.ReadUInt64LittleEndian(payload[offset..]);
+        offset += 8;
+        uint rptSeq = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+        offset += 4;
+        byte deliveryKind = payload.Length > offset
+            ? payload[offset]
+            : (byte)InstrumentStatusDeliveryKind.LiveTransition;
+
+        status = new InstrumentStatusEvent
+        {
+            SecurityId = securityId,
+            Symbol = symbol,
+            ReceivedUtc = receivedUtc,
+            PreviousStatus = previousStatus == byte.MaxValue ? null : previousStatus,
+            NewStatus = newStatus,
+            Transition = Enum.IsDefined(typeof(InstrumentStatusTransitionKind), transition)
+                ? (InstrumentStatusTransitionKind)transition
+                : InstrumentStatusTransitionKind.Unknown,
+            RawTransitionCode = transition,
+            HaltReason = haltReason == byte.MaxValue
+                ? null
+                : Enum.IsDefined(typeof(InstrumentHaltReason), haltReason)
+                    ? (InstrumentHaltReason)haltReason
+                    : InstrumentHaltReason.Unknown,
+            RawHaltReasonCode = haltReason == byte.MaxValue ? null : haltReason,
+            SourceTimestampNanos = sourceTimestampNanos,
+            RptSeq = rptSeq == 0 ? null : rptSeq,
+            DeliveryKind = Enum.IsDefined(typeof(InstrumentStatusDeliveryKind), deliveryKind)
+                ? (InstrumentStatusDeliveryKind)deliveryKind
+                : InstrumentStatusDeliveryKind.Unknown,
+            RawDeliveryKind = deliveryKind,
+        };
+        return true;
+    }
+
     // SBE ImbalanceCondition bit positions (uint16):
     //   bit 8 (0x0100) = ImbalanceMoreBuyers
     //   bit 9 (0x0200) = ImbalanceMoreSellers
