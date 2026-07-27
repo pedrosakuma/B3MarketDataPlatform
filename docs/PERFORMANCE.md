@@ -97,6 +97,7 @@ Events are coalesced into a single WS frame via three complementary windows:
 | ----- | ------ | ------- |
 | **Server-side flush** (per group) | `UMDF_SERVER_FLUSH_WINDOW_MS` (binary default `0` = per packet; **compose default `10`**) | When `> 0`, defers `FlushBuffers` so conflation spans multiple upstream B3 packets — `LEVEL_UPDATE` (last-write-wins per `secId,side,price`), `CANDLE_UPDATE` (one per security per window), `TRADE` (same-price summation), `OrderAdded`+`OrderDeleted` cancellation all extend across the window |
 | **Server-side flush** (per packet) | 1 packet (per `OnBatchComplete`) | Default. Conflation effective only within a single B3 packet |
+| **Opt-in cadence tier** | `ConflatedMbp` at an allowed 100/250/500 ms cadence | Broadcaster-thread, cross-packet last-value-wins MBP/book-context buffering shared by every subscriber on that cadence. Ordinary Book/MBP paths are unchanged; snapshot-on-subscribe remains immediate. |
 | **Per-client write loop** | `UMDF_CLIENT_COALESCE_WINDOW_MS` (default 10 ms) | After the first item, wait *N* ms before draining → larger frames, fewer pipe-lock acquisitions |
 
 The two server-side modes are mutually exclusive: `UMDF_SERVER_FLUSH_WINDOW_MS=0`
@@ -104,6 +105,14 @@ preserves legacy per-packet behavior; any positive value enables debounce-style
 deferral (flush fires `WindowMs` after the first dirty event since the previous
 flush). Forced flushes still occur at: pre-snapshot cutoffs (subscribe/get
 requests), trade-bust ordering boundaries, and shutdown.
+
+The opt-in cadence tier is independent of the process-wide flush window. It
+consumes the already-serialized MBP/book-context frames, retains one latest
+value per semantic key per allowed cadence, then fans that shared result out.
+Per-security copy-on-write routing indexes separate immediate MBP recipients
+from each active cadence: event-time work is O(active cadence set), not
+O(conflated consumers), and consumers are enumerated only when a cadence
+releases. Trades are not cadence-buffered or replaced by a bespoke summary frame.
 
 Empirically, raising the per-client window from 0 → 10 ms reduces total
 syscalls by ~6× without measurably increasing client-perceived latency for

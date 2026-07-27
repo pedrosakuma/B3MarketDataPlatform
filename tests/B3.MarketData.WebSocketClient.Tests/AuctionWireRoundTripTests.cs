@@ -120,9 +120,9 @@ public class AuctionWireRoundTripTests
     }
 
     [Fact]
-    public void SubscribeFlags_Everything_Is0xFF()
+    public void SubscribeFlags_Everything_RemainsAdditiveChannelsOnly()
     {
-        // After adding Auction (0x80), Everything should cover all channels.
-        Assert.Equal((byte)0xFF, (byte)SubscribeFlags.Everything);
+        Assert.Equal(0xFFu, (uint)SubscribeFlags.Everything);
+        Assert.False(SubscribeFlags.Everything.HasFlag(SubscribeFlags.ConflatedMbp));
     }
 }

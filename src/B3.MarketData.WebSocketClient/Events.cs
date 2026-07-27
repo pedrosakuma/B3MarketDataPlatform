@@ -13,6 +13,7 @@ public enum ServerCapabilities : uint
     SnapshotOnSubscribe = 0x0001,
     SymbolDelistedNotification = 0x0002,
     InstrumentStatus = 0x0004,
+    ConflatedMbpCadence = 0x0008,
 }
 
 /// <summary>Connection state surfaced via <see cref="MarketDataClient.ConnectionStateChanged"/>.</summary>
@@ -219,11 +220,21 @@ public enum SubscribeErrorCode : byte
     Unknown = 0,
     UnknownSymbol = 0x01,
     NotReady = 0x02,
+    InvalidCadence = 0x03,
+    InvalidFlags = 0x04,
 }
 
 public readonly record struct SubscribeErrorEvent(
     string Symbol,
     SubscribeErrorCode ErrorCode,
+    DateTime ReceivedUtc);
+
+/// <summary>Server acknowledgement of the accepted channels and cadence.</summary>
+public readonly record struct SubscriptionAcceptedEvent(
+    ulong SecurityId,
+    string Symbol,
+    SubscribeFlags Flags,
+    TimeSpan? ConflationInterval,
     DateTime ReceivedUtc);
 
 public readonly record struct ConnectionStateChangedEvent(

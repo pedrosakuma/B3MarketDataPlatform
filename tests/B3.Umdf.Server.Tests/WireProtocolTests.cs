@@ -5,6 +5,53 @@ namespace B3.Umdf.Server.Tests;
 
 public class WireProtocolTests
 {
+    [Fact]
+    public void ReadSubscribe_ParsesOptionalConflatedCadence()
+    {
+        Span<byte> payload = stackalloc byte[4 + 1 + 5 + 2];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, (uint)DataFlags.ConflatedMbp);
+        payload[4] = 5;
+        "PETR4"u8.CopyTo(payload[5..]);
+        BinaryPrimitives.WriteUInt16LittleEndian(payload[10..], 250);
+
+        var (symbol, flags, cadenceMs) = WireProtocol.ReadSubscribe(payload);
+
+        Assert.Equal("PETR4", symbol);
+        Assert.Equal(DataFlags.ConflatedMbp, flags);
+        Assert.Equal((ushort)250, cadenceMs);
+    }
+
+    [Fact]
+    public void ReadSubscribe_NormalizesMbpFallbackToConflatedTier()
+    {
+        Span<byte> payload = stackalloc byte[4 + 1 + 5 + 2];
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload,
+            (uint)(DataFlags.Mbp | DataFlags.ConflatedMbp));
+        payload[4] = 5;
+        "PETR4"u8.CopyTo(payload[5..]);
+        BinaryPrimitives.WriteUInt16LittleEndian(payload[10..], 500);
+
+        var (_, flags, _) = WireProtocol.ReadSubscribe(payload);
+
+        Assert.Equal(DataFlags.ConflatedMbp, flags);
+    }
+
+    [Fact]
+    public void WriteSubscribeOk_AppendsAcceptedCadence()
+    {
+        Span<byte> frame = stackalloc byte[64];
+        int len = WireProtocol.WriteSubscribeOk(
+            frame,
+            42,
+            DataFlags.ConflatedMbp,
+            "PETR4",
+            500);
+
+        Assert.Equal((uint)len, BinaryPrimitives.ReadUInt32LittleEndian(frame));
+        Assert.Equal((ushort)500, BinaryPrimitives.ReadUInt16LittleEndian(frame[(len - 2)..]));
+    }
+
     private static (int length, MessageType type) ReadFraming(Span<byte> buf) =>
         ((int)BinaryPrimitives.ReadUInt32LittleEndian(buf), (MessageType)BinaryPrimitives.ReadUInt16LittleEndian(buf[4..]));
 

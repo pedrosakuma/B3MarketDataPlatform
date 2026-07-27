@@ -26,6 +26,10 @@ public sealed class MetricsRegistry
     public static readonly Counter<long> WsSlowDisconnects = Meter.CreateCounter<long>("umdf.ws.slow_disconnects");
     public static readonly Counter<long> WsSubscriptions = Meter.CreateCounter<long>("umdf.ws.subscriptions");
     public static readonly Counter<long> WsMessagesConflated = Meter.CreateCounter<long>("umdf.ws.messages.conflated");
+    public static readonly Counter<long> ConflatedCadenceFramesBuffered =
+        Meter.CreateCounter<long>("umdf.ws.conflated_cadence.frames_buffered");
+    public static readonly Counter<long> ConflatedCadenceFramesEmitted =
+        Meter.CreateCounter<long>("umdf.ws.conflated_cadence.frames_emitted");
 
     /// <summary>
     /// Per-publisher counter of broadcast payloads dropped because a client's outbound
@@ -56,6 +60,7 @@ public sealed class MetricsRegistry
     /// at least one active subscriber. Set once at startup.
     /// </summary>
     public static Func<int>? ActiveSubscribedSymbolsProvider { get; set; }
+    public static Func<int>? ActiveConflatedSubscriptionsProvider { get; set; }
 
     static MetricsRegistry()
     {
@@ -63,5 +68,9 @@ public sealed class MetricsRegistry
             "umdf.ws.subscribed_symbols",
             static () => ActiveSubscribedSymbolsProvider?.Invoke() ?? 0,
             description: "Distinct securities with at least one active WebSocket subscriber.");
+        Meter.CreateObservableGauge(
+            "umdf.ws.conflated_cadence.subscriptions",
+            static () => ActiveConflatedSubscriptionsProvider?.Invoke() ?? 0,
+            description: "Active fixed-cadence MBP subscriptions.");
     }
 }

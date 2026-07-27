@@ -124,12 +124,19 @@ public enum DataFlags : uint
     SecurityDefinition = 0x0020,
     PriceBand = 0x0040,
     Auction = 0x0080,
+    /// <summary>
+    /// Fixed-cadence, last-value-wins MBP stream. Requires the optional
+    /// <c>conflationIntervalMs</c> field on Subscribe/Get.
+    /// </summary>
+    ConflatedMbp = 0x0100,
 
     /// <summary>Legacy convenience: Book + Info.</summary>
     All = Book | Info,
 
-    /// <summary>Every channel this build knows about. NOT all-ones — new
-    /// channels are added here explicitly so unknown bits stay unrequested.</summary>
+    /// <summary>Every additive channel this build knows about. Alternative
+    /// parameterized tiers such as <see cref="ConflatedMbp"/> are excluded.</summary>
+    // ConflatedMbp is intentionally excluded: it is an alternative delivery
+    // tier for Mbp and requires a cadence parameter, not an additive channel.
     AllKnown = Book | Info | News | Mbp | Trades | SecurityDefinition | PriceBand | Auction,
 }
 
@@ -141,6 +148,7 @@ public enum ServerCapabilities : uint
     SnapshotOnSubscribe = 0x0001,
     SymbolDelistedNotification = 0x0002,
     InstrumentStatus = 0x0004,
+    ConflatedMbpCadence = 0x0008,
 }
 
 /// <summary>Optional client features advertised in <see cref="MessageType.ClientHello"/>. Append-only; 0 today.</summary>
@@ -164,6 +172,8 @@ public enum SubscribeErrorCode : byte
 {
     UnknownSymbol = 0x01,
     NotReady = 0x02,
+    InvalidCadence = 0x03,
+    InvalidFlags = 0x04,
 }
 
 /// <summary>Framing-header read/write helpers and the blittable fast path.</summary>

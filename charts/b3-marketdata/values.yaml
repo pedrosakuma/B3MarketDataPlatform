@@ -23,6 +23,10 @@ fullnameOverride: ""
 # -- WebSocket / health port (trading-host IReferencePrice + browser clients).
 wsPort: 8080
 
+# -- Comma-separated safe fixed cadences accepted by ConflatedMbp subscriptions.
+# The server enforces an absolute 100 ms minimum.
+conflatedCadencesMs: "100,250,500"
+
 # -- UMDF unicast UDP ingest ports (matching → marketdata). Keys mirror the
 # channel roles in config/marketdata-transport.json — the ConfigMap below is
 # rendered from these same values so the container ports, Service ports, and

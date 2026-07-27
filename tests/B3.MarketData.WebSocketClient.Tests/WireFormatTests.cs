@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using B3.MarketData.Wire;
 using B3.MarketData.WebSocketClient;
 
@@ -79,6 +80,73 @@ public class WireFormatTests
         Assert.Equal((byte)5, buf[12]);
         Assert.Equal((byte)'P', buf[13]);
         Assert.Equal((byte)'4', buf[17]);
+    }
+
+    [Fact]
+    public void Subscribe_ConflatedMbp_AppendsCadence()
+    {
+        Span<byte> buf = stackalloc byte[64];
+        int len = WireFormat.WriteSubscribe(buf, SubscribeFlags.ConflatedMbp, "PETR4", 250);
+
+        Assert.Equal((uint)len, BinaryPrimitives.ReadUInt32LittleEndian(buf));
+        Assert.Equal(
+            (uint)(SubscribeFlags.ConflatedMbp | SubscribeFlags.Mbp),
+            BinaryPrimitives.ReadUInt32LittleEndian(buf[8..]));
+        Assert.Equal((ushort)250, BinaryPrimitives.ReadUInt16LittleEndian(buf[(len - 2)..]));
+    }
+
+    [Fact]
+    public void SubscribeOkDetails_ReadsAcceptedCadence()
+    {
+        Span<byte> payload = stackalloc byte[8 + 4 + 1 + 5 + 2];
+        BinaryPrimitives.WriteUInt64LittleEndian(payload, 42);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload[8..], (uint)SubscribeFlags.ConflatedMbp);
+        payload[12] = 5;
+        "PETR4"u8.CopyTo(payload[13..]);
+        BinaryPrimitives.WriteUInt16LittleEndian(payload[18..], 500);
+
+        var details = WireFormat.ReadSubscribeOkDetails(payload);
+
+        Assert.Equal(42UL, details.SecurityId);
+        Assert.Equal((uint)SubscribeFlags.ConflatedMbp, details.Flags);
+        Assert.Equal("PETR4", details.Symbol);
+        Assert.Equal((ushort)500, details.ConflationIntervalMs);
+    }
+
+    [Fact]
+    public void SubscriptionOptions_RequireCadenceFlagPairing()
+    {
+        var client = new MarketDataClient(new MarketDataClientOptions());
+
+        Assert.Throws<ArgumentException>(() =>
+        {
+            _ = client.SubscribeAsync("PETR4", SubscribeFlags.ConflatedMbp);
+        });
+        Assert.Throws<ArgumentException>(() => client.SubscribeAsync(
+            "PETR4",
+            new SubscriptionOptions
+            {
+                Flags = SubscribeFlags.Mbp,
+                ConflationInterval = TimeSpan.FromMilliseconds(250),
+            }));
+        Assert.Throws<ArgumentException>(() => client.SubscribeAsync(
+            "PETR4",
+            new SubscriptionOptions
+            {
+                Flags = SubscribeFlags.ConflatedMbp | SubscribeFlags.Mbp,
+                ConflationInterval = TimeSpan.FromMilliseconds(250),
+            }));
+    }
+
+    [Fact]
+    public void SubscriptionOptions_DefaultOrdinarySubscription_DoesNotRequireCadence()
+    {
+        var client = new MarketDataClient(new MarketDataClientOptions());
+
+        var send = client.SubscribeAsync("PETR4", new SubscriptionOptions());
+
+        Assert.True(send.IsCompletedSuccessfully);
+        Assert.Contains("PETR4", client.ActiveSubscriptions);
     }
 
     [Fact]

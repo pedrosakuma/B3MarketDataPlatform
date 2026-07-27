@@ -45,6 +45,7 @@ public sealed partial class AppSettings
         GroupRingCapacity: GroupRingCapacity,
         MulticastMergeCapacity: MulticastMergeCapacity,
         ServerFlushWindowMs: ServerFlushWindowMs,
+        ConflatedCadencesMs: ConflatedCadencesMs,
         MaxSnapshotRequestsPerBatch: MaxSnapshotRequestsPerBatch,
         StaleBufferGlobalMib: StaleBufferGlobalMib,
         StaleBufferCapLevels: StaleBufferCapLevels,

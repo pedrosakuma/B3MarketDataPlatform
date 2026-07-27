@@ -128,15 +128,30 @@ internal static class WireFormat
     public static int WriteClientHello(Span<byte> dest, uint protocolVersion, ClientCapabilities capabilities = ClientCapabilities.None)
         => WireFrame.Write(dest, new ClientHelloFrame(protocolVersion, capabilities));
 
-    /// <summary>Encode a <c>Subscribe</c> frame: <c>[flags u32][symLen u8][symbol UTF-8…]</c>.</summary>
-    public static int WriteSubscribe(Span<byte> dest, SubscribeFlags flags, string symbol)
+    /// <summary>
+    /// Encode a Subscribe frame:
+    /// <c>[flags u32][symLen u8][symbol UTF-8…][conflationIntervalMs u16?]</c>.
+    /// </summary>
+    public static int WriteSubscribe(
+        Span<byte> dest,
+        SubscribeFlags flags,
+        string symbol,
+        ushort conflationIntervalMs = 0)
     {
         int o = FramingHeaderSize;
         int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(o + 4 + 1)..]);
-        int totalLen = o + 4 + 1 + symbolLen;
+        int totalLen = o + 4 + 1 + symbolLen + (conflationIntervalMs == 0 ? 0 : sizeof(ushort));
         WireFrame.WriteHeader(dest, totalLen, MessageType.Subscribe);
-        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)flags);
+        // Include ordinary Mbp as an old-server fallback. New servers normalize
+        // Mbp|ConflatedMbp to ConflatedMbp; old servers safely deliver MBP rather
+        // than interpreting an unknown-only flag set as the legacy zero/default.
+        var wireFlags = (flags & SubscribeFlags.ConflatedMbp) != 0
+            ? flags | SubscribeFlags.Mbp
+            : flags;
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)wireFlags);
         dest[o + 4] = (byte)symbolLen;
+        if (conflationIntervalMs != 0)
+            BinaryPrimitives.WriteUInt16LittleEndian(dest[(o + 5 + symbolLen)..], conflationIntervalMs);
         return totalLen;
     }
 
@@ -151,6 +166,18 @@ internal static class WireFormat
         byte symLen = payload[12];
         string sym = Encoding.UTF8.GetString(payload.Slice(13, symLen));
         return (secId, flags, sym);
+    }
+
+    /// <summary>Decode SubscribeOk including the optional accepted cadence.</summary>
+    public static (ulong SecurityId, uint Flags, string Symbol, ushort ConflationIntervalMs)
+        ReadSubscribeOkDetails(ReadOnlySpan<byte> payload)
+    {
+        var (secId, flags, sym) = ReadSubscribeOk(payload);
+        int cadenceOffset = 13 + Encoding.UTF8.GetByteCount(sym);
+        ushort cadenceMs = payload.Length >= cadenceOffset + sizeof(ushort)
+            ? BinaryPrimitives.ReadUInt16LittleEndian(payload[cadenceOffset..])
+            : (ushort)0;
+        return (secId, flags, sym, cadenceMs);
     }
 
     public static (string Symbol, byte ErrorCode) ReadSubscribeError(ReadOnlySpan<byte> payload)

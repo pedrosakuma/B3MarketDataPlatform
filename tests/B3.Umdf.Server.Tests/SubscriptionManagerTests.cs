@@ -299,10 +299,45 @@ public class SubscriptionManagerTests
         Assert.Equal(0.50, settings.ClientOutlierPressurePct);
         Assert.Equal(1000, settings.ClientOutlierIntervalMs);
         Assert.Equal(10, settings.ClientCoalesceWindowMs);
+        Assert.Equal([100, 250, 500], settings.ConflatedCadencesMs);
         Assert.Equal(5, settings.ShutdownDrainSeconds);
         Assert.Equal(1_000_000, settings.MulticastMergeCapacity);
         Assert.Equal(250_000, settings.FeedChannelCapacity);
         Assert.Equal("Information", settings.LogLevel);
+    }
+
+    [Fact]
+    public void ConflatedCadenceConfiguration_EnforcesHardMinimum()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SubscriptionManager(allowedConflatedCadencesMs: [1, 100]));
+        using var manager = new SubscriptionManager(allowedConflatedCadencesMs: [500, 100, 250, 250]);
+        Assert.Equal([100, 250, 500], manager.AllowedConflatedCadencesMs);
+    }
+
+    [Fact]
+    public void RoutingIndexes_SeparateImmediateAndCadenceMbpConsumers()
+    {
+        using var manager = new SubscriptionManager();
+        const ulong securityId = 5001;
+
+        for (int i = 0; i < 128; i++)
+            manager.AddSubscriptionForTest(
+                $"cadence-{i}",
+                securityId,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 250);
+        manager.AddSubscriptionForTest("immediate", securityId, DataFlags.Mbp);
+
+        var immediate = manager.GetImmediateMbpSubscribers(securityId);
+        var cadence = manager.GetConflatedMbpSubscribers(securityId, 250);
+
+        Assert.NotNull(immediate);
+        Assert.Single(immediate);
+        Assert.True(immediate.ContainsKey("immediate"));
+        Assert.NotNull(cadence);
+        Assert.Equal(128, cadence.Count);
+        Assert.Null(manager.GetConflatedMbpSubscribers(securityId, 500));
     }
 
     [Fact]

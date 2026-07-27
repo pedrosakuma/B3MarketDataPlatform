@@ -40,17 +40,28 @@ public static class WireProtocol
 
     /// <summary>
     /// Parse a Subscribe message (payload = everything after the 8-byte header).
-    /// Format: <c>[flags u32][symbolLen u8][symbol…]</c>. Unknown flag bits are
+    /// Format: <c>[flags u32][symbolLen u8][symbol…][conflationIntervalMs u16?]</c>.
+    /// The trailing cadence is required only for <see cref="DataFlags.ConflatedMbp"/>
+    /// and is additive under the protocol's min-length rule. Unknown flag bits are
     /// masked off (skip-unknown): the server only honours channels it knows about
     /// and echoes the accepted set back in <see cref="MessageType.SubscribeOk"/>.
     /// </summary>
-    public static (string symbol, DataFlags flags) ReadSubscribe(ReadOnlySpan<byte> payload)
+    public static (string symbol, DataFlags flags, ushort conflationIntervalMs) ReadSubscribe(ReadOnlySpan<byte> payload)
     {
-        var flags = (DataFlags)BinaryPrimitives.ReadUInt32LittleEndian(payload) & DataFlags.AllKnown;
-        if (flags == DataFlags.None) flags = DataFlags.All; // treat 0 as "all"
+        uint requested = BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        var flags = (DataFlags)requested & (DataFlags.AllKnown | DataFlags.ConflatedMbp);
+        if (flags == DataFlags.None) flags = DataFlags.All; // preserve legacy zero/unknown-only default
+        // New SDKs include Mbp as a safe fallback for older servers. A server
+        // that understands ConflatedMbp normalizes the pair to the cadence tier.
+        if ((flags & DataFlags.ConflatedMbp) != 0)
+            flags &= ~DataFlags.Mbp;
         byte symbolLen = payload[4];
         var symbol = Encoding.UTF8.GetString(payload.Slice(5, symbolLen));
-        return (symbol, flags);
+        int cadenceOffset = 5 + symbolLen;
+        ushort cadenceMs = payload.Length >= cadenceOffset + sizeof(ushort)
+            ? BinaryPrimitives.ReadUInt16LittleEndian(payload[cadenceOffset..])
+            : (ushort)0;
+        return (symbol, flags, cadenceMs);
     }
 
     /// <summary>Parse an Unsubscribe message. Returns securityId.</summary>
@@ -65,16 +76,28 @@ public static class WireProtocol
     public static int WriteServerStatus(Span<byte> dest, bool ready)
         => WireFrame.Write(dest, new ServerStatusFrame(ready));
 
-    /// <summary>Write SubscribeOk: <c>[secId u64][flags u32][symLen u8][symbol…]</c>.</summary>
-    public static int WriteSubscribeOk(Span<byte> dest, ulong securityId, DataFlags flags, string symbol)
+    /// <summary>
+    /// Write SubscribeOk:
+    /// <c>[secId u64][flags u32][symLen u8][symbol…][conflationIntervalMs u16?]</c>.
+    /// The cadence is appended only for a fixed-cadence subscription.
+    /// </summary>
+    public static int WriteSubscribeOk(
+        Span<byte> dest,
+        ulong securityId,
+        DataFlags flags,
+        string symbol,
+        ushort conflationIntervalMs = 0)
     {
         int o = FramingHeaderSize;
         int symbolLen = Encoding.UTF8.GetBytes(symbol, dest[(o + 8 + 4 + 1)..]);
-        int totalLen = o + 8 + 4 + 1 + symbolLen;
+        int totalLen = o + 8 + 4 + 1 + symbolLen + (conflationIntervalMs == 0 ? 0 : sizeof(ushort));
         WriteFramingHeader(dest, totalLen, MessageType.SubscribeOk);
         BinaryPrimitives.WriteUInt64LittleEndian(dest[o..], securityId); o += 8;
         BinaryPrimitives.WriteUInt32LittleEndian(dest[o..], (uint)flags); o += 4;
-        dest[o] = (byte)symbolLen;
+        dest[o++] = (byte)symbolLen;
+        o += symbolLen;
+        if (conflationIntervalMs != 0)
+            BinaryPrimitives.WriteUInt16LittleEndian(dest[o..], conflationIntervalMs);
         return totalLen;
     }
 

@@ -31,7 +31,8 @@ internal static class SnapshotEmitter
     internal const ServerCapabilities AdvertisedCapabilities =
         ServerCapabilities.SnapshotOnSubscribe
         | ServerCapabilities.SymbolDelistedNotification
-        | ServerCapabilities.InstrumentStatus;
+        | ServerCapabilities.InstrumentStatus
+        | ServerCapabilities.ConflatedMbpCadence;
 
     /// <summary>
     /// Send a <see cref="MessageType.ServerHello"/> as the very first server-initiated
@@ -93,7 +94,7 @@ internal static class SnapshotEmitter
 
         if (!session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf))
             return false;
-        return SendMarketTierSnapshot(session, book);
+        return SendMarketTierSnapshot(session, book, includeEmptySides: false);
     }
 
     /// <summary>
@@ -113,10 +114,14 @@ internal static class SnapshotEmitter
     /// Serialize the current MBP (price-level) snapshot for both sides of an
     /// <see cref="OrderBook"/>. One <see cref="MessageType.LevelSnapshot"/> frame is
     /// produced per security — the wire payload is bid-then-ask price levels, each
-    /// 20 bytes (price/totalQty/orderCount). Pooled buffer ownership transfers to
-    /// the session on success.
+    /// 20 bytes (price/totalQty/orderCount). The current market-order tiers (including
+    /// explicit zero sides) and stale status follow before incrementals can pass the
+    /// subscription cutoff. Pooled buffer ownership transfers to the session on success.
     /// </summary>
-    public static bool SendMbpSnapshot(ClientSession session, OrderBook book)
+    public static bool SendMbpSnapshot(
+        ClientSession session,
+        OrderBook book,
+        bool isStale)
     {
         ulong securityId = book.SecurityId;
         var bids = book.Bids;
@@ -137,32 +142,80 @@ internal static class SnapshotEmitter
         foreach (var lvl in asks.PriceLevelAggregates)
             offset = WireProtocol.WriteLevelSnapshotEntry(buf, offset, lvl.Price, lvl.TotalQty, lvl.Count);
 
-        return session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf);
+        if (!session.TryEnqueueBatch(new ReadOnlyMemory<byte>(buf, 0, offset), 1, pooledArray: buf))
+            return false;
+        if (!SendMarketTierSnapshot(session, book, includeEmptySides: true))
+            return false;
+        return SendSymbolStaleStatusSnapshot(session, securityId, isStale);
     }
 
     /// <summary>
     /// Send an empty MBP snapshot (header only) so the frontend can drop any
     /// "loading" placeholder when the security has no live book yet.
     /// </summary>
-    public static bool SendEmptyMbpSnapshot(ClientSession session, ulong securityId)
+    public static bool SendEmptyMbpSnapshot(
+        ClientSession session,
+        ulong securityId,
+        bool isStale)
     {
         var emptyBuf = new byte[WireProtocol.LevelSnapshotSize(0, 0)];
         WireProtocol.WriteLevelSnapshotHeader(emptyBuf, securityId, 0, 0);
-        return session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf));
+        if (!session.TryEnqueue(new ReadOnlyMemory<byte>(emptyBuf)))
+            return false;
+        Span<byte> tierBuf = stackalloc byte[32];
+        return SendMarketTierSide(
+                session, tierBuf, securityId, BookSideType.Bid, 0, 0, includeEmpty: true)
+            && SendMarketTierSide(
+                session, tierBuf, securityId, BookSideType.Ask, 0, 0, includeEmpty: true)
+            && SendSymbolStaleStatusSnapshot(session, securityId, isStale);
     }
 
-    private static bool SendMarketTierSnapshot(ClientSession session, OrderBook book)
+    private static bool SendMarketTierSnapshot(
+        ClientSession session,
+        OrderBook book,
+        bool includeEmptySides)
     {
         Span<byte> buf = stackalloc byte[32];
-        return SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Bid, book.MarketOrderQuantity(BookSideType.Bid), book.MarketOrderCount(BookSideType.Bid))
-            && SendMarketTierSide(session, buf, book.SecurityId, BookSideType.Ask, book.MarketOrderQuantity(BookSideType.Ask), book.MarketOrderCount(BookSideType.Ask));
+        return SendMarketTierSide(
+                session,
+                buf,
+                book.SecurityId,
+                BookSideType.Bid,
+                book.MarketOrderQuantity(BookSideType.Bid),
+                book.MarketOrderCount(BookSideType.Bid),
+                includeEmptySides)
+            && SendMarketTierSide(
+                session,
+                buf,
+                book.SecurityId,
+                BookSideType.Ask,
+                book.MarketOrderQuantity(BookSideType.Ask),
+                book.MarketOrderCount(BookSideType.Ask),
+                includeEmptySides);
     }
 
-    private static bool SendMarketTierSide(ClientSession session, Span<byte> buf, ulong securityId, BookSideType side, long totalQty, int orderCount)
+    private static bool SendMarketTierSide(
+        ClientSession session,
+        Span<byte> buf,
+        ulong securityId,
+        BookSideType side,
+        long totalQty,
+        int orderCount,
+        bool includeEmpty)
     {
-        if (orderCount == 0 && totalQty == 0)
+        if (!includeEmpty && orderCount == 0 && totalQty == 0)
             return true;
         int len = WireProtocol.WriteMarketTierUpdate(buf, securityId, (byte)side, totalQty, orderCount);
+        return session.TryEnqueue(new ReadOnlyMemory<byte>(buf[..len].ToArray()));
+    }
+
+    private static bool SendSymbolStaleStatusSnapshot(
+        ClientSession session,
+        ulong securityId,
+        bool isStale)
+    {
+        Span<byte> buf = stackalloc byte[17];
+        int len = WireProtocol.WriteSymbolStaleStatus(buf, securityId, isStale);
         return session.TryEnqueue(new ReadOnlyMemory<byte>(buf[..len].ToArray()));
     }
 

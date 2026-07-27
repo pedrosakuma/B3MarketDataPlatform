@@ -52,6 +52,7 @@ public class AppSettingsProjectionsTests
         Assert.Equal(s.StaleBufferGlobalMib, opts.StaleBufferGlobalMib);
         Assert.Equal(s.StaleBufferCapLevels, opts.StaleBufferCapLevels);
         Assert.Equal(s.ServerFlushWindowMs, opts.ServerFlushWindowMs);
+        Assert.Equal(s.ConflatedCadencesMs, opts.ConflatedCadencesMs);
         Assert.Equal(s.PerSymbolFanoutSuppressHighPct, opts.PerSymbolFanoutSuppressHighPct);
     }
 

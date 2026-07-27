@@ -118,6 +118,13 @@ public sealed partial class AppSettings
     public int ServerFlushWindowMs { get; set; } = 0;
 
     /// <summary>
+    /// Safe fixed cadences accepted for <c>DataFlags.ConflatedMbp</c>.
+    /// Values below the hard server minimum (100 ms) are rejected at startup.
+    /// CLI: env UMDF_CONFLATED_CADENCES_MS (comma-separated).
+    /// </summary>
+    public int[] ConflatedCadencesMs { get; set; } = [100, 250, 500];
+
+    /// <summary>
     /// Maximum number of subscribe/get snapshot requests the dispatch thread will
     /// service per packet batch. Snapshots allocate (CopyOrderData + ArrayPool rent)
     /// and are queued onto per-client outbound rings. Without a per-batch cap, an
@@ -312,6 +319,16 @@ public sealed partial class AppSettings
             ClientCoalesceWindowMs = coalesceMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SERVER_FLUSH_WINDOW_MS"), out var serverFlushMs) && serverFlushMs >= 0)
             ServerFlushWindowMs = serverFlushMs;
+        var conflatedCadences = Environment.GetEnvironmentVariable("UMDF_CONFLATED_CADENCES_MS");
+        if (!string.IsNullOrWhiteSpace(conflatedCadences))
+        {
+            var parsed = conflatedCadences
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(static value => int.TryParse(value, out int cadence) ? cadence : -1)
+                .ToArray();
+            if (parsed.Length > 0 && parsed.All(static cadence => cadence > 0))
+                ConflatedCadencesMs = parsed;
+        }
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_MAX_SNAPSHOT_REQUESTS_PER_BATCH"), out var maxSnapPerBatch))
             MaxSnapshotRequestsPerBatch = maxSnapPerBatch;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SHUTDOWN_DRAIN_SECONDS"), out var sd))

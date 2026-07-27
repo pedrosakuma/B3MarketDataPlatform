@@ -17,6 +17,8 @@ namespace B3.Umdf.Server;
 /// </summary>
 public sealed class SubscriptionManager : IDisposable
 {
+    public const int MinimumConflatedCadenceMs = 100;
+    private static readonly int[] DefaultConflatedCadences = [100, 250, 500];
     private volatile BookManager[]? _bookManagers;
     private volatile MarketDataManager[]? _marketDataManagers;
     private SymbolRegistry? _symbolRegistry;
@@ -32,6 +34,11 @@ public sealed class SubscriptionManager : IDisposable
     // Outer dict is ConcurrentDictionary (lock-free reads).
     // Inner dicts use copy-on-write under _subLock for safe concurrent iteration.
     private readonly ConcurrentDictionary<ulong, Dictionary<string, SubscriptionState>> _subscriptions = new();
+    // Per-security routing indexes derived from the same immutable subscription
+    // snapshot. Rebuilt only on subscription mutation so event-time fanout never
+    // scans conflated-only consumers to find immediate recipients, nor scans
+    // consumers to decide which cadence buckets are active.
+    private readonly ConcurrentDictionary<ulong, SubscriptionRoutingIndex> _routingIndexes = new();
 
     // Pending unsubscribe requests from WebSocket threads (processed by any group)
     private readonly ConcurrentQueue<SubscriptionRequest> _pendingUnsubscribes = new();
@@ -56,6 +63,7 @@ public sealed class SubscriptionManager : IDisposable
     private volatile bool _ready;
     private readonly int _maxSnapshotRequestsPerBatch;
     private readonly int _serverFlushWindowMs;
+    private readonly int[] _allowedConflatedCadencesMs;
 
     private readonly long _clientMaxPendingBytes;
     private readonly OutlierSweeper _outlierSweeper;
@@ -70,12 +78,14 @@ public sealed class SubscriptionManager : IDisposable
         long outlierMinBytes = 256L * 1024,
         double outlierPressurePct = 0.50,
         int outlierIntervalMs = 1000,
-        int serverFlushWindowMs = 0)
+        int serverFlushWindowMs = 0,
+        IReadOnlyCollection<int>? allowedConflatedCadencesMs = null)
     {
         if (serverFlushWindowMs < 0) throw new ArgumentOutOfRangeException(nameof(serverFlushWindowMs));
         _logger = logger ?? NullLogger<SubscriptionManager>.Instance;
         _maxSnapshotRequestsPerBatch = maxSnapshotRequestsPerBatch;
         _serverFlushWindowMs = serverFlushWindowMs;
+        _allowedConflatedCadencesMs = ValidateConflatedCadences(allowedConflatedCadencesMs);
         _clientMaxPendingBytes = clientMaxPendingBytes;
         _outlierSweeper = new OutlierSweeper(
             _clients,
@@ -94,6 +104,25 @@ public sealed class SubscriptionManager : IDisposable
             () => _bookManagers,
             _clients,
             _logger);
+    }
+
+    public IReadOnlyList<int> AllowedConflatedCadencesMs => _allowedConflatedCadencesMs;
+
+    private static int[] ValidateConflatedCadences(IReadOnlyCollection<int>? configured)
+    {
+        var values = configured is null
+            ? (int[])DefaultConflatedCadences.Clone()
+            : configured.Distinct().Order().ToArray();
+        if (values.Length == 0)
+            throw new ArgumentException("At least one conflated cadence must be configured.", nameof(configured));
+        foreach (int cadence in values)
+        {
+            if (cadence < MinimumConflatedCadenceMs || cadence > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(
+                    nameof(configured),
+                    $"Conflated cadences must be between {MinimumConflatedCadenceMs} and {ushort.MaxValue} ms.");
+        }
+        return values;
     }
 
     public bool IsReady => _ready;
@@ -202,8 +231,8 @@ public sealed class SubscriptionManager : IDisposable
     /// <summary>
     /// Centralised copy-on-write writer for <see cref="_subscriptions"/>. Acquires
     /// <see cref="_subLock"/>, snapshots the current per-security inner map, hands it
-    /// to <paramref name="mutator"/>, and atomically publishes the result (removes the
-    /// outer entry if the mutator returns null or an empty map).
+    /// to <paramref name="mutator"/>, and publishes the result plus its derived
+    /// routing indexes (removes both entries if the mutator returns null or an empty map).
     ///
     /// ALL writes that bump the per-security snapshot MUST go through this helper so
     /// the COW invariant ("readers always see a frozen Dictionary, writers always
@@ -222,9 +251,81 @@ public sealed class SubscriptionManager : IDisposable
             _subscriptions.TryGetValue(securityId, out var existing);
             var next = mutator(existing);
             if (next is null || next.Count == 0)
+            {
                 _subscriptions.TryRemove(securityId, out _);
+                _routingIndexes.TryRemove(securityId, out _);
+            }
             else if (!ReferenceEquals(next, existing))
+            {
                 _subscriptions[securityId] = next;
+                _routingIndexes[securityId] = SubscriptionRoutingIndex.Create(next);
+            }
+        }
+    }
+
+    private sealed class SubscriptionRoutingIndex
+    {
+        public Dictionary<string, SubscriptionState> Book { get; }
+        public Dictionary<string, SubscriptionState> ImmediateMbp { get; }
+        public Dictionary<string, SubscriptionState> BookOrImmediateMbp { get; }
+        public Dictionary<string, SubscriptionState> Trades { get; }
+        public Dictionary<ushort, Dictionary<string, SubscriptionState>> ConflatedMbpByCadence { get; }
+
+        private SubscriptionRoutingIndex(
+            Dictionary<string, SubscriptionState> book,
+            Dictionary<string, SubscriptionState> immediateMbp,
+            Dictionary<string, SubscriptionState> bookOrImmediateMbp,
+            Dictionary<string, SubscriptionState> trades,
+            Dictionary<ushort, Dictionary<string, SubscriptionState>> conflatedMbpByCadence)
+        {
+            Book = book;
+            ImmediateMbp = immediateMbp;
+            BookOrImmediateMbp = bookOrImmediateMbp;
+            Trades = trades;
+            ConflatedMbpByCadence = conflatedMbpByCadence;
+        }
+
+        public static SubscriptionRoutingIndex Create(
+            Dictionary<string, SubscriptionState> subscriptions)
+        {
+            var book = new Dictionary<string, SubscriptionState>();
+            var immediateMbp = new Dictionary<string, SubscriptionState>();
+            var bookOrImmediateMbp = new Dictionary<string, SubscriptionState>();
+            var trades = new Dictionary<string, SubscriptionState>();
+            var conflated = new Dictionary<ushort, Dictionary<string, SubscriptionState>>();
+
+            foreach (var (clientId, state) in subscriptions)
+            {
+                bool wantsBook = (state.Flags & DataFlags.Book) != 0;
+                if (wantsBook)
+                    book[clientId] = state;
+
+                if (state.WantsMbp)
+                    immediateMbp[clientId] = state;
+
+                if (wantsBook || state.WantsMbp)
+                    bookOrImmediateMbp[clientId] = state;
+
+                if (state.WantsTrades)
+                    trades[clientId] = state;
+
+                if (state.WantsConflatedMbp)
+                {
+                    if (!conflated.TryGetValue(state.ConflationIntervalMs, out var cadence))
+                    {
+                        cadence = new Dictionary<string, SubscriptionState>();
+                        conflated[state.ConflationIntervalMs] = cadence;
+                    }
+                    cadence[clientId] = state;
+                }
+            }
+
+            return new SubscriptionRoutingIndex(
+                book,
+                immediateMbp,
+                bookOrImmediateMbp,
+                trades,
+                conflated);
         }
     }
 
@@ -233,14 +334,22 @@ public sealed class SubscriptionManager : IDisposable
     /// full snapshot/registry pipeline. Used by <c>SubscriptionManagerTests</c> to
     /// exercise <see cref="NotifyDelisted"/> in isolation.
     /// </summary>
-    internal void AddSubscriptionForTest(string clientId, ulong securityId, DataFlags flags)
+    internal void AddSubscriptionForTest(
+        string clientId,
+        ulong securityId,
+        DataFlags flags,
+        ushort conflationIntervalMs = 0)
     {
         UpdateSubscriptionSnapshot(securityId, existing =>
         {
             var next = existing is not null
                 ? new Dictionary<string, SubscriptionState>(existing)
                 : new Dictionary<string, SubscriptionState>();
-            next[clientId] = new SubscriptionState(flags, 0);
+            next[clientId] = new SubscriptionState(
+                flags,
+                minBookBroadcastSequenceExclusive: 0,
+                minTradeBroadcastSequenceExclusive: 0,
+                conflationIntervalMs: conflationIntervalMs);
             return next;
         });
     }
@@ -254,17 +363,25 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     /// <summary>Called from WebSocket read thread to request a subscription.</summary>
-    public void RequestSubscribe(string clientId, string symbol, DataFlags flags)
+    public void RequestSubscribe(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs = 0)
     {
-        var req = SubscriptionRequest.Subscribe(clientId, symbol, flags);
+        var req = SubscriptionRequest.Subscribe(clientId, symbol, flags, conflationIntervalMs);
         if (!RouteToGroup(req))
             SendRouteFailureError(clientId, symbol);
     }
 
     /// <summary>Called from WebSocket read thread to request a one-shot snapshot.</summary>
-    public void RequestGet(string clientId, string symbol, DataFlags flags)
+    public void RequestGet(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs = 0)
     {
-        var req = SubscriptionRequest.Get(clientId, symbol, flags);
+        var req = SubscriptionRequest.Get(clientId, symbol, flags, conflationIntervalMs);
         if (!RouteToGroup(req))
             SendRouteFailureError(clientId, symbol);
     }
@@ -299,8 +416,12 @@ public sealed class SubscriptionManager : IDisposable
         {
             if (gh.BookManager.Books.ContainsKey(secId))
             {
-                gh.EnqueueRequest(req.ClientId, req.Symbol, req.Flags,
-                    req.Kind == SubscriptionRequestKind.Get);
+                gh.EnqueueRequest(
+                    req.ClientId,
+                    req.Symbol,
+                    req.Flags,
+                    req.Kind == SubscriptionRequestKind.Get,
+                    req.ConflationIntervalMs);
                 return true;
             }
         }
@@ -338,14 +459,24 @@ public sealed class SubscriptionManager : IDisposable
     /// </summary>
     public int ActiveSymbolCount => _subscriptions.Count;
 
+    public int ActiveConflatedSubscriptionCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var subscriptions in _subscriptions.Values)
+                foreach (var state in subscriptions.Values)
+                    if (state.WantsConflatedMbp) count++;
+            return count;
+        }
+    }
+
     /// <summary>Broadcast pre-serialized bytes to all Book subscribers for a security.</summary>
     internal void BroadcastToSubscribers(ulong securityId, ReadOnlyMemory<byte> payload)
     {
-        // Lock-free read: inner dict is a copy-on-write snapshot, safe to iterate.
-        if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
-        foreach (var (clientId, state) in clients)
+        if (GetBookSubscribers(securityId) is not { } clients) return;
+        foreach (var (clientId, _) in clients)
         {
-            if ((state.Flags & DataFlags.Book) == 0) continue;
             if (_clients.TryGetValue(clientId, out var session))
                 session.TryEnqueue(payload);
         }
@@ -361,6 +492,35 @@ public sealed class SubscriptionManager : IDisposable
     /// </summary>
     internal Dictionary<string, SubscriptionState>? GetSubscribers(ulong securityId) =>
         _subscriptions.TryGetValue(securityId, out var clients) ? clients : null;
+
+    internal Dictionary<string, SubscriptionState>? GetBookSubscribers(ulong securityId) =>
+        _routingIndexes.TryGetValue(securityId, out var routes) && routes.Book.Count != 0
+            ? routes.Book
+            : null;
+
+    internal Dictionary<string, SubscriptionState>? GetImmediateMbpSubscribers(ulong securityId) =>
+        _routingIndexes.TryGetValue(securityId, out var routes) && routes.ImmediateMbp.Count != 0
+            ? routes.ImmediateMbp
+            : null;
+
+    internal Dictionary<string, SubscriptionState>? GetBookOrImmediateMbpSubscribers(ulong securityId) =>
+        _routingIndexes.TryGetValue(securityId, out var routes) && routes.BookOrImmediateMbp.Count != 0
+            ? routes.BookOrImmediateMbp
+            : null;
+
+    internal Dictionary<string, SubscriptionState>? GetTradeSubscribers(ulong securityId) =>
+        _routingIndexes.TryGetValue(securityId, out var routes) && routes.Trades.Count != 0
+            ? routes.Trades
+            : null;
+
+    internal Dictionary<string, SubscriptionState>? GetConflatedMbpSubscribers(
+        ulong securityId,
+        int cadenceMs) =>
+        _routingIndexes.TryGetValue(securityId, out var routes) &&
+        routes.ConflatedMbpByCadence.TryGetValue(checked((ushort)cadenceMs), out var cadence) &&
+        cadence.Count != 0
+            ? cadence
+            : null;
 
     /// <summary>
     /// Lock-free quick check used by the dispatch thread to skip serializing
@@ -399,32 +559,21 @@ public sealed class SubscriptionManager : IDisposable
     /// current subscriber has <see cref="DataFlags.Book"/> set.
     /// </summary>
     internal bool HasAnyBookSubscriber(ulong securityId)
-    {
-        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
-        foreach (var (_, state) in clients)
-            if ((state.Flags & DataFlags.Book) != 0) return true;
-        return false;
-    }
+        => _routingIndexes.TryGetValue(securityId, out var routes) && routes.Book.Count != 0;
 
     /// <summary>Lock-free quick check used by the dispatch thread to skip MBP buffering
     /// for securities with no MBP-flag subscriber.</summary>
     internal bool HasAnyMbpSubscriber(ulong securityId)
-    {
-        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
-        foreach (var (_, state) in clients)
-            if ((state.Flags & DataFlags.Mbp) != 0) return true;
-        return false;
-    }
+        => _routingIndexes.TryGetValue(securityId, out var routes) &&
+           (routes.ImmediateMbp.Count != 0 || routes.ConflatedMbpByCadence.Count != 0);
+
+    internal bool HasAnyConflatedMbpSubscriber(ulong securityId, int cadenceMs)
+        => GetConflatedMbpSubscribers(securityId, cadenceMs) is not null;
 
     /// <summary>Lock-free quick check used by the dispatch thread to skip serializing
     /// trade frames (Trade, TradeBust) for securities with no Trades-flag subscriber.</summary>
     internal bool HasAnyTradesSubscriber(ulong securityId)
-    {
-        if (!_subscriptions.TryGetValue(securityId, out var clients)) return false;
-        foreach (var (_, state) in clients)
-            if ((state.Flags & DataFlags.Trades) != 0) return true;
-        return false;
-    }
+        => _routingIndexes.TryGetValue(securityId, out var routes) && routes.Trades.Count != 0;
 
     /// <summary>
     /// Invoked from the dispatch thread when a broadcast batch had to be dropped
@@ -444,9 +593,14 @@ public sealed class SubscriptionManager : IDisposable
         if (group is null) return false;
         foreach (var (clientId, state) in clients)
         {
-            var resyncFlags = state.Flags & (DataFlags.Book | DataFlags.Mbp);
+            var resyncFlags = state.Flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp);
             if (resyncFlags == 0) continue;
-            group.EnqueueRequest(clientId, symbol, resyncFlags, isGet: true);
+            group.EnqueueRequest(
+                clientId,
+                symbol,
+                resyncFlags,
+                isGet: true,
+                state.ConflationIntervalMs);
             any = true;
         }
         return any;
@@ -587,13 +741,27 @@ public sealed class SubscriptionManager : IDisposable
 
     internal void HandleSubscribe(string clientId, string symbol, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
+        => HandleSubscribe(clientId, symbol, flags, 0, bookManager, group, bookBatchCutoffSequence);
+
+    internal void HandleSubscribe(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs,
+        BookManager bookManager,
+        GroupConflationHandler group,
+        long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
+        if (!ValidateSubscriptionOptions(session, symbol, flags, conflationIntervalMs))
+            return;
 
         // Send SubscribeOk
-        var okBuf = new byte[WireProtocol.FramingHeaderSize + 8 + 1 + 1 + System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length)];
-        int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol);
+        var okBuf = new byte[
+            WireProtocol.FramingHeaderSize + 8 + 4 + 1 +
+            System.Text.Encoding.UTF8.GetMaxByteCount(symbol.Length) + 2];
+        int okLen = WireProtocol.WriteSubscribeOk(okBuf, securityId, flags, symbol, conflationIntervalMs);
         if (!session.TryEnqueue(new ReadOnlyMemory<byte>(okBuf, 0, okLen)))
             return;
 
@@ -601,7 +769,14 @@ public sealed class SubscriptionManager : IDisposable
         // a sequence barrier. The broadcaster will skip every queued/current batch
         // at or below bookBatchCutoffSequence for this subscription, so the snapshot
         // remains the client's baseline and future incrementals start after it.
-        if (!ActivateSubscription(session, clientId, securityId, flags, bookBatchCutoffSequence, out var activation))
+        if (!ActivateSubscription(
+                session,
+                clientId,
+                securityId,
+                flags,
+                conflationIntervalMs,
+                bookBatchCutoffSequence,
+                out var activation))
             return;
 
         if (!SendSnapshots(session, securityId, flags, bookManager, group))
@@ -616,14 +791,54 @@ public sealed class SubscriptionManager : IDisposable
 
     internal void HandleGet(string clientId, string symbol, DataFlags flags,
         BookManager bookManager, GroupConflationHandler group, long bookBatchCutoffSequence)
+        => HandleGet(clientId, symbol, flags, 0, bookManager, group, bookBatchCutoffSequence);
+
+    internal void HandleGet(
+        string clientId,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs,
+        BookManager bookManager,
+        GroupConflationHandler group,
+        long bookBatchCutoffSequence)
     {
         if (!TryValidateAndResolve(clientId, symbol, out var session, out var securityId))
             return;
+        if (!ValidateSubscriptionOptions(session, symbol, flags, conflationIntervalMs))
+            return;
 
-        if (flags.HasFlag(DataFlags.Book) || flags.HasFlag(DataFlags.Mbp))
-            UpdateBookCutoffIfSubscribed(clientId, securityId, bookBatchCutoffSequence);
+        UpdateSnapshotCutoffsIfSubscribed(
+            clientId,
+            securityId,
+            flags,
+            bookBatchCutoffSequence);
 
         SendSnapshots(session, securityId, flags, bookManager, group);
+    }
+
+    private bool ValidateSubscriptionOptions(
+        ClientSession session,
+        string symbol,
+        DataFlags flags,
+        ushort conflationIntervalMs)
+    {
+        bool conflated = (flags & DataFlags.ConflatedMbp) != 0;
+        if (conflated && (flags & DataFlags.Mbp) != 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidFlags, symbol);
+            return false;
+        }
+        if (!conflated && conflationIntervalMs != 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidFlags, symbol);
+            return false;
+        }
+        if (conflated && Array.BinarySearch(_allowedConflatedCadencesMs, (int)conflationIntervalMs) < 0)
+        {
+            SendError(session, SubscribeErrorCode.InvalidCadence, symbol);
+            return false;
+        }
+        return true;
     }
 
     /// <summary>Validate client, readiness, and symbol resolution. Sends error responses on failure.</summary>
@@ -681,16 +896,20 @@ public sealed class SubscriptionManager : IDisposable
             }
         }
 
-        if (flags.HasFlag(DataFlags.Mbp))
+        if ((flags & (DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0)
         {
+            bool isStale = bookManager.StateRegistry.IsAnyStale(securityId);
             if (bookManager.Books.TryGetValue(securityId, out var mbpBook))
             {
-                if (!SnapshotEmitter.SendMbpSnapshot(session, mbpBook))
+                if (!SnapshotEmitter.SendMbpSnapshot(
+                        session,
+                        mbpBook,
+                        isStale))
                     return false;
             }
             else
             {
-                if (!SnapshotEmitter.SendEmptyMbpSnapshot(session, securityId))
+                if (!SnapshotEmitter.SendEmptyMbpSnapshot(session, securityId, isStale))
                     return false;
             }
 
@@ -726,7 +945,8 @@ public sealed class SubscriptionManager : IDisposable
             // Trades-only subscribers (no Book/Mbp) still need candles for the
             // chart panel. Book and Mbp already send candles above, so only
             // emit here if neither is set.
-            if (!flags.HasFlag(DataFlags.Book) && !flags.HasFlag(DataFlags.Mbp))
+            if (!flags.HasFlag(DataFlags.Book) &&
+                (flags & (DataFlags.Mbp | DataFlags.ConflatedMbp)) == 0)
             {
                 if (group.Candles.TryGetValue(securityId, out var agg))
                 {
@@ -832,6 +1052,7 @@ public sealed class SubscriptionManager : IDisposable
         string clientId,
         ulong securityId,
         DataFlags flags,
+        ushort conflationIntervalMs,
         long bookBatchCutoffSequence,
         out SubscriptionActivation activation)
     {
@@ -883,7 +1104,16 @@ public sealed class SubscriptionManager : IDisposable
                 var next = current is not null
                     ? new Dictionary<string, SubscriptionState>(current)
                     : new Dictionary<string, SubscriptionState>();
-                next[clientId] = new SubscriptionState(flags, bookBatchCutoffSequence);
+                bool includesBookSnapshot =
+                    (flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0;
+                bool includesTradeHistory = (flags & DataFlags.Trades) != 0;
+                next[clientId] = new SubscriptionState(
+                    flags,
+                    minBookBroadcastSequenceExclusive:
+                        includesBookSnapshot ? bookBatchCutoffSequence : 0,
+                    minTradeBroadcastSequenceExclusive:
+                        includesTradeHistory ? bookBatchCutoffSequence : 0,
+                    conflationIntervalMs: conflationIntervalMs);
                 return next;
             });
             activation = new SubscriptionActivation(
@@ -968,7 +1198,7 @@ public sealed class SubscriptionManager : IDisposable
     }
 
     /// <summary>
-    /// Advance the per-client book broadcast cutoff after a Get snapshot. Lock-free:
+    /// Advance only the per-channel cutoffs covered by a Get snapshot. Lock-free:
     /// reads the lock-free outer <see cref="_subscriptions"/> and the lock-free inner
     /// dictionary snapshot, then performs a CAS-max on the mutable cutoff cell of the
     /// shared <see cref="SubscriptionState"/>. CoW snapshots share the state reference,
@@ -976,12 +1206,23 @@ public sealed class SubscriptionManager : IDisposable
     /// Safe against concurrent Subscribe/Unsubscribe (worst case: a stale state object
     /// no longer reachable from the current snapshot is updated harmlessly).
     /// </summary>
-    private void UpdateBookCutoffIfSubscribed(string clientId, ulong securityId, long bookBatchCutoffSequence)
+    private void UpdateSnapshotCutoffsIfSubscribed(
+        string clientId,
+        ulong securityId,
+        DataFlags snapshotFlags,
+        long batchCutoffSequence)
     {
         if (!_subscriptions.TryGetValue(securityId, out var clients)) return;
         if (!clients.TryGetValue(clientId, out var state)) return;
-        if ((state.Flags & DataFlags.Book) == 0) return;
-        state.AdvanceMinBroadcastSequence(bookBatchCutoffSequence);
+
+        if ((snapshotFlags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0 &&
+            (state.Flags & (DataFlags.Book | DataFlags.Mbp | DataFlags.ConflatedMbp)) != 0)
+        {
+            state.AdvanceBookMinBroadcastSequence(batchCutoffSequence);
+        }
+
+        if ((snapshotFlags & DataFlags.Trades) != 0 && state.WantsTrades)
+            state.AdvanceTradeMinBroadcastSequence(batchCutoffSequence);
     }
 
     private void RemoveSubscriptionCore(string clientId, ulong securityId, bool enqueueAck, bool adjustMetric)

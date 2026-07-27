@@ -248,6 +248,346 @@ public class GroupConflationHandlerMbpTests
         }
     }
 
+    [Fact]
+    public async Task ConflatedMbp_SnapshotIsImmediate_AndLevelsFlushLastValueAtCadence()
+    {
+        var w = NewWiring([500]);
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 64);
+            w.Manager.RegisterClient(session); _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 4));
+            w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+            w.Group.OnBatchComplete();
+            book.Bids.Add(NewEntry(orderId: 2, price: 1000, qty: 6));
+            w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+            w.Group.OnBatchComplete();
+
+            await Task.Delay(100);
+            Assert.Equal(0, rec.CountByType(MessageType.LevelUpdate));
+            Assert.True(w.Group.CadenceFramesBuffered > 0);
+
+            await WaitUntil(
+                () => w.Group.CadenceFramesEmitted > 0,
+                TimeSpan.FromSeconds(2));
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelUpdate), TimeSpan.FromSeconds(1));
+            Assert.Equal(1, rec.CountByType(MessageType.LevelUpdate));
+            var update = rec.LastFrame(MessageType.LevelUpdate)!;
+            Assert.Equal(10L, BinaryPrimitives.ReadInt64LittleEndian(update.AsSpan(24)));
+            Assert.Equal(2u, BinaryPrimitives.ReadUInt32LittleEndian(update.AsSpan(32)));
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_DoesNotDelayExistingMbpSubscribers()
+    {
+        var w = NewWiring([500]);
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+            var liveRec = new RecordingWebSocket();
+            var conflatedRec = new RecordingWebSocket();
+            var live = new ClientSession(liveRec, channelCapacity: 64);
+            var conflated = new ClientSession(conflatedRec, channelCapacity: 64);
+            w.Manager.RegisterClient(live); _ = Task.Run(() => live.RunWriteLoopAsync());
+            w.Manager.RegisterClient(conflated); _ = Task.Run(() => conflated.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(live.Id, Symbol, DataFlags.Mbp,
+                w.BookManager, w.Group, bookBatchCutoffSequence: 0);
+            w.Manager.HandleSubscribe(
+                conflated.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(
+                () => liveRec.HasMessageType(MessageType.LevelSnapshot) &&
+                      conflatedRec.HasMessageType(MessageType.LevelSnapshot),
+                TimeSpan.FromSeconds(2));
+
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
+            w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+            w.Group.OnBatchComplete();
+
+            await WaitUntil(() => liveRec.HasMessageType(MessageType.LevelUpdate), TimeSpan.FromSeconds(1));
+            Assert.Equal(0, conflatedRec.CountByType(MessageType.LevelUpdate));
+            await WaitUntil(() => conflatedRec.HasMessageType(MessageType.LevelUpdate), TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_RejectsUnsupportedCadence()
+    {
+        var w = NewWiring();
+        var rec = new RecordingWebSocket();
+        var session = new ClientSession(rec, channelCapacity: 64);
+        w.Manager.RegisterClient(session); _ = Task.Run(() => session.RunWriteLoopAsync());
+
+        w.Manager.HandleSubscribe(
+            session.Id,
+            Symbol,
+            DataFlags.ConflatedMbp,
+            conflationIntervalMs: 50,
+            w.BookManager,
+            w.Group,
+            bookBatchCutoffSequence: 0);
+
+        await WaitUntil(() => rec.HasMessageType(MessageType.SubscribeError), TimeSpan.FromSeconds(2));
+        Assert.False(rec.HasMessageType(MessageType.LevelSnapshot));
+        Assert.Equal(
+            (byte)SubscribeErrorCode.InvalidCadence,
+            rec.LastFrame(MessageType.SubscribeError)![8]);
+        w.Manager.Dispose();
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_TradesRemainSeparateAndImmediate()
+    {
+        var w = NewWiring([500]);
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 64);
+            w.Manager.RegisterClient(session); _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp | DataFlags.Trades,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            w.Group.OnTrade(SecurityId, price: 1000, quantity: 2, tradeId: 9, sendingTimeNs: 0);
+            w.Group.OnBatchComplete();
+
+            await WaitUntil(() => rec.HasMessageType(MessageType.Trade), TimeSpan.FromSeconds(1));
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_EventTimeBuffering_IsPerCadenceNotPerConsumer()
+    {
+        var w = NewWiring([500]);
+        w.Group.StartBroadcaster(0);
+        try
+        {
+            for (int i = 0; i < 256; i++)
+            {
+                w.Manager.AddSubscriptionForTest(
+                    $"cadence-{i}",
+                    SecurityId,
+                    DataFlags.ConflatedMbp,
+                    conflationIntervalMs: 500);
+            }
+
+            Assert.Null(w.Manager.GetImmediateMbpSubscribers(SecurityId));
+            Assert.Equal(
+                256,
+                w.Manager.GetConflatedMbpSubscribers(SecurityId, 500)!.Count);
+
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
+            w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+            w.Group.OnBatchComplete();
+
+            await WaitUntil(() => w.Group.CadenceFramesBuffered > 0, TimeSpan.FromSeconds(1));
+            Assert.Equal(1, w.Group.CadenceFramesBuffered);
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_SustainedBacklog_ReleasesCadenceBeforeRingDrains()
+    {
+        var w = NewWiring([100]);
+        try
+        {
+            var book = w.BookManager.GetOrCreateBook(SecurityId);
+            book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
+
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 256);
+            w.Manager.RegisterClient(session);
+            _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 100,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            // Seed a pending cadence frame and force its deadline due before starting
+            // the broadcaster. This avoids timing races while the queued batches model
+            // a producer that keeps the ring continuously non-empty.
+            var cadenceBuffer = GetCadenceBuffer(w.Group);
+            byte[] frame = new byte[WireProtocol.LevelUpdateSize];
+            int frameLength = WireProtocol.WriteLevelUpdate(
+                frame,
+                SecurityId,
+                (byte)BookSideType.Bid,
+                price: 1000,
+                totalQty: 7,
+                orderCount: 1);
+            cadenceBuffer.Buffer(SecurityId, frame.AsSpan(0, frameLength), batchSequence: 1, epoch: 0);
+            typeof(CadenceConflationBuffer)
+                .GetField("_nextFlushTicks", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(cadenceBuffer, Environment.TickCount64 - 1);
+
+            const int queuedBatches = 128;
+            for (int i = 0; i < queuedBatches; i++)
+            {
+                w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
+                w.Group.OnBatchComplete();
+            }
+            Assert.Equal(queuedBatches, w.Group.BroadcastRingDepth);
+
+            w.Group.StartBroadcaster(0);
+
+            await WaitUntil(
+                () => w.Group.CadenceFlushesWhileBacklogged > 0,
+                TimeSpan.FromSeconds(2));
+            await WaitUntil(
+                () => rec.HasMessageType(MessageType.LevelUpdate),
+                TimeSpan.FromSeconds(1));
+            Assert.True(w.Group.CadenceFramesEmitted > 0);
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task GetConflatedMbp_DoesNotAdvanceTradeCutoff()
+    {
+        var w = NewWiring([500]);
+        try
+        {
+            w.BookManager.GetOrCreateBook(SecurityId);
+            var rec = new RecordingWebSocket();
+            var session = new ClientSession(rec, channelCapacity: 64);
+            w.Manager.RegisterClient(session);
+            _ = Task.Run(() => session.RunWriteLoopAsync());
+            w.Manager.HandleSubscribe(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp | DataFlags.Trades,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.LevelSnapshot), TimeSpan.FromSeconds(2));
+
+            w.Group.OnTrade(SecurityId, price: 1000, quantity: 2, tradeId: 9, sendingTimeNs: 0);
+            w.Group.OnBatchComplete(); // queued batch sequence 1; broadcaster is not started yet
+
+            w.Manager.HandleGet(
+                session.Id,
+                Symbol,
+                DataFlags.ConflatedMbp,
+                conflationIntervalMs: 500,
+                w.BookManager,
+                w.Group,
+                bookBatchCutoffSequence: 1);
+
+            w.Group.StartBroadcaster(0);
+            await WaitUntil(() => rec.HasMessageType(MessageType.Trade), TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            w.Group.StopBroadcaster();
+            w.Manager.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ConflatedMbp_BootstrapIncludesMarketTierAndStaleStatus()
+    {
+        var w = NewWiring([500]);
+        var book = w.BookManager.GetOrCreateBook(SecurityId);
+        book.UpsertMarketOrder(
+            orderId: 900,
+            side: BookSideType.Bid,
+            quantity: 123,
+            enteringFirm: 7);
+        w.BookManager.StateRegistry.HealFromSnapshot(SecurityId, SymbolGapKind.Mbo, 100);
+        w.BookManager.StateRegistry.Observe(SecurityId, SymbolGapKind.Mbo, 102);
+        Assert.True(w.BookManager.StateRegistry.IsAnyStale(SecurityId));
+
+        var rec = new RecordingWebSocket();
+        var session = new ClientSession(rec, channelCapacity: 64);
+        w.Manager.RegisterClient(session);
+        _ = Task.Run(() => session.RunWriteLoopAsync());
+        w.Manager.HandleSubscribe(
+            session.Id,
+            Symbol,
+            DataFlags.ConflatedMbp,
+            conflationIntervalMs: 500,
+            w.BookManager,
+            w.Group,
+            bookBatchCutoffSequence: 0);
+
+        await WaitUntil(
+            () => rec.HasMessageType(MessageType.LevelSnapshot) &&
+                  rec.HasMessageType(MessageType.MarketTierUpdate) &&
+                  rec.HasMessageType(MessageType.SymbolStaleStatus),
+            TimeSpan.FromSeconds(2));
+
+        var tiers = rec.AllFrames(MessageType.MarketTierUpdate);
+        Assert.Equal(2, tiers.Count);
+        var bidTier = Assert.Single(tiers, frame => frame[28] == (byte)BookSideType.Bid);
+        var askTier = Assert.Single(tiers, frame => frame[28] == (byte)BookSideType.Ask);
+        Assert.Equal(123L, BinaryPrimitives.ReadInt64LittleEndian(bidTier.AsSpan(16)));
+        Assert.Equal(1u, BinaryPrimitives.ReadUInt32LittleEndian(bidTier.AsSpan(24)));
+        Assert.Equal(0L, BinaryPrimitives.ReadInt64LittleEndian(askTier.AsSpan(16)));
+        Assert.Equal(0u, BinaryPrimitives.ReadUInt32LittleEndian(askTier.AsSpan(24)));
+        Assert.Equal(1, rec.LastFrame(MessageType.SymbolStaleStatus)![16]);
+        w.Manager.Dispose();
+    }
+
     // ── helpers ──
 
     private static OrderBookEntry NewEntry(ulong orderId, long price, long qty,
@@ -260,9 +600,10 @@ public class GroupConflationHandlerMbpTests
         Side = side,
     };
 
-    private static (SubscriptionManager Manager, GroupConflationHandler Group, BookManager BookManager) NewWiring()
+    private static (SubscriptionManager Manager, GroupConflationHandler Group, BookManager BookManager) NewWiring(
+        IReadOnlyCollection<int>? cadences = null)
     {
-        var manager = new SubscriptionManager();
+        var manager = new SubscriptionManager(allowedConflatedCadencesMs: cadences);
         var group = manager.CreateGroupHandler();
         var registry = new SymbolStateRegistry(NullLogger.Instance);
         var staleBuffer = new StaleMboBuffer(NullLogger.Instance);
@@ -280,6 +621,14 @@ public class GroupConflationHandlerMbpTests
         manager.SetReady();
 
         return (manager, group, book);
+    }
+
+    private static CadenceConflationBuffer GetCadenceBuffer(GroupConflationHandler group)
+    {
+        var buffers = (CadenceConflationBuffer[])typeof(GroupConflationHandler)
+            .GetField("_cadenceBuffers", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .GetValue(group)!;
+        return Assert.Single(buffers);
     }
 
     private static void RegisterSymbol(SymbolRegistry registry, string symbol, ulong securityId)

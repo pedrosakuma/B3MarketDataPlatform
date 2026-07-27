@@ -3,10 +3,10 @@ using B3.Umdf.Server;
 namespace B3.Umdf.Server.Tests;
 
 /// <summary>
-/// Stress test for the centralised <c>UpdateSubscriptionSnapshot</c> helper in
+/// Stress test for the centralised subscription snapshot + routing-index publication in
 /// <see cref="SubscriptionManager"/>. Concurrent <see cref="SubscriptionManager.AddSubscriptionForTest"/>
-/// callers — which all flow through the helper — must never publish a torn snapshot
-/// (an inner Dictionary that is being mutated while another thread iterates it).
+/// callers must never publish a torn all-subscriber or immediate/cadence routing snapshot
+/// while another thread iterates it.
 /// </summary>
 public class SubscriptionManagerSnapshotAtomicityTests
 {
@@ -28,7 +28,12 @@ public class SubscriptionManagerSnapshotAtomicityTests
                 for (int i = 0; i < iters && !cts.IsCancellationRequested; i++)
                 {
                     ulong sec = (ulong)(rng.Next(symbols) + 1);
-                    sm.AddSubscriptionForTest($"c{seed}-{i & 0x3F}", sec, DataFlags.Book);
+                    bool cadence = (i & 1) == 0;
+                    sm.AddSubscriptionForTest(
+                        $"c{seed}-{i & 0x3F}",
+                        sec,
+                        cadence ? DataFlags.ConflatedMbp : DataFlags.Mbp,
+                        cadence ? (ushort)250 : (ushort)0);
                     if ((i & 7) == 0) sm.NotifyDelisted(sec);
                 }
             }, cts.Token));
@@ -44,6 +49,11 @@ public class SubscriptionManagerSnapshotAtomicityTests
             while (!cts.IsCancellationRequested && loops < 100_000)
             {
                 _ = sm.ActiveSymbolCount;
+                ulong securityId = (ulong)(loops % symbols + 1);
+                if (sm.GetImmediateMbpSubscribers(securityId) is { } immediate)
+                    foreach (var entry in immediate) _ = entry.Key;
+                if (sm.GetConflatedMbpSubscribers(securityId, 250) is { } cadence)
+                    foreach (var entry in cadence) _ = entry.Key;
                 loops++;
             }
         }, cts.Token));

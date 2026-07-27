@@ -132,9 +132,9 @@ public class WireProtocolAuctionTests
     }
 
     [Fact]
-    public void DataFlags_Everything_Is0xFF()
+    public void DataFlags_AllKnown_RemainsAdditiveChannelsOnly()
     {
-        // After adding Auction (0x80), Everything should be all bits set.
-        Assert.Equal((byte)0xFF, (byte)DataFlags.AllKnown);
+        Assert.Equal(0xFFu, (uint)DataFlags.AllKnown);
+        Assert.False(DataFlags.AllKnown.HasFlag(DataFlags.ConflatedMbp));
     }
 }
