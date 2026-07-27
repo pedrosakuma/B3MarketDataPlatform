@@ -110,7 +110,9 @@ stateDiagram-v2
     Stale --> Stale: snapshot.Begin<br/>SetProtectedFloor(snap+1)
     Stale --> Stale: hot-cap eviction (safe)<br/>oldest.rptSeq < ProtectedFloor<br/>MinHeal NOT bumped<br/>+stale_buffer_evicted_safe_below_floor
     Stale --> Stale: hot-cap eviction (unsafe)<br/>oldest.rptSeq ≥ ProtectedFloor<br/>MinHeal bumped (fail-safe)<br/>+stale_buffer_evicted_unsafe
+    Stale --> Stale: later global gap<br/>MinHeal := max(MinHeal, received - 1)
     Stale --> Stale: snapshot.Complete REJECT<br/>snap < MinHeal<br/>staging discarded; live book intact<br/>+snapshots_rejected_too_old
+    Stale --> Stale: snapshot.Complete REJECT<br/>post-snapshot replay has uncovered rptSeq<br/>staging discarded; live book intact<br/>+snapshots_rejected_replay_gap
 
     Stale --> Healthy: snapshot.Complete ACCEPT<br/>snap ≥ MinHeal<br/>ApplySnapshotStaging (atomic swap)<br/>replay buffer [snap+1, high-water]<br/>+snapshots_healed<br/>fires OnSymbolStaleStatusChanged(false)<br/>if StaleKindMask = 0
 
@@ -169,7 +171,12 @@ Snapshot arrives → BookManager.CompleteSnapshot
     ├── snapshotRptSeq < MinHeal → REJECT (lagging snapshot, stays Stale,
     │                              counts b3.umdf.persymbol.snapshots_rejected_too_old)
     │
-    └── snapshotRptSeq >= MinHeal → ACCEPT
+    ├── replay window contains an rptSeq that is neither retained MBO nor
+    │   proven delivered non-MBO semantics → REJECT (stays Stale, tightens
+    │   MinHeal to the first missing sequence, counts
+    │   b3.umdf.persymbol.snapshots_rejected_replay_gap)
+    │
+    └── snapshotRptSeq >= MinHeal and replay coverage is complete → ACCEPT
             │
             ▼
         ApplySnapshotStaging → live book swapped
@@ -235,6 +242,7 @@ b3.umdf.feed.channel_gaps_absorbed                  # gaps absorbed without leav
 b3.umdf.persymbol.stale_symbols                     # per-symbol Stale gauge by kind
 b3.umdf.persymbol.snapshots_healed
 b3.umdf.persymbol.snapshots_rejected_too_old        # ALERT if growing monotonically
+b3.umdf.persymbol.snapshots_rejected_replay_gap     # ALERT: retained replay has an uncovered sequence
 b3.umdf.persymbol.stale_buffer_hot_promotions       # symbols at hot cap (65 536)
 b3.umdf.persymbol.stale_buffer_evicted_safe_below_floor
 b3.umdf.persymbol.stale_buffer_evicted_unsafe       # ALERT if growing — pathological loss
@@ -326,12 +334,19 @@ Per-symbol stale buffers (`StaleMboBuffer`) cap at **8 192** messages
 (normal) / **65 536** (hot list — mini-index futures). When the cap is
 hit the buffer drops the **oldest** queued incremental, not the newest:
 keeping the freshest tail maximises the chance that an arriving snapshot
-covers the gap. Each eviction calls
-`SymbolStateRegistry.BumpMinHeal(secId, evictedRptSeq + 1)` so the
+covers the gap. Each unsafe eviction calls
+`SymbolStateRegistry.BumpMinHeal(secId, evictedRptSeq)` so the
 acceptance floor for the next snapshot stays monotonic with the buffer's
 earliest retained sequence — a snapshot older than the bumped floor is
 rejected immediately, with no risk of replaying stale data over a fresher
 book.
+
+While MBO is stale, every delivered non-MBO sequence is retained as compact
+coverage ranges. Before swapping a completed snapshot into the live book,
+the recovery path proves every `rptSeq` in the MBO replay window is either a
+retained MBO mutation or a delivered non-MBO semantic. This permits valid
+interleaving such as MBO 13, Trade 14, ExecSummary 15, MBO 16 while rejecting
+sparse replay that would bridge an unknown book mutation.
 
 ### 2.9 Forced-heal escape valve for hot symbols
 

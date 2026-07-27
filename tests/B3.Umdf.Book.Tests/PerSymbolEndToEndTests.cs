@@ -275,8 +275,12 @@ public class PerSymbolEndToEndTests
         var book = bm.GetOrCreateBook(sec);
         var entry = new B3.Umdf.Book.OrderBookEntry
         {
-            OrderId = 7777, Price = 14721000, Quantity = 5, EnteringFirm = 0,
-            SecurityId = sec, Side = B3.Umdf.Book.BookSideType.Bid,
+            OrderId = 7777,
+            Price = 14721000,
+            Quantity = 5,
+            EnteringFirm = 0,
+            SecurityId = sec,
+            Side = B3.Umdf.Book.BookSideType.Bid,
         };
         book.GetSide(B3.Umdf.Book.BookSideType.Bid).Add(in entry);
         Assert.Equal(1, book.Bids.OrderCount);
@@ -342,9 +346,8 @@ public class PerSymbolEndToEndTests
 
         long skippedBefore = bm.SnapshotsSkippedHealthyAhead;
 
-        // Snapshot at 109 (= MinHealRptSeq): should NOT be skipped (symbol is Stale),
-        // and should be accepted by the heal path.
-        bm.BeginSnapshotHeader(sec, lastRptSeq: 109, hasRptSeq: true, ordersExpected: 0);
+        // Snapshot covers the registry-only observation and must not be skipped.
+        bm.BeginSnapshotHeader(sec, lastRptSeq: 110, hasRptSeq: true, ordersExpected: 0);
 
         Assert.Equal(skippedBefore, bm.SnapshotsSkippedHealthyAhead); // not skipped
         Assert.Equal(SymbolState.Healthy, reg.GetState(sec, SymbolGapKind.Mbo));
@@ -426,8 +429,8 @@ public class PerSymbolEndToEndTests
         Assert.Equal(3, snap.TotalSymbols);
 
         // Heal 500: snap drops to 1.
-        reg.Observe(500, SymbolGapKind.Mbo, 200); // first observation already buffered above
-        bm.RecordSnapshotHeader(500, lastRptSeq: 199);
+        reg.Observe(500, SymbolGapKind.Mbo, 200); // duplicate observation
+        bm.RecordSnapshotHeader(500, lastRptSeq: 200);
         bm.HealAfterSnapshotForTest(500);
         Assert.Equal(1, reg.GetAggregateSnapshot().TotalStaleSymbols);
     }

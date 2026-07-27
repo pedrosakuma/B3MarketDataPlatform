@@ -1164,6 +1164,8 @@ public sealed class BookManager : IFeedEventHandler, IMarketDataEventHandler
     public long SnapshotChunksOrphaned => _snapshotApplier.SnapshotChunksOrphaned;
     /// <summary>Snapshots rejected because their LastRptSeq is older than the symbol's MinHealRptSeq.</summary>
     public long SnapshotsRejectedTooOld => _snapshotApplier.SnapshotsRejectedTooOld;
+    /// <summary>Snapshots rejected because retained MBO replay plus proven non-MBO coverage contained a hole.</summary>
+    public long SnapshotsRejectedReplayGap => _snapshotApplier.SnapshotsRejectedReplayGap;
     /// <summary>Snapshots ignored at Header_30 because the symbol is already Healthy with a more recent baseline.</summary>
     public long SnapshotsSkippedHealthyAhead => _snapshotApplier.SnapshotsSkippedHealthyAhead;
     /// <summary>Snapshots skipped because LastSequenceVersion is stale or missing after the channel epoch is established.</summary>

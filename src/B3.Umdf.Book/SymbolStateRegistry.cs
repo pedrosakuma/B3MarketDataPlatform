@@ -190,6 +190,7 @@ public sealed class SymbolStateRegistry
         internal readonly SymbolState[] States = new SymbolState[KindCount];
         internal readonly uint[] LastRptSeq = new uint[KindCount];
         internal readonly uint[] LastSemanticRptSeq = new uint[SemanticKindCount];
+        internal readonly List<SequenceRange> NonMboCoverage = new();
         internal readonly long[] StaleSinceTicks = new long[KindCount];
 
         // Lower bound for snapshot rptSeq accepted by HealFromSnapshot. Set whenever
@@ -221,6 +222,8 @@ public sealed class SymbolStateRegistry
         internal uint ObservedRptSeq;
         internal bool MboSemanticReconciliation;
     }
+
+    internal readonly record struct SequenceRange(uint Start, uint End);
 
     /// <summary>
     /// Outcome of <see cref="Observe"/>: tells the caller whether to apply,
@@ -263,7 +266,8 @@ public sealed class SymbolStateRegistry
     /// stored last-seen value. Returns the action the caller should take.
     /// </summary>
     /// <param name="securityId">Security identifier.</param>
-    /// <param name="kind">Message family — distinguishes independent rptSeq streams per symbol.</param>
+    /// <param name="kind">Message family whose state/recovery policy is being updated.
+    /// Wire continuity is still tracked by the one global per-security watermark.</param>
     /// <param name="receivedRptSeq">The rptSeq carried by the incoming message. Caller
     /// must not pass 0 (sentinel for "absent" in SBE) — guard at the call site.</param>
     public ObserveResult Observe(ulong securityId, SymbolGapKind kind, uint receivedRptSeq)
@@ -296,6 +300,12 @@ public sealed class SymbolStateRegistry
             // absent: the global watermark above is the single source of truth.
             // The Healthy branch only handles duplicate suppression and forward apply.
             result = DispatchByState(entry, idx, kind, receivedRptSeq, lastSeen, prev, bootPolicy, gap);
+            if (kind != SymbolGapKind.Mbo
+                && result.Action != ObserveAction.Drop
+                && entry.States[(int)SymbolGapKind.Mbo] != SymbolState.Healthy)
+            {
+                AddNonMboCoverage(entry.NonMboCoverage, receivedRptSeq);
+            }
         }
 
         // Invoke the (Mbo) stale-status callback OUTSIDE the per-symbol lock to
@@ -310,8 +320,9 @@ public sealed class SymbolStateRegistry
     /// Observes an incremental whose semantic effect is independent of MBO
     /// snapshot recovery. Global gap detection still runs first and may force
     /// the MBO bucket stale, but a forward semantic message is applied immediately.
-    /// Duplicate and reordered semantics are suppressed by both the dedicated
-    /// semantic watermark and the shared per-security observed watermark.
+    /// Duplicate and reordered semantics are suppressed by the dedicated emitted
+    /// semantic watermark; snapshot advancement of the global watermark alone is
+    /// never proof that a semantic payload was delivered.
     /// </summary>
     internal SemanticObserveResult ObserveSemantic(
         ulong securityId,
@@ -337,11 +348,14 @@ public sealed class SymbolStateRegistry
                 receivedRptSeq,
                 observed);
 
-            drop = receivedRptSeq <= lastSemantic || receivedRptSeq <= observed;
+            drop = receivedRptSeq <= lastSemantic;
             if (!drop)
             {
                 entry.LastSemanticRptSeq[idx] = receivedRptSeq;
-                entry.ObservedRptSeq = receivedRptSeq;
+                if (receivedRptSeq > observed)
+                    entry.ObservedRptSeq = receivedRptSeq;
+                if (entry.States[(int)SymbolGapKind.Mbo] != SymbolState.Healthy)
+                    AddNonMboCoverage(entry.NonMboCoverage, receivedRptSeq);
             }
         }
 
@@ -378,15 +392,15 @@ public sealed class SymbolStateRegistry
 
         uint gapSize = receivedRptSeq - observed - 1;
         if (entry.States[mboIdx] != SymbolState.Healthy)
+        {
+            TightenMboMinHeal(entry, receivedRptSeq - 1);
             return new GapInfo(true, gapSize, false);
+        }
 
-        // Tighten MinHeal[Mbo] to (received - 1) on the Healthy→Stale transition.
-        // Subsequent gaps while already Stale do NOT bump MinHeal — the
-        // StaleMboBuffer eviction callback (BumpMinHeal) is responsible for
-        // advancing it when buffered entries are dropped.
-        uint mboMin = receivedRptSeq - 1;
-        if (mboMin > entry.MinHealRptSeq[mboIdx])
-            entry.MinHealRptSeq[mboIdx] = mboMin;
+        // Tighten MinHeal[Mbo] to (received - 1). The same rule applies to every
+        // later gap while Stale: skipped wire sequences are not replayable unless
+        // an accepted snapshot covers them.
+        TightenMboMinHeal(entry, receivedRptSeq - 1);
 
         int prevMask = entry.StaleKindMask;
         entry.States[mboIdx] = SymbolState.Stale;
@@ -426,7 +440,12 @@ public sealed class SymbolStateRegistry
                 // so a snapshot older than our first live observation is rejected
                 // (we cannot replay messages we never saw).
                 if (entry.MinHealRptSeq[idx] == 0 && receivedRptSeq > 0)
-                    entry.MinHealRptSeq[idx] = receivedRptSeq - 1;
+                {
+                    if (kind == SymbolGapKind.Mbo)
+                        TightenMboMinHeal(entry, receivedRptSeq - 1);
+                    else
+                        entry.MinHealRptSeq[idx] = receivedRptSeq - 1;
+                }
                 return new ObserveResult(SymbolState.Unknown, ObserveAction.Buffer, false, false, 0);
 
             case SymbolState.Healthy:
@@ -438,6 +457,8 @@ public sealed class SymbolStateRegistry
                     GapSize: gap.GlobalGap ? gap.Size : 0);
 
             case SymbolState.Stale:
+                if (receivedRptSeq <= lastSeen)
+                    return new ObserveResult(SymbolState.Stale, ObserveAction.Drop, false, false, 0);
                 if (receivedRptSeq > lastSeen)
                     entry.LastRptSeq[idx] = receivedRptSeq;
                 bool surfaceStaleTransition = gap.MboForcedStale && kind == SymbolGapKind.Mbo;
@@ -453,6 +474,167 @@ public sealed class SymbolStateRegistry
 
     /// <summary>Output of <see cref="DetectAndApplyGlobalGap"/>.</summary>
     private readonly record struct GapInfo(bool GlobalGap, uint Size, bool MboForcedStale);
+
+    internal bool ValidateMboReplayCoverage(
+        ulong securityId,
+        uint snapshotRptSeq,
+        ReadOnlySpan<uint> bufferedRptSeqs,
+        out uint missingRptSeq)
+    {
+        missingRptSeq = 0;
+        if (!_entries.TryGetValue(securityId, out var entry))
+            return true;
+
+        lock (entry.Sync)
+        {
+            const int mboIdx = (int)SymbolGapKind.Mbo;
+            uint minHeal = entry.MinHealRptSeq[mboIdx];
+            if (minHeal > 0 && snapshotRptSeq < minHeal)
+                return true;
+
+            uint drainTo = entry.LastRptSeq[mboIdx];
+            if (snapshotRptSeq >= drainTo)
+                return true;
+
+            uint expected = snapshotRptSeq + 1;
+            int bufferedIndex = 0;
+            int coverageIndex = 0;
+
+            while (true)
+            {
+                while (bufferedIndex < bufferedRptSeqs.Length
+                       && bufferedRptSeqs[bufferedIndex] < expected)
+                {
+                    bufferedIndex++;
+                }
+
+                while (coverageIndex < entry.NonMboCoverage.Count
+                       && entry.NonMboCoverage[coverageIndex].End < expected)
+                {
+                    coverageIndex++;
+                }
+
+                if (coverageIndex < entry.NonMboCoverage.Count)
+                {
+                    var coverage = entry.NonMboCoverage[coverageIndex];
+                    if (coverage.Start <= expected)
+                    {
+                        if (coverage.End >= drainTo)
+                            return true;
+                        expected = coverage.End + 1;
+                        coverageIndex++;
+                        continue;
+                    }
+                }
+
+                if (bufferedIndex < bufferedRptSeqs.Length
+                    && bufferedRptSeqs[bufferedIndex] == expected)
+                {
+                    if (expected == drainTo)
+                        return true;
+                    expected++;
+                    bufferedIndex++;
+                    continue;
+                }
+
+                missingRptSeq = expected;
+                return false;
+            }
+        }
+    }
+
+    private static void TightenMboMinHeal(SymbolEntry entry, uint newMin)
+    {
+        const int mboIdx = (int)SymbolGapKind.Mbo;
+        if (newMin <= entry.MinHealRptSeq[mboIdx])
+            return;
+
+        entry.MinHealRptSeq[mboIdx] = newMin;
+        RemoveNonMboCoverageThrough(entry.NonMboCoverage, newMin);
+    }
+
+    private static void AddNonMboCoverage(List<SequenceRange> ranges, uint rptSeq)
+    {
+        if (ranges.Count == 0)
+        {
+            ranges.Add(new SequenceRange(rptSeq, rptSeq));
+            return;
+        }
+
+        int lastIndex = ranges.Count - 1;
+        var last = ranges[lastIndex];
+        if (rptSeq > last.End)
+        {
+            if (last.End != uint.MaxValue && rptSeq == last.End + 1)
+                ranges[lastIndex] = last with { End = rptSeq };
+            else
+                ranges.Add(new SequenceRange(rptSeq, rptSeq));
+            return;
+        }
+
+        int lo = 0;
+        int hi = ranges.Count;
+        while (lo < hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            if (ranges[mid].Start <= rptSeq)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+
+        int nextIndex = lo;
+        int previousIndex = nextIndex - 1;
+        if (previousIndex >= 0 && rptSeq <= ranges[previousIndex].End)
+            return;
+
+        bool joinsPrevious = previousIndex >= 0
+            && ranges[previousIndex].End != uint.MaxValue
+            && rptSeq == ranges[previousIndex].End + 1;
+        bool joinsNext = nextIndex < ranges.Count
+            && rptSeq != uint.MaxValue
+            && rptSeq + 1 == ranges[nextIndex].Start;
+
+        if (joinsPrevious && joinsNext)
+        {
+            ranges[previousIndex] = new SequenceRange(
+                ranges[previousIndex].Start,
+                ranges[nextIndex].End);
+            ranges.RemoveAt(nextIndex);
+        }
+        else if (joinsPrevious)
+        {
+            ranges[previousIndex] = ranges[previousIndex] with { End = rptSeq };
+        }
+        else if (joinsNext)
+        {
+            ranges[nextIndex] = ranges[nextIndex] with { Start = rptSeq };
+        }
+        else
+        {
+            ranges.Insert(nextIndex, new SequenceRange(rptSeq, rptSeq));
+        }
+    }
+
+    private static void RemoveNonMboCoverageThrough(List<SequenceRange> ranges, uint rptSeq)
+    {
+        int removeCount = 0;
+        while (removeCount < ranges.Count && ranges[removeCount].End <= rptSeq)
+            removeCount++;
+        if (removeCount > 0)
+            ranges.RemoveRange(0, removeCount);
+
+        if (ranges.Count == 0 || ranges[0].Start > rptSeq)
+            return;
+
+        if (rptSeq == uint.MaxValue)
+        {
+            ranges.Clear();
+            return;
+        }
+
+        ranges[0] = ranges[0] with { Start = rptSeq + 1 };
+    }
 
     /// <summary>
     /// Temporarily moves a Healthy MBO symbol to Stale while an authoritative
@@ -479,8 +661,7 @@ public sealed class SymbolStateRegistry
             entry.StaleSinceTicks[mboIdx] = _clock.NowTicks;
             entry.StaleKindMask |= 1 << mboIdx;
             entry.MboSemanticReconciliation = true;
-            if (priorHighWater > entry.MinHealRptSeq[mboIdx])
-                entry.MinHealRptSeq[mboIdx] = priorHighWater;
+            TightenMboMinHeal(entry, priorHighWater);
             if (prevMask == 0)
                 Interlocked.Increment(ref _staleSymbolCount);
             transitioned = true;
@@ -654,7 +835,10 @@ public sealed class SymbolStateRegistry
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0; // baseline restored — no constraint until next stale event
             if (kind == SymbolGapKind.Mbo)
+            {
                 entry.MboSemanticReconciliation = false;
+                entry.NonMboCoverage.Clear();
+            }
 
             // Bump observed to at least snapshotRptSeq. Snapshots are an authoritative
             // "instrument is at rptSeq=N" signal from the wire (lower bound — live may
@@ -748,7 +932,10 @@ public sealed class SymbolStateRegistry
             entry.States[idx] = SymbolState.Healthy;
             entry.MinHealRptSeq[idx] = 0;
             if (kind == SymbolGapKind.Mbo)
+            {
                 entry.MboSemanticReconciliation = false;
+                entry.NonMboCoverage.Clear();
+            }
             if (anchor > entry.ObservedRptSeq) entry.ObservedRptSeq = anchor;
 
             bool transitioned = prev != SymbolState.Healthy;
@@ -797,6 +984,7 @@ public sealed class SymbolStateRegistry
                     entry.MinHealRptSeq[i] = 0;
                 }
                 Array.Clear(entry.LastSemanticRptSeq);
+                entry.NonMboCoverage.Clear();
                 entry.StaleKindMask = 0;
                 entry.MboSemanticReconciliation = false;
                 // Wire counter restarts on a catastrophic reset (SequenceReset_1 /
@@ -873,7 +1061,10 @@ public sealed class SymbolStateRegistry
             entry.MinHealRptSeq[idx] = 0;
             entry.StaleKindMask &= ~(1 << idx);
             if (kind == SymbolGapKind.Mbo)
+            {
                 entry.MboSemanticReconciliation = false;
+                entry.NonMboCoverage.Clear();
+            }
             if (prevMask != 0 && entry.StaleKindMask == 0)
                 Interlocked.Decrement(ref _staleSymbolCount);
             // EmptyBook resets the wire-level rptSeq counter for this instrument
@@ -919,7 +1110,10 @@ public sealed class SymbolStateRegistry
         {
             if (newMin > entry.MinHealRptSeq[idx])
             {
-                entry.MinHealRptSeq[idx] = newMin;
+                if (kind == SymbolGapKind.Mbo)
+                    TightenMboMinHeal(entry, newMin);
+                else
+                    entry.MinHealRptSeq[idx] = newMin;
                 return true;
             }
         }

@@ -460,6 +460,38 @@ public sealed class StaleMboBuffer
         _queues.TryGetValue(securityId, out var q) ? q.Items.Count : 0;
 
     /// <summary>
+    /// Returns the sorted, de-duplicated buffered MBO rptSeq values in the
+    /// requested inclusive window. Used to prove snapshot replay continuity
+    /// before the live book is swapped.
+    /// </summary>
+    internal uint[] SnapshotRptSeqs(ulong securityId, uint from, uint to)
+    {
+        if (from > to || !_queues.TryGetValue(securityId, out var queue))
+            return Array.Empty<uint>();
+
+        var values = new List<uint>(queue.Items.Count);
+        foreach (var item in queue.Items)
+        {
+            if (item.RptSeq >= from && item.RptSeq <= to)
+                values.Add(item.RptSeq);
+        }
+
+        if (values.Count == 0)
+            return Array.Empty<uint>();
+
+        values.Sort();
+        int write = 1;
+        for (int read = 1; read < values.Count; read++)
+        {
+            if (values[read] != values[write - 1])
+                values[write++] = values[read];
+        }
+        if (write < values.Count)
+            values.RemoveRange(write, values.Count - write);
+        return values.ToArray();
+    }
+
+    /// <summary>
     /// Begin a transactional drain of the per-symbol buffer for
     /// <paramref name="securityId"/>. The returned <see cref="DrainTransaction"/>
     /// extracts the matching window (rptSeq ∈ [drainFrom, drainTo]) and the

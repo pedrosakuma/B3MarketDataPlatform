@@ -24,12 +24,12 @@ public class BookManagerSnapshotHealTests
             reg.Observe(securityId: 42, SymbolGapKind.Mbo, r);
         // Cold-start MBO is Unknown (not yet Stale; that requires Healthy→gap).
 
-        bm.RecordSnapshotHeader(42, lastRptSeq: 12);
+        bm.RecordSnapshotHeader(42, lastRptSeq: 15);
         bm.HealAfterSnapshotForTest(42);
 
         Assert.Equal(1, bm.SnapshotsHealed);
         Assert.Equal(0, bm.SnapshotsMissingRptSeq);
-        Assert.Equal(12u, bm.Books[42].LastRptSeq); // book reflects snapshot baseline
+        Assert.Equal(15u, bm.Books[42].LastRptSeq); // book reflects snapshot baseline
     }
 
     [Fact]
@@ -128,7 +128,7 @@ public class BookManagerSnapshotHealTests
         for (uint r = 10; r <= 15; r++)
             reg.Observe(securityId: 100, SymbolGapKind.Mbo, r);
 
-        bm.BeginChunkedSnapshotForTest(100, lastRptSeq: 12, ordersExpected: 30);
+        bm.BeginChunkedSnapshotForTest(100, lastRptSeq: 15, ordersExpected: 30);
         bm.RecordSnapshotChunkForTest(100, ordersInChunk: 10);
         Assert.Equal(0, bm.SnapshotsHealed);
         Assert.Equal(0, bm.SnapshotsMissingRptSeq);
@@ -139,7 +139,7 @@ public class BookManagerSnapshotHealTests
         bm.RecordSnapshotChunkForTest(100, ordersInChunk: 10);
         Assert.Equal(1, bm.SnapshotsHealed);
         Assert.Equal(0, bm.SnapshotsMissingRptSeq);
-        Assert.Equal(12u, bm.Books[100].LastRptSeq);
+        Assert.Equal(15u, bm.Books[100].LastRptSeq);
     }
 
     [Fact]
@@ -390,23 +390,23 @@ public class BookManagerSnapshotHealTests
     }
 
     [Fact]
-    public void Snapshot_AcceptedAtBoundary_S_EqualsMinHeal()
+    public void Snapshot_CoveringHighWater_IsAccepted()
     {
-        // Cenário 3: snapshot exatamente em S = MinHeal deve ser aceito (>=, não >).
-        // Drain window = [S+1, highWater] = [MinHeal+1, highWater].
+        // A snapshot at the observed high-water needs no retained replay body.
         var (bm, reg, _) = CreatePerSymbol();
         for (uint r = 50; r <= 100; r++)
             reg.Observe(securityId: 900, SymbolGapKind.Mbo, r);
         reg.HealFromSnapshot(900, SymbolGapKind.Mbo, 100);
         reg.Observe(securityId: 900, SymbolGapKind.Mbo, 200); // gap → Stale; MinHeal=199, highWater=200
 
-        // Snapshot exatamente em 199 — boundary case.
-        bm.BeginChunkedSnapshotForTest(900, lastRptSeq: 199, ordersExpected: 0);
+        // No retained message body exists in this registry-only setup, so the
+        // snapshot must cover the observed high-water.
+        bm.BeginChunkedSnapshotForTest(900, lastRptSeq: 200, ordersExpected: 0);
 
         Assert.Equal(1, bm.SnapshotsHealed);
         Assert.Equal(0, bm.SnapshotsRejectedTooOld);
         Assert.Equal(SymbolState.Healthy, reg.GetState(900, SymbolGapKind.Mbo));
-        Assert.Equal(199u, bm.Books[900].LastRptSeq);
+        Assert.Equal(200u, bm.Books[900].LastRptSeq);
     }
 
     [Fact]
@@ -496,8 +496,8 @@ public class BookManagerSnapshotHealTests
         Assert.Equal(SymbolStateRegistry.ObserveAction.Buffer, obs.Action);
         Assert.Equal(SymbolState.Stale, reg.GetState(1300, SymbolGapKind.Mbo));
 
-        // Próximo snapshot fresco (rpt >= 159) cura corretamente.
-        bm.BeginChunkedSnapshotForTest(1300, lastRptSeq: 159, ordersExpected: 0);
+        // Snapshot covering the unretained registry-only observation heals.
+        bm.BeginChunkedSnapshotForTest(1300, lastRptSeq: 160, ordersExpected: 0);
         Assert.Equal(1, bm.SnapshotsHealed);
         Assert.Equal(SymbolState.Healthy, reg.GetState(1300, SymbolGapKind.Mbo));
     }

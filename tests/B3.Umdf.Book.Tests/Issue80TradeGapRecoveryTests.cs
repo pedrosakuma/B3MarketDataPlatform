@@ -75,6 +75,27 @@ public class Issue80TradeGapRecoveryTests
     }
 
     [Fact]
+    public void SnapshotWatermark_DoesNotSuppressNeverEmittedDelayedTrade()
+    {
+        var (bookManager, registry, _, recorder) = Create();
+        Bootstrap(bookManager, rptSeq: 10);
+
+        SendOrder(bookManager, rptSeq: 13, orderId: 100);
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 14, ordersExpected: 0);
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+
+        SendTrade(bookManager, rptSeq: 14, tradeId: 1);
+        SendTrade(bookManager, rptSeq: 14, tradeId: 1);
+        SendTrade(bookManager, rptSeq: 13, tradeId: 2);
+
+        Assert.Equal(1, recorder.TradeCount);
+        Assert.Equal(2, bookManager.TradeRouteRejected);
+        Assert.True(bookManager.TryGetTradeState(SecurityId, out var tradeState));
+        Assert.Single(tradeState!.Ring.AsSpan());
+        Assert.Equal(35_3400L, tradeState.LastTradePrice);
+    }
+
+    [Fact]
     public void DuplicateAndReorderedTrades_AreSuppressed()
     {
         var (bookManager, _, _, recorder) = Create();
@@ -135,10 +156,105 @@ public class Issue80TradeGapRecoveryTests
         Assert.Equal(1, bookManager.TradeBustsApplied);
     }
 
+    [Fact]
+    public void AdditionalGapWhileStale_TightensMinHealAndPreventsSparseReplay()
+    {
+        var (bookManager, registry, buffer, recorder) = Create();
+        Bootstrap(bookManager, rptSeq: 10);
+
+        SendOrder(bookManager, rptSeq: 13, orderId: 100);
+        SendOrder(bookManager, rptSeq: 16, orderId: 101);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 14, ordersExpected: 0);
+        Assert.Equal(SymbolState.Stale, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, bookManager.SnapshotsRejectedTooOld);
+        Assert.Equal(2, buffer.DepthOf(SecurityId));
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 15, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(0, buffer.DepthOf(SecurityId));
+        Assert.Equal(1, recorder.OrderAddCount);
+        Assert.True(bookManager.Books[SecurityId].Bids.TryGetOrder(101, out _));
+        Assert.False(bookManager.Books[SecurityId].Bids.TryGetOrder(100, out _));
+    }
+
+    [Fact]
+    public void SemanticOnlySequences_ProveSparseMboReplayCoverage()
+    {
+        var (bookManager, registry, buffer, recorder) = Create();
+        Bootstrap(bookManager, rptSeq: 10);
+
+        SendOrder(bookManager, rptSeq: 13, orderId: 100);
+        SendTrade(bookManager, rptSeq: 14, tradeId: 1);
+        SendExecutionSummary(bookManager, rptSeq: 15);
+        SendOrder(bookManager, rptSeq: 16, orderId: 101);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 12, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(0, buffer.DepthOf(SecurityId));
+        Assert.Equal(2, recorder.OrderAddCount);
+        Assert.Equal(1, recorder.TradeCount);
+        Assert.Equal(1, recorder.ExecutionSummaryCount);
+        Assert.Equal(0, bookManager.SnapshotsRejectedReplayGap);
+        Assert.True(bookManager.Books[SecurityId].Bids.TryGetOrder(100, out _));
+        Assert.True(bookManager.Books[SecurityId].Bids.TryGetOrder(101, out _));
+    }
+
+    [Fact]
+    public void MissingBufferedMbo_IsRejectedUntilSnapshotCoversIt()
+    {
+        var buffer = new StaleMboBuffer(
+            NullLogger.Instance,
+            perSymbolCap: 8,
+            globalByteCap: 1,
+            hotPerSymbolCap: 16);
+        var (bookManager, registry, _, recorder) = Create(buffer);
+        Bootstrap(bookManager, rptSeq: 10);
+
+        SendOrder(bookManager, rptSeq: 13, orderId: 100);
+        Assert.Equal(1, buffer.DroppedGlobalCapCount);
+        Assert.Equal(0, buffer.DepthOf(SecurityId));
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 12, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Stale, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, bookManager.SnapshotsRejectedReplayGap);
+        Assert.Equal(0, recorder.OrderAddCount);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 13, ordersExpected: 0);
+
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(0, recorder.OrderAddCount);
+    }
+
+    [Fact]
+    public void SemanticGapWhileStale_TightensFloorButStillEmitsSemantic()
+    {
+        var (bookManager, registry, _, recorder) = Create();
+        Bootstrap(bookManager, rptSeq: 10);
+
+        SendOrder(bookManager, rptSeq: 13, orderId: 100);
+        SendTrade(bookManager, rptSeq: 16, tradeId: 1);
+
+        Assert.Equal(1, recorder.TradeCount);
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 14, ordersExpected: 0);
+        Assert.Equal(SymbolState.Stale, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, bookManager.SnapshotsRejectedTooOld);
+
+        bookManager.BeginChunkedSnapshotForTest(SecurityId, lastRptSeq: 15, ordersExpected: 0);
+        Assert.Equal(SymbolState.Healthy, registry.GetState(SecurityId, SymbolGapKind.Mbo));
+        Assert.Equal(1, recorder.TradeCount);
+    }
+
     private static (BookManager Manager, SymbolStateRegistry Registry, StaleMboBuffer Buffer, Recorder Recorder) Create()
+        => Create(new StaleMboBuffer(NullLogger.Instance));
+
+    private static (BookManager Manager, SymbolStateRegistry Registry, StaleMboBuffer Buffer, Recorder Recorder) Create(
+        StaleMboBuffer buffer)
     {
         var registry = new SymbolStateRegistry(NullLogger.Instance);
-        var buffer = new StaleMboBuffer(NullLogger.Instance);
         var recorder = new Recorder();
         var manager = new BookManager(
             eventHandler: recorder,

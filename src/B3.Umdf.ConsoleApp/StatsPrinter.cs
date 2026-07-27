@@ -216,7 +216,7 @@ internal sealed class StatsPrinter
                     forced = $" forcedHeal[count:{authReset:N0} maxUnsafe:{maxUnsafe:N0} maxDiscardedTail:{maxDiscarded:N0}]";
                 }
                 perSymbolParts.Add(
-                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}{forced}");
+                    $"G{_groupIds[i]}=stale:{snap.TotalStaleSymbols}/{snap.TotalSymbols} buf:{stalePending:N0}msg/{bufBytes:N0}B healed:{bm.SnapshotsHealed:N0} skipHA:{bm.SnapshotsSkippedHealthyAhead:N0} rejTooOld:{bm.SnapshotsRejectedTooOld:N0} rejReplayGap:{bm.SnapshotsRejectedReplayGap:N0} miss:{bm.SnapshotsMissingRptSeq:N0}{gate}{floor}{forced}");
             }
         }
         if (_multiFeed is not null)

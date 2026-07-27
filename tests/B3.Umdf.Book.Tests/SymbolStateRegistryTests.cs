@@ -111,11 +111,11 @@ public class SymbolStateRegistryTests
         r.Observe(1, SymbolGapKind.Mbo, 110);  // gap → Stale
         r.Observe(1, SymbolGapKind.Mbo, 115);  // buffered, advances high-water
 
-        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 112);
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 114);
 
         Assert.True(heal.TransitionedToHealthy);
-        Assert.Equal(112u, heal.SnapshotRptSeq);
-        Assert.Equal(113u, heal.DrainFrom);
+        Assert.Equal(114u, heal.SnapshotRptSeq);
+        Assert.Equal(115u, heal.DrainFrom);
         Assert.Equal(115u, heal.DrainTo);
         Assert.False(r.IsAnyStale(1));
     }
@@ -154,10 +154,10 @@ public class SymbolStateRegistryTests
         Assert.Equal(2, r.LaggingSnapshotCount);
 
         // A snapshot fresh enough to bridge the gap is accepted normally.
-        var fresh = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 150);
+        var fresh = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 199);
         Assert.True(fresh.Accepted);
         Assert.True(fresh.TransitionedToHealthy);
-        Assert.Equal(151u, fresh.DrainFrom);
+        Assert.Equal(200u, fresh.DrainFrom);
         Assert.Equal(200u, fresh.DrainTo);
     }
 
@@ -207,15 +207,14 @@ public class SymbolStateRegistryTests
         var r = NewRegistry();
         r.HealFromSnapshot(1, SymbolGapKind.Mbo, 100);
         r.Observe(1, SymbolGapKind.Mbo, 105);  // gap → Stale, MinHealRptSeq=104
-        r.Observe(1, SymbolGapKind.Mbo, 108);
+        r.Observe(1, SymbolGapKind.Mbo, 108); // later gap tightens MinHealRptSeq=107
 
-        // Snapshot at exactly MinHealRptSeq (104): drain [105, 108] aligns with first
-        // buffered entry. Accepted.
-        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 104);
+        // Snapshot at the tightened MinHealRptSeq (107) is accepted.
+        var heal = r.HealFromSnapshot(1, SymbolGapKind.Mbo, snapshotRptSeq: 107);
 
         Assert.True(heal.Accepted);
         Assert.True(heal.TransitionedToHealthy);
-        Assert.Equal(105u, heal.DrainFrom);
+        Assert.Equal(108u, heal.DrainFrom);
         Assert.Equal(108u, heal.DrainTo);
     }
 
