@@ -10,15 +10,17 @@ namespace B3.Umdf.Transport;
 public sealed class MulticastPacketSource : IPacketSource
 {
     private const int SourceMembershipRequestSize = 12;
-    // UMDF over UDP datagrams are bounded by Ethernet MTU (~1500 bytes); 9 KiB jumbo is the realistic upper bound.
-    // Using 64 KiB per rent multiplied by hundreds of thousands of in-flight pooled buffers caused OOM on bursts.
-    private const int MaxDatagramSize = 9 * 1024;
+    public const int JumboDatagramBytes = 9 * 1024;
+    public const int MaximumUdpPayloadBytes = 65_507;
     public const int MaxBatchSize = 64;
 
     private readonly Socket _socket;
     private readonly ChannelType _channelType;
     private readonly int _channelGroup;
     private readonly TransportKind _transport;
+    private readonly int _maxDatagramBytes;
+    private readonly int _receiveCapacityBytes;
+    private readonly bool _copyBatchPayloads;
     private readonly ILogger _logger;
 
     // Membership info retained so we can leave and rejoin the multicast group on demand
@@ -55,16 +57,15 @@ public sealed class MulticastPacketSource : IPacketSource
     /// <summary>Count of successful multicast membership leaves.</summary>
     public long MembershipLeaves => Volatile.Read(ref _membershipLeaves);
     /// <summary>
-    /// Number of datagrams the kernel reported as truncated to the receive buffer
-    /// (MSG_TRUNC in the recvmmsg path). These are dropped — never delivered downstream —
-    /// so the count is the operator's only visibility into "datagram bigger than
-    /// <see cref="MaxDatagramSize"/>" events.
+    /// Number of datagrams dropped because they exceeded <see cref="MaxDatagramBytes"/>
+    /// or the kernel reported MSG_TRUNC. They are never delivered partially downstream.
     /// </summary>
     public long TruncatedDatagramCount => Volatile.Read(ref _truncatedDatagramCount);
 
     public ChannelType ChannelType => _channelType;
     public int ChannelGroup => _channelGroup;
     public TransportKind Transport => _transport;
+    public int MaxDatagramBytes => _maxDatagramBytes;
     public bool IsJoined { get { lock (_membershipLock) return _isJoined; } }
 
     // Test-only: exposes whether the recvmmsg batch state (POH buffer pool +
@@ -88,6 +89,11 @@ public sealed class MulticastPacketSource : IPacketSource
     public MulticastPacketSource(ChannelConfig config, ILogger<MulticastPacketSource>? logger = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(config.ReceiveBufferBytes, 1);
+        int maxDatagramBytes = config.MaxDatagramBytes == 0
+            ? MulticastFeedConfig.DefaultMaxDatagramBytesFor(config.Type)
+            : config.MaxDatagramBytes;
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxDatagramBytes, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxDatagramBytes, MaximumUdpPayloadBytes);
         ValidateIPv4(config.MulticastGroup, nameof(config.MulticastGroup));
         if (config.SourceAddress is not null)
             ValidateIPv4(config.SourceAddress, nameof(config.SourceAddress));
@@ -112,6 +118,16 @@ public sealed class MulticastPacketSource : IPacketSource
         _channelType = config.Type;
         _channelGroup = config.ChannelGroup;
         _transport = config.Transport;
+        _maxDatagramBytes = maxDatagramBytes;
+        // A one-byte lookahead distinguishes a valid datagram exactly at the configured
+        // cap from an oversized datagram without relying on MSG_TRUNC propagation.
+        _receiveCapacityBytes = maxDatagramBytes < MaximumUdpPayloadBytes
+            ? maxDatagramBytes + 1
+            : MaximumUdpPayloadBytes;
+        // Large receive slots remain scratch buffers. Copying only the bytes actually
+        // received prevents every in-flight snapshot from retaining a 64 KiB pinned
+        // array while preserving the existing zero-copy path for hot UMDF channels.
+        _copyBatchPayloads = maxDatagramBytes > JumboDatagramBytes;
         _multicastGroup = config.MulticastGroup;
         _port = config.Port;
         _localAddress = config.LocalAddress;
@@ -182,8 +198,8 @@ public sealed class MulticastPacketSource : IPacketSource
             // directly. _isJoined is set true so callers treat the source as "ready to receive";
             // Leave/Rejoin become no-ops (see those methods).
             _logger.LogInformation(
-                "Listening unicast UDP on {Bind}:{Port} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes})",
-                bindAddress, config.Port, _channelType, _channelGroup, actualReceiveBufferBytes);
+                "Listening unicast UDP on {Bind}:{Port} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes}, maxDatagram={MaxDatagramBytes})",
+                bindAddress, config.Port, _channelType, _channelGroup, actualReceiveBufferBytes, _maxDatagramBytes);
         }
         else if (config.SourceAddress is not null)
         {
@@ -194,8 +210,8 @@ public sealed class MulticastPacketSource : IPacketSource
                 BuildSourceMembershipRequest(config.MulticastGroup, localAddress, config.SourceAddress));
 
             _logger.LogInformation(
-                "Joined SSM group {Group}:{Port} source {SourceAddress} via {LocalAddress} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes})",
-                config.MulticastGroup, config.Port, config.SourceAddress, localAddress, _channelType, _channelGroup, actualReceiveBufferBytes);
+                "Joined SSM group {Group}:{Port} source {SourceAddress} via {LocalAddress} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes}, maxDatagram={MaxDatagramBytes})",
+                config.MulticastGroup, config.Port, config.SourceAddress, localAddress, _channelType, _channelGroup, actualReceiveBufferBytes, _maxDatagramBytes);
         }
         else if (config.LocalAddress is not null)
         {
@@ -204,8 +220,8 @@ public sealed class MulticastPacketSource : IPacketSource
                 SocketOptionName.AddMembership,
                 new MulticastOption(config.MulticastGroup, config.LocalAddress));
             _logger.LogInformation(
-                "Joined multicast group {Group}:{Port} via {LocalAddress} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes})",
-                config.MulticastGroup, config.Port, config.LocalAddress, _channelType, _channelGroup, actualReceiveBufferBytes);
+                "Joined multicast group {Group}:{Port} via {LocalAddress} ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes}, maxDatagram={MaxDatagramBytes})",
+                config.MulticastGroup, config.Port, config.LocalAddress, _channelType, _channelGroup, actualReceiveBufferBytes, _maxDatagramBytes);
         }
         else
         {
@@ -214,8 +230,8 @@ public sealed class MulticastPacketSource : IPacketSource
                 SocketOptionName.AddMembership,
                 new MulticastOption(config.MulticastGroup));
             _logger.LogInformation(
-                "Joined multicast group {Group}:{Port} on any local interface ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes})",
-                config.MulticastGroup, config.Port, _channelType, _channelGroup, actualReceiveBufferBytes);
+                "Joined multicast group {Group}:{Port} on any local interface ({ChannelType}, group {ChannelGroup}, recvBuffer={ReceiveBufferBytes}, maxDatagram={MaxDatagramBytes})",
+                config.MulticastGroup, config.Port, _channelType, _channelGroup, actualReceiveBufferBytes, _maxDatagramBytes);
         }
         _isJoined = true;
         Interlocked.Increment(ref _membershipJoins);
@@ -325,22 +341,30 @@ public sealed class MulticastPacketSource : IPacketSource
 
     public async ValueTask<UmdfPacket> ReceiveAsync(CancellationToken ct = default)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(MaxDatagramSize);
-        try
+        while (true)
         {
-            int received = await _socket.ReceiveAsync(buffer.AsMemory(), SocketFlags.None, ct);
-            var lease = new ArrayPoolPacketLease(buffer);
-            return UmdfPacket.CreateOwned(
-                new ReadOnlyMemory<byte>(buffer, 0, received),
-                _channelType,
-                _channelGroup,
-                Environment.TickCount64,
-                lease);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-            throw;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(_receiveCapacityBytes);
+            try
+            {
+                var result = await _socket.ReceiveMessageFromAsync(
+                    buffer.AsMemory(0, _receiveCapacityBytes),
+                    SocketFlags.None,
+                    new IPEndPoint(IPAddress.Any, 0),
+                    ct);
+                if (IsOversizedOrTruncated((int)result.SocketFlags, result.ReceivedBytes, _maxDatagramBytes))
+                {
+                    long tn = Interlocked.Increment(ref _truncatedDatagramCount);
+                    LogTruncatedRateLimited(tn, result.ReceivedBytes);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    continue;
+                }
+                return CreatePacket(buffer, result.ReceivedBytes, Environment.TickCount64);
+            }
+            catch
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+                throw;
+            }
         }
     }
 
@@ -353,22 +377,29 @@ public sealed class MulticastPacketSource : IPacketSource
     /// </summary>
     public UmdfPacket Receive()
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(MaxDatagramSize);
-        try
+        while (true)
         {
-            int received = _socket.Receive(buffer, 0, MaxDatagramSize, SocketFlags.None);
-            var lease = new ArrayPoolPacketLease(buffer);
-            return UmdfPacket.CreateOwned(
-                new ReadOnlyMemory<byte>(buffer, 0, received),
-                _channelType,
-                _channelGroup,
-                Environment.TickCount64,
-                lease);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-            throw;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(_receiveCapacityBytes);
+            try
+            {
+                SocketFlags flags = SocketFlags.None;
+                EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                int received = _socket.ReceiveMessageFrom(
+                    buffer, 0, _receiveCapacityBytes, ref flags, ref remote, out _);
+                if (IsOversizedOrTruncated((int)flags, received, _maxDatagramBytes))
+                {
+                    long tn = Interlocked.Increment(ref _truncatedDatagramCount);
+                    LogTruncatedRateLimited(tn, received);
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    continue;
+                }
+                return CreatePacket(buffer, received, Environment.TickCount64);
+            }
+            catch
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+                throw;
+            }
         }
     }
 
@@ -431,34 +462,47 @@ public sealed class MulticastPacketSource : IPacketSource
             int received = (int)mmsghdrs[i].msg_len;
             int msgFlags = mmsghdrs[i].msg_hdr.msg_flags;
 
-            if (IsKernelTruncated(msgFlags, received, MaxDatagramSize))
+            if (IsOversizedOrTruncated(msgFlags, received, _maxDatagramBytes))
             {
-                // Datagram exceeded our receive buffer — kernel truncated it.
-                // Dropping is the only safe option: a partial UMDF SBE message would
-                // mis-parse downstream. Reuse the buffer in-place (no rent/return)
-                // since no lease is created and the iovec is still bound to it.
+                // Datagram exceeded the configured cap or the kernel truncated it.
+                // Drop the whole datagram: partial UMDF data would mis-parse downstream.
+                // Reuse the buffer in-place since no lease is created.
                 long tn = Interlocked.Increment(ref _truncatedDatagramCount);
                 LogTruncatedRateLimited(tn, received);
                 continue;
             }
 
-            var lease = new PinnedPoolPacketLease(buf, pool);
-            destination[delivered++] = UmdfPacket.CreateOwned(
-                new ReadOnlyMemory<byte>(buf, 0, received),
-                _channelType,
-                _channelGroup,
-                ticks,
-                lease);
-
-            // Refill the slot for the next syscall: rent a fresh buffer and rebind iovec.
-            // Address is stable for POH arrays, so we capture it once via fixed and store.
-            var newBuf = pool.Rent();
-            pending[i] = newBuf;
-            unsafe
+            if (_copyBatchPayloads)
             {
-                fixed (byte* p = newBuf)
+                byte[] payload = ArrayPool<byte>.Shared.Rent(received);
+                buf.AsSpan(0, received).CopyTo(payload);
+                destination[delivered++] = UmdfPacket.CreateOwned(
+                    new ReadOnlyMemory<byte>(payload, 0, received),
+                    _channelType,
+                    _channelGroup,
+                    ticks,
+                    new ArrayPoolPacketLease(payload));
+            }
+            else
+            {
+                var lease = new PinnedPoolPacketLease(buf, pool);
+                destination[delivered++] = UmdfPacket.CreateOwned(
+                    new ReadOnlyMemory<byte>(buf, 0, received),
+                    _channelType,
+                    _channelGroup,
+                    ticks,
+                    lease);
+
+                // Refill the slot for the next syscall: rent a fresh buffer and rebind iovec.
+                // Address is stable for POH arrays, so we capture it once via fixed and store.
+                var newBuf = pool.Rent();
+                pending[i] = newBuf;
+                unsafe
                 {
-                    iovecs[i].iov_base = (IntPtr)p;
+                    fixed (byte* p = newBuf)
+                    {
+                        iovecs[i].iov_base = (IntPtr)p;
+                    }
                 }
             }
         }
@@ -471,34 +515,25 @@ public sealed class MulticastPacketSource : IPacketSource
     }
 
     /// <summary>
-    /// True if the kernel signalled that the datagram was truncated to the receive buffer.
-    /// Prefers the direct MSG_TRUNC flag (<see cref="LinuxNative.MSG_TRUNC"/>) when set in
-    /// <paramref name="msgFlags"/>; otherwise falls back to a heuristic on older kernels /
-    /// libc combinations that don't propagate per-message flags through recvmmsg: the
-    /// returned length being exactly the buffer cap is suspect for the UMDF workload
-    /// (genuine UMDF datagrams are bounded by Ethernet MTU well below 9 KiB).
-    /// Exposed as internal so the truncation policy can be unit-tested with synthetic flags.
+    /// True when a datagram exceeded the configured policy cap or the kernel explicitly
+    /// reported truncation. Receive buffers use one byte of lookahead below the protocol
+    /// maximum, so a length exactly equal to <paramref name="maxDatagramBytes"/> is valid.
     /// </summary>
-    internal static bool IsKernelTruncated(int msgFlags, int receivedLen, int bufferCap)
-    {
-        if ((msgFlags & LinuxNative.MSG_TRUNC) != 0) return true;
-        // Heuristic fallback: a datagram exactly filling the cap is treated as suspect.
-        // For UMDF (max payload << 9 KiB) this never triggers in steady state.
-        return receivedLen >= bufferCap;
-    }
+    internal static bool IsOversizedOrTruncated(int msgFlags, int receivedLen, int maxDatagramBytes) =>
+        (msgFlags & LinuxNative.MSG_TRUNC) != 0 || receivedLen > maxDatagramBytes;
 
     private void LogTruncatedRateLimited(long counter, int receivedLen)
     {
         if (counter == 1 || (counter & 63) == 0)
             _logger.LogWarning(
-                "Dropped truncated UDP datagram on {ChannelType} (group {ChannelGroup}): kernel truncated to {ReceivedLen} bytes (cap {Cap}); upstream sender exceeds the receive buffer (TruncatedDatagramCount={Count}).",
-                _channelType, _channelGroup, receivedLen, MaxDatagramSize, counter);
+                "Dropped oversized or truncated UDP datagram on {ChannelType} (group {ChannelGroup}): received {ReceivedLen} bytes (maxDatagramBytes={Cap}); upstream sender exceeds the configured per-datagram cap (TruncatedDatagramCount={Count}).",
+                _channelType, _channelGroup, receivedLen, _maxDatagramBytes, counter);
     }
 
     private void EnsureBatchStateInitialized()
     {
         if (_batchBufferPool is not null) return;
-        _batchBufferPool = new PinnedBufferPool(MaxDatagramSize);
+        _batchBufferPool = new PinnedBufferPool(_receiveCapacityBytes);
         _batchIovecs = new LinuxNative.Iovec[MaxBatchSize];
         _batchMmsghdrs = new LinuxNative.Mmsghdr[MaxBatchSize];
         _batchPendingBuffers = new byte[MaxBatchSize][];
@@ -525,8 +560,31 @@ public sealed class MulticastPacketSource : IPacketSource
                     _batchIovecs[i].iov_base = (IntPtr)p;
                 }
             }
-            _batchIovecs[i].iov_len = (nuint)MaxDatagramSize;
+            _batchIovecs[i].iov_len = (nuint)_receiveCapacityBytes;
         }
+    }
+
+    private UmdfPacket CreatePacket(byte[] receiveBuffer, int received, long ticks)
+    {
+        if (!_copyBatchPayloads)
+        {
+            return UmdfPacket.CreateOwned(
+                new ReadOnlyMemory<byte>(receiveBuffer, 0, received),
+                _channelType,
+                _channelGroup,
+                ticks,
+                new ArrayPoolPacketLease(receiveBuffer));
+        }
+
+        byte[] payload = ArrayPool<byte>.Shared.Rent(received);
+        receiveBuffer.AsSpan(0, received).CopyTo(payload);
+        ArrayPool<byte>.Shared.Return(receiveBuffer);
+        return UmdfPacket.CreateOwned(
+            new ReadOnlyMemory<byte>(payload, 0, received),
+            _channelType,
+            _channelGroup,
+            ticks,
+            new ArrayPoolPacketLease(payload));
     }
 
     internal static byte[] BuildSourceMembershipRequest(IPAddress multicastGroup, IPAddress localAddress, IPAddress sourceAddress)

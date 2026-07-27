@@ -100,6 +100,33 @@ public class PerSymbolFanoutGateTests
     }
 
     [Fact]
+    public void Gate_ValidSnapshotsAfterTransientRecoveryLoss_ReleaseSuppression()
+    {
+        var (registry, _, gh) = NewWiring();
+        for (ulong securityId = 1; securityId <= 3; securityId++)
+            registry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 100);
+
+        var gate = new PerSymbolFanoutGate(registry, gh, highRatio: 0.50, lowRatio: 0.0);
+        for (ulong securityId = 1; securityId <= 3; securityId++)
+            registry.Observe(securityId, SymbolGapKind.Mbo, 110);
+
+        gate.Evaluate();
+        Assert.True(gate.IsEngaged);
+        Assert.True(gh.IsFanoutSuppressed);
+
+        // Lost/truncated snapshot rotations do not mutate the registry. Once complete,
+        // valid snapshots resume, the normal Stale→Healthy path clears the ratio gate.
+        gate.Evaluate();
+        for (ulong securityId = 1; securityId <= 3; securityId++)
+            Assert.True(registry.HealFromSnapshot(securityId, SymbolGapKind.Mbo, 120).Accepted);
+
+        gate.Evaluate();
+        Assert.Equal(0, registry.StaleSymbolCount);
+        Assert.False(gate.IsEngaged);
+        Assert.False(gh.IsFanoutSuppressed);
+    }
+
+    [Fact]
     public void Gate_RejectsLowGreaterThanHigh()
     {
         var (registry, _, gh) = NewWiring();

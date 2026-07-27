@@ -12,4 +12,5 @@ public sealed record ChannelConfig(
     int ReceiveBufferBytes = 16 * 1024 * 1024,
     int ChannelGroup = 0,
     int ReceiveSocketCount = 1,
-    TransportKind Transport = TransportKind.Multicast);
+    TransportKind Transport = TransportKind.Multicast,
+    int MaxDatagramBytes = 0);

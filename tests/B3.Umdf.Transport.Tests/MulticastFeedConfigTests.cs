@@ -54,11 +54,13 @@ public class MulticastFeedConfigTests
             Assert.Null(eqtIncrA.SourceAddress);
             Assert.Null(eqtIncrA.LocalAddress);
             Assert.Equal(16 * 1024 * 1024, eqtIncrA.ReceiveBufferBytes);
+            Assert.Equal(MulticastPacketSource.JumboDatagramBytes, eqtIncrA.MaxDatagramBytes);
             Assert.Equal(1, eqtIncrA.ReceiveSocketCount);
 
             // EQT SnapshotRecovery channel uses receiveSocketCount=4
             var eqtSnap = channelConfigs[3];
             Assert.Equal(ChannelType.SnapshotRecovery, eqtSnap.Type);
+            Assert.Equal(MulticastPacketSource.MaximumUdpPayloadBytes, eqtSnap.MaxDatagramBytes);
             Assert.Equal(4, eqtSnap.ReceiveSocketCount);
 
             // DRV group 1 with source filter and explicit local interface
@@ -73,10 +75,39 @@ public class MulticastFeedConfigTests
             // Group IDs
             Assert.Equal([0, 1], config.GetGroupIds());
         }
+
         finally
         {
             File.Delete(tmpFile);
         }
+    }
+
+    [Fact]
+    public void ToChannelConfigs_ParsesExplicitMaxDatagramBytes()
+    {
+        var config = new MulticastFeedConfig
+        {
+            ChannelGroups =
+            [
+                new ChannelGroupConfig
+                {
+                    Name = "G0",
+                    Channels =
+                    [
+                        new ChannelEntryConfig
+                        {
+                            ChannelId = 84,
+                            Type = ChannelType.SnapshotRecovery,
+                            MulticastGroup = "224.0.20.87",
+                            Port = 30087,
+                            MaxDatagramBytes = 32 * 1024,
+                        },
+                    ],
+                },
+            ],
+        };
+
+        Assert.Equal(32 * 1024, Assert.Single(config.ToChannelConfigs()).MaxDatagramBytes);
     }
 
     [Fact]

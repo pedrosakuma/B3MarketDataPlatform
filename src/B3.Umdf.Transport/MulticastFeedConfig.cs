@@ -44,7 +44,8 @@ public sealed class MulticastFeedConfig
                     ReceiveBufferBytes: ch.ReceiveBufferBytes ?? DefaultReceiveBufferBytesFor(ch.Type),
                     ChannelGroup: g,
                     ReceiveSocketCount: Math.Max(1, ch.ReceiveSocketCount ?? 1),
-                    Transport: ParseTransport(ch.Transport)));
+                    Transport: ParseTransport(ch.Transport),
+                    MaxDatagramBytes: ch.MaxDatagramBytes ?? DefaultMaxDatagramBytesFor(ch.Type)));
             }
         }
         return configs;
@@ -69,7 +70,7 @@ public sealed class MulticastFeedConfig
     /// <summary>
     /// Builds flat list of publish routes from all groups for PCAP replay to multicast.
     /// Reuses the same JSON topology as live consume mode, but ignores receive-only fields
-    /// such as sourceAddress and receiveBufferBytes.
+    /// such as sourceAddress, receiveBufferBytes, and maxDatagramBytes.
     /// </summary>
     public List<MulticastPublishChannelConfig> ToPublishChannelConfigs()
     {
@@ -112,6 +113,17 @@ public sealed class MulticastFeedConfig
         ChannelType.InstrumentDefinition  =>  2 * 1024 * 1024,  //  2 MiB — low-rate, periodic, idempotent
         _                                 =>  4 * 1024 * 1024,
     };
+
+    /// <summary>
+    /// Per-datagram application buffer sizing. Snapshot recovery accepts the full
+    /// IPv4 UDP payload range because a snapshot is one atomic UDP datagram and
+    /// cannot be reconstructed after kernel truncation. Other UMDF channels retain
+    /// the jumbo-frame-sized cap to avoid inflating hot-path packet leases.
+    /// </summary>
+    public static int DefaultMaxDatagramBytesFor(ChannelType type) =>
+        type == ChannelType.SnapshotRecovery
+            ? MulticastPacketSource.MaximumUdpPayloadBytes
+            : MulticastPacketSource.JumboDatagramBytes;
 }
 
 public sealed class ChannelGroupConfig
@@ -145,6 +157,13 @@ public sealed class ChannelEntryConfig
 
     [JsonPropertyName("receiveBufferBytes")]
     public int? ReceiveBufferBytes { get; set; }
+
+    /// <summary>
+    /// Maximum bytes accepted in one UDP datagram. This is distinct from
+    /// <see cref="ReceiveBufferBytes"/>, which sizes the kernel's queued-data buffer.
+    /// </summary>
+    [JsonPropertyName("maxDatagramBytes")]
+    public int? MaxDatagramBytes { get; set; }
 
     /// <summary>
     /// Number of UDP sockets to bind for this channel using SO_REUSEPORT (Linux).
