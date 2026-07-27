@@ -55,6 +55,11 @@ public class InstrumentStatusBootstrapTests
             () => socket.HasMessageType(MessageType.InstrumentStatus),
             TimeSpan.FromSeconds(2));
         Assert.Equal(1, socket.CountByType(MessageType.InstrumentStatus));
+        var frame = socket.LastFrame(MessageType.InstrumentStatus);
+        Assert.NotNull(frame);
+        Assert.Equal(
+            WireProtocol.InstrumentStatusDeliverySnapshot,
+            frame![^1]);
 
         session.Dispose();
         await writeTask.WaitAsync(TimeSpan.FromSeconds(2));

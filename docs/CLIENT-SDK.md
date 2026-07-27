@@ -223,6 +223,12 @@ from UMDF" or "not applicable to the current phase".
 ```csharp
 client.InstrumentStatus += status =>
 {
+    if (status.IsSnapshot)
+    {
+        Console.WriteLine($"{status.Symbol}: bootstrapped halted={status.IsHalted}");
+        return;
+    }
+
     Console.WriteLine(
         $"{status.Symbol}: {(status.IsHalted ? "HALTED" : "RESUMED")} " +
         $"phase {status.PreviousStatus?.ToString() ?? "unknown"} -> {status.NewStatus}, " +
@@ -251,5 +257,14 @@ instead of inventing a reason from the marker.
 
 The latest administrative state is retained in the server's `InstrumentInfo`
 cache. Every new `Info` subscribe — including automatic re-subscribe after a
-WebSocket reconnect — receives the cached typed status after `InfoSnapshot`.
+WebSocket reconnect — receives the cached typed status after `InfoSnapshot`
+with `DeliveryKind=Snapshot` / `IsSnapshot=true`. It retains the original
+source timestamp and RptSeq for provenance; do not repeat live transition side
+effects for snapshot delivery. Live source changes use
+`DeliveryKind=LiveTransition`.
+
+Check `client.LastServerHello?.Capabilities` for
+`ServerCapabilities.InstrumentStatus` before relying on this stream. If the bit
+is absent, the server predates this feature; if present but no event arrives,
+the server has not yet observed administrative status for that symbol.
 Existing `InfoSnapshot` delivery remains unchanged for compatibility.

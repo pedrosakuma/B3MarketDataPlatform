@@ -81,7 +81,7 @@ public class MarketDataClientIntegrationTests
             await TestWsServer.SendInstrumentStatusAsync(
                 ws, 12345, symbol, previousStatus: 17, newStatus: 17,
                 transitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
-                sourceTimestamp, rptSeq: 9, ct);
+                sourceTimestamp, rptSeq: 9, isSnapshot: false, ct: ct);
             await Task.Delay(Timeout.Infinite, ct);
         });
 
@@ -104,6 +104,7 @@ public class MarketDataClientIntegrationTests
         Assert.Equal(InstrumentStatusTransitionKind.Halted, status.Transition);
         Assert.Null(status.HaltReason);
         Assert.True(status.IsHalted);
+        Assert.False(status.IsSnapshot);
         Assert.Equal(sourceTimestamp, status.SourceTimestampNanos);
         Assert.Equal(9u, status.RptSeq);
     }
@@ -121,7 +122,7 @@ public class MarketDataClientIntegrationTests
             await TestWsServer.SendInstrumentStatusAsync(
                 ws, 42, symbol, previousStatus: 17, newStatus: 17,
                 transitionCode: InstrumentStatusDecoder.InstrumentHaltedTransitionCode,
-                sourceTimestamp: 123, rptSeq: 9, ct);
+                sourceTimestamp: 123, rptSeq: 9, isSnapshot: true, ct: ct);
 
             if (subscribeNumber == 1)
             {
@@ -162,6 +163,7 @@ public class MarketDataClientIntegrationTests
         {
             Assert.True(status.IsHalted);
             Assert.Null(status.HaltReason);
+            Assert.True(status.IsSnapshot);
         });
     }
 
@@ -322,7 +324,7 @@ public class MarketDataClientIntegrationTests
             await TestWsServer.SendServerHelloAsync(
                 ws,
                 protocolVersion: 1,
-                capabilities: 0x03, // SnapshotOnSubscribe | SymbolDelistedNotification
+                capabilities: 0x07, // SnapshotOnSubscribe | SymbolDelistedNotification | InstrumentStatus
                 buildVersion: "1.2.3-test",
                 ct);
             await Task.Delay(Timeout.Infinite, ct);
@@ -340,7 +342,11 @@ public class MarketDataClientIntegrationTests
 
         var hello = await helloReceived.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(1U, hello.ProtocolVersion);
-        Assert.Equal(ServerCapabilities.SnapshotOnSubscribe | ServerCapabilities.SymbolDelistedNotification, hello.Capabilities);
+        Assert.Equal(
+            ServerCapabilities.SnapshotOnSubscribe
+            | ServerCapabilities.SymbolDelistedNotification
+            | ServerCapabilities.InstrumentStatus,
+            hello.Capabilities);
         Assert.Equal("1.2.3-test", hello.BuildVersion);
 
         // LastServerHello property snapshots the most-recently-received hello so
@@ -564,6 +570,7 @@ internal sealed class TestWsServer : IAsyncDisposable
         byte transitionCode,
         ulong sourceTimestamp,
         uint? rptSeq,
+        bool isSnapshot,
         CancellationToken ct)
     {
         var update = new InstrumentStatusUpdate(
@@ -571,7 +578,7 @@ internal sealed class TestWsServer : IAsyncDisposable
             sourceTimestamp, rptSeq);
         var buffer = new byte[WireProtocol.InstrumentStatusMaxSize];
         int length = WireProtocol.WriteInstrumentStatus(
-            buffer, securityId, symbol, in update);
+            buffer, securityId, symbol, in update, isSnapshot);
         return ws.SendAsync(
             buffer.AsMemory(0, length), WebSocketMessageType.Binary, true, ct).AsTask();
     }

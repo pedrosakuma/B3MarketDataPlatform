@@ -194,7 +194,10 @@ Total length = 18 bytes (8 header + 4 flags + 1 symLen + 5 symbol).
 
 **ServerHello** is the **first** server-initiated frame on every connection. It
 advertises the server's `protocolVersion` and a `serverCapabilities` bitmask
-(`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification; append-only).
+(`0x01` SnapshotOnSubscribe, `0x02` SymbolDelistedNotification,
+`0x04` InstrumentStatus; append-only). Clients use the InstrumentStatus bit to
+distinguish an older server that cannot emit `0x00B3` from a capable server that
+has simply not observed an administrative status yet.
 `SubscribeOk.flags` echoes the **accepted** `DataFlags` (`u32`) after the server
 masks off unknown/unimplemented bits requested by the client.
 
@@ -258,7 +261,7 @@ unrecognised combinations map to `Unknown`.
 
 | Message | Type | Payload |
 |---------|------|---------|
-| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]` |
+| **InstrumentStatus** | `0x00B3` | `[secId u64][symLen u8][symbol UTF-8][previousStatus u8][newStatus u8][transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32][deliveryKind u8]` |
 
 This is the dedicated, non-conflated transition surface for administrative
 single-instrument halt/resume. It is decoded from the existing schema-generated
@@ -270,10 +273,17 @@ otherwise schema-reserved `securityTradingEvent` values `1` (halt) and `2`
 
 `previousStatus=255` means the platform had no prior status cached,
 `haltReason=255` means the upstream frame supplied no detailed operator reason,
-and `rptSeq=0` means absent/snapshot. The venue preserves the underlying trading
+and `rptSeq=0` means unavailable. The venue preserves the underlying trading
 phase during an administrative halt, so `previousStatus` and `newStatus` may
 both be `17` (OPEN); consumers should use `transition`/the SDK's `IsHalted`
 property to identify the current administrative state.
+
+`deliveryKind` is append-only: `0` = live source transition, `1` = cached
+subscribe/reconnect snapshot. Snapshot frames deliberately retain the original
+source timestamp and RptSeq for provenance; consumers MUST check
+`deliveryKind`/`InstrumentStatusEvent.IsSnapshot` before running one-shot
+transition side effects. SDKs decoding a legacy frame without this trailing
+byte default it to live transition.
 
 The current source frame does **not** carry the operator's detailed halt reason
 (`RegulatoryHalt`, `NewsHold`, etc.). `transition` exposes the exact available
@@ -297,8 +307,9 @@ The missing upstream contract is tracked by
 until it lands, this frame cannot satisfy the detailed-reason portion of
 `B3MarketDataPlatform#73`.
 
-The current state is cached and emitted after `InfoSnapshot` on every Info
-subscribe/re-subscribe. The normal `InfoSnapshot.TradingStatus` update remains
+The current state is cached and emitted with `deliveryKind=1` after
+`InfoSnapshot` on every Info subscribe/re-subscribe. Live frames use
+`deliveryKind=0`. The normal `InfoSnapshot.TradingStatus` update remains
 unchanged for compatibility, and older clients safely skip the additive
 `0x00B3` opcode. SDK decoders validate the minimum payload and symbol length;
 malformed frames are logged and skipped without tearing down the connection.

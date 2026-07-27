@@ -543,7 +543,9 @@ internal static class WireFormat
     /// Safely parse an <see cref="MessageType.InstrumentStatus"/> frame.
     /// Layout:
     /// <c>[securityId u64][symLen u8][symbol][previousStatus u8][newStatus u8]
-    /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]</c>.
+    /// [transition u8][haltReason u8][sourceTimestampNanos u64][rptSeq u32]
+    /// [deliveryKind u8?]</c>. A missing trailing delivery kind is treated as
+    /// <see cref="InstrumentStatusDeliveryKind.LiveTransition"/> for compatibility.
     /// </summary>
     public static bool TryReadInstrumentStatus(
         ReadOnlySpan<byte> payload,
@@ -579,6 +581,10 @@ internal static class WireFormat
         ulong sourceTimestampNanos = BinaryPrimitives.ReadUInt64LittleEndian(payload[offset..]);
         offset += 8;
         uint rptSeq = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
+        offset += 4;
+        byte deliveryKind = payload.Length > offset
+            ? payload[offset]
+            : (byte)InstrumentStatusDeliveryKind.LiveTransition;
 
         status = new InstrumentStatusEvent
         {
@@ -599,6 +605,10 @@ internal static class WireFormat
             RawHaltReasonCode = haltReason == byte.MaxValue ? null : haltReason,
             SourceTimestampNanos = sourceTimestampNanos,
             RptSeq = rptSeq == 0 ? null : rptSeq,
+            DeliveryKind = Enum.IsDefined(typeof(InstrumentStatusDeliveryKind), deliveryKind)
+                ? (InstrumentStatusDeliveryKind)deliveryKind
+                : InstrumentStatusDeliveryKind.Unknown,
+            RawDeliveryKind = deliveryKind,
         };
         return true;
     }
