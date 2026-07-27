@@ -1,0 +1,47 @@
+name: Protocol implementation (contract proven)
+description: Request decoding or WebSocket projection for a proven UMDF/SBE wire contract.
+title: "Protocol: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this route only when the contract is already proven. Issue proposals,
+        draft PRs, and local branches are not evidence; use the research/blocker
+        route if the merged upstream contract or official schema details are absent.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Implementation request
+      description: What should this repository decode, project, or expose?
+    validations:
+      required: true
+  - type: textarea
+    id: upstream-contract
+    attributes:
+      label: Merged upstream contract
+      description: Cite the upstream repository, merged PR URL, and merge commit SHA.
+      placeholder: "pedrosakuma/B3MatchingPlatform#582, merge commit 8212925..."
+    validations:
+      required: true
+  - type: textarea
+    id: official-schema
+    attributes:
+      label: Official schema details
+      description: Cite the official schema family/version, template ID/name, fields/tags/offsets, and enum values.
+      placeholder: "B3 Binary UMDF Market Data vX.Y.Z, template NN Name_NN, field tags ..., enum values ..."
+    validations:
+      required: true
+  - type: textarea
+    id: websocket-projection
+    attributes:
+      label: MarketData WebSocket projection
+      description: If adding WebSocket frames, describe them as this repository's WebSocket protocol messages, not official UMDF templates. Use N/A if none.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and validation plan
+      description: Describe backwards compatibility, bootstrap/recovery behavior, and targeted validation.
+    validations:
+      required: true

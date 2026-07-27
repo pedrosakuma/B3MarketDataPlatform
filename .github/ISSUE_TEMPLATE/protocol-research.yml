@@ -1,0 +1,39 @@
+name: Protocol research / blocker (contract absent)
+description: Track protocol feasibility, missing schema evidence, or blocked downstream requests.
+title: "Protocol research: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this route when the desired behavior is not backed by a merged
+        upstream wire contract plus exact official schema details. Research can
+        collect evidence, define blockers, or link the upstream work that must
+        merge before implementation starts.
+  - type: textarea
+    id: desired-behavior
+    attributes:
+      label: Desired behavior
+      description: What downstream or operator outcome is being investigated?
+    validations:
+      required: true
+  - type: textarea
+    id: missing-contract
+    attributes:
+      label: Missing contract evidence / blocker
+      description: State what is absent, such as a merged upstream PR/commit, official schema version, template ID, fields, or enums.
+    validations:
+      required: true
+  - type: textarea
+    id: sources-checked
+    attributes:
+      label: Sources checked
+      description: Link issue proposals, draft PRs, schema docs, PCAP evidence, or code searches that explain the current state.
+    validations:
+      required: true
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Acknowledgement
+      options:
+        - label: I understand that issue proposals, draft PRs, and local branches are not implementation evidence.
+          required: true
