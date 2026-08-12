@@ -3,37 +3,60 @@
 #
 # Runs the consumer in docker for ${DURATION_MIN} minutes, sampling RSS
 # (resident set size, the runtime memory footprint), GC counts, and key
-# per-symbol counters every 30 s into a CSV.
+# per-symbol counters every 30 s into a CSV. When ENABLE_FIX_CONFLATED=true,
+# the script also enables the opt-in FIX sandbox listener in docker-compose and
+# appends FIX-specific Prometheus metrics (connections/messages/queue depth).
 #
 # Usage:
 #   tools/soak-test.sh [DURATION_MIN]   # default 240 (4 h)
-#   OUT=/tmp/soak-out tools/soak-test.sh 60
+#   OUT=artifacts/soak-out tools/soak-test.sh 60
+#   ENABLE_FIX_CONFLATED=true tools/soak-test.sh 60
 #
 # Pass criteria (printed at end):
 #   - RSS slope (last hour vs first hour post-warmup) < +10 %
 #   - No monotonic gen2 GC pressure increase (>2x first-window rate)
 #   - No 'evictUnsafe' growth without matching 'authReset' (would mean
 #     stuck-stale escape isn't catching a leak)
+#   - Optional FIX queue depth stays bounded and queue drops stay flat/near-flat
 #
 set -u
 DURATION_MIN="${1:-240}"
 OUT="${OUT:-/tmp/soak-$(date +%Y%m%d-%H%M%S)}"
 WARMUP_S=120
 SAMPLE_INTERVAL=30
+WS_PORT="${WS_PORT:-8080}"
+ENABLE_FIX_CONFLATED="${ENABLE_FIX_CONFLATED:-false}"
+UMDF_FIX_CONFLATED_PORT="${UMDF_FIX_CONFLATED_PORT:-9200}"
+
+if [ "$ENABLE_FIX_CONFLATED" = "true" ] || [ "$ENABLE_FIX_CONFLATED" = "1" ]; then
+  FIX_ENABLED=true
+else
+  FIX_ENABLED=false
+fi
 
 mkdir -p "$OUT"
 CSV="$OUT/soak.csv"
-echo "ts,uptime_s,rss_MB,gen0,gen1,gen2,heap_MB,workingSet_MB,threads,cpu_pct,stale,healed,authReset,evictSafe,evictUnsafe,hotProm,rejTooOld,absorbedGaps" > "$CSV"
+HEADER="ts,uptime_s,rss_MB,gen0,gen1,gen2,heap_MB,workingSet_MB,threads,cpu_pct,stale,healed,authReset,evictSafe,evictUnsafe,hotProm,rejTooOld,absorbedGaps"
+if [ "$FIX_ENABLED" = true ]; then
+  HEADER="$HEADER,fixConnections,fixMessagesSent,fixBytesSent,fixQueueDepth,fixQueueDropped"
+fi
+echo "$HEADER" > "$CSV"
 
-echo "## soak-test  duration=${DURATION_MIN}m  out=$OUT"
+echo "## soak-test  duration=${DURATION_MIN}m  out=$OUT  ws_port=$WS_PORT  fix=${FIX_ENABLED}"
 
 # Bring up docker compose stack.
+UMDF_FIX_CONFLATED_ENABLED="$ENABLE_FIX_CONFLATED" \
+UMDF_FIX_CONFLATED_PORT="$UMDF_FIX_CONFLATED_PORT" \
+UMDF_FIX_CONFLATED_CONFLATION_MS="${UMDF_FIX_CONFLATED_CONFLATION_MS:-380}" \
+UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY="${UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY:-10000}" \
+UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY="${UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY:-4096}" \
+UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY="${UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY:-65536}" \
 docker compose up -d --build > "$OUT/compose-up.log" 2>&1
 sleep 5
 
 # Wait for backend healthcheck to be ready.
 for i in $(seq 1 60); do
-  if curl -fsS http://localhost:8080/health/ready 2>/dev/null | grep -q '"status":"ready"'; then
+  if curl -fsS "http://localhost:${WS_PORT}/ready" >/dev/null 2>&1; then
     echo "[t=0] backend ready"
     break
   fi
@@ -66,16 +89,38 @@ while [ $(date +%s) -lt $END_TS ]; do
   LAST_LOG=$(docker compose logs --tail=200 backend 2>/dev/null | grep -E 'PerSymbol:|per-symbol: G' | tail -1)
   STALE=$(echo "$LAST_LOG" | grep -oE 'stale[=:][0-9]+' | head -1 | grep -oE '[0-9]+' || echo 0)
   HEALED=$(echo "$LAST_LOG" | grep -oE 'healed[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  AUTHRESET=$(echo "$LAST_LOG" | grep -oE 'authReset[=:][0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  EVICTSAFE=$(echo "$LAST_LOG" | grep -oE 'evictSafe[=:][0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  EVICTUNSAFE=$(echo "$LAST_LOG" | grep -oE 'evictUnsafe[=:][0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  HOTPROM=$(echo "$LAST_LOG" | grep -oE 'hotProm[=:][0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  REJTOOOLD=$(echo "$LAST_LOG" | grep -oE 'rejTooOld:[0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
-  ABSORBED=$(echo "$LAST_LOG" | grep -oE 'channelGapsAbsorbed[=:][0-9,]+' | tr -d ',' | grep -oE '[0-9]+' || echo 0)
+  AUTHRESET=$(echo "$LAST_LOG" | grep -oE 'authReset[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  EVICTSAFE=$(echo "$LAST_LOG" | grep -oE 'evictSafe[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  EVICTUNSAFE=$(echo "$LAST_LOG" | grep -oE 'evictUnsafe[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  HOTPROM=$(echo "$LAST_LOG" | grep -oE 'hotProm[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  REJTOOOLD=$(echo "$LAST_LOG" | grep -oE 'rejTooOld:[0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  ABSORBED=$(echo "$LAST_LOG" | grep -oE 'channelGapsAbsorbed[=:][0-9,]+' | head -1 | tr -d ',' | grep -oE '[0-9]+' | head -1 || echo 0)
+  [ -n "$HEALED" ] || HEALED=0
+  [ -n "$AUTHRESET" ] || AUTHRESET=0
+  [ -n "$EVICTSAFE" ] || EVICTSAFE=0
+  [ -n "$EVICTUNSAFE" ] || EVICTUNSAFE=0
+  [ -n "$HOTPROM" ] || HOTPROM=0
+  [ -n "$REJTOOOLD" ] || REJTOOOLD=0
+  [ -n "$ABSORBED" ] || ABSORBED=0
 
-  echo "$NOW,$UPTIME,$RSS_MB,$GEN0,$GEN1,$GEN2,$HEAP,$WS_MB,$THREADS,$CPU_PCT,$STALE,$HEALED,$AUTHRESET,$EVICTSAFE,$EVICTUNSAFE,$HOTPROM,$REJTOOOLD,$ABSORBED" >> "$CSV"
-  printf "[t=%5ds] RSS=%4dMB  gen2=%-4s  stale=%-4s  authReset=%-4s  evictUnsafe=%-10s  rejTooOld=%-4s\n" \
-    "$UPTIME" "$RSS_MB" "$GEN2" "$STALE" "$AUTHRESET" "$EVICTUNSAFE" "$REJTOOOLD"
+  EXTRA_CSV=""
+  EXTRA_STATUS=""
+  if [ "$FIX_ENABLED" = true ]; then
+    METRICS=$(curl -fsS "http://localhost:${WS_PORT}/metrics" 2>/dev/null || echo '')
+    read FIX_CONNECTIONS FIX_MESSAGES FIX_BYTES FIX_QUEUE_DEPTH FIX_QUEUE_DROPPED <<< "$(printf '%s\n' "$METRICS" | awk '
+      $1 ~ /^b3_umdf_fix_conflated_connections_active(\{|$)/ { conn += $2 }
+      $1 ~ /^b3_umdf_fix_conflated_messages_sent_total(\{|$)/ { msg += $2 }
+      $1 ~ /^b3_umdf_fix_conflated_bytes_sent_total(\{|$)/ { bytes += $2 }
+      $1 ~ /^b3_umdf_fix_conflated_queue_depth(\{|$)/ { depth += $2 }
+      $1 ~ /^b3_umdf_fix_conflated_queue_dropped_total(\{|$)/ { dropped += $2 }
+      END { printf "%.0f %.0f %.0f %.0f %.0f\n", conn + 0, msg + 0, bytes + 0, depth + 0, dropped + 0 }')"
+    EXTRA_CSV=",$FIX_CONNECTIONS,$FIX_MESSAGES,$FIX_BYTES,$FIX_QUEUE_DEPTH,$FIX_QUEUE_DROPPED"
+    EXTRA_STATUS="  fixConn=${FIX_CONNECTIONS} fixMsg=${FIX_MESSAGES} fixQ=${FIX_QUEUE_DEPTH} fixDrop=${FIX_QUEUE_DROPPED}"
+  fi
+
+  echo "$NOW,$UPTIME,$RSS_MB,$GEN0,$GEN1,$GEN2,$HEAP,$WS_MB,$THREADS,$CPU_PCT,$STALE,$HEALED,$AUTHRESET,$EVICTSAFE,$EVICTUNSAFE,$HOTPROM,$REJTOOOLD,$ABSORBED$EXTRA_CSV" >> "$CSV"
+  printf "[t=%5ds] RSS=%4dMB  gen2=%-4s  stale=%-4s  authReset=%-4s  evictUnsafe=%-10s  rejTooOld=%-4s%s\n" \
+    "$UPTIME" "$RSS_MB" "$GEN2" "$STALE" "$AUTHRESET" "$EVICTUNSAFE" "$REJTOOOLD" "$EXTRA_STATUS"
 
   sleep $SAMPLE_INTERVAL
 done
@@ -128,6 +173,16 @@ print(f"  evictUnsafe growth : {evictUnsafe_growth:.0f}")
 print(f"  authReset growth   : {authReset_growth:.0f}")
 if evictUnsafe_growth > 0 and authReset_growth == 0:
     print(f"  ⚠ evictUnsafe growing but no authReset — investigate stuck-stale escape")
+
+if 'fixConnections' in post[0]:
+    fix_conn_max = max(col(post, 'fixConnections'))
+    fix_msg_growth = get(post[-1], 'fixMessagesSent') - get(post[0], 'fixMessagesSent')
+    fix_q_max = max(col(post, 'fixQueueDepth'))
+    fix_drop_growth = get(post[-1], 'fixQueueDropped') - get(post[0], 'fixQueueDropped')
+    print(f"  FIX conn max       : {fix_conn_max:.0f}")
+    print(f"  FIX msgs growth    : {fix_msg_growth:.0f}")
+    print(f"  FIX queue depth max: {fix_q_max:.0f}")
+    print(f"  FIX queue drop Δ   : {fix_drop_growth:.0f}")
 PY
 
 echo
