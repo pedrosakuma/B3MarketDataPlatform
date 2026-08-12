@@ -14,6 +14,12 @@ public sealed partial class AppSettings
     /// <summary>WebSocket server port. CLI: --ws-port</summary>
     public int? WsPort { get; set; }
 
+    /// <summary>Enable the opt-in FIX conflated TCP listener. Env: UMDF_FIX_CONFLATED_ENABLED.</summary>
+    public bool FixConflatedEnabled { get; set; }
+
+    /// <summary>FIX conflated TCP listener port. Env: UMDF_FIX_CONFLATED_PORT.</summary>
+    public int? FixConflatedPort { get; set; }
+
     /// <summary>Replay speed multiplier. 0=max, 1=real-time. CLI: --speed</summary>
     public double Speed { get; set; }
 
@@ -104,6 +110,34 @@ public sealed partial class AppSettings
     /// UMDF_CLIENT_COALESCE_WINDOW_MS.
     /// </summary>
     public int ClientCoalesceWindowMs { get; set; } = 10;
+
+    /// <summary>
+    /// FIX conflated book-delta conflation window (milliseconds). Mirrors the
+    /// sandbox spec default (~380 ms) but remains configurable for experiments.
+    /// Env: UMDF_FIX_CONFLATED_CONFLATION_MS.
+    /// </summary>
+    public int FixConflatedConflationWindowMs { get; set; } = 380;
+
+    /// <summary>
+    /// Per-connection FIX session resend-buffer capacity (application messages kept
+    /// in memory for ResendRequest replay inside the current process/session only).
+    /// Env: UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY.
+    /// </summary>
+    public int FixConflatedResendBufferCapacity { get; set; } = 10_000;
+
+    /// <summary>
+    /// Per-connection outbound queue capacity for the FIX TCP transport. Slow
+    /// sessions are disconnected when this bounded queue fills. Env:
+    /// UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY.
+    /// </summary>
+    public int FixConflatedOutboundQueueCapacity { get; set; } = 4096;
+
+    /// <summary>
+    /// Hot-path event queue capacity per group for the FIX conflated publisher.
+    /// When full, new events are dropped instead of blocking the shared group
+    /// thread. Env: UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY.
+    /// </summary>
+    public int FixConflatedEventQueueCapacity { get; set; } = 65_536;
 
     /// <summary>
     /// Server-side semantic conflation window (milliseconds) applied inside
@@ -293,6 +327,10 @@ public sealed partial class AppSettings
     {
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_WS_PORT"), out var port))
             WsPort = port;
+        if (TryParseBoolean(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_ENABLED"), out var fixConflatedEnabled))
+            FixConflatedEnabled = fixConflatedEnabled;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_PORT"), out var fixPort))
+            FixConflatedPort = fixPort;
         if (double.TryParse(Environment.GetEnvironmentVariable("UMDF_SPEED"), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var sp))
             Speed = sp;
         if (TryParseBoolean(Environment.GetEnvironmentVariable("UMDF_REPLAY_TO_MULTICAST"), out var replayToMulticast))
@@ -317,6 +355,14 @@ public sealed partial class AppSettings
             ClientOutlierIntervalMs = outlierMs;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_CLIENT_COALESCE_WINDOW_MS"), out var coalesceMs))
             ClientCoalesceWindowMs = coalesceMs;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_CONFLATION_MS"), out var fixConflationMs) && fixConflationMs > 0)
+            FixConflatedConflationWindowMs = fixConflationMs;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY"), out var fixResendCapacity) && fixResendCapacity >= 0)
+            FixConflatedResendBufferCapacity = fixResendCapacity;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY"), out var fixOutboundQueueCapacity) && fixOutboundQueueCapacity > 0)
+            FixConflatedOutboundQueueCapacity = fixOutboundQueueCapacity;
+        if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY"), out var fixEventQueueCapacity) && fixEventQueueCapacity > 0)
+            FixConflatedEventQueueCapacity = fixEventQueueCapacity;
         if (int.TryParse(Environment.GetEnvironmentVariable("UMDF_SERVER_FLUSH_WINDOW_MS"), out var serverFlushMs) && serverFlushMs >= 0)
             ServerFlushWindowMs = serverFlushMs;
         var conflatedCadences = Environment.GetEnvironmentVariable("UMDF_CONFLATED_CADENCES_MS");

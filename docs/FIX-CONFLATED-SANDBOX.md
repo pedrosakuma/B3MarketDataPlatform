@@ -110,7 +110,10 @@ the shared per-group hot path.
 
 ## Enabling
 
-Disabled by default. Enable with `UMDF_FIX_CONFLATED_ENABLED=true` and
-configure the listening port and conflation window per
-[docs/CONFIGURATION.md](CONFIGURATION.md) (reference added once the
-transport lands).
+Disabled by default. Enable with `UMDF_FIX_CONFLATED_ENABLED=true` plus
+at least `UMDF_FIX_CONFLATED_PORT=<port>`. Optional transport tuning
+includes `UMDF_FIX_CONFLATED_CONFLATION_MS`,
+`UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY`,
+`UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY`, and
+`UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY`; see
+[docs/CONFIGURATION.md](CONFIGURATION.md).

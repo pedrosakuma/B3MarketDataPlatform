@@ -27,11 +27,18 @@ The full set of `UMDF_*` knobs surfaced by `AppSettings` and `Program.cs`:
 | Environment Variable | CLI | Default | Description |
 |---------------------|-----|---------|-------------|
 | `UMDF_WS_PORT` | `--ws-port` | *(off)* | WebSocket server port |
+| `UMDF_FIX_CONFLATED_ENABLED` | — | `false` | Enable the opt-in FIX conflated TCP listener |
+| `UMDF_FIX_CONFLATED_PORT` | — | *(off)* | FIX conflated TCP listener port (required when enabled) |
 | `UMDF_SPEED` | `--speed` | `0` | Replay speed multiplier |
 | `UMDF_REPLAY_TO_MULTICAST` | `--replay-to-multicast` | `false` | Publish replayed PCAP payloads to multicast instead of consuming them in-process |
 | `UMDF_MULTICAST_CONFIG` | `--multicast-config` | — | Multicast JSON config path |
 | `UMDF_LOG_LEVEL` | — | `Information` | Minimum log level |
 | `UMDF_SHUTDOWN_DRAIN_SECONDS` | — | `5` | Graceful shutdown drain timeout |
+| **FIX conflated TCP** | | | |
+| `UMDF_FIX_CONFLATED_CONFLATION_MS` | — | `380` | Book-delta conflation window used by the FIX sandbox publisher |
+| `UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY` | — | `10000` | Per-connection in-memory application resend buffer size for `ResendRequest` handling |
+| `UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY` | — | `4096` | Per-connection bounded outbound queue; slow FIX consumers are disconnected when it fills |
+| `UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY` | — | `65536` | Per-group bounded hot-path event queue feeding the background FIX encoder |
 | **WebSocket / clients** | | | |
 | `UMDF_MAX_CONNECTIONS` | — | `0` (unlimited) | Max concurrent WebSocket connections |
 | `UMDF_CLIENT_CHANNEL_CAPACITY` | — | `4096` | Per-client outbound queue size (msgs) |

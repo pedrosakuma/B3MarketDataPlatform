@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using B3.Umdf.Book;
 using B3.Umdf.ConsoleApp;
 using B3.Umdf.Feed;
+using B3.Umdf.FixConflated;
 using B3.Umdf.PcapReplay;
 using B3.Umdf.Server;
 using B3.Umdf.Transport;
@@ -22,6 +23,13 @@ if (!CliArgs.TryApply(args, settings, positionalArgs, out var cliError))
 }
 
 int? wsPort = settings.WsPort;
+bool fixConflatedEnabled = FixConflatedFeatureGate.TryResolvePort(settings, out int fixConflatedPort, out string? fixConflatedError);
+if (fixConflatedError is not null)
+{
+    Console.Error.WriteLine(fixConflatedError);
+    return 1;
+}
+
 double speed = settings.Speed;
 bool replayToMulticast = settings.ReplayToMulticast;
 var pcapPrefixes = new List<string>(settings.PcapPrefixes);
@@ -39,7 +47,44 @@ int shutdownDrainSeconds = settings.ShutdownDrainSeconds;
 int multicastMergeCapacity = settings.MulticastMergeCapacity;
 int feedChannelCapacity = settings.FeedChannelCapacity;
 int groupRingCapacity = settings.GroupRingCapacity;
+int fixConflatedConflationWindowMs = settings.FixConflatedConflationWindowMs;
+int fixConflatedResendBufferCapacity = settings.FixConflatedResendBufferCapacity;
+int fixConflatedOutboundQueueCapacity = settings.FixConflatedOutboundQueueCapacity;
+int fixConflatedEventQueueCapacity = settings.FixConflatedEventQueueCapacity;
 var logLevel = LogLevelParser.Parse(settings.LogLevel);
+
+if (fixConflatedEnabled)
+{
+    if (wsPort is int configuredWsPort && configuredWsPort == fixConflatedPort)
+    {
+        Console.Error.WriteLine("UMDF_FIX_CONFLATED_PORT must differ from UMDF_WS_PORT.");
+        return 1;
+    }
+
+    if (fixConflatedConflationWindowMs <= 0)
+    {
+        Console.Error.WriteLine("UMDF_FIX_CONFLATED_CONFLATION_MS must be greater than zero when FIX conflated transport is enabled.");
+        return 1;
+    }
+
+    if (fixConflatedResendBufferCapacity < 0)
+    {
+        Console.Error.WriteLine("UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY must be zero or greater.");
+        return 1;
+    }
+
+    if (fixConflatedOutboundQueueCapacity <= 0)
+    {
+        Console.Error.WriteLine("UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY must be greater than zero.");
+        return 1;
+    }
+
+    if (fixConflatedEventQueueCapacity <= 0)
+    {
+        Console.Error.WriteLine("UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY must be greater than zero.");
+        return 1;
+    }
+}
 
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
@@ -373,6 +418,7 @@ var recoveryEventLog = new RecoveryEventLog(capacity: 256);
 // Wire up subscription manager if WebSocket port is specified
 SubscriptionManager? subscriptionManager = null;
 WebSocketHost? wsHost = null;
+FixConflatedTcpServer? fixConflatedServer = null;
 var symbolRegistry = new SymbolRegistry();
 
 if (wsPort is not null)
@@ -391,6 +437,7 @@ if (wsPort is not null)
 var bookManagers = new List<BookManager>();
 var marketDataManagers = new List<MarketDataManager>();
 var groupHandlers = new List<GroupConflationHandler>();
+var fixChannelHandlers = new List<FixConflatedChannelHandler>();
 var groupFeedHandlers = new Dictionary<int, IFeedEventHandler>();
 var groupMdHandlers = new Dictionary<int, IFeedEventHandler>();
 var epochCoordinators = new Dictionary<int, ChannelEpochCoordinator>();
@@ -405,11 +452,36 @@ var staleBufferLogger = loggerFactory.CreateLogger<StaleMboBuffer>();
 // SymbolStateRegistry + StaleMboBuffer.
 var registries = new Dictionary<int, SymbolStateRegistry>();
 var staleBuffers = new Dictionary<int, StaleMboBuffer>();
+FixConflatedSessionHub? fixSessionHub = null;
+FixLiveInstrumentResolver? fixInstrumentResolver = null;
+FixConflatedMarketDataOptions? fixConflatedOptions = null;
+
+if (fixConflatedEnabled)
+{
+    fixSessionHub = new FixConflatedSessionHub(loggerFactory.CreateLogger<FixConflatedSessionHub>());
+    fixInstrumentResolver = new FixLiveInstrumentResolver(symbolRegistry, marketDataManagers);
+    fixConflatedOptions = new FixConflatedMarketDataOptions
+    {
+        ConflationInterval = TimeSpan.FromMilliseconds(fixConflatedConflationWindowMs),
+        PendingEventCapacity = fixConflatedEventQueueCapacity,
+    };
+}
 
 foreach (var gid in groupIds)
 {
     IBookEventHandler bookHandler;
     IMarketDataEventHandler mdHandler = stats;
+    FixConflatedChannelHandler? fixChannelHandler = null;
+    if (fixSessionHub is not null && fixInstrumentResolver is not null && fixConflatedOptions is not null)
+    {
+        fixChannelHandler = new FixConflatedChannelHandler(
+            gid,
+            fixSessionHub,
+            fixInstrumentResolver,
+            fixConflatedOptions);
+        fixChannelHandlers.Add(fixChannelHandler);
+    }
+
     var epochCoordinator = new ChannelEpochCoordinator(
         loggerFactory.CreateLogger<ChannelEpochCoordinator>());
     epochCoordinators[gid] = epochCoordinator;
@@ -443,12 +515,17 @@ foreach (var gid in groupIds)
     if (subscriptionManager is not null)
     {
         var gh = subscriptionManager.CreateGroupHandler();
-        bookHandler = new CompositeBookEventHandler(stats, gh);
+        bookHandler = fixChannelHandler is null
+            ? new CompositeBookEventHandler(stats, gh)
+            : new CompositeBookEventHandler(stats, gh, fixChannelHandler);
         var bm = new BookManager(bookHandler, bmLogger,
             stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
             epochCoordinator: epochCoordinator);
-        mdHandler = new CompositeMarketDataEventHandler(stats, gh, bm,
-            new RecoveryEventLoggerHandler(recoveryEventLog, gid));
+        mdHandler = fixChannelHandler is null
+            ? new CompositeMarketDataEventHandler(stats, gh, bm,
+                new RecoveryEventLoggerHandler(recoveryEventLog, gid))
+            : new CompositeMarketDataEventHandler(stats, gh, bm,
+                new RecoveryEventLoggerHandler(recoveryEventLog, gid), fixChannelHandler);
         gh.SetBookManager(bm);
         gh.StartBroadcaster(gid);
         groupHandlers.Add(gh);
@@ -456,12 +533,17 @@ foreach (var gid in groupIds)
     }
     else
     {
-        bookHandler = stats;
+        bookHandler = fixChannelHandler is null
+            ? stats
+            : new CompositeBookEventHandler(stats, fixChannelHandler);
         var bm = new BookManager(bookHandler, bmLogger,
             stateRegistry: groupRegistry, staleBuffer: groupStaleBuffer,
             epochCoordinator: epochCoordinator);
-        mdHandler = new CompositeMarketDataEventHandler(stats, bm,
-            new RecoveryEventLoggerHandler(recoveryEventLog, gid));
+        mdHandler = fixChannelHandler is null
+            ? new CompositeMarketDataEventHandler(stats, bm,
+                new RecoveryEventLoggerHandler(recoveryEventLog, gid))
+            : new CompositeMarketDataEventHandler(stats, bm,
+                new RecoveryEventLoggerHandler(recoveryEventLog, gid), fixChannelHandler);
         bookManagers.Add(bm);
     }
 
@@ -580,7 +662,9 @@ if (subscriptionManager is not null)
 
     // Expose the ConsoleApp's MetricsBinder meter through the host's
     // /metrics endpoint alongside the Server's own "B3.Umdf" meter.
-    wsHost.AdditionalMeterNames = new[] { MetricsBinder.Meter.Name };
+    wsHost.AdditionalMeterNames = fixConflatedEnabled
+        ? [MetricsBinder.Meter.Name, FixConflatedMetrics.Meter.Name]
+        : [MetricsBinder.Meter.Name];
 
     // Wire the active-symbol gauge to SubscriptionManager. Captured once;
     // SubscriptionManager outlives the host.
@@ -589,6 +673,23 @@ if (subscriptionManager is not null)
     MetricsRegistry.ActiveConflatedSubscriptionsProvider = () => sm.ActiveConflatedSubscriptionCount;
 
     await wsHost.StartAsync(wsPort!.Value, cts.Token);
+}
+
+if (fixConflatedEnabled && fixSessionHub is not null && fixInstrumentResolver is not null)
+{
+    fixConflatedServer = new FixConflatedTcpServer(
+        fixSessionHub,
+        new FixConflatedTcpServerOptions
+        {
+            OutboundQueueCapacity = fixConflatedOutboundQueueCapacity,
+            SessionOptions = new FixSessionOptions
+            {
+                ApplicationResendBufferCapacity = fixConflatedResendBufferCapacity,
+            },
+        },
+        initialMessagesProvider: new FixInitialSnapshotProvider(bookManagers, fixInstrumentResolver).CreateMessages,
+        loggerFactory: loggerFactory);
+    await fixConflatedServer.StartAsync(fixConflatedPort, cts.Token);
 }
 
 // Periodic stats timer
@@ -705,10 +806,15 @@ if (singleFeed is not null)
     await singleFeed.StopAsync();
 subscriptionManager?.StopRankingsTimer();
 
-// Brief drain period for in-flight WebSocket writes
+// Brief drain period for in-flight socket writes
+if (wsHost is not null || fixConflatedServer is not null)
+    await Task.Delay(TimeSpan.FromSeconds(shutdownDrainSeconds));
+
+if (fixConflatedServer is not null)
+    await fixConflatedServer.DisposeAsync();
+
 if (wsHost is not null)
 {
-    await Task.Delay(TimeSpan.FromSeconds(shutdownDrainSeconds));
     await wsHost.StopAsync(TimeSpan.FromSeconds(shutdownDrainSeconds));
     await wsHost.DisposeAsync();
 }
@@ -719,6 +825,7 @@ singleFeed?.Dispose();
 // Stop broadcaster threads after feed sources are disposed so no more batches can be
 // published. StopBroadcaster signals the ring and joins the thread.
 foreach (var gh in groupHandlers) gh.StopBroadcaster();
+foreach (var fixHandler in fixChannelHandlers) fixHandler.Dispose();
 
 jitterProbe?.Dispose();
 
