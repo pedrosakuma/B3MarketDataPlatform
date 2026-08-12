@@ -65,6 +65,8 @@ const CHECK_INTERVAL = parsePositiveInt(process.env.CHECK_INTERVAL_MS || '5000',
 const HTTP_TIMEOUT_MS = parsePositiveInt(process.env.HTTP_TIMEOUT_MS || '3000', 3000);
 const INITIAL_HEARTBEAT_SECONDS = parsePositiveInt(process.env.FIX_HEARTBEAT_SEC || '30', 30);
 const RUN_SECONDS = parseNonNegativeInt(process.env.RUN_SECONDS || '0', 0);
+const WS_SNAPSHOT_COMPARE_URL = process.env.WS_SNAPSHOT_COMPARE_URL || '';
+const WS_SNAPSHOT_TIMEOUT_MS = parsePositiveInt(process.env.WS_SNAPSHOT_TIMEOUT_MS || '5000', 5000);
 const SENDER_COMP_ID = process.env.FIX_SENDER_COMP_ID || `FIX-VALIDATOR-${process.pid}-${Date.now().toString(36)}`;
 const TARGET_COMP_ID = process.env.FIX_TARGET_COMP_ID || 'SANDBOX';
 
@@ -99,6 +101,7 @@ let checkTimer = null;
 let heartbeatTimer = null;
 let runTimer = null;
 let shuttingDown = false;
+let shutdownPromise = null;
 
 console.log(`Connecting FIX validator to ${HOST}:${PORT} sender=${SENDER_COMP_ID} target=${TARGET_COMP_ID} symbol=${trackedSymbol ?? '(first snapshot)'} http=${HTTP_BASE}`);
 
@@ -132,7 +135,7 @@ socket.on('connect', () => {
   {
     runTimer = setTimeout(() => {
       console.log(`RUN_SECONDS=${RUN_SECONDS} reached; requesting graceful shutdown.`);
-      requestShutdown('timer');
+      void beginShutdown('timer');
     }, RUN_SECONDS * 1000);
   }
 });
@@ -155,8 +158,8 @@ socket.on('error', error => {
   console.error(`Socket error: ${error.message}`);
 });
 
-process.on('SIGINT', () => requestShutdown('SIGINT'));
-process.on('SIGTERM', () => requestShutdown('SIGTERM'));
+process.on('SIGINT', () => void beginShutdown('SIGINT'));
+process.on('SIGTERM', () => void beginShutdown('SIGTERM'));
 
 async function checkServer() {
   const local = computeBookState();
@@ -207,6 +210,58 @@ async function checkServer() {
     lastBookError = error instanceof Error ? error.message : String(error);
     console.log(`${prefix} local=${formatLocalSummary(local)} | server-check failed: ${lastBookError}`);
   }
+}
+
+async function runFreshWsSnapshotCompare() {
+  if (!WS_SNAPSHOT_COMPARE_URL) {
+    console.log('[fresh-ws] skipped (WS_SNAPSHOT_COMPARE_URL not set)');
+    return;
+  }
+
+  if (!snapshotSeen || !trackedSymbol) {
+    console.log('[fresh-ws] skipped (no FIX snapshot tracked yet)');
+    return;
+  }
+
+  try {
+    const fresh = await pullFreshWsBookState(WS_SNAPSHOT_COMPARE_URL, trackedSymbol, WS_SNAPSHOT_TIMEOUT_MS);
+    const local = computeBookState();
+    const comparison = compareBooks(local, fresh);
+    const tag = comparison.match ? '✅ MATCH' : '❌ MISMATCH';
+    console.log(`${tag} | fresh-ws ${trackedSymbol} | local: ${formatLocalSummary(local)} | snapshot: ${formatServerSummary(fresh)}`);
+    console.log(`  wsSnapshot msgs=${fresh.metrics.messages} adds=${fresh.metrics.adds} upd=${fresh.metrics.updates} dels=${fresh.metrics.deletes} snaps=${fresh.metrics.snapshots} clears=${fresh.metrics.clears}`);
+    if (!comparison.match) {
+      counters.divergences++;
+      comparison.lines.slice(0, 10).forEach(line => console.log(`  ${line}`));
+      console.log(`  local top bids: ${formatTopLevels(local.bids)}`);
+      console.log(`  local top asks: ${formatTopLevels(local.asks)}`);
+      console.log(`  snapshot top bids: ${formatTopLevels(fresh.bids)}`);
+      console.log(`  snapshot top asks: ${formatTopLevels(fresh.asks)}`);
+    }
+  } catch (error) {
+    counters.divergences++;
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`[fresh-ws] compare failed: ${message}`);
+  }
+}
+
+async function beginShutdown(reason) {
+  if (shutdownPromise)
+    return shutdownPromise;
+
+  shutdownPromise = (async () => {
+    if (runTimer) {
+      clearTimeout(runTimer);
+      runTimer = null;
+    }
+
+    if (reason === 'timer')
+      await runFreshWsSnapshotCompare();
+
+    requestShutdown(reason);
+  })();
+
+  return shutdownPromise;
 }
 
 function requestShutdown(reason) {
@@ -771,6 +826,201 @@ function formatNumber(value) {
 
 function formatMaybe(value) {
   return value == null ? '?' : String(value);
+}
+
+async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
+  const { default: WebSocket } = await import('ws');
+
+  return await new Promise((resolve, reject) => {
+    const ws = new WebSocket(wsUrl);
+    const wsOrders = new Map();
+    let subscribeSent = false;
+    let snapshotSeenLocal = false;
+    let resolved = false;
+    let timeout = setTimeout(() => finishError(`timeout waiting for fresh BookSnapshot after ${timeoutMs}ms`), timeoutMs);
+    const metrics = { messages: 0, adds: 0, updates: 0, deletes: 0, snapshots: 0, clears: 0 };
+
+    function buildSubscribe(symbolText) {
+      const symBytes = Buffer.from(symbolText, 'utf8');
+      const buf = Buffer.alloc(8 + 4 + 1 + symBytes.length);
+      buf.writeUInt32LE(buf.length, 0);
+      buf.writeUInt16LE(0x0001, 4);
+      buf.writeUInt16LE(0, 6);
+      buf.writeUInt32LE(0x0001, 8);
+      buf.writeUInt8(symBytes.length, 12);
+      symBytes.copy(buf, 13);
+      return buf;
+    }
+
+    function sendSubscribe(reason) {
+      if (subscribeSent || ws.readyState !== WebSocket.OPEN)
+        return;
+
+      subscribeSent = true;
+      console.log(`[fresh-ws] subscribe (${reason}) symbol=${symbol}`);
+      ws.send(buildSubscribe(symbol));
+    }
+
+    function finishSuccess() {
+      if (resolved)
+        return;
+
+      resolved = true;
+      clearTimeout(timeout);
+      cleanup();
+      const state = computeWsBookState(wsOrders);
+      state.metrics = metrics;
+      resolve(state);
+      if (ws.readyState === WebSocket.OPEN)
+        ws.close();
+    }
+
+    function finishError(message) {
+      if (resolved)
+        return;
+
+      resolved = true;
+      clearTimeout(timeout);
+      cleanup();
+      reject(new Error(message));
+      if (ws.readyState === WebSocket.OPEN)
+        ws.close();
+    }
+
+    function cleanup() {
+      ws.removeAllListeners('open');
+      ws.removeAllListeners('message');
+      ws.removeAllListeners('error');
+      ws.removeAllListeners('close');
+    }
+
+    function processFrame(data) {
+      let offset = 0;
+      while (offset + 8 <= data.length) {
+        const len = data.readUInt32LE(offset);
+        if (len < 8 || offset + len > data.length)
+          break;
+
+        const type = data.readUInt16LE(offset + 4);
+        const headerFlags = data.readUInt16LE(offset + 6);
+        if (headerFlags !== 0)
+          break;
+
+        const payload = data.subarray(offset + 8, offset + len);
+        processMessage(type, payload);
+        offset += len;
+      }
+    }
+
+    function processMessage(type, payload) {
+      metrics.messages++;
+      switch (type) {
+        case 0x0050: {
+          const ready = payload.length > 0 && payload.readUInt8(0) === 1;
+          if (ready)
+            sendSubscribe('server-ready');
+          break;
+        }
+        case 0x0010:
+          break;
+        case 0x0011: {
+          const code = payload.readUInt8(0);
+          const sLen = payload.readUInt8(1);
+          const sym = payload.subarray(2, 2 + sLen).toString('utf8');
+          finishError(`fresh snapshot SubscribeError code=${code} symbol=${sym}`);
+          break;
+        }
+        case 0x0020: {
+          metrics.snapshots++;
+          snapshotSeenLocal = true;
+          wsOrders.clear();
+          break;
+        }
+        case 0x0030:
+        case 0x0031: {
+          const orderId = payload.readBigUInt64LE(8).toString();
+          const price = Number(payload.readBigInt64LE(16)) / 10000;
+          const qty = Number(payload.readBigInt64LE(24));
+          const side = payload.readUInt8(32);
+          if (type === 0x0030)
+            metrics.adds++;
+          else
+            metrics.updates++;
+          wsOrders.set(orderId, { side, price, qty });
+          break;
+        }
+        case 0x0032: {
+          const orderId = payload.readBigUInt64LE(8).toString();
+          wsOrders.delete(orderId);
+          metrics.deletes++;
+          break;
+        }
+        case 0x0034: {
+          metrics.clears++;
+          const clearSide = payload.length > 8 ? payload.readUInt8(8) : 0;
+          if (clearSide === 0) {
+            wsOrders.clear();
+          } else {
+            const side = clearSide - 1;
+            for (const [orderId, order] of wsOrders) {
+              if (order.side === side)
+                wsOrders.delete(orderId);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+
+    ws.on('open', () => {
+      setTimeout(() => sendSubscribe('open-delay'), 250).unref();
+    });
+
+    ws.on('message', data => {
+      processFrame(Buffer.from(data));
+      if (snapshotSeenLocal)
+        finishSuccess();
+    });
+
+    ws.on('error', error => finishError(error.message));
+    ws.on('close', () => {
+      if (!resolved)
+        finishError('socket closed before fresh BookSnapshot arrived');
+    });
+  });
+}
+
+function computeWsBookState(wsOrders) {
+  const bidMap = new Map();
+  const askMap = new Map();
+
+  for (const order of wsOrders.values()) {
+    const levels = order.side === 0 ? bidMap : askMap;
+    const existing = levels.get(order.price);
+    if (existing) {
+      existing.qty += order.qty;
+      existing.count += 1;
+    } else {
+      levels.set(order.price, { price: order.price, qty: order.qty, count: 1 });
+    }
+  }
+
+  const bids = [...bidMap.values()].sort((a, b) => b.price - a.price);
+  const asks = [...askMap.values()].sort((a, b) => a.price - b.price);
+  return {
+    valid: true,
+    bids,
+    asks,
+    bidOrders: bids.reduce((sum, level) => sum + level.count, 0),
+    askOrders: asks.reduce((sum, level) => sum + level.count, 0),
+    bidLevels: bids.length,
+    askLevels: asks.length,
+    bestBid: bids[0]?.price ?? 0,
+    bestAsk: asks[0]?.price ?? 0,
+    crossed: bids.length > 0 && asks.length > 0 && bids[0].price >= asks[0].price,
+  };
 }
 
 function calculateChecksum(buffer) {

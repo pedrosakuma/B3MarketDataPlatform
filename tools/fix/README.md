@@ -2,6 +2,13 @@
 
 `tools/fix/fix-validate.mjs` is a standalone FIX 4.4 tag=value validator for the opt-in FIX Conflated sandbox channel. It opens a real TCP session, performs `Logon`, consumes the automatic `MarketDataSnapshotFullRefresh` plus later `MarketDataIncrementalRefresh` messages, rebuilds the book locally, and periodically compares that state with `GET /book/{symbol}` from the HTTP side that `tools/ws/ws-validate.mjs` already expects.
 
+Today the server does **not** expose a production `/book/{symbol}` route, so
+that HTTP check is intentionally non-fatal and usually logs the cross-check as
+unavailable (`404`). For replay-driven cross-channel validation, use
+`tools/fix-conflated-replay-validate.sh`, which compares the final FIX-derived
+book summary against a **fresh WebSocket `Subscribe` → `BookSnapshot` pull**
+for the same symbol — effectively the current server-side truth via WireV2.
+
 ## Prerequisites
 
 - Enable the FIX sandbox listener:
@@ -34,6 +41,12 @@ Useful environment overrides:
 - `FIX_HEARTBEAT_SEC` — requested heartbeat interval (default `30`).
 - `CHECK_INTERVAL_MS` — `/book` comparison interval (default `5000`).
 - `RUN_SECONDS` — optional auto-stop timer for short validation runs.
+- `WS_SNAPSHOT_COMPARE_URL` — optional fresh WebSocket `Subscribe` target
+  (for example `ws://localhost:8080/ws`). When set, the validator performs one
+  final fresh-connection `BookSnapshot` pull at shutdown time and compares the
+  current FIX-derived book against that server-side snapshot.
+- `WS_SNAPSHOT_TIMEOUT_MS` — timeout for the fresh WebSocket snapshot pull
+  (default `5000`).
 
 If `GET /book/{symbol}` is unavailable (for example it returns `404` in the
 current local host setup), the validator keeps running and logs the server-check
@@ -50,4 +63,5 @@ UMDF_FIX_CONFLATED_ENABLED=true UMDF_FIX_CONFLATED_PORT=9200 \
 HTTP_BASE=http://localhost:8080 node tools/fix/fix-validate.mjs localhost 9200 PETR4
 ```
 
-This is the standalone client piece for issue #103 item 1. A later follow-up can wrap it together with a live replay harness and the existing WebSocket validators.
+This is the standalone client piece for issue #103 item 1. For the replay
+harness from issue #103 item 2, run `tools/fix-conflated-replay-validate.sh`.
