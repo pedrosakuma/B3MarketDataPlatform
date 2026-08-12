@@ -28,6 +28,7 @@
     <Project Path="tests/B3.Umdf.Book.Tests/B3.Umdf.Book.Tests.csproj" />
     <Project Path="tests/B3.Umdf.ConsoleApp.Tests/B3.Umdf.ConsoleApp.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Feed.Tests/B3.Umdf.Feed.Tests.csproj" />
+    <Project Path="tests/B3.Umdf.FixConflated.Tests/B3.Umdf.FixConflated.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Fuzz.Tests/B3.Umdf.Fuzz.Tests.csproj" />
     <Project Path="tests/B3.Umdf.PcapReplay.Tests/B3.Umdf.PcapReplay.Tests.csproj" />
     <Project Path="tests/B3.Umdf.Sbe.Tests/B3.Umdf.Sbe.Tests.csproj" />
