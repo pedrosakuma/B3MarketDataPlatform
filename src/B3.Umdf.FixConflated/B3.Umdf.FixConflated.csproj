@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>B3.Umdf.FixConflated</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      Only depends on B3.Umdf.Book for the IBookEventHandler /
+      IMarketDataEventHandler event contracts this project implements.
+      Deliberately has NO reference to B3.Umdf.Server / B3.MarketData.Wire:
+      this is an isolated, opt-in sandbox channel, never sharing code or
+      wire-format with the WireV2 WebSocket protocol.
+    -->
+    <ProjectReference Include="..\B3.Umdf.Book\B3.Umdf.Book.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="B3.Umdf.FixConflated.Tests" />
+  </ItemGroup>
+
+</Project>
