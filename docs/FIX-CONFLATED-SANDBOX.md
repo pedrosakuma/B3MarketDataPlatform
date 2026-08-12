@@ -14,11 +14,13 @@
 An additional, **opt-in** output channel, alongside the existing
 `WireV2` WebSocket protocol (see
 [docs/WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md)), through which this
-platform emits book, trade, instrument-status, news, security-list, and
-market-totals data encoded as **FIX 4.4 Tag=Value** messages, batching
-book deltas over a configurable time window ("conflation"). This
-platform acts as the **FIX session acceptor** ("server" role) — the
-inverse of connecting out to a real B3 UMDF Conflated feed.
+platform emits live book, trade, instrument-status, and news data
+encoded as **FIX 4.4 Tag=Value** messages, batching book deltas over a
+configurable time window ("conflation"). The same project also models
+additional UMDF-specific message shapes such as `SecurityList*` and
+`MarketTotals*`. This platform acts as the **FIX session acceptor**
+("server" role) — the inverse of connecting out to a real B3 UMDF
+Conflated feed.
 
 ## What this is not
 
@@ -70,22 +72,52 @@ it needs the `schema-upgrade` label.
 - `ResendRequest` (2) is honored only for messages still available in
   the **current session's** bounded in-memory buffer — there is no
   cross-session/cross-day persisted message store.
-  `MsgSeqNum` is tracked per connection; a reconnect presenting a
+- `MsgSeqNum` is tracked per connection; a reconnect presenting a
   sequence number lower than expected is disconnected immediately (no
   `SequenceReset`-based gap-fill across reconnects), matching B3's
   documented behavior. Recovery after such a disconnect happens via a
   fresh `MarketDataSnapshotFullRefresh` on the new session.
 
-## Message scope
+## Message catalog
 
-| Message | MsgType | Source in this platform |
+MsgType codes below are verified against both the vendored dictionary
+(`schemas/fix-conflated/FIX44_UMDFConflated.xml`) and the in-repo
+constants in `FixMsgTypes` / `FixApplicationMsgTypes`.
+
+### Session/admin messages
+
+| Message | MsgType | Direction in this sandbox | Current behavior |
+|---|---|---|---|
+| `Logon` | `A` | inbound + outbound | First inbound message must be `Logon`; the sandbox always accepts it and replies with a `Logon` ack |
+| `Heartbeat` | `0` | inbound + outbound | Periodic server heartbeat; also the response to `TestRequest` |
+| `TestRequest` | `1` | inbound | Accepted; answered with a `Heartbeat` carrying the same `TestReqID` |
+| `ResendRequest` | `2` | inbound | Replays only application messages still retained in the current session's bounded in-memory resend buffer |
+| `SequenceReset` | `4` | outbound | Emitted only as in-session gap-fill during `ResendRequest` handling |
+| `Logout` | `5` | inbound + outbound | Used for orderly shutdown and validation/sequence failures after logon |
+
+### Application messages emitted by the current TCP listener wiring
+
+| Message | MsgType | Trigger / source |
 |---|---|---|
-| `MarketDataSnapshotFullRefresh` | W | Book state on subscribe / post-reconnect recovery |
-| `MarketDataIncrementalRefresh` | X | Book deltas, batched per configurable conflation window; trades sent unthrottled in the same message family |
-| `SecurityStatus` | f | `OnInstrumentStatusChanged` |
-| `News` | B | Existing `NewsReassembler` pipeline |
-| `SecurityList` / `SecurityListRequest` | y / x | `SymbolRegistry` |
-| `MarketTotals*` | UTOT/UTOTC/UTOTQ/UTOTP | Best-effort, from existing rankings/aggregates |
+| `MarketDataSnapshotFullRefresh` | `W` | `FixInitialSnapshotProvider` sends one full snapshot per known book immediately after logon / reconnect recovery |
+| `MarketDataIncrementalRefresh` | `X` | `FixConflatedMarketDataPublisher` batches book deltas per instrument/side over the configured conflation window; trade entries (`MDEntryType=2`) bypass that window and flush immediately |
+| `SecurityStatus` | `f` | `FixConflatedChannelHandler.OnSecurityStatusChanged` |
+| `News` | `B` | `FixConflatedChannelHandler.OnNews`, fed by the existing `NewsReassembler` pipeline |
+
+### Additional UMDF-specific message definitions modeled in code/schema
+
+These message shapes are implemented by builders in
+`src/B3.Umdf.FixConflated`, but the current listener wiring does **not**
+yet auto-publish them on its own:
+
+| Message | MsgType | Current status |
+|---|---|---|
+| `SecurityListRequest` | `x` | Request/builder shape implemented by `SecurityListMessageBuilder.BuildRequest`; no automatic request/response flow is wired today |
+| `SecurityList` | `y` | Builder implemented by `SecurityListMessageBuilder.Build`; not automatically broadcast by the current TCP server wiring |
+| `MarketTotalsBroadcast` | `UTOT` | Builder implemented; not automatically broadcast by the current TCP server wiring |
+| `MarketTotalsComposition` | `UTOTC` | Builder implemented; not automatically broadcast by the current TCP server wiring |
+| `MarketTotalsRequest` | `UTOTQ` | Request/builder shape implemented; no automatic request/response flow is wired today |
+| `MarketTotalsResponse` | `UTOTP` | Builder implemented; not automatically broadcast by the current TCP server wiring |
 
 ## Conflation model
 
@@ -107,6 +139,41 @@ callback only performs a cheap, allocation-free enqueue into its own
 ring buffer; FIX encoding, conflation-window flushing, and socket I/O all
 run on a dedicated background thread, never blocking or allocating on
 the shared per-group hot path.
+
+## Configuration reference
+
+All FIX sandbox knobs are environment-variable only; there are no
+dedicated CLI switches.
+
+| Environment Variable | Default | Valid values | Effect |
+|---|---|---|---|
+| `UMDF_FIX_CONFLATED_ENABLED` | `false` | `true` / `false` | Enables the opt-in FIX conflated TCP listener. When `false`, the other FIX knobs are ignored |
+| `UMDF_FIX_CONFLATED_PORT` | *(off)* | integer `1..65535`; required when enabled; must differ from `UMDF_WS_PORT` | TCP listen port for the FIX acceptor |
+| `UMDF_FIX_CONFLATED_CONFLATION_MS` | `380` | integer `> 0` | Book-delta conflation window in milliseconds. The sandbox default matches the real product's documented ~380 ms cadence, but remains configurable for experiments |
+| `UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY` | `10000` | integer `>= 0` | Per-connection in-memory application resend buffer size. `0` disables in-session replay retention |
+| `UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY` | `4096` | integer `> 0` | Per-connection bounded outbound queue. Slow clients are disconnected if it fills |
+| `UMDF_FIX_CONFLATED_EVENT_QUEUE_CAPACITY` | `65536` | integer `> 0` | Per-group hot-path queue feeding the background FIX encoder. When full, new FIX events are dropped instead of blocking the shared UMDF group thread |
+
+See [docs/CONFIGURATION.md](CONFIGURATION.md) for the full configuration
+matrix alongside the existing WebSocket and transport knobs.
+
+## Explicit deviations from the real B3 product
+
+- **Logon always succeeds.** There is no password, certificate, CompID
+  whitelist, or session-level authentication step.
+- **No B3 certification / onboarding process.** This repo is an
+  exploratory local sandbox, not an official access path.
+- **Reconnect recovery is snapshot-based.** `ResendRequest` only replays
+  application messages still buffered inside the current TCP session;
+  there is no persisted cross-session or cross-day gap-fill store.
+- **Conflation cadence is configurable.** Real B3 documentation cites an
+  approximately 380 ms cadence; this sandbox uses
+  `UMDF_FIX_CONFLATED_CONFLATION_MS` with a default of `380`.
+- **Role relationship is inverted.** This platform is the FIX session
+  **acceptor/server**; downstream clients connect *to it*, rather than
+  this repo acting as a FIX client connecting out to B3.
+- **This remains a non-official sandbox only.** It is not certified for,
+  or suitable for, production connectivity to B3.
 
 ## Enabling
 
