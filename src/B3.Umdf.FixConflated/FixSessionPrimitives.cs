@@ -94,7 +94,11 @@ internal static class FixTags
     public const int BeginString = 8;
     public const int BodyLength = 9;
     public const int MsgType = 35;
+    public const int OrderId = 37;
+    public const int SecurityId = 48;
     public const int SenderCompId = 49;
+    public const int Symbol = 55;
+    public const int Text = 58;
     public const int TargetCompId = 56;
     public const int MsgSeqNum = 34;
     public const int SendingTime = 52;
@@ -108,7 +112,17 @@ internal static class FixTags
     public const int EndSeqNo = 16;
     public const int NewSeqNo = 36;
     public const int NextExpectedMsgSeqNum = 789;
+    public const int MDReqId = 262;
+    public const int NoMDEntries = 268;
+    public const int MDEntryType = 269;
+    public const int MDEntryPx = 270;
+    public const int MDEntrySize = 271;
+    public const int MDEntryDate = 272;
+    public const int MDEntryTime = 273;
+    public const int TradeCondition = 277;
+    public const int MDUpdateAction = 279;
     public const int CheckSum = 10;
+    public const int TradeId = 1003;
 }
 
 internal static class FixMsgTypes
@@ -120,10 +134,93 @@ internal static class FixMsgTypes
     public const string SequenceReset = "4";
     public const string Logout = "5";
     public const string Logon = "A";
+    public const string MarketDataSnapshotFullRefresh = "W";
+    public const string MarketDataIncrementalRefresh = "X";
 }
 
 internal static class FixValueFormatting
 {
     public static string FormatUtcTimestamp(DateTimeOffset value)
         => value.UtcDateTime.ToString("yyyyMMdd-HH:mm:ss.fff", CultureInfo.InvariantCulture);
+
+    public static bool TryFormatUtcTimestamp(DateTimeOffset value, Span<byte> destination, out int written)
+    {
+        if (destination.Length < 21)
+        {
+            written = 0;
+            return false;
+        }
+
+        DateTime utc = value.UtcDateTime;
+        Write4(destination, utc.Year);
+        Write2(destination[4..], utc.Month);
+        Write2(destination[6..], utc.Day);
+        destination[8] = (byte)'-';
+        Write2(destination[9..], utc.Hour);
+        destination[11] = (byte)':';
+        Write2(destination[12..], utc.Minute);
+        destination[14] = (byte)':';
+        Write2(destination[15..], utc.Second);
+        destination[17] = (byte)'.';
+        Write3(destination[18..], utc.Millisecond);
+        written = 21;
+        return true;
+    }
+
+    public static bool TryFormatUtcDate(DateTimeOffset value, Span<byte> destination, out int written)
+    {
+        if (destination.Length < 8)
+        {
+            written = 0;
+            return false;
+        }
+
+        DateTime utc = value.UtcDateTime;
+        Write4(destination, utc.Year);
+        Write2(destination[4..], utc.Month);
+        Write2(destination[6..], utc.Day);
+        written = 8;
+        return true;
+    }
+
+    public static bool TryFormatUtcTime(DateTimeOffset value, Span<byte> destination, out int written)
+    {
+        if (destination.Length < 12)
+        {
+            written = 0;
+            return false;
+        }
+
+        DateTime utc = value.UtcDateTime;
+        Write2(destination, utc.Hour);
+        destination[2] = (byte)':';
+        Write2(destination[3..], utc.Minute);
+        destination[5] = (byte)':';
+        Write2(destination[6..], utc.Second);
+        destination[8] = (byte)'.';
+        Write3(destination[9..], utc.Millisecond);
+        written = 12;
+        return true;
+    }
+
+    private static void Write2(Span<byte> destination, int value)
+    {
+        destination[0] = (byte)('0' + (value / 10));
+        destination[1] = (byte)('0' + (value % 10));
+    }
+
+    private static void Write3(Span<byte> destination, int value)
+    {
+        destination[0] = (byte)('0' + (value / 100));
+        destination[1] = (byte)('0' + ((value / 10) % 10));
+        destination[2] = (byte)('0' + (value % 10));
+    }
+
+    private static void Write4(Span<byte> destination, int value)
+    {
+        destination[0] = (byte)('0' + ((value / 1000) % 10));
+        destination[1] = (byte)('0' + ((value / 100) % 10));
+        destination[2] = (byte)('0' + ((value / 10) % 10));
+        destination[3] = (byte)('0' + (value % 10));
+    }
 }
