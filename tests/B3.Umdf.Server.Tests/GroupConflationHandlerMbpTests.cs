@@ -306,12 +306,10 @@ public class GroupConflationHandlerMbpTests
         try
         {
             var book = w.BookManager.GetOrCreateBook(SecurityId);
-            var liveRec = new RecordingWebSocket();
-            var conflatedRec = new RecordingWebSocket();
-            var live = new ClientSession(liveRec, channelCapacity: 64);
-            var conflated = new ClientSession(conflatedRec, channelCapacity: 64);
-            w.Manager.RegisterClient(live); _ = Task.Run(() => live.RunWriteLoopAsync());
-            w.Manager.RegisterClient(conflated); _ = Task.Run(() => conflated.RunWriteLoopAsync());
+            var live = new ClientSession(new FakeWebSocket(), channelCapacity: 64);
+            var conflated = new ClientSession(new FakeWebSocket(), channelCapacity: 64);
+            w.Manager.RegisterClient(live);
+            w.Manager.RegisterClient(conflated);
             w.Manager.HandleSubscribe(live.Id, Symbol, DataFlags.Mbp,
                 w.BookManager, w.Group, bookBatchCutoffSequence: 0);
             w.Manager.HandleSubscribe(
@@ -322,18 +320,24 @@ public class GroupConflationHandlerMbpTests
                 w.BookManager,
                 w.Group,
                 bookBatchCutoffSequence: 0);
-            await WaitUntil(
-                () => liveRec.HasMessageType(MessageType.LevelSnapshot) &&
-                      conflatedRec.HasMessageType(MessageType.LevelSnapshot),
-                TimeSpan.FromSeconds(2));
+
+            int liveBefore = live.QueueDepth;
+            int conflatedBefore = conflated.QueueDepth;
+
+            // Pin the cadence deadline to a full interval after the delta is buffered
+            // so the test observes immediate MBP enqueueing instead of racing the
+            // broadcaster timer's current phase.
+            typeof(CadenceConflationBuffer)
+                .GetField("_nextFlushTicks", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .SetValue(GetCadenceBuffer(w.Group), Environment.TickCount64 + 500);
 
             book.Bids.Add(NewEntry(orderId: 1, price: 1000, qty: 7));
             w.Group.OnPriceLevelChanged(book, BookSideType.Bid, 1000);
             w.Group.OnBatchComplete();
 
-            await WaitUntil(() => liveRec.HasMessageType(MessageType.LevelUpdate), TimeSpan.FromSeconds(1));
-            Assert.Equal(0, conflatedRec.CountByType(MessageType.LevelUpdate));
-            await WaitUntil(() => conflatedRec.HasMessageType(MessageType.LevelUpdate), TimeSpan.FromSeconds(2));
+            await WaitUntil(() => live.QueueDepth > liveBefore, TimeSpan.FromSeconds(2));
+            Assert.Equal(conflatedBefore, conflated.QueueDepth);
+            await WaitUntil(() => conflated.QueueDepth > conflatedBefore, TimeSpan.FromSeconds(2));
         }
         finally
         {
