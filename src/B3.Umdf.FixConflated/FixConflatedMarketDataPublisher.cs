@@ -11,6 +11,7 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
     private readonly IFixClock _clock;
     private readonly FixApplicationMessageWriter _writer;
     private readonly ConcurrentQueue<QueuedBookDelta> _pendingBookDeltas = new();
+    private readonly ConcurrentQueue<QueuedTrade> _pendingTrades = new();
     private readonly Dictionary<ConflationKey, List<QueuedBookDelta>> _bufferedBookDeltas = new();
     private readonly List<ConflationKey> _bufferedOrder = new();
     private readonly object _stateGate = new();
@@ -18,10 +19,13 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
     private readonly AutoResetEvent _wakeSignal = new(false);
     private readonly TimeSpan _conflationInterval;
     private readonly long _conflationIntervalMs;
+    private readonly int _pendingEventCapacity;
     private readonly Thread? _workerThread;
     private volatile bool _disposed;
     private volatile bool _stopRequested;
     private long _nextFlushTicks;
+    private int _pendingEventCount;
+    private long _droppedEvents;
 
     public FixConflatedMarketDataPublisher(
         IFixApplicationMessageSink sink,
@@ -41,6 +45,7 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
 
         _conflationInterval = resolvedOptions.ConflationInterval;
         _conflationIntervalMs = checked((long)Math.Ceiling(_conflationInterval.TotalMilliseconds));
+        _pendingEventCapacity = resolvedOptions.PendingEventCapacity;
         _writer = new FixApplicationMessageWriter(resolvedOptions.InitialBufferSize);
 
         if (resolvedOptions.StartBackgroundWorker)
@@ -55,6 +60,8 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
     }
 
     public TimeSpan ConflationInterval => _conflationInterval;
+    public int PendingEventCount => Volatile.Read(ref _pendingEventCount);
+    public long DroppedEvents => Volatile.Read(ref _droppedEvents);
 
     public void PublishSnapshot(FixMarketDataSnapshotRequest request, OrderBook book)
     {
@@ -104,35 +111,42 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         => OnTrade(securityId, price, quantity, tradeId, sendingTimeNs, TradeFlags.None);
 
     public void OnTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
-        => PublishTrade(securityId, price, quantity, tradeId, sendingTimeNs);
+        => EnqueueTrade(new QueuedTrade(securityId, price, quantity, tradeId, sendingTimeNs));
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
         => OnForwardTrade(securityId, price, quantity, tradeId, sendingTimeNs, TradeFlags.None);
 
     public void OnForwardTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs, TradeFlags flags)
-        => PublishTrade(securityId, price, quantity, tradeId, sendingTimeNs);
+        => EnqueueTrade(new QueuedTrade(securityId, price, quantity, tradeId, sendingTimeNs));
 
     public void OnBookCleared(ulong securityId, BookClearSide side)
     {
+        ThrowIfDisposed();
         long nowTicks = _clock.MonotonicTicks;
         if (side is BookClearSide.Bid or BookClearSide.Both)
         {
-            _pendingBookDeltas.Enqueue(new QueuedBookDelta(
-                securityId,
-                BookSideType.Bid,
-                FixMdUpdateAction.DeleteThru,
-                FixMarketDataEntryFields.None,
-                nowTicks));
+            if (TryReservePendingEventSlot())
+            {
+                _pendingBookDeltas.Enqueue(new QueuedBookDelta(
+                    securityId,
+                    BookSideType.Bid,
+                    FixMdUpdateAction.DeleteThru,
+                    FixMarketDataEntryFields.None,
+                    nowTicks));
+            }
         }
 
         if (side is BookClearSide.Ask or BookClearSide.Both)
         {
-            _pendingBookDeltas.Enqueue(new QueuedBookDelta(
-                securityId,
-                BookSideType.Ask,
-                FixMdUpdateAction.DeleteThru,
-                FixMarketDataEntryFields.None,
-                nowTicks));
+            if (TryReservePendingEventSlot())
+            {
+                _pendingBookDeltas.Enqueue(new QueuedBookDelta(
+                    securityId,
+                    BookSideType.Ask,
+                    FixMdUpdateAction.DeleteThru,
+                    FixMarketDataEntryFields.None,
+                    nowTicks));
+            }
         }
 
         _wakeSignal.Set();
@@ -145,6 +159,12 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         {
             while (_pendingBookDeltas.TryDequeue(out _))
             {
+                ReleasePendingEventSlot();
+            }
+
+            while (_pendingTrades.TryDequeue(out _))
+            {
+                ReleasePendingEventSlot();
             }
 
             _bufferedBookDeltas.Clear();
@@ -203,36 +223,23 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         }
     }
 
-    private void PublishTrade(ulong securityId, long price, long quantity, long tradeId, long sendingTimeNs)
-    {
-        ThrowIfDisposed();
-        if (!_instrumentResolver.TryResolve(securityId, out FixMarketDataInstrument instrument))
-            return;
-
-        DateTimeOffset entryTime = ConvertToTimestamp(sendingTimeNs);
-        FixApplicationSessionHeader header = _headerProvider.NextHeader(entryTime);
-
-        Span<FixMarketDataIncrementalEntry> entries = stackalloc FixMarketDataIncrementalEntry[1];
-        entries[0] = new FixMarketDataIncrementalEntry(
-            FixMdUpdateAction.New,
-            FixMdEntryType.Trade,
-            entryTime,
-            FixMarketDataEntryFields.Price | FixMarketDataEntryFields.Size | FixMarketDataEntryFields.TradeId,
-            price,
-            quantity,
-            TradeId: tradeId);
-
-        lock (_emitGate)
-        {
-            ReadOnlyMemory<byte> frame = _writer.WriteIncrementalRefresh(header, instrument, entries);
-            _sink.OnMessage(frame);
-        }
-    }
-
     private void EnqueueBookDelta(QueuedBookDelta delta)
     {
         ThrowIfDisposed();
+        if (!TryReservePendingEventSlot())
+            return;
+
         _pendingBookDeltas.Enqueue(delta);
+        _wakeSignal.Set();
+    }
+
+    private void EnqueueTrade(QueuedTrade trade)
+    {
+        ThrowIfDisposed();
+        if (!TryReservePendingEventSlot())
+            return;
+
+        _pendingTrades.Enqueue(trade);
         _wakeSignal.Set();
     }
 
@@ -256,52 +263,64 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
 
     private void FlushBuffered(bool force)
     {
-        List<BufferedBatch>? batches = null;
+        List<BufferedBatch>? bookBatches = null;
+        List<QueuedTrade>? trades = null;
 
         lock (_stateGate)
         {
             DrainPendingDeltas();
+            trades = DrainPendingTrades();
 
-            if (_bufferedOrder.Count == 0)
+            if (_bufferedOrder.Count == 0 && (trades is null || trades.Count == 0))
                 return;
 
             long nowTicks = _clock.MonotonicTicks;
-            if (!force && nowTicks < _nextFlushTicks)
+            bool emitBookBatches = _bufferedOrder.Count != 0 && (force || nowTicks >= _nextFlushTicks);
+            if (!emitBookBatches && (trades is null || trades.Count == 0))
                 return;
 
-            DateTimeOffset flushTime = _clock.UtcNow;
-            batches = new List<BufferedBatch>(_bufferedOrder.Count);
-            foreach (ConflationKey key in _bufferedOrder)
+            if (emitBookBatches)
             {
-                List<QueuedBookDelta> deltas = _bufferedBookDeltas[key];
-                var entries = new FixMarketDataIncrementalEntry[deltas.Count];
-                for (int i = 0; i < deltas.Count; i++)
+                DateTimeOffset flushTime = _clock.UtcNow;
+                bookBatches = new List<BufferedBatch>(_bufferedOrder.Count);
+                foreach (ConflationKey key in _bufferedOrder)
                 {
-                    QueuedBookDelta delta = deltas[i];
-                    entries[i] = new FixMarketDataIncrementalEntry(
-                        delta.UpdateAction,
-                        key.EntryType,
-                        flushTime,
-                        delta.Fields,
-                        delta.Price,
-                        delta.Size,
-                        delta.OrderId);
+                    List<QueuedBookDelta> deltas = _bufferedBookDeltas[key];
+                    var entries = new FixMarketDataIncrementalEntry[deltas.Count];
+                    for (int i = 0; i < deltas.Count; i++)
+                    {
+                        QueuedBookDelta delta = deltas[i];
+                        entries[i] = new FixMarketDataIncrementalEntry(
+                            delta.UpdateAction,
+                            key.EntryType,
+                            flushTime,
+                            delta.Fields,
+                            delta.Price,
+                            delta.Size,
+                            delta.OrderId);
+                    }
+
+                    bookBatches.Add(new BufferedBatch(key.SecurityId, entries));
                 }
 
-                batches.Add(new BufferedBatch(key.SecurityId, entries));
+                _bufferedBookDeltas.Clear();
+                _bufferedOrder.Clear();
+                _nextFlushTicks = 0;
             }
-
-            _bufferedBookDeltas.Clear();
-            _bufferedOrder.Clear();
-            _nextFlushTicks = 0;
         }
 
         lock (_emitGate)
         {
-            if (batches is null)
+            if (trades is not null)
+            {
+                foreach (QueuedTrade trade in trades)
+                    EmitTrade(trade);
+            }
+
+            if (bookBatches is null)
                 return;
 
-            foreach (BufferedBatch batch in batches)
+            foreach (BufferedBatch batch in bookBatches)
             {
                 if (!_instrumentResolver.TryResolve(batch.SecurityId, out FixMarketDataInstrument instrument))
                     continue;
@@ -317,6 +336,7 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
     {
         while (_pendingBookDeltas.TryDequeue(out QueuedBookDelta delta))
         {
+            ReleasePendingEventSlot();
             var key = new ConflationKey(delta.SecurityId, delta.Side);
             if (!_bufferedBookDeltas.TryGetValue(key, out List<QueuedBookDelta>? entries))
             {
@@ -329,6 +349,69 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
             if (_nextFlushTicks == 0)
                 _nextFlushTicks = delta.EnqueueTicks + _conflationIntervalMs;
         }
+    }
+
+    private List<QueuedTrade>? DrainPendingTrades()
+    {
+        List<QueuedTrade>? trades = null;
+        while (_pendingTrades.TryDequeue(out QueuedTrade trade))
+        {
+            ReleasePendingEventSlot();
+            trades ??= new List<QueuedTrade>();
+            trades.Add(trade);
+        }
+
+        return trades;
+    }
+
+    private void EmitTrade(QueuedTrade trade)
+    {
+        if (!_instrumentResolver.TryResolve(trade.SecurityId, out FixMarketDataInstrument instrument))
+            return;
+
+        DateTimeOffset entryTime = ConvertToTimestamp(trade.SendingTimeNs);
+        FixApplicationSessionHeader header = _headerProvider.NextHeader(entryTime);
+
+        Span<FixMarketDataIncrementalEntry> entries = stackalloc FixMarketDataIncrementalEntry[1];
+        entries[0] = new FixMarketDataIncrementalEntry(
+            FixMdUpdateAction.New,
+            FixMdEntryType.Trade,
+            entryTime,
+            FixMarketDataEntryFields.Price | FixMarketDataEntryFields.Size | FixMarketDataEntryFields.TradeId,
+            trade.Price,
+            trade.Quantity,
+            TradeId: trade.TradeId);
+
+        ReadOnlyMemory<byte> frame = _writer.WriteIncrementalRefresh(header, instrument, entries);
+        _sink.OnMessage(frame);
+    }
+
+    private bool TryReservePendingEventSlot()
+    {
+        if (_pendingEventCapacity <= 0)
+        {
+            Interlocked.Increment(ref _pendingEventCount);
+            return true;
+        }
+
+        while (true)
+        {
+            int snapshot = Volatile.Read(ref _pendingEventCount);
+            if (snapshot >= _pendingEventCapacity)
+            {
+                Interlocked.Increment(ref _droppedEvents);
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _pendingEventCount, snapshot + 1, snapshot) == snapshot)
+                return true;
+        }
+    }
+
+    private void ReleasePendingEventSlot()
+    {
+        if (Interlocked.Decrement(ref _pendingEventCount) < 0)
+            Interlocked.Exchange(ref _pendingEventCount, 0);
     }
 
     private void ThrowIfDisposed()
@@ -358,6 +441,13 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         long Price = 0,
         long Size = 0,
         ulong OrderId = 0);
+
+    private readonly record struct QueuedTrade(
+        ulong SecurityId,
+        long Price,
+        long Quantity,
+        long TradeId,
+        long SendingTimeNs);
 
     private readonly record struct BufferedBatch(
         ulong SecurityId,

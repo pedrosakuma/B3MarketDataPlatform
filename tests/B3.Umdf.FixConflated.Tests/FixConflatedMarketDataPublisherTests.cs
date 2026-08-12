@@ -83,6 +83,7 @@ public sealed class FixConflatedMarketDataPublisherTests
 
         var tradeTime = new DateTimeOffset(2026, 8, 12, 19, 20, 30, 555, TimeSpan.Zero);
         publisher.OnTrade(1234, 2812, 250, 771122, tradeTime.ToUnixTimeMilliseconds() * 1_000_000);
+        publisher.FlushIfDue();
 
         Assert.Single(sink.Messages);
         FixMessage tradeMessage = Decode(sink.Messages[0]);

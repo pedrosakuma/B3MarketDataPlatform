@@ -96,8 +96,10 @@ public interface IFixMarketDataInstrumentResolver
 public sealed class FixConflatedMarketDataOptions
 {
     public static readonly TimeSpan DefaultConflationInterval = TimeSpan.FromMilliseconds(380);
+    public const int DefaultPendingEventCapacity = 65_536;
 
     public TimeSpan ConflationInterval { get; init; } = DefaultConflationInterval;
     public int InitialBufferSize { get; init; } = 4 * 1024;
+    public int PendingEventCapacity { get; init; } = DefaultPendingEventCapacity;
     public bool StartBackgroundWorker { get; init; } = true;
 }
