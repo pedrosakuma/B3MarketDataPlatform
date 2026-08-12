@@ -6,7 +6,8 @@ Today the server does **not** expose a production `/book/{symbol}` route, so
 that HTTP check is intentionally non-fatal and usually logs the cross-check as
 unavailable (`404`). For replay-driven cross-channel validation, use
 `tools/fix-conflated-replay-validate.sh`, which compares the final FIX-derived
-book summary against the independent WireV2 client reconstruction instead.
+book summary against a **fresh WebSocket `Subscribe` → `BookSnapshot` pull**
+for the same symbol — effectively the current server-side truth via WireV2.
 
 ## Prerequisites
 
@@ -40,6 +41,12 @@ Useful environment overrides:
 - `FIX_HEARTBEAT_SEC` — requested heartbeat interval (default `30`).
 - `CHECK_INTERVAL_MS` — `/book` comparison interval (default `5000`).
 - `RUN_SECONDS` — optional auto-stop timer for short validation runs.
+- `WS_SNAPSHOT_COMPARE_URL` — optional fresh WebSocket `Subscribe` target
+  (for example `ws://localhost:8080/ws`). When set, the validator performs one
+  final fresh-connection `BookSnapshot` pull at shutdown time and compares the
+  current FIX-derived book against that server-side snapshot.
+- `WS_SNAPSHOT_TIMEOUT_MS` — timeout for the fresh WebSocket snapshot pull
+  (default `5000`).
 
 If `GET /book/{symbol}` is unavailable (for example it returns `404` in the
 current local host setup), the validator keeps running and logs the server-check
