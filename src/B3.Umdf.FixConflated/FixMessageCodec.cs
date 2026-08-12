@@ -55,19 +55,17 @@ public static class FixMessageCodec
             AppendField(bodyBuilder, field);
 
         string body = bodyBuilder.ToString();
-        string prefix = $"8={beginString}{(char)Soh}9={Encoding.ASCII.GetByteCount(body).ToString(CultureInfo.InvariantCulture)}{(char)Soh}";
-        string messageWithoutChecksum = prefix + body;
+        byte[] bodyBytes = Encoding.ASCII.GetBytes(body);
+        byte[] beginStringBytes = Encoding.ASCII.GetBytes(beginString);
+        byte[] payload = new byte[FixFrameEncoding.GetFrameLength(beginStringBytes.Length, bodyBytes.Length)];
 
-        int checksum = 0;
-        byte[] payloadBytes = Encoding.ASCII.GetBytes(messageWithoutChecksum);
-        for (int i = 0; i < payloadBytes.Length; i++)
-            checksum = (checksum + payloadBytes[i]) & 0xFF;
+        int prefixLength = FixFrameEncoding.WritePrefix(payload, beginStringBytes, bodyBytes.Length);
+        bodyBytes.CopyTo(payload.AsSpan(prefixLength));
 
-        string finalMessage = string.Create(
-            CultureInfo.InvariantCulture,
-            $"{messageWithoutChecksum}10={checksum:000}{(char)Soh}");
-
-        return Encoding.ASCII.GetBytes(finalMessage);
+        int checksumOffset = prefixLength + bodyBytes.Length;
+        int checksum = FixFrameEncoding.CalculateChecksum(payload.AsSpan(0, checksumOffset));
+        FixFrameEncoding.WriteChecksumField(payload.AsSpan(checksumOffset), checksum);
+        return payload;
     }
 
     public static FixDecodeResult Decode(ReadOnlySpan<byte> buffer)
@@ -119,9 +117,7 @@ public static class FixMessageCodec
             !int.TryParse(Encoding.ASCII.GetString(checksumSpan), NumberStyles.None, CultureInfo.InvariantCulture, out int expectedChecksum))
             return FixDecodeResult.Failure(FixDecodeError.InvalidCheckSum);
 
-        int actualChecksum = 0;
-        for (int i = 0; i < checksumFieldStart; i++)
-            actualChecksum = (actualChecksum + buffer[i]) & 0xFF;
+        int actualChecksum = FixFrameEncoding.CalculateChecksum(buffer[..checksumFieldStart]);
         if (actualChecksum != expectedChecksum)
             return FixDecodeResult.Failure(FixDecodeError.CheckSumMismatch);
 
