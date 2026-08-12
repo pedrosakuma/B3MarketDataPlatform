@@ -222,6 +222,13 @@ SBE XML schema. The schema's `<!DOCTYPE xml>` declaration is removed
 because .NET's `XmlReader` prohibits DTD processing by default. This is
 the only modification to the original B3 schema.
 
+`schemas/fix-conflated/FIX44_UMDFConflated.xml` vendors the FIX 4.4 data
+dictionary published alongside B3's *UMDF PUMA Conflated Market Data
+Specification* (v2.2.0). It is used only by the experimental,
+non-official FIX Conflated sandbox channel described in
+[docs/FIX-CONFLATED-SANDBOX.md](docs/FIX-CONFLATED-SANDBOX.md) — unrelated
+to, and never mixed with, the Binary UMDF/SBE decoding path above.
+
 ## Documentation
 
 | Document | What's inside |
@@ -233,6 +240,7 @@ the only modification to the original B3 schema.
 | [docs/CLIENT-SDK.md](docs/CLIENT-SDK.md) | **Typed C# SDK** (`B3.MarketData.WebSocketClient` NuGet): API, DI extension, reconnect+replay, back-pressure policies |
 | [docs/WEBSOCKET-PROTOCOL.md](docs/WEBSOCKET-PROTOCOL.md) | Wire framing, message catalog, hex examples, subscription / reconnect / slow-consumer flows, candle chunking |
 | [docs/PROTOCOL-CONTRACTS.md](docs/PROTOCOL-CONTRACTS.md) | Contribution gate for UMDF/SBE wire-contract evidence, protocol research blockers, and WebSocket-vs-UMDF terminology |
+| [docs/FIX-CONFLATED-SANDBOX.md](docs/FIX-CONFLATED-SANDBOX.md) | **Experimental, non-official** FIX 4.4 "UMDF Conflated" sandbox output channel: scope, message catalog, and explicit deviations from B3's real product |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Hot-path design, zero-copy decoding, MPSC ring, broadcaster decoupling, coalescing, benchmarks |
 | [docs/RESILIENCE.md](docs/RESILIENCE.md) | Failure modes, gap recovery, fanout suppression, slow-consumer layered defenses, memory bounds, operational playbook |
 | [docs/NOISY-NEIGHBOUR.md](docs/NOISY-NEIGHBOUR.md) | Behaviour under host-level resource contention, scheduler jitter probe, deployment hardening (cpuset, k8s static CPU manager, NIC IRQ pinning, sysctls) |
