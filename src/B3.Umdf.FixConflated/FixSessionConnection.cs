@@ -287,8 +287,8 @@ public sealed class FixSessionConnection
 
     private static FixMessage CloneForReplay(FixMessage message)
     {
-        var replay = message.Clone();
-        replay.Upsert(FixTags.PossDupFlag, "Y");
+        var replay = new FixMessage(message, capacity: 1);
+        replay.AddBoolean(FixTags.PossDupFlag, true);
         return replay;
     }
 
@@ -307,7 +307,7 @@ public sealed class FixSessionConnection
         DateTimeOffset nowUtc,
         bool possDup)
     {
-        var outbound = new FixMessage(payload.Fields.Count + 5 + (possDup ? 1 : 0));
+        var outbound = new FixMessage(payload, capacity: 5 + (possDup ? 1 : 0));
         outbound.Add(FixTags.MsgType, GetRequiredString(payload, FixTags.MsgType));
         outbound.Add(FixTags.SenderCompId, identity.TargetCompId);
         outbound.Add(FixTags.TargetCompId, identity.SenderCompId);
@@ -315,19 +315,6 @@ public sealed class FixSessionConnection
         outbound.Add(FixTags.SendingTime, FixValueFormatting.FormatUtcTimestamp(nowUtc));
         if (possDup)
             outbound.AddBoolean(FixTags.PossDupFlag, true);
-
-        foreach (var field in payload.Fields)
-        {
-            if (field.Tag == FixTags.MsgType)
-                continue;
-            if (field.Tag == FixTags.PossDupFlag)
-            {
-                outbound.Upsert(field.Tag, field.Value);
-                continue;
-            }
-
-            outbound.Add(field.Tag, field.Value);
-        }
 
         return outbound;
     }
