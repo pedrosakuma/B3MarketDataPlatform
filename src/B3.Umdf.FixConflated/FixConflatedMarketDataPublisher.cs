@@ -12,6 +12,7 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
     private const int MaxRetainedBufferedBookDeltaCapacity = 4_096;
 
     private readonly IFixApplicationMessageSink _sink;
+    private readonly IFixApplicationBroadcastSink? _broadcastSink;
     private readonly IFixApplicationHeaderProvider _headerProvider;
     private readonly IFixMarketDataInstrumentResolver _instrumentResolver;
     private readonly IFixClock _clock;
@@ -44,6 +45,7 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         IFixClock? clock = null)
     {
         _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+        _broadcastSink = sink as IFixApplicationBroadcastSink;
         _headerProvider = headerProvider ?? throw new ArgumentNullException(nameof(headerProvider));
         _instrumentResolver = instrumentResolver ?? throw new ArgumentNullException(nameof(instrumentResolver));
         _clock = clock ?? SystemFixClock.Instance;
@@ -80,6 +82,12 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
         lock (_emitGate)
         {
             DateTimeOffset now = _clock.UtcNow;
+            if (_broadcastSink is not null)
+            {
+                _broadcastSink.OnApplicationMessage(FixSnapshotMessageBuilder.Build(request, book, now));
+                return;
+            }
+
             FixApplicationSessionHeader header = _headerProvider.NextHeader(now);
             ReadOnlyMemory<byte> frame = _writer.WriteSnapshotFullRefresh(header, request, book);
             _sink.OnMessage(frame);
@@ -335,9 +343,16 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
                             delta.OrderId);
                     }
 
-                    FixApplicationSessionHeader header = _headerProvider.NextHeader(batch.EntryTime);
-                    ReadOnlyMemory<byte> frame = _writer.WriteIncrementalRefresh(header, instrument, entries);
-                    _sink.OnMessage(frame);
+                    if (_broadcastSink is not null)
+                    {
+                        _broadcastSink.OnApplicationMessage(FixIncrementalRefreshMessageBuilder.Build(instrument, entries));
+                    }
+                    else
+                    {
+                        FixApplicationSessionHeader header = _headerProvider.NextHeader(batch.EntryTime);
+                        ReadOnlyMemory<byte> frame = _writer.WriteIncrementalRefresh(header, instrument, entries);
+                        _sink.OnMessage(frame);
+                    }
                 }
             }
         }
@@ -385,7 +400,6 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
             return;
 
         DateTimeOffset entryTime = ConvertToTimestamp(trade.SendingTimeNs);
-        FixApplicationSessionHeader header = _headerProvider.NextHeader(entryTime);
 
         Span<FixMarketDataIncrementalEntry> entries = stackalloc FixMarketDataIncrementalEntry[1];
         entries[0] = new FixMarketDataIncrementalEntry(
@@ -397,6 +411,13 @@ public sealed class FixConflatedMarketDataPublisher : IBookEventHandler, IDispos
             trade.Quantity,
             TradeId: trade.TradeId);
 
+        if (_broadcastSink is not null)
+        {
+            _broadcastSink.OnApplicationMessage(FixIncrementalRefreshMessageBuilder.Build(instrument, entries));
+            return;
+        }
+
+        FixApplicationSessionHeader header = _headerProvider.NextHeader(entryTime);
         ReadOnlyMemory<byte> frame = _writer.WriteIncrementalRefresh(header, instrument, entries);
         _sink.OnMessage(frame);
     }

@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace B3.Umdf.FixConflated;
 
-public sealed class FixConflatedSessionHub : IFixApplicationMessageSink
+public sealed class FixConflatedSessionHub : IFixApplicationMessageSink, IFixApplicationBroadcastSink
 {
     private readonly ConcurrentDictionary<long, FixTcpClientSession> _sessions = new();
     private readonly ILogger<FixConflatedSessionHub> _logger;
@@ -29,6 +29,9 @@ public sealed class FixConflatedSessionHub : IFixApplicationMessageSink
 
     public void OnMessage(ReadOnlyMemory<byte> message)
         => BroadcastApplication(FixApplicationMessageAdapter.FromEncodedFrame(message.Span));
+
+    public void OnApplicationMessage(FixMessage message)
+        => BroadcastApplication(message);
 
     public void BroadcastApplication(FixMessage message)
     {

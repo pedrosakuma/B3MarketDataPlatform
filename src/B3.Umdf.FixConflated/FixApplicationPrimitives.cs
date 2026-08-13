@@ -88,6 +88,11 @@ public interface IFixApplicationMessageSink
     void OnMessage(ReadOnlyMemory<byte> message);
 }
 
+public interface IFixApplicationBroadcastSink
+{
+    void OnApplicationMessage(FixMessage message);
+}
+
 public interface IFixMarketDataInstrumentResolver
 {
     bool TryResolve(ulong securityId, out FixMarketDataInstrument instrument);

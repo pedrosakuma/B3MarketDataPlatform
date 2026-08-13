@@ -128,6 +128,34 @@ public sealed class FixConflatedMarketDataPublisherTests
         Assert.False(entries[0].ContainsKey(FixTags.MDEntryPx));
     }
 
+    [Fact]
+    public void DirectBroadcastSink_Bypasses_EncodeDecode_RoundTrip()
+    {
+        var clock = new FakeFixClock();
+        var sink = new DirectCapturingSink();
+        var publisher = CreatePublisher(clock, sink);
+        OrderBook book = new(1234);
+
+        var add = CreateEntry(book.SecurityId, 7001, BookSideType.Bid, 2810, 100);
+        var update = CreateEntry(book.SecurityId, 7001, BookSideType.Bid, 2811, 90);
+
+        publisher.OnOrderAdded(book, in add);
+        publisher.OnOrderUpdated(book, in update);
+        clock.AdvanceMilliseconds(400);
+        publisher.FlushIfDue();
+
+        Assert.Empty(sink.Messages);
+        FixMessage message = Assert.Single(sink.ApplicationMessages);
+        Assert.Equal(FixMsgTypes.MarketDataIncrementalRefresh, GetRequired(message, FixTags.MsgType));
+
+        IReadOnlyList<IReadOnlyDictionary<int, string>> entries = ParseIncrementalEntries(message);
+        Assert.Equal(2, entries.Count);
+        Assert.Equal("0", entries[0][FixTags.MDUpdateAction]);
+        Assert.Equal("28.10", entries[0][FixTags.MDEntryPx]);
+        Assert.Equal("1", entries[1][FixTags.MDUpdateAction]);
+        Assert.Equal("28.11", entries[1][FixTags.MDEntryPx]);
+    }
+
     private static FixConflatedMarketDataPublisher CreatePublisher(FakeFixClock clock, CapturingSink sink)
     {
         return new FixConflatedMarketDataPublisher(
@@ -242,11 +270,19 @@ public sealed class FixConflatedMarketDataPublisherTests
         }
     }
 
-    private sealed class CapturingSink : IFixApplicationMessageSink
+    private class CapturingSink : IFixApplicationMessageSink
     {
         public List<byte[]> Messages { get; } = [];
 
         public void OnMessage(ReadOnlyMemory<byte> message)
             => Messages.Add(message.ToArray());
+    }
+
+    private sealed class DirectCapturingSink : CapturingSink, IFixApplicationBroadcastSink
+    {
+        public List<FixMessage> ApplicationMessages { get; } = [];
+
+        public void OnApplicationMessage(FixMessage message)
+            => ApplicationMessages.Add(message.Clone());
     }
 }

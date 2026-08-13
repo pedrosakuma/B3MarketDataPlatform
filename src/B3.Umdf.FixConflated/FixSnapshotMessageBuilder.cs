@@ -9,13 +9,13 @@ internal static class FixSnapshotMessageBuilder
     {
         ArgumentNullException.ThrowIfNull(book);
 
-        var message = new FixMessage();
+        int entryCount = book.Bids.OrderCount + book.Asks.OrderCount;
+        var message = new FixMessage(5 + (entryCount * 6));
         message.Add(FixTags.MsgType, FixMsgTypes.MarketDataSnapshotFullRefresh);
         message.Add(FixTags.MDReqId, request.MdReqId);
         message.Add(FixTags.Symbol, request.Instrument.Symbol);
         message.Add(FixTags.SecurityId, request.Instrument.SecurityId.ToString(CultureInfo.InvariantCulture));
 
-        int entryCount = book.Bids.OrderCount + book.Asks.OrderCount;
         message.Add(FixTags.NoMDEntries, entryCount);
 
         string entryDate = entryTime.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture);

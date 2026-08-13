@@ -11,6 +11,14 @@ public sealed class FixMessage
         _fields = new List<FixField>();
     }
 
+    public FixMessage(int capacity)
+    {
+        if (capacity < 0)
+            throw new ArgumentOutOfRangeException(nameof(capacity));
+
+        _fields = new List<FixField>(capacity);
+    }
+
     public FixMessage(IEnumerable<FixField> fields)
     {
         _fields = new List<FixField>(fields);
