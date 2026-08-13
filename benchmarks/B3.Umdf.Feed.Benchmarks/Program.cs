@@ -3,7 +3,7 @@ using BenchmarkDotNet.Running;
 using B3.Umdf.Feed;
 using B3.Umdf.Transport;
 
-BenchmarkRunner.Run<MpscPacketRingBenchmarks>();
+BenchmarkSwitcher.FromAssembly(typeof(MpscPacketRingBenchmarks).Assembly).Run(args);
 
 [MemoryDiagnoser]
 [SimpleJob(warmupCount: 2, iterationCount: 5)]

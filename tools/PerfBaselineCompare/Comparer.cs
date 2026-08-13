@@ -153,7 +153,7 @@ public static class Comparer
     {
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
         if (string.IsNullOrWhiteSpace(parameters)) return result;
-        foreach (var part in parameters.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var part in parameters.Split([',', '&'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var eq = part.IndexOf('=');
             if (eq <= 0) continue;

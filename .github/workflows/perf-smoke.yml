@@ -1,4 +1,4 @@
-# Perf-smoke: runs the three representative microbenchmarks and compares
+# Perf-smoke: runs the representative microbenchmarks and compares
 # results against committed baselines under docs/perf/baselines/.
 #
 # WHY OPT-IN: BenchmarkDotNet on shared GitHub-hosted runners is high-noise
@@ -40,7 +40,7 @@ jobs:
         working-directory: benchmarks/B3.Umdf.Book.Benchmarks
         run: |
           dotnet run -c Release --no-build -- \
-            --filter '*BookManagerOnPacketBenchmarks*|*BookSideBenchmarks*' \
+            --filter '*BookManagerOnPacketBenchmarks*' '*BookSideBenchmarks*' \
             --exporters json
 
       - name: Run Feed benchmarks (MpscPacketRing)
@@ -48,6 +48,13 @@ jobs:
         run: |
           dotnet run -c Release --no-build -- \
             --filter '*MpscPacketRingBenchmarks*' \
+            --exporters json
+
+      - name: Run FIX conflated benchmarks (writer + publisher)
+        working-directory: benchmarks/B3.Umdf.FixConflated.Benchmarks
+        run: |
+          dotnet run -c Release --no-build -- \
+            --filter '*FixApplicationMessageWriterBenchmarks*' '*FixConflatedMarketDataPublisherBenchmarks*' \
             --exporters json
 
       - name: Upload BDN artifacts
@@ -58,6 +65,7 @@ jobs:
           path: |
             benchmarks/B3.Umdf.Book.Benchmarks/BenchmarkDotNet.Artifacts/
             benchmarks/B3.Umdf.Feed.Benchmarks/BenchmarkDotNet.Artifacts/
+            benchmarks/B3.Umdf.FixConflated.Benchmarks/BenchmarkDotNet.Artifacts/
           if-no-files-found: warn
           retention-days: 14
 
@@ -65,12 +73,13 @@ jobs:
         run: |
           shopt -s nullglob
           reports=()
-          for f in benchmarks/B3.Umdf.Book.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full.json \
-                  benchmarks/B3.Umdf.Feed.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full.json; do
+          for f in benchmarks/B3.Umdf.Book.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full*.json \
+                  benchmarks/B3.Umdf.Feed.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full*.json \
+                  benchmarks/B3.Umdf.FixConflated.Benchmarks/BenchmarkDotNet.Artifacts/results/*-report-full*.json; do
             reports+=(--report "$f")
           done
           if [ ${#reports[@]} -eq 0 ]; then
-            echo "No BenchmarkDotNet -report-full.json files found." >&2
+            echo "No BenchmarkDotNet report-full JSON files found." >&2
             exit 1
           fi
           dotnet run -c Release --no-build --project tools/PerfBaselineCompare -- \

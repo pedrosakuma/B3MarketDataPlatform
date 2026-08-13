@@ -2,6 +2,7 @@
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/B3.Umdf.Book.Benchmarks/B3.Umdf.Book.Benchmarks.csproj" />
     <Project Path="benchmarks/B3.Umdf.Feed.Benchmarks/B3.Umdf.Feed.Benchmarks.csproj" />
+    <Project Path="benchmarks/B3.Umdf.FixConflated.Benchmarks/B3.Umdf.FixConflated.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/B3.MarketData.WebSocketClient/B3.MarketData.WebSocketClient.csproj" />

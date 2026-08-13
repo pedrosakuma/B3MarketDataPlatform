@@ -129,12 +129,17 @@ public class ComparerTests
         Assert.Equal("10000", parsed["MessageCount"]);
         Assert.Equal("64", parsed["SymbolCount"]);
 
+        var ampersandParsed = Comparer.ParseBdnParams("MessageCount=10000&SymbolCount=64");
+        Assert.Equal("10000", ampersandParsed["MessageCount"]);
+        Assert.Equal("64", ampersandParsed["SymbolCount"]);
+
         var want = new Dictionary<string, JsonElement>
         {
             ["MessageCount"] = JsonDocument.Parse("10000").RootElement.Clone(),
             ["SymbolCount"] = JsonDocument.Parse("64").RootElement.Clone(),
         };
         Assert.True(Comparer.ParamsMatch("MessageCount=10000, SymbolCount=64", want));
+        Assert.True(Comparer.ParamsMatch("MessageCount=10000&SymbolCount=64", want));
         Assert.False(Comparer.ParamsMatch("MessageCount=10000, SymbolCount=512", want));
         Assert.False(Comparer.ParamsMatch("MessageCount=10000", want));
     }

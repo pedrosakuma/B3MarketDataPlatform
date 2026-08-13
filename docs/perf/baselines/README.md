@@ -85,9 +85,9 @@ required-checks list.
 
 ## Why some files are schema-only
 
-`BookSideBenchmarks.*.json` and `MpscPacketRingBenchmarks.*.json` ship
-without populated `metrics`. The committed prose docs don't include a
-single defensible number for those benchmarks in isolation, so we'd
+`BookSideBenchmarks.*.json` and `MpscPacketRingBenchmarks.*.json` still
+ship without populated `metrics`. The committed prose docs don't include
+a single defensible number for those benchmarks in isolation, so we'd
 rather commit a no-metric placeholder (which the comparer treats as
 "matched but nothing to gate on") than fabricate numbers that quietly
 drift. Populating those numbers is a follow-up to issue #19 and should
