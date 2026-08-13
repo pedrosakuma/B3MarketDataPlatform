@@ -135,7 +135,7 @@ public sealed class FixSessionConnection
             nowUtc,
             possDup: false);
 
-        StoreApplicationMessage(seqNum, outbound.Clone());
+        StoreApplicationMessage(seqNum, outbound);
         _lastSentTicks = nowTicks;
         update = UpdateWith(outbound, disconnect: false, reason: null);
         return true;
@@ -206,7 +206,7 @@ public sealed class FixSessionConnection
         if (requestedEnd < beginSeqNo)
             return FixSessionUpdate.None;
 
-        List<FixMessage> outbound = new();
+        List<FixMessage> outbound = new((requestedEnd - beginSeqNo) + 1);
         int cursor = beginSeqNo;
         while (cursor <= requestedEnd)
         {
@@ -307,8 +307,7 @@ public sealed class FixSessionConnection
         DateTimeOffset nowUtc,
         bool possDup)
     {
-        var outbound = new FixMessage();
-        outbound.Add(FixTags.BeginString, FixMessageCodec.BeginString);
+        var outbound = new FixMessage(payload.Fields.Count + 5 + (possDup ? 1 : 0));
         outbound.Add(FixTags.MsgType, GetRequiredString(payload, FixTags.MsgType));
         outbound.Add(FixTags.SenderCompId, identity.TargetCompId);
         outbound.Add(FixTags.TargetCompId, identity.SenderCompId);

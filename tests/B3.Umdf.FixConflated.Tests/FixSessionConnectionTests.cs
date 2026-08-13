@@ -56,7 +56,7 @@ public sealed class FixSessionConnectionTests
         var clock = new FakeFixClock();
         var session = CreateLoggedOnSession(clock, new FixSessionOptions { ApplicationResendBufferCapacity = 8 });
 
-        Assert.True(session.TrySendApplication(CreateApplicationMessage("m1"), out _));
+        Assert.True(session.TrySendApplication(CreateApplicationMessage("m1"), out FixSessionUpdate firstSend));
         Assert.True(session.TrySendApplication(CreateApplicationMessage("m2"), out _));
         Assert.True(session.TrySendApplication(CreateApplicationMessage("m3"), out _));
 
@@ -70,6 +70,7 @@ public sealed class FixSessionConnectionTests
         Assert.Equal(3, resendUpdate.OutboundMessages.Count);
         Assert.All(resendUpdate.OutboundMessages, message => Assert.Equal("Y", GetRequired(message, FixTags.PossDupFlag)));
         Assert.Equal(new[] { "2", "3", "4" }, resendUpdate.OutboundMessages.Select(m => GetRequired(m, FixTags.MsgSeqNum)).ToArray());
+        Assert.False(firstSend.OutboundMessages[0].TryGetString(FixTags.PossDupFlag, out _));
     }
 
     [Fact]
