@@ -7,6 +7,8 @@ namespace B3.Umdf.FixConflated;
 
 public sealed class FixTcpClientSession : IAsyncDisposable
 {
+    private const int MaxWriteBatchBytes = 64 * 1024;
+
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly FixSessionConnection _session;
@@ -14,10 +16,11 @@ public sealed class FixTcpClientSession : IAsyncDisposable
     private readonly Action<long> _onClosed;
     private readonly ILogger<FixTcpClientSession> _logger;
     private readonly FixOutboundRing<FixMessage> _outbound;
-    private readonly FixMessageEncoder _encoder = new();
+    private readonly FixMessageBatchEncoder _batchEncoder = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly object _sessionGate = new();
     private readonly ConcurrentBag<Task> _tasks = new();
+    private FixMessage? _deferredMessage;
     private int _closed;
 
     public FixTcpClientSession(
@@ -87,7 +90,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         {
             _stream.Dispose();
             _client.Dispose();
-            _encoder.Dispose();
+            _batchEncoder.Dispose();
             _outbound.Dispose();
             _cts.Dispose();
         }
@@ -171,15 +174,17 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         {
             while (!_cts.IsCancellationRequested)
             {
-                while (_outbound.TryDequeue(out FixMessage? payload))
+                int batchMessageCount = FillWriteBatch();
+                if (batchMessageCount == 0)
                 {
-                    ReadOnlyMemory<byte> encoded = _encoder.Encode(payload);
-                    await _stream.WriteAsync(encoded, _cts.Token).ConfigureAwait(false);
-                    FixConflatedMetrics.MessagesSent.Add(1);
-                    FixConflatedMetrics.BytesSent.Add(encoded.Length);
+                    _outbound.WaitForItems(_cts.Token);
+                    continue;
                 }
 
-                _outbound.WaitForItems(_cts.Token);
+                ReadOnlyMemory<byte> encoded = _batchEncoder.WrittenMemory;
+                await _stream.WriteAsync(encoded, _cts.Token).ConfigureAwait(false);
+                FixConflatedMetrics.MessagesSent.Add(batchMessageCount);
+                FixConflatedMetrics.BytesSent.Add(encoded.Length);
             }
         }
         catch (OperationCanceledException)
@@ -245,6 +250,41 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         }
 
         return true;
+    }
+
+    private int FillWriteBatch()
+    {
+        _batchEncoder.Reset();
+        int messageCount = 0;
+
+        if (_deferredMessage is not null)
+        {
+            messageCount += AppendToBatch(_deferredMessage, FixMessageCodec.GetEncodedLength(_deferredMessage));
+            _deferredMessage = null;
+        }
+
+        while (_outbound.TryDequeue(out FixMessage? payload))
+        {
+            int encodedLength = FixMessageCodec.GetEncodedLength(payload);
+            if (messageCount != 0 &&
+                _batchEncoder.WrittenCount + encodedLength > MaxWriteBatchBytes)
+            {
+                _deferredMessage = payload;
+                break;
+            }
+
+            messageCount += AppendToBatch(payload, encodedLength);
+            if (_batchEncoder.WrittenCount >= MaxWriteBatchBytes)
+                break;
+        }
+
+        return messageCount;
+    }
+
+    private int AppendToBatch(FixMessage payload, int encodedLength)
+    {
+        _batchEncoder.Append(payload, encodedLength);
+        return 1;
     }
 
     private void SendInitialMessages()
