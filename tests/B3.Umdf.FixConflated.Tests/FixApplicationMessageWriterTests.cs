@@ -1,5 +1,6 @@
 using B3.Umdf.Book;
 using B3.Umdf.FixConflated;
+using System.Text;
 
 namespace B3.Umdf.FixConflated.Tests;
 
@@ -36,8 +37,10 @@ public sealed class FixApplicationMessageWriterTests
         ];
 
         ReadOnlyMemory<byte> frame = writer.WriteIncrementalRefresh(header, instrument, entries);
+        string encoded = Encoding.ASCII.GetString(frame.Span);
 
         FixMessage decoded = Decode(frame);
+        Assert.StartsWith($"8=FIX.4.4{(char)FixMessageCodec.Soh}9=000", encoded, StringComparison.Ordinal);
         Assert.Equal(FixMsgTypes.MarketDataIncrementalRefresh, GetRequired(decoded, FixTags.MsgType));
         Assert.Equal("SERVER", GetRequired(decoded, FixTags.SenderCompId));
         Assert.Equal("CLIENT", GetRequired(decoded, FixTags.TargetCompId));

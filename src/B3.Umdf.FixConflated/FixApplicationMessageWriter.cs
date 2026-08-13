@@ -7,7 +7,7 @@ namespace B3.Umdf.FixConflated;
 
 public sealed class FixApplicationMessageWriter : IDisposable
 {
-    private const int MaxReservedPrefixLength = 32;
+    private const int FixedBodyLengthDigits = 6;
     private static readonly Encoding s_ascii = Encoding.ASCII;
 
     private readonly ArrayPool<byte> _bufferPool;
@@ -34,9 +34,9 @@ public sealed class FixApplicationMessageWriter : IDisposable
         if (entries.IsEmpty)
             throw new ArgumentException("At least one incremental entry is required.", nameof(entries));
 
+        int bodyStart = GetReservedPrefixLength(header.BeginString.Length);
         EnsureCapacity(EstimateIncrementalFrameSize(header, instrument, entries.Length, mdReqId));
 
-        int bodyStart = MaxReservedPrefixLength;
         int bodyLength = WriteIncrementalBody(
             _buffer.AsSpan(bodyStart),
             header,
@@ -55,9 +55,9 @@ public sealed class FixApplicationMessageWriter : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         int entryCount = book.Bids.OrderCount + book.Asks.OrderCount;
+        int bodyStart = GetReservedPrefixLength(header.BeginString.Length);
         EnsureCapacity(EstimateSnapshotFrameSize(header, request, entryCount));
 
-        int bodyStart = MaxReservedPrefixLength;
         int bodyLength = WriteSnapshotBody(
             _buffer.AsSpan(bodyStart),
             header,
@@ -81,14 +81,9 @@ public sealed class FixApplicationMessageWriter : IDisposable
 
     private ReadOnlyMemory<byte> FinalizeFrame(string beginString, int bodyStart, int bodyLength)
     {
-        Span<byte> beginStringBytes = stackalloc byte[Math.Max(beginString.Length, 1)];
-        int beginStringLength = s_ascii.GetBytes(beginString, beginStringBytes);
-        int prefixLength = FixFrameEncoding.WritePrefix(_buffer, beginStringBytes[..beginStringLength], bodyLength);
+        WriteFixedWidthPrefix(_buffer, beginString, bodyLength);
 
-        if (prefixLength != bodyStart)
-            _buffer.AsSpan(bodyStart, bodyLength).CopyTo(_buffer.AsSpan(prefixLength));
-
-        int checksumOffset = prefixLength + bodyLength;
+        int checksumOffset = bodyStart + bodyLength;
         int checksum = FixFrameEncoding.CalculateChecksum(_buffer.AsSpan(0, checksumOffset));
         int checksumLength = FixFrameEncoding.WriteChecksumField(_buffer.AsSpan(checksumOffset), checksum);
 
@@ -197,7 +192,7 @@ public sealed class FixApplicationMessageWriter : IDisposable
         int beginStringLength = header.BeginString.Length;
         int mdReqIdLength = string.IsNullOrEmpty(mdReqId) ? 0 : mdReqId!.Length + 16;
         int bodyLength = 96 + header.SenderCompId.Length + header.TargetCompId.Length + mdReqIdLength + entryCount * (160 + instrument.Symbol.Length);
-        return MaxReservedPrefixLength + bodyLength + FixFrameEncoding.ChecksumFieldLength + beginStringLength;
+        return GetReservedPrefixLength(beginStringLength) + bodyLength + FixFrameEncoding.ChecksumFieldLength;
     }
 
     private static int EstimateSnapshotFrameSize(
@@ -207,7 +202,33 @@ public sealed class FixApplicationMessageWriter : IDisposable
     {
         int beginStringLength = header.BeginString.Length;
         int bodyLength = 96 + header.SenderCompId.Length + header.TargetCompId.Length + request.MdReqId.Length + request.Instrument.Symbol.Length + entryCount * 96;
-        return MaxReservedPrefixLength + bodyLength + FixFrameEncoding.ChecksumFieldLength + beginStringLength;
+        return GetReservedPrefixLength(beginStringLength) + bodyLength + FixFrameEncoding.ChecksumFieldLength;
+    }
+
+    private static int GetReservedPrefixLength(int beginStringLength)
+        => 2 + beginStringLength + 1 + 2 + FixedBodyLengthDigits + 1;
+
+    private static void WriteFixedWidthPrefix(Span<byte> destination, string beginString, int bodyLength)
+    {
+        if (bodyLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(bodyLength));
+
+        int offset = 0;
+        destination[offset++] = (byte)'8';
+        destination[offset++] = (byte)'=';
+        offset += s_ascii.GetBytes(beginString, destination[offset..]);
+        destination[offset++] = FixMessageCodec.Soh;
+        destination[offset++] = (byte)'9';
+        destination[offset++] = (byte)'=';
+
+        Span<byte> digits = stackalloc byte[10];
+        if (!Utf8Formatter.TryFormat(bodyLength, digits, out int digitsWritten) || digitsWritten > FixedBodyLengthDigits)
+            throw new InvalidOperationException("FIX body length exceeded the fixed-width prefix budget.");
+
+        destination.Slice(offset, FixedBodyLengthDigits).Fill((byte)'0');
+        digits[..digitsWritten].CopyTo(destination[(offset + FixedBodyLengthDigits - digitsWritten)..]);
+        offset += FixedBodyLengthDigits;
+        destination[offset] = FixMessageCodec.Soh;
     }
 
     private static int WriteSessionHeader(Span<byte> destination, FixApplicationSessionHeader header, string msgType)
