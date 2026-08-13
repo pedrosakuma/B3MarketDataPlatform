@@ -144,7 +144,7 @@ straight from the B3 SBE XML schema.
 | `B3.Umdf.PcapReplay.Tests` | 28 | PCAP reader, UDP/VLAN/SLL extraction, timestamp-merge ordering |
 | `B3.Umdf.Transport.Tests` | 39 | Packet source, multicast config, batch receive (`recvmmsg`) |
 | `B3.Umdf.Server.Tests` | 212 | Subscription manager, snapshot emitter, outlier sweep, conflation, epoch reset, trade bust, news fan-out, wire protocol, client session, backpressure |
-| `B3.Umdf.FixConflated.Tests` | 25 | FIX codec/session engine, builders, hot-path queueing, TCP transport, and end-to-end snapshot/conflation/trade delivery |
+| `B3.Umdf.FixConflated.Tests` | 26 | FIX codec/session engine, builders, hot-path queueing, TCP transport, end-to-end snapshot/conflation/trade delivery, and real-socket reconnect/recovery |
 | `B3.Umdf.ConsoleApp.Tests` | 44 | CLI option parsing, env-var precedence, multicast config validation |
 
 ```bash

@@ -157,6 +157,48 @@ dedicated CLI switches.
 See [docs/CONFIGURATION.md](CONFIGURATION.md) for the full configuration
 matrix alongside the existing WebSocket and transport knobs.
 
+## Validation & tooling
+
+The FIX Conflated channel has validation/observability tooling parity with
+the existing `WireV2` WebSocket path (tracked by issue #103):
+
+- **Standalone FIX validator** — `tools/fix/fix-validate.mjs` is a
+  dependency-free Node.js TCP client mirroring `tools/ws/ws-validate.mjs`. It
+  performs `Logon`, consumes the automatic `MarketDataSnapshotFullRefresh` and
+  subsequent `MarketDataIncrementalRefresh` messages, reconstructs the book
+  locally, tracks trades, and answers `TestRequest` with `Heartbeat`. See
+  [tools/fix/README.md](../tools/fix/README.md) for usage and environment
+  variables.
+- **Server-truth comparison via fresh WS snapshot.** The current server does
+  **not** expose an HTTP `/book/{symbol}` route (a pre-existing gap that also
+  affects `tools/ws/ws-validate.mjs`, unrelated to this channel). Rather than
+  adding a new HTTP endpoint or comparing two independently-accumulated
+  client-side books (which could drift identically on a shared conceptual
+  bug), validation instead opens a **fresh WebSocket connection and sends a
+  plain `Subscribe`** for the tracked symbol at the end of a run. The server
+  always answers a fresh subscribe with a full, server-computed
+  `BookSnapshot` — this is genuine server-side truth, the closest available
+  equivalent to what `/book/{symbol}` would have provided. This is wired via
+  `WS_SNAPSHOT_COMPARE_URL` in `fix-validate.mjs`.
+- **Real-socket reconnect/recovery test** —
+  `tests/B3.Umdf.FixConflated.Tests/FixConflatedReconnectEndToEndTests.cs`
+  proves the reconnect rule (stale `MsgSeqNum` disconnects with no gap-fill;
+  a fresh session with `MsgSeqNum=1` recovers via a new snapshot) through the
+  real `FixConflatedTcpServer`/socket layer, not just the in-process session
+  state machine.
+- **Pcap-replay harness** — `tools/fix-conflated-replay-validate.sh` starts
+  the console app against a PCAP prefix with the FIX listener enabled, runs
+  `fix-validate.mjs` for the replay window, and reports the final fresh-WS
+  `BookSnapshot` comparison as the pass/fail verdict. Mirrors the conventions
+  of `tools/loss-resilience-test.sh`.
+- **Soak test coverage** — `tools/soak-test.sh` optionally starts the FIX
+  listener alongside the WebSocket host (`ENABLE_FIX_CONFLATED=true`) and
+  samples `FixConflatedMetrics` via the Prometheus `/metrics` endpoint into
+  the same long-running RSS/GC/counter stability CSV used for the WireV2
+  path.
+- **Perf-smoke benchmark coverage** — not yet added (deliberately deferred,
+  best-effort/optional item in issue #103).
+
 ## Explicit deviations from the real B3 product
 
 - **Logon always succeeds.** There is no password, certificate, CompID
