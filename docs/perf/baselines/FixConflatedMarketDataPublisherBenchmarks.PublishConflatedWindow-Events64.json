@@ -6,9 +6,9 @@
   "captured_on": "AMD EPYC 7763 (local BenchmarkDotNet capture on issue-103b worktree)",
   "runtime": "net10.0 Release",
   "metrics": {
-    "mean_ns_per_op": 26675.693534851074,
-    "alloc_b_per_op": 10248.0
+    "mean_ns_per_op": 23457.0,
+    "alloc_b_per_op": 136.0
   },
   "tolerance": { "mean_pct": 20, "alloc_pct": 25 },
-  "notes": "Captured locally with BenchmarkDotNet from benchmarks/B3.Umdf.FixConflated.Benchmarks on the AMD EPYC 7763 host used for this worktree session. Treat as advisory until it has been refreshed on the exact runner profile used by the opt-in perf-smoke workflow."
+  "notes": "Updated after pooling buffered delta lists and renting incremental-entry arrays in FixConflatedMarketDataPublisher. Captured locally with BenchmarkDotNet on the AMD EPYC 7763 host used for this worktree session; treat the mean as advisory until it has been refreshed on the exact runner profile used by the opt-in perf-smoke workflow."
 }
