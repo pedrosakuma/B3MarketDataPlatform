@@ -1,3 +1,4 @@
+using System.Buffers.Text;
 using System.Globalization;
 using System.Text;
 
@@ -35,6 +36,7 @@ public static class FixMessageCodec
 {
     public const byte Soh = 0x01;
     public const string BeginString = "FIX.4.4";
+    private static readonly Encoding Ascii = Encoding.ASCII;
 
     public static byte[] Encode(FixMessage message)
     {
@@ -47,22 +49,22 @@ public static class FixMessageCodec
         if (!message.TryGetString(FixTags.MsgType, out var msgType) || string.IsNullOrEmpty(msgType))
             throw new InvalidOperationException("FIX message requires MsgType (35) before encoding.");
 
-        List<FixField> fields = CollectFields(message, msgType);
+        int bodyLength = CalculateBodyLength(message, msgType);
+        byte[] payload = new byte[FixFrameEncoding.GetFrameLength(beginString.Length, bodyLength)];
+        int offset = WritePrefix(payload, beginString, bodyLength);
+        offset += WriteField(payload.AsSpan(offset), FixTags.MsgType, msgType);
 
-        var bodyBuilder = new StringBuilder();
-        bodyBuilder.Append("35=").Append(msgType).Append((char)Soh);
-        foreach (var field in fields)
-            AppendField(bodyBuilder, field);
+        IReadOnlyList<FixField> fields = message.Fields;
+        for (int i = 0; i < fields.Count; i++)
+        {
+            FixField field = fields[i];
+            if (ShouldSkipEncodeField(field))
+                continue;
 
-        string body = bodyBuilder.ToString();
-        byte[] bodyBytes = Encoding.ASCII.GetBytes(body);
-        byte[] beginStringBytes = Encoding.ASCII.GetBytes(beginString);
-        byte[] payload = new byte[FixFrameEncoding.GetFrameLength(beginStringBytes.Length, bodyBytes.Length)];
+            offset += WriteField(payload.AsSpan(offset), field.Tag, field.Value);
+        }
 
-        int prefixLength = FixFrameEncoding.WritePrefix(payload, beginStringBytes, bodyBytes.Length);
-        bodyBytes.CopyTo(payload.AsSpan(prefixLength));
-
-        int checksumOffset = prefixLength + bodyBytes.Length;
+        int checksumOffset = offset;
         int checksum = FixFrameEncoding.CalculateChecksum(payload.AsSpan(0, checksumOffset));
         FixFrameEncoding.WriteChecksumField(payload.AsSpan(checksumOffset), checksum);
         return payload;
@@ -155,25 +157,20 @@ public static class FixMessageCodec
         return FixDecodeResult.Completed(message, totalLength);
     }
 
-    private static List<FixField> CollectFields(FixMessage message, string msgType)
+    private static int CalculateBodyLength(FixMessage message, string msgType)
     {
-        var fields = new List<FixField>(message.Fields.Count);
-        for (int i = 0; i < message.Fields.Count; i++)
+        int bodyLength = GetFieldLength(FixTags.MsgType, msgType);
+        IReadOnlyList<FixField> fields = message.Fields;
+        for (int i = 0; i < fields.Count; i++)
         {
-            var field = message.Fields[i];
-            if (field.Tag is FixTags.BeginString or FixTags.BodyLength or FixTags.CheckSum)
+            FixField field = fields[i];
+            if (ShouldSkipEncodeField(field))
                 continue;
-            if (field.Tag == FixTags.MsgType)
-            {
-                if (!string.Equals(field.Value, msgType, StringComparison.Ordinal))
-                    continue;
-                continue;
-            }
 
-            fields.Add(field);
+            bodyLength += GetFieldLength(field.Tag, field.Value);
         }
 
-        return fields;
+        return bodyLength;
     }
 
     private static bool TryParseField(ReadOnlySpan<byte> span, out FixField field)
@@ -195,12 +192,58 @@ public static class FixMessageCodec
         return true;
     }
 
-    private static void AppendField(StringBuilder builder, FixField field)
+    private static bool ShouldSkipEncodeField(FixField field)
     {
-        builder
-            .Append(field.Tag.ToString(CultureInfo.InvariantCulture))
-            .Append('=')
-            .Append(field.Value)
-            .Append((char)Soh);
+        if (field.Tag is FixTags.BeginString or FixTags.BodyLength or FixTags.CheckSum)
+            return true;
+
+        return field.Tag == FixTags.MsgType;
+    }
+
+    private static int GetFieldLength(int tag, string value)
+        => CountDigits(tag) + 1 + value.Length + 1;
+
+    private static int WritePrefix(Span<byte> destination, string beginString, int bodyLength)
+    {
+        int offset = 0;
+        destination[offset++] = (byte)'8';
+        destination[offset++] = (byte)'=';
+        offset += Ascii.GetBytes(beginString.AsSpan(), destination[offset..]);
+        destination[offset++] = Soh;
+        destination[offset++] = (byte)'9';
+        destination[offset++] = (byte)'=';
+        if (!Utf8Formatter.TryFormat(bodyLength, destination[offset..], out int bodyLengthDigits))
+            throw new InvalidOperationException("Unable to format FIX body length.");
+
+        offset += bodyLengthDigits;
+        destination[offset++] = Soh;
+        return offset;
+    }
+
+    private static int WriteField(Span<byte> destination, int tag, string value)
+    {
+        if (!Utf8Formatter.TryFormat(tag, destination, out int offset))
+            throw new InvalidOperationException("Unable to format FIX tag.");
+
+        destination[offset++] = (byte)'=';
+        offset += Ascii.GetBytes(value.AsSpan(), destination[offset..]);
+        destination[offset++] = Soh;
+        return offset;
+    }
+
+    private static int CountDigits(int value)
+    {
+        if (value == 0)
+            return 1;
+
+        int digits = 0;
+        int remaining = value;
+        while (remaining != 0)
+        {
+            remaining /= 10;
+            digits++;
+        }
+
+        return digits;
     }
 }
