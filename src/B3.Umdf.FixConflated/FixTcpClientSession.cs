@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Net.Sockets;
-using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -14,7 +13,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
     private readonly Func<IEnumerable<FixMessage>>? _initialMessagesProvider;
     private readonly Action<long> _onClosed;
     private readonly ILogger<FixTcpClientSession> _logger;
-    private readonly Channel<byte[]> _outbound;
+    private readonly FixOutboundFrameRing _outbound;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _sessionGate = new();
     private readonly ConcurrentBag<Task> _tasks = new();
@@ -39,13 +38,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         _initialMessagesProvider = initialMessagesProvider;
         _onClosed = onClosed ?? throw new ArgumentNullException(nameof(onClosed));
         _logger = logger ?? NullLogger<FixTcpClientSession>.Instance;
-        _outbound = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(outboundQueueCapacity)
-        {
-            FullMode = BoundedChannelFullMode.DropWrite,
-            SingleReader = true,
-            SingleWriter = false,
-            AllowSynchronousContinuations = false,
-        });
+        _outbound = new FixOutboundFrameRing(outboundQueueCapacity);
     }
 
     public long Id { get; }
@@ -93,6 +86,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         {
             _stream.Dispose();
             _client.Dispose();
+            _outbound.Dispose();
             _cts.Dispose();
         }
     }
@@ -173,14 +167,16 @@ public sealed class FixTcpClientSession : IAsyncDisposable
     {
         try
         {
-            while (await _outbound.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            while (!_cts.IsCancellationRequested)
             {
-                while (_outbound.Reader.TryRead(out byte[]? payload))
+                while (_outbound.TryDequeue(out byte[]? payload))
                 {
                     await _stream.WriteAsync(payload, _cts.Token).ConfigureAwait(false);
                     FixConflatedMetrics.MessagesSent.Add(1);
                     FixConflatedMetrics.BytesSent.Add(payload.Length);
                 }
+
+                _outbound.WaitForItems(_cts.Token);
             }
         }
         catch (OperationCanceledException)
@@ -226,9 +222,12 @@ public sealed class FixTcpClientSession : IAsyncDisposable
 
     private bool ProcessUpdate(FixSessionUpdate update)
     {
+        if (_cts.IsCancellationRequested)
+            return false;
+
         foreach (FixMessage outbound in update.OutboundMessages)
         {
-            if (!_outbound.Writer.TryWrite(FixMessageCodec.Encode(outbound)))
+            if (!_outbound.TryEnqueue(FixMessageCodec.Encode(outbound)))
             {
                 _logger.LogWarning("Disconnecting FIX session {SessionId}: outbound queue full", Id);
                 Close();
@@ -263,7 +262,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
             return;
 
         _cts.Cancel();
-        _outbound.Writer.TryComplete();
+        _outbound.SignalShutdown();
         try { _client.Client.Shutdown(SocketShutdown.Both); }
         catch (SocketException) { }
         catch (ObjectDisposedException) { }
