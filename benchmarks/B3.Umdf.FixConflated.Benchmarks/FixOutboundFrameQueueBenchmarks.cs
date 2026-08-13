@@ -12,7 +12,7 @@ public class FixOutboundFrameQueueBenchmarks
 
     private byte[][] _payloads = null!;
     private Channel<byte[]> _channel = null!;
-    private FixOutboundFrameRing _ring = null!;
+    private FixOutboundRing<byte[]> _ring = null!;
 
     [GlobalSetup]
     public void Setup()
@@ -35,7 +35,7 @@ public class FixOutboundFrameQueueBenchmarks
             SingleWriter = false,
             AllowSynchronousContinuations = false,
         });
-        _ring = new FixOutboundFrameRing(MessageCount);
+        _ring = new FixOutboundRing<byte[]>(MessageCount);
     }
 
     [IterationCleanup(Targets = [nameof(ChannelRoundTrip), nameof(RingRoundTrip)])]

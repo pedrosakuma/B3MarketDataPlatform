@@ -1,11 +1,11 @@
 namespace B3.Umdf.FixConflated.Tests;
 
-public sealed class FixOutboundFrameRingTests
+public sealed class FixOutboundRingTests
 {
     [Fact]
     public void TryEnqueue_ReturnsFalse_WhenRingIsFull()
     {
-        using var ring = new FixOutboundFrameRing(2);
+        using var ring = new FixOutboundRing<byte[]>(2);
 
         Assert.True(ring.TryEnqueue([0x01]));
         Assert.True(ring.TryEnqueue([0x02]));
@@ -20,7 +20,7 @@ public sealed class FixOutboundFrameRingTests
         byte[] third = [0x03];
         byte[] fourth = [0x04];
 
-        using var ring = new FixOutboundFrameRing(2);
+        using var ring = new FixOutboundRing<byte[]>(2);
         Assert.True(ring.TryEnqueue(first));
         Assert.True(ring.TryEnqueue(second));
 
@@ -44,7 +44,7 @@ public sealed class FixOutboundFrameRingTests
     [Fact]
     public async Task WaitForItems_Unblocks_WhenProducerEnqueues()
     {
-        using var ring = new FixOutboundFrameRing(4);
+        using var ring = new FixOutboundRing<byte[]>(4);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         using var waiterStarted = new ManualResetEventSlim(false);
 

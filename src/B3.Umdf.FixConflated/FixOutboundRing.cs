@@ -5,27 +5,26 @@ using System.Runtime.InteropServices;
 namespace B3.Umdf.FixConflated;
 
 /// <summary>
-/// Multi-producer, single-consumer bounded ring for encoded FIX frames.
-/// Keeps the session write loop off <see cref="System.Threading.Channels.Channel"/>
-/// so the steady-state enqueue/drain path avoids channel coordination overhead.
+/// Multi-producer, single-consumer bounded ring used by FIX session fanout paths.
 /// </summary>
-internal sealed class FixOutboundFrameRing : IDisposable
+internal sealed class FixOutboundRing<T> : IDisposable
+    where T : class
 {
-    private readonly byte[]?[] _slots;
+    private readonly T?[] _slots;
     private readonly long[] _seqs;
     private readonly int _mask;
 
-    private PaddedLong _producerSeq;
-    private PaddedLong _consumerSeq;
+    private FixPaddedLong _producerSeq;
+    private FixPaddedLong _consumerSeq;
 
     private int _consumerWaiting;
     private readonly ManualResetEventSlim _itemsAvailable = new(initialState: false, spinCount: 0);
 
-    public FixOutboundFrameRing(int capacity)
+    public FixOutboundRing(int capacity)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacity, 2);
         capacity = NextPow2(capacity);
-        _slots = new byte[]?[capacity];
+        _slots = new T?[capacity];
         _seqs = new long[capacity];
         for (int i = 0; i < capacity; i++)
             _seqs[i] = i;
@@ -34,7 +33,7 @@ internal sealed class FixOutboundFrameRing : IDisposable
 
     public int Capacity => _slots.Length;
 
-    public bool TryEnqueue(byte[] payload)
+    public bool TryEnqueue(T payload)
     {
         ArgumentNullException.ThrowIfNull(payload);
 
@@ -69,7 +68,7 @@ internal sealed class FixOutboundFrameRing : IDisposable
         }
     }
 
-    public bool TryDequeue([MaybeNullWhen(false)] out byte[] payload)
+    public bool TryDequeue([MaybeNullWhen(false)] out T payload)
     {
         long pos = _consumerSeq.Value;
         int idx = (int)(pos & _mask);
@@ -131,11 +130,11 @@ internal sealed class FixOutboundFrameRing : IDisposable
             n <<= 1;
         return n;
     }
+}
 
-    [StructLayout(LayoutKind.Explicit, Size = 128)]
-    private struct PaddedLong
-    {
-        [FieldOffset(64)]
-        public long Value;
-    }
+[StructLayout(LayoutKind.Explicit, Size = 128)]
+internal struct FixPaddedLong
+{
+    [FieldOffset(64)]
+    public long Value;
 }

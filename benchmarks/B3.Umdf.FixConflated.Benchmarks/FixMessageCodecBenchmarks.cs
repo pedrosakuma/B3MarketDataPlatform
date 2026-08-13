@@ -15,8 +15,11 @@ public class FixMessageCodecBenchmarks
 
     [GlobalSetup]
     public void Setup()
+        => _message = CreateMessage(EntryCount);
+
+    internal static FixMessage CreateMessage(int entryCount)
     {
-        var message = new FixMessage(8 + (EntryCount * 8));
+        var message = new FixMessage(8 + (entryCount * 8));
         message.Add(FixTags.BeginString, FixMessageCodec.BeginString);
         message.Add(FixTags.MsgType, FixMsgTypes.MarketDataIncrementalRefresh);
         message.Add(FixTags.SenderCompId, "SANDBOX");
@@ -24,9 +27,9 @@ public class FixMessageCodecBenchmarks
         message.Add(FixTags.MsgSeqNum, 42);
         message.Add(FixTags.SendingTime, "20260813-17:30:00.123");
         message.Add(FixTags.MDReqId, "md-1234");
-        message.Add(FixTags.NoMDEntries, EntryCount);
+        message.Add(FixTags.NoMDEntries, entryCount);
 
-        for (int i = 0; i < EntryCount; i++)
+        for (int i = 0; i < entryCount; i++)
         {
             message.Add(FixTags.MDUpdateAction, i % 3 == 0 ? "0" : "1");
             message.Add(FixTags.MDEntryType, (i & 1) == 0 ? "0" : "1");
@@ -38,7 +41,7 @@ public class FixMessageCodecBenchmarks
             message.Add(FixTags.MDEntryTime, "17:30:00.123");
         }
 
-        _message = message;
+        return message;
     }
 
     [Benchmark]

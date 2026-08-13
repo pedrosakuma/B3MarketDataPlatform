@@ -13,7 +13,8 @@ public sealed class FixTcpClientSession : IAsyncDisposable
     private readonly Func<IEnumerable<FixMessage>>? _initialMessagesProvider;
     private readonly Action<long> _onClosed;
     private readonly ILogger<FixTcpClientSession> _logger;
-    private readonly FixOutboundFrameRing _outbound;
+    private readonly FixOutboundRing<FixMessage> _outbound;
+    private readonly FixMessageEncoder _encoder = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly object _sessionGate = new();
     private readonly ConcurrentBag<Task> _tasks = new();
@@ -38,7 +39,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         _initialMessagesProvider = initialMessagesProvider;
         _onClosed = onClosed ?? throw new ArgumentNullException(nameof(onClosed));
         _logger = logger ?? NullLogger<FixTcpClientSession>.Instance;
-        _outbound = new FixOutboundFrameRing(outboundQueueCapacity);
+        _outbound = new FixOutboundRing<FixMessage>(outboundQueueCapacity);
     }
 
     public long Id { get; }
@@ -86,6 +87,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         {
             _stream.Dispose();
             _client.Dispose();
+            _encoder.Dispose();
             _outbound.Dispose();
             _cts.Dispose();
         }
@@ -169,11 +171,12 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         {
             while (!_cts.IsCancellationRequested)
             {
-                while (_outbound.TryDequeue(out byte[]? payload))
+                while (_outbound.TryDequeue(out FixMessage? payload))
                 {
-                    await _stream.WriteAsync(payload, _cts.Token).ConfigureAwait(false);
+                    ReadOnlyMemory<byte> encoded = _encoder.Encode(payload);
+                    await _stream.WriteAsync(encoded, _cts.Token).ConfigureAwait(false);
                     FixConflatedMetrics.MessagesSent.Add(1);
-                    FixConflatedMetrics.BytesSent.Add(payload.Length);
+                    FixConflatedMetrics.BytesSent.Add(encoded.Length);
                 }
 
                 _outbound.WaitForItems(_cts.Token);
@@ -227,7 +230,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
 
         foreach (FixMessage outbound in update.OutboundMessages)
         {
-            if (!_outbound.TryEnqueue(FixMessageCodec.Encode(outbound)))
+            if (!_outbound.TryEnqueue(outbound))
             {
                 _logger.LogWarning("Disconnecting FIX session {SessionId}: outbound queue full", Id);
                 Close();

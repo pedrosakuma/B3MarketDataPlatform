@@ -42,17 +42,32 @@ public static class FixMessageCodec
     {
         ArgumentNullException.ThrowIfNull(message);
 
-        string beginString = message.TryGetString(FixTags.BeginString, out var begin)
-            ? begin!
-            : BeginString;
+        int encodedLength = GetEncodedLength(message);
+        byte[] payload = new byte[encodedLength];
+        int written = EncodeInto(payload, message);
+        if (written != encodedLength)
+            throw new InvalidOperationException("Encoded FIX frame length mismatch.");
 
-        if (!message.TryGetString(FixTags.MsgType, out var msgType) || string.IsNullOrEmpty(msgType))
-            throw new InvalidOperationException("FIX message requires MsgType (35) before encoding.");
+        return payload;
+    }
 
+    internal static int GetEncodedLength(FixMessage message)
+    {
+        (string beginString, string msgType) = GetEncodeHeader(message);
         int bodyLength = CalculateBodyLength(message, msgType);
-        byte[] payload = new byte[FixFrameEncoding.GetFrameLength(beginString.Length, bodyLength)];
-        int offset = WritePrefix(payload, beginString, bodyLength);
-        offset += WriteField(payload.AsSpan(offset), FixTags.MsgType, msgType);
+        return FixFrameEncoding.GetFrameLength(beginString.Length, bodyLength);
+    }
+
+    internal static int EncodeInto(Span<byte> destination, FixMessage message)
+    {
+        (string beginString, string msgType) = GetEncodeHeader(message);
+        int bodyLength = CalculateBodyLength(message, msgType);
+        int frameLength = FixFrameEncoding.GetFrameLength(beginString.Length, bodyLength);
+        if (destination.Length < frameLength)
+            throw new ArgumentException("Destination buffer too small for encoded FIX frame.", nameof(destination));
+
+        int offset = WritePrefix(destination, beginString, bodyLength);
+        offset += WriteField(destination[offset..], FixTags.MsgType, msgType);
 
         IReadOnlyList<FixField> fields = message.Fields;
         for (int i = 0; i < fields.Count; i++)
@@ -61,13 +76,12 @@ public static class FixMessageCodec
             if (ShouldSkipEncodeField(field))
                 continue;
 
-            offset += WriteField(payload.AsSpan(offset), field.Tag, field.Value);
+            offset += WriteField(destination[offset..], field.Tag, field.Value);
         }
 
-        int checksumOffset = offset;
-        int checksum = FixFrameEncoding.CalculateChecksum(payload.AsSpan(0, checksumOffset));
-        FixFrameEncoding.WriteChecksumField(payload.AsSpan(checksumOffset), checksum);
-        return payload;
+        int checksum = FixFrameEncoding.CalculateChecksum(destination[..offset]);
+        FixFrameEncoding.WriteChecksumField(destination[offset..], checksum);
+        return frameLength;
     }
 
     public static FixDecodeResult Decode(ReadOnlySpan<byte> buffer)
@@ -171,6 +185,18 @@ public static class FixMessageCodec
         }
 
         return bodyLength;
+    }
+
+    private static (string BeginString, string MsgType) GetEncodeHeader(FixMessage message)
+    {
+        string beginString = message.TryGetString(FixTags.BeginString, out var begin)
+            ? begin!
+            : BeginString;
+
+        if (!message.TryGetString(FixTags.MsgType, out var msgType) || string.IsNullOrEmpty(msgType))
+            throw new InvalidOperationException("FIX message requires MsgType (35) before encoding.");
+
+        return (beginString, msgType);
     }
 
     private static bool TryParseField(ReadOnlySpan<byte> span, out FixField field)
