@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone interop-check tool. Deliberately NOT referenced by, or a
+    dependency of, any project under src/ or tests/ — it exists purely as an
+    independent, third-party-engine validation harness for the FIX Conflated
+    sandbox (see ../README.md) and must never affect the main solution build.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Maintained QuickFIX/n fork (github.com/connamara/quickfixn), NOT the
+         stale 2016 `quickfixn` NuGet package, which is .NET Framework-only
+         and mis-parses messages under modern .NET compat shims. -->
+    <PackageReference Include="QuickFIXn.Core" Version="1.14.1" />
+  </ItemGroup>
+
+</Project>

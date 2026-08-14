@@ -242,6 +242,16 @@ the existing `WireV2` WebSocket path (tracked by issue #103). All listed tooling
   samples `FixConflatedMetrics` via the Prometheus `/metrics` endpoint into
   the same long-running RSS/GC/counter stability CSV used for the WireV2
   path.
+- **Independent third-party FIX engine interop check** —
+  `tools/fix/quickfixn-interop/` points the maintained
+  [QuickFIX/n](https://github.com/connamara/quickfixn) engine
+  (`QuickFIXn.Core` NuGet package) at the sandbox through a small
+  zlib-inflating TCP proxy, using the vendored data dictionary. This proves
+  session/encoding parseability against a real, independent, non-self-written
+  FIX engine — a check `fix-validate.mjs` alone cannot provide, since it is
+  this repo's own code. See its README for setup and known gotchas. Scope
+  note: this validates protocol/encoding correctness, not content-level
+  fidelity against the real B3 product.
 - **Perf-smoke benchmark coverage** — not yet added (deliberately deferred,
   best-effort/optional item in issue #103).
 
