@@ -55,7 +55,7 @@ public sealed class FixConflatedReconnectEndToEndTests
         {
             await staleClient.ConnectAsync(IPAddress.Loopback, port);
             using NetworkStream staleStream = staleClient.GetStream();
-            var staleFixClient = new TestFixClient(staleStream);
+            await using var staleFixClient = new FixSocketClientTestHelpers.InflatingFixClient(staleStream);
 
             await staleFixClient.SendAsync(CreateLogon("CLIENT-A", "SANDBOX", 3));
             await staleFixClient.AssertClosedWithoutFrameAsync();
@@ -65,7 +65,7 @@ public sealed class FixConflatedReconnectEndToEndTests
         {
             await freshClient.ConnectAsync(IPAddress.Loopback, port);
             using NetworkStream freshStream = freshClient.GetStream();
-            var freshFixClient = new TestFixClient(freshStream);
+            await using var freshFixClient = new FixSocketClientTestHelpers.InflatingFixClient(freshStream);
 
             await freshFixClient.SendAsync(CreateLogon("CLIENT-B", "SANDBOX", 1));
 
@@ -89,7 +89,7 @@ public sealed class FixConflatedReconnectEndToEndTests
         client.Client.LingerState = new LingerOption(true, 0);
 
         using NetworkStream stream = client.GetStream();
-        var fixClient = new TestFixClient(stream);
+        await using var fixClient = new FixSocketClientTestHelpers.InflatingFixClient(stream);
 
         await fixClient.SendAsync(CreateLogon("CLIENT-A", "SANDBOX", 1));
 
@@ -163,107 +163,6 @@ public sealed class FixConflatedReconnectEndToEndTests
         finally
         {
             listener.Stop();
-        }
-    }
-
-    private sealed class TestFixClient
-    {
-        private readonly NetworkStream _stream;
-        private byte[] _buffer = new byte[4096];
-        private int _buffered;
-
-        public TestFixClient(NetworkStream stream)
-        {
-            _stream = stream;
-        }
-
-        public Task SendAsync(FixMessage message)
-            => _stream.WriteAsync(FixMessageCodec.Encode(message)).AsTask();
-
-        public async Task<FixMessage> ReadMessageAsync(TimeSpan? timeout = null)
-        {
-            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(5));
-
-            while (true)
-            {
-                FixDecodeResult decoded = FixMessageCodec.Decode(_buffer.AsSpan(0, _buffered));
-                if (decoded.Success)
-                {
-                    FixMessage message = decoded.Message!;
-                    Consume(decoded.BytesConsumed);
-                    return message;
-                }
-
-                if (decoded.Error != FixDecodeError.Incomplete)
-                    throw new XunitException($"Expected a full FIX frame but decode failed with {decoded.Error}.");
-
-                EnsureCapacity();
-                int read = await _stream.ReadAsync(_buffer.AsMemory(_buffered), cts.Token);
-                Assert.True(read > 0, "Expected the FIX server to send a frame before closing the socket.");
-                _buffered += read;
-            }
-        }
-
-        public async Task AssertClosedWithoutFrameAsync(TimeSpan? timeout = null)
-        {
-            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(2));
-
-            try
-            {
-                while (true)
-                {
-                    FixDecodeResult decoded = FixMessageCodec.Decode(_buffer.AsSpan(0, _buffered));
-                    if (decoded.Success)
-                    {
-                        FixMessage unexpected = decoded.Message!;
-                        throw new XunitException(
-                            $"Expected stale reconnect to be dropped without Logout, but received MsgType={FixApplicationMessageTestHelpers.GetRequired(unexpected, FixTags.MsgType)}.");
-                    }
-
-                    if (decoded.Error != FixDecodeError.Incomplete)
-                        throw new XunitException($"Expected transport close without FIX frame, but decode failed with {decoded.Error}.");
-
-                    EnsureCapacity();
-                    int read = await _stream.ReadAsync(_buffer.AsMemory(_buffered), cts.Token);
-                    if (read == 0)
-                    {
-                        Assert.Equal(0, _buffered);
-                        return;
-                    }
-
-                    _buffered += read;
-                }
-            }
-            catch (OperationCanceledException) when (!cts.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (OperationCanceledException)
-            {
-                throw new XunitException("Expected the FIX server to close the stale reconnect promptly, but it stayed open past the timeout.");
-            }
-            catch (IOException)
-            {
-                Assert.Equal(0, _buffered);
-            }
-            catch (SocketException)
-            {
-                Assert.Equal(0, _buffered);
-            }
-        }
-
-        private void Consume(int count)
-        {
-            Buffer.BlockCopy(_buffer, count, _buffer, 0, _buffered - count);
-            _buffered -= count;
-        }
-
-        private void EnsureCapacity()
-        {
-            if (_buffered < _buffer.Length)
-                return;
-
-            Array.Resize(ref _buffer, _buffer.Length * 2);
         }
     }
 }

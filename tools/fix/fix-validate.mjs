@@ -17,6 +17,7 @@
 // GET /book/{symbol} on the HTTP side used by the existing WS validator.
 
 import net from 'node:net';
+import zlib from 'node:zlib';
 
 const SOH = 0x01;
 const BEGIN_STRING = 'FIX.4.4';
@@ -71,6 +72,7 @@ const SENDER_COMP_ID = process.env.FIX_SENDER_COMP_ID || `FIX-VALIDATOR-${proces
 const TARGET_COMP_ID = process.env.FIX_TARGET_COMP_ID || 'SANDBOX';
 
 let inboundBuffer = Buffer.alloc(0);
+let inflatedBuffer = Buffer.alloc(0);
 let nextOutboundSeqNum = 1;
 let heartbeatIntervalSeconds = INITIAL_HEARTBEAT_SECONDS;
 let trackedSymbol = REQUESTED_SYMBOL;
@@ -107,6 +109,18 @@ console.log(`Connecting FIX validator to ${HOST}:${PORT} sender=${SENDER_COMP_ID
 
 const socket = net.createConnection({ host: HOST, port: PORT });
 socket.setNoDelay(true);
+const inflater = zlib.createInflate();
+
+inflater.on('data', chunk => {
+  lastReceivedAt = Date.now();
+  inflatedBuffer = Buffer.concat([inflatedBuffer, chunk]);
+  drainInbound(socket);
+});
+
+inflater.on('error', error => {
+  console.error(`Inbound zlib inflate failed: ${error.message}`);
+  socket.destroy(error);
+});
 
 socket.on('connect', () => {
   console.log('TCP connected; sending Logon');
@@ -141,9 +155,8 @@ socket.on('connect', () => {
 });
 
 socket.on('data', chunk => {
-  lastReceivedAt = Date.now();
   inboundBuffer = Buffer.concat([inboundBuffer, chunk]);
-  drainInbound(socket);
+  inflater.write(chunk);
 });
 
 socket.on('close', hadError => {
@@ -280,11 +293,12 @@ function requestShutdown(reason) {
   }
 
   socket.destroy();
+  inflater.destroy();
 }
 
 function drainInbound(currentSocket) {
-  while (inboundBuffer.length > 0) {
-    const decoded = decodeFrame(inboundBuffer);
+  while (inflatedBuffer.length > 0) {
+    const decoded = decodeFrame(inflatedBuffer);
     if (decoded.status === 'incomplete')
       return;
 
@@ -294,7 +308,7 @@ function drainInbound(currentSocket) {
       return;
     }
 
-    inboundBuffer = inboundBuffer.subarray(decoded.bytesConsumed);
+    inflatedBuffer = inflatedBuffer.subarray(decoded.bytesConsumed);
     handleMessage(decoded.message, currentSocket);
   }
 }

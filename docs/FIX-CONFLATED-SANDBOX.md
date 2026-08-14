@@ -15,7 +15,7 @@ An additional, **opt-in** output channel, alongside the existing
 `WireV2` WebSocket protocol (see
 [docs/WEBSOCKET-PROTOCOL.md](WEBSOCKET-PROTOCOL.md)), through which this
 platform emits live book, trade, instrument-status, and news data
-encoded as **FIX 4.4 Tag=Value** messages, batching book deltas over a
+encoded as **FIX 4.4 Tag=Value** messages inside a **single continuous per-session RFC 1950 ZLIB stream**, batching book deltas over a
 configurable time window ("conflation"). The same project also models
 additional UMDF-specific message shapes such as `SecurityList*` and
 `MarketTotals*`. This platform acts as the **FIX session acceptor**
@@ -66,6 +66,8 @@ it needs the `schema-upgrade` label.
 
 ## Session behavior (summary)
 
+- Outbound bytes are wrapped once per TCP connection in a **single continuous ZLIB stream** (`System.IO.Compression.ZLibStream`). The sandbox does **not** compress each FIX frame independently; clients must inflate the whole socket stream and then parse tag=value FIX messages out of the resulting plaintext byte stream. This is always on, because that matches the real B3 product and keeps the sandbox wire contract faithful by default.
+- The write loop flushes the shared connection-lifetime compressor after each encoded FIX message so logon, heartbeats, trades, and conflated book updates become readable to the client promptly instead of waiting for additional deflater buffering.
 - `Logon` (A) / `Heartbeat` (0) / `TestRequest` (1) / `Logout` (5) are
   supported per standard FIX 4.4 session semantics, with no credential
   check.
@@ -160,7 +162,7 @@ matrix alongside the existing WebSocket and transport knobs.
 ## Validation & tooling
 
 The FIX Conflated channel has validation/observability tooling parity with
-the existing `WireV2` WebSocket path (tracked by issue #103):
+the existing `WireV2` WebSocket path (tracked by issue #103). All listed tooling now inflates the continuous ZLIB transport stream before FIX frame parsing:
 
 - **Standalone FIX validator** — `tools/fix/fix-validate.mjs` is a
   dependency-free Node.js TCP client mirroring `tools/ws/ws-validate.mjs`. It
@@ -220,7 +222,7 @@ the existing `WireV2` WebSocket path (tracked by issue #103):
 ## Enabling
 
 Disabled by default. Enable with `UMDF_FIX_CONFLATED_ENABLED=true` plus
-at least `UMDF_FIX_CONFLATED_PORT=<port>`. Optional transport tuning
+at least `UMDF_FIX_CONFLATED_PORT=<port>`. Once enabled, transport compression is always on and mirrors the real B3 conflated feed: downstream clients must wrap the TCP socket in a ZLIB inflater before parsing FIX tag=value frames. Optional transport tuning
 includes `UMDF_FIX_CONFLATED_CONFLATION_MS`,
 `UMDF_FIX_CONFLATED_RESEND_BUFFER_CAPACITY`,
 `UMDF_FIX_CONFLATED_OUTBOUND_QUEUE_CAPACITY`, and
