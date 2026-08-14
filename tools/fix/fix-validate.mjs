@@ -286,6 +286,7 @@ function requestShutdown(reason) {
   clearTimers();
   console.log(`Shutdown requested (${reason})`);
   if (sessionActive && !socket.destroyed) {
+    sessionActive = false;
     sendSessionMessage(socket, MSG.Logout, [[TAG.Text, `fix-validate shutdown (${reason})`]]);
     socket.end();
     setTimeout(() => socket.destroy(), 1000).unref();
@@ -375,15 +376,12 @@ function applySnapshot(message) {
     if (entryType !== '0' && entryType !== '1')
       continue;
 
-    const orderId = entry.get(TAG.OrderId);
-    if (!orderId)
-      continue;
-
     const price = toFiniteNumber(entry.get(TAG.MDEntryPx));
     const size = toFiniteNumber(entry.get(TAG.MDEntrySize));
     if (price == null || size == null)
       continue;
 
+    const orderId = entry.get(TAG.OrderId) || `snapshot:${entryType}:${price}:${orders.size}`;
     orders.set(orderId, { side: entryType, price, size });
   }
 
@@ -844,13 +842,16 @@ function formatMaybe(value) {
 
 async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
   const { default: WebSocket } = await import('ws');
+  const snapshotIdleMs = parsePositiveInt(process.env.WS_SNAPSHOT_IDLE_MS || '200', 200);
 
   return await new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl);
     const wsOrders = new Map();
     let subscribeSent = false;
     let snapshotSeenLocal = false;
+    let snapshotPopulationStarted = false;
     let resolved = false;
+    let snapshotIdleTimer = null;
     let timeout = setTimeout(() => finishError(`timeout waiting for fresh BookSnapshot after ${timeoutMs}ms`), timeoutMs);
     const metrics = { messages: 0, adds: 0, updates: 0, deletes: 0, snapshots: 0, clears: 0 };
 
@@ -860,7 +861,7 @@ async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
       buf.writeUInt32LE(buf.length, 0);
       buf.writeUInt16LE(0x0001, 4);
       buf.writeUInt16LE(0, 6);
-      buf.writeUInt32LE(0x0001, 8);
+      buf.writeUInt32LE(0x0003, 8);
       buf.writeUInt8(symBytes.length, 12);
       symBytes.copy(buf, 13);
       return buf;
@@ -902,10 +903,27 @@ async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
     }
 
     function cleanup() {
+      if (snapshotIdleTimer) {
+        clearTimeout(snapshotIdleTimer);
+        snapshotIdleTimer = null;
+      }
       ws.removeAllListeners('open');
       ws.removeAllListeners('message');
       ws.removeAllListeners('error');
       ws.removeAllListeners('close');
+    }
+
+    function armSnapshotIdleTimer() {
+      if (!snapshotSeenLocal || !snapshotPopulationStarted || resolved)
+        return;
+
+      if (snapshotIdleTimer)
+        clearTimeout(snapshotIdleTimer);
+      snapshotIdleTimer = setTimeout(() => {
+        snapshotIdleTimer = null;
+        finishSuccess();
+      }, snapshotIdleMs);
+      snapshotIdleTimer.unref?.();
     }
 
     function processFrame(data) {
@@ -947,6 +965,7 @@ async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
         case 0x0020: {
           metrics.snapshots++;
           snapshotSeenLocal = true;
+          snapshotPopulationStarted = false;
           wsOrders.clear();
           break;
         }
@@ -961,6 +980,8 @@ async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
           else
             metrics.updates++;
           wsOrders.set(orderId, { side, price, qty });
+          if (snapshotSeenLocal)
+            snapshotPopulationStarted = true;
           break;
         }
         case 0x0032: {
@@ -994,8 +1015,7 @@ async function pullFreshWsBookState(wsUrl, symbol, timeoutMs) {
 
     ws.on('message', data => {
       processFrame(Buffer.from(data));
-      if (snapshotSeenLocal)
-        finishSuccess();
+      armSnapshotIdleTimer();
     });
 
     ws.on('error', error => finishError(error.message));

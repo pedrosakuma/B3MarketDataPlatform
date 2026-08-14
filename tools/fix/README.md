@@ -44,9 +44,13 @@ Useful environment overrides:
 - `WS_SNAPSHOT_COMPARE_URL` — optional fresh WebSocket `Subscribe` target
   (for example `ws://localhost:8080/ws`). When set, the validator performs one
   final fresh-connection `BookSnapshot` pull at shutdown time and compares the
-  current FIX-derived book against that server-side snapshot.
+  current FIX-derived book against that server-side snapshot. The pull waits
+  for the post-reset `OrderAdded` burst to go quiescent before computing the
+  book.
 - `WS_SNAPSHOT_TIMEOUT_MS` — timeout for the fresh WebSocket snapshot pull
   (default `5000`).
+- `WS_SNAPSHOT_IDLE_MS` — post-snapshot idle window used to decide that the
+  `OrderAdded` snapshot burst is complete (default `200`).
 
 If `GET /book/{symbol}` is unavailable (for example it returns `404` in the
 current local host setup), the validator keeps running and logs the server-check

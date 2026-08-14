@@ -179,8 +179,10 @@ the existing `WireV2` WebSocket path (tracked by issue #103). All listed tooling
   bug), validation instead opens a **fresh WebSocket connection and sends a
   plain `Subscribe`** for the tracked symbol at the end of a run. The server
   always answers a fresh subscribe with a full, server-computed
-  `BookSnapshot` — this is genuine server-side truth, the closest available
-  equivalent to what `/book/{symbol}` would have provided. This is wired via
+  `BookSnapshot` reset marker followed by the MBO `OrderAdded` burst — the
+  validator waits for that burst to go briefly idle before computing the book.
+  This is genuine server-side truth, the closest available equivalent to what
+  `/book/{symbol}` would have provided. This is wired via
   `WS_SNAPSHOT_COMPARE_URL` in `fix-validate.mjs`.
 - **Real-socket reconnect/recovery test** —
   `tests/B3.Umdf.FixConflated.Tests/FixConflatedReconnectEndToEndTests.cs`
