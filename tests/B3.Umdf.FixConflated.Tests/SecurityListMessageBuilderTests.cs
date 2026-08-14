@@ -53,6 +53,15 @@ public sealed class SecurityListMessageBuilderTests
                         SecurityGroup = "EQUITY",
                         SecurityType = "CS"
                     },
+                    Currency = "BRL",
+                    SettlType = "0",
+                    SettlDate = new DateOnly(2026, 8, 13),
+                    MaturityMonthYear = "202608",
+                    IssueDate = new DateOnly(2020, 1, 2),
+                    SettlCurrency = "BRL",
+                    Asset = "PETR",
+                    MinPriceIncrement = 0.01m,
+                    TickSizeDenominator = 1m,
                     MarketDataFeeds =
                     [
                         new FixMarketDataFeed("BOOK", 10, 1),
@@ -73,6 +82,13 @@ public sealed class SecurityListMessageBuilderTests
                         SecurityGroup = "EQUITY",
                         SecurityType = "CS"
                     },
+                    Currency = "BRL",
+                    SettlType = "0",
+                    SettlDate = new DateOnly(2026, 8, 13),
+                    SettlCurrency = "BRL",
+                    Asset = "VALE",
+                    MinPriceIncrement = 0.01m,
+                    TickSizeDenominator = 1m,
                     MarketDataFeeds =
                     [
                         new FixMarketDataFeed("BOOK", 10, 1)
@@ -92,5 +108,8 @@ public sealed class SecurityListMessageBuilderTests
         FixMessage decoded = FixApplicationMessageTestHelpers.RoundTrip(message);
         Assert.Equal(["10", "1", "10"], FixApplicationMessageTestHelpers.GetAllValues(decoded, FixApplicationTags.MarketDepth));
         Assert.Equal("list-1", FixApplicationMessageTestHelpers.GetRequired(decoded, FixApplicationTags.SecurityListId));
+        Assert.Equal(["BRL", "BRL"], FixApplicationMessageTestHelpers.GetAllValues(decoded, FixApplicationTags.Currency));
+        Assert.Equal(["0", "0"], FixApplicationMessageTestHelpers.GetAllValues(decoded, FixApplicationTags.SettlType));
+        Assert.Equal(["BRL", "BRL"], FixApplicationMessageTestHelpers.GetAllValues(decoded, FixApplicationTags.SettlCurrency));
     }
 }

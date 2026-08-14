@@ -11,11 +11,16 @@ internal static class FixSnapshotMessageBuilder
 
         var message = new FixMessage();
         message.Add(FixTags.MsgType, FixMsgTypes.MarketDataSnapshotFullRefresh);
+        if (!string.IsNullOrEmpty(request.Instrument.DeliverToCompId))
+            message.Add(FixTags.DeliverToCompID, request.Instrument.DeliverToCompId!);
+        message.Add(FixTags.SecurityIdSource, request.Instrument.SecurityIdSource);
+        message.Add(FixTags.SecurityExchange, request.Instrument.SecurityExchange);
         message.Add(FixTags.MDReqId, request.MdReqId);
         message.Add(FixTags.Symbol, request.Instrument.Symbol);
         message.Add(FixTags.SecurityId, request.Instrument.SecurityId.ToString(CultureInfo.InvariantCulture));
 
         int entryCount = book.Bids.OrderCount + book.Asks.OrderCount;
+        message.Add(FixTags.TotNumReports, entryCount);
         message.Add(FixTags.NoMDEntries, entryCount);
 
         string entryDate = entryTime.UtcDateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
@@ -42,6 +47,9 @@ internal static class FixSnapshotMessageBuilder
                 message.Add(FixTags.MDEntrySize, order.Quantity.ToString(CultureInfo.InvariantCulture));
                 message.Add(FixTags.MDEntryDate, entryDate);
                 message.Add(FixTags.MDEntryTime, entryTime);
+                message.Add(FixTags.MDInsertDate, entryDate);
+                message.Add(FixTags.MDInsertTime, entryTime);
+                message.Add(FixTags.MDEntryPositionNo, 1);
                 message.Add(FixTags.OrderId, order.OrderId.ToString(CultureInfo.InvariantCulture));
             }
         }

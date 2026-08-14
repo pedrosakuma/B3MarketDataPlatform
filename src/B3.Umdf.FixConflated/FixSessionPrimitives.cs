@@ -106,6 +106,7 @@ internal static class FixTags
     public const int EncryptMethod = 98;
     public const int HeartBtInt = 108;
     public const int TestReqId = 112;
+    public const int DeliverToCompID = 128;
     public const int GapFillFlag = 123;
     public const int ResetSeqNumFlag = 141;
     public const int BeginSeqNo = 7;
@@ -119,10 +120,27 @@ internal static class FixTags
     public const int MDEntrySize = 271;
     public const int MDEntryDate = 272;
     public const int MDEntryTime = 273;
+    public const int QuoteCondition = 276;
     public const int TradeCondition = 277;
     public const int MDUpdateAction = 279;
+    public const int OpenCloseSettlFlag = 286;
+    public const int MDEntrySeller = 289;
+    public const int MDEntryPositionNo = 290;
+    public const int SecurityExchange = 207;
+    public const int SecurityIdSource = 22;
+    public const int TradeDate = 75;
+    public const int TradingSessionId = 336;
+    public const int NumberOfOrders = 346;
+    public const int TradingSessionSubId = 625;
+    public const int TotNumReports = 911;
+    public const int MDBookType = 1021;
+    public const int SecurityGroup = 1151;
+    public const int MDStreamId = 1500;
     public const int CheckSum = 10;
     public const int TradeId = 1003;
+    public const int LastTradeDate = 9325;
+    public const int MDInsertDate = 37016;
+    public const int MDInsertTime = 37017;
 }
 
 internal static class FixMsgTypes

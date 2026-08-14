@@ -43,13 +43,14 @@ public sealed record FixSecurityStatusDefinition
     public decimal? LastPrice { get; init; }
     public DateOnly? TradeDate { get; init; }
     public string? Text { get; init; }
+    public string? TradingSessionId { get; init; }
+    public string? TradingSessionSubId { get; init; }
 }
 
 public sealed record FixNewsDefinition
 {
     public required long OrigTimeNanoseconds { get; init; }
     public required string Headline { get; init; }
-    public required string NewsSource { get; init; }
     public string BodyText { get; init; } = string.Empty;
     public char? Urgency { get; init; }
     public string? NewsId { get; init; }
@@ -57,6 +58,7 @@ public sealed record FixNewsDefinition
     public string? Language { get; init; }
     public IReadOnlyList<FixInstrumentReference> RelatedInstruments { get; init; } = [];
     public string? UrlLink { get; init; }
+    public string NewsSourceCode { get; init; } = "17";
 }
 
 public readonly record struct FixMarketDataFeed(string MdFeedType, int MarketDepth, int MdBookType);
@@ -65,6 +67,15 @@ public sealed record FixSecurityListEntry
 {
     public required FixInstrumentReference Instrument { get; init; }
     public IReadOnlyList<FixMarketDataFeed> MarketDataFeeds { get; init; } = [];
+    public string? Currency { get; init; }
+    public string? SettlType { get; init; }
+    public DateOnly? SettlDate { get; init; }
+    public string? MaturityMonthYear { get; init; }
+    public DateOnly? IssueDate { get; init; }
+    public string? SettlCurrency { get; init; }
+    public string? Asset { get; init; }
+    public decimal? MinPriceIncrement { get; init; }
+    public decimal? TickSizeDenominator { get; init; }
 }
 
 public sealed record FixSecurityListDefinition
@@ -158,13 +169,20 @@ internal static class FixApplicationTags
     public const int Urgency = 61;
     public const int TradeDate = 75;
     public const int SecurityDescription = 107;
+    public const int Currency = 15;
+    public const int DeliverToCompId = 128;
     public const int Headline = 148;
     public const int UrlLink = 149;
     public const int NoRelatedSym = 146;
     public const int SecurityType = 167;
     public const int PutOrCall = 201;
     public const int SecurityExchange = 207;
+    public const int SettlCurrency = 120;
     public const int ContractMultiplier = 231;
+    public const int SettlType = 63;
+    public const int SettlDate = 64;
+    public const int MaturityMonthYear = 200;
+    public const int IssueDate = 225;
     public const int MDReqID = 262;
     public const int SubscriptionRequestType = 263;
     public const int MarketDepth = 264;
@@ -184,15 +202,20 @@ internal static class FixApplicationTags
     public const int HighPrice = 332;
     public const int LowPrice = 333;
     public const int TradSesOpenTime = 342;
+    public const int TradingSessionId = 336;
+    public const int TradingSessionSubId = 625;
     public const int GrossTradeAmt = 381;
     public const int TotalVolumeTraded = 387;
     public const int TotNoRelatedSym = 393;
     public const int LastPx = 31;
     public const int Product = 460;
     public const int CfiCode = 461;
+    public const int CountryOfIssue = 470;
     public const int MaturityDate = 541;
     public const int SecurityListRequestType = 559;
     public const int SecurityRequestResult = 560;
+    public const int MinPriceIncrement = 969;
+    public const int SecurityUpdateAction = 980;
     public const int SecuritySubType = 762;
     public const int LastFragment = 893;
     public const int MdBookType = 1021;
@@ -211,6 +234,8 @@ internal static class FixApplicationTags
     public const int TotalNumOfTrades = 6139;
     public const int SecurityUpdatesSince = 6935;
     public const int Language = 6936;
+    public const int Asset = 6937;
+    public const int TickSizeDenominator = 9749;
     public const int NewsSource = 6940;
     public const int InstrumentId = 9219;
     public const int NoSecurityGroups = 37022;

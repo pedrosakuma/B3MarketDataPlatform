@@ -36,20 +36,38 @@ public readonly record struct FixApplicationSessionHeader(
 
 public readonly record struct FixMarketDataInstrument
 {
-    public FixMarketDataInstrument(string symbol, ulong securityId, int priceScale = 0)
+    public FixMarketDataInstrument(
+        string symbol,
+        ulong securityId,
+        int priceScale = 0,
+        string securityIdSource = "8",
+        string securityExchange = "BVMF",
+        string? deliverToCompId = null,
+        string mdStreamId = "3")
     {
         ArgumentNullException.ThrowIfNull(symbol);
+        ArgumentNullException.ThrowIfNull(securityIdSource);
+        ArgumentNullException.ThrowIfNull(securityExchange);
+        ArgumentNullException.ThrowIfNull(mdStreamId);
         if (priceScale is < 0 or > 18)
             throw new ArgumentOutOfRangeException(nameof(priceScale));
 
         Symbol = symbol;
         SecurityId = securityId;
         PriceScale = priceScale;
+        SecurityIdSource = securityIdSource;
+        SecurityExchange = securityExchange;
+        DeliverToCompId = deliverToCompId;
+        MdStreamId = mdStreamId;
     }
 
     public string Symbol { get; }
     public ulong SecurityId { get; }
     public int PriceScale { get; }
+    public string SecurityIdSource { get; }
+    public string SecurityExchange { get; }
+    public string? DeliverToCompId { get; }
+    public string MdStreamId { get; }
 
     public FixMdEntryType GetEntryType(BookSideType side)
         => side == BookSideType.Bid ? FixMdEntryType.Bid : FixMdEntryType.Offer;

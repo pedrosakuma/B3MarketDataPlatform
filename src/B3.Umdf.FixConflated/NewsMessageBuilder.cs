@@ -9,7 +9,7 @@ public static class NewsMessageBuilder
     {
         ArgumentNullException.ThrowIfNull(definition);
         ArgumentException.ThrowIfNullOrEmpty(definition.Headline);
-        ArgumentException.ThrowIfNullOrEmpty(definition.NewsSource);
+        ArgumentException.ThrowIfNullOrEmpty(definition.NewsSourceCode);
 
         var message = new FixMessage();
         message.Add(FixTags.MsgType, FixApplicationMsgTypes.News);
@@ -19,7 +19,7 @@ public static class NewsMessageBuilder
                 FixApplicationMessageBuilderSupport.FromUnixNanoseconds(definition.OrigTimeNanoseconds)));
         FixApplicationMessageBuilderSupport.AddOptionalChar(message, FixApplicationTags.Urgency, definition.Urgency);
         message.Add(FixApplicationTags.Headline, definition.Headline);
-        message.Add(FixApplicationTags.NewsSource, definition.NewsSource);
+        message.Add(FixApplicationTags.NewsSource, definition.NewsSourceCode);
         FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.NewsId, definition.NewsId);
         FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.LanguageCode, definition.LanguageCode);
         FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.Language, definition.Language);

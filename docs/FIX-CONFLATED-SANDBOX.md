@@ -235,45 +235,47 @@ Issue #108 added a manual/offline comparison pass against the local B3 sample
 
 #### Observed discrepancies / gaps
 
-- **Snapshot (`W`) instrument identity differs materially.** Real captures use
+- **Snapshot (`W`) instrument identity is partially aligned now.** Real captures use
   an instrument-only header such as
   `35=W|...|128=LUX00|22=8|48=910000|207=BVMF|262=...|268=0|911=33943`,
   typically **without `55=Symbol`**, and include optional header `128` plus
-  `911=TotNumReports`. The sandbox currently emits `262`, `55`, `48`, `268`
-  and omits `22`, `207`, `128`, and `911`.
-- **Snapshot entry content is much thinner in the sandbox.** The derivatives
+  `911=TotNumReports`. The sandbox now emits `22`, `207`, optional `128`, and
+  `911`, but still keeps `55=Symbol` for compatibility and does not yet mirror
+  the full production header shape exactly.
+- **Snapshot entry content is still thinner than production, but less so.** The derivatives
   sample shows populated snapshot entries like
   `269=0|270=14|271=200|272=...|273=...|37017=...|37=...|288=88|290=1|1021=3`
-  and status-style entries like `269=c|...|336=1|625=21|342=...`. Our current
-  snapshot builder only writes `269/270/271/272/273/37`.
-- **Incremental (`X`) messages use production-specific tags the sandbox never
-  writes.** Real captures consistently include message-level `75=TradeDate`,
+  and status-style entries like `269=c|...|336=1|625=21|342=...`. The sandbox
+  now also emits `37016/37017` and `290`, but still does not cover the broader
+  production entry set.
+- **Incremental (`X`) messages are closer to production, but still simplified.** Real captures consistently include message-level `75=TradeDate`,
   sometimes `1021=MDBookType`, and entry-level `22`, `207`, frequent `276`,
   `286`, `289`, `290`, `346`, `1500`, `9325`, and timestamp/order metadata
-  such as `37016`/`37017`. The sandbox currently writes only
-  `279`, `269`, `55`, `48`, optional `270/271`, `272`, `273`, optional `37`,
-  and optional `1003`.
+  such as `37016`/`37017`. The sandbox now writes `75`, `1021`, `22`, `207`,
+  `276`, `286`, `290`, `346`, `1500`, `9325`, `37016`, and `37017`, but some
+  values remain fixed placeholders where the current in-memory model has no
+  richer source of truth (for example constant position/order-count style
+  metadata).
 - **Incremental tag order differs.** Real captures lead each entry with
   `279`, then usually instrument identity (`22/48/207`) before or around
-  `269`, whereas the sandbox emits `279`, `269`, `55`, `48`, then price/size
-  fields. FIX allows this, but matching production ordering more closely may
-  help downstream interoperability testing.
-- **SecurityStatus (`f`) coverage is currently far from production.** Real
+  `269`, whereas the sandbox now follows that pattern more closely but still
+  prioritizes parser stability over exact byte-for-byte ordering parity.
+- **SecurityStatus (`f`) coverage is now intentionally compact.** Real
   samples are compact, typically
   `35=f|...|60=...|75=...|336=1|625=18|1151=69`, with no broad instrument block
-  or descriptive text. The sandbox instead emits a much richer instrument-heavy
-  message (`55/48/22/207/...`) plus optional `58`, `1149`, `1020`, volumes and
-  prices. This is valid per schema, but does **not** match what the sampled B3
-  feed actually populated.
-- **News (`B`) has at least one unmapped production tag.** Real samples end
-  with `6940=17` (equities) or `6940=3` (derivatives); the sandbox `News`
-  builder does not currently expose that field.
-- **SecurityList (`y`) is missing several production-populated fields in the
-  sandbox builder.** The real capture repeatedly includes tags such as `15`,
+  or descriptive text. The sandbox builder now centers on `60/75/336/625/1151`
+  plus routing identity, instead of the previous richer status payload.
+- **News (`B`) production tag `6940` is now modeled.** Real samples end
+  with `6940=17` (equities) or `6940=3` (derivatives); the sandbox builder now
+  exposes that field directly.
+- **SecurityList (`y`) coverage is expanded, but still partial.** The real capture repeatedly includes tags such as `15`,
   `63`, `64`, `107`, `120`, `200`, `225`, `231`, `454/455/456`, `470`, `541`,
   `667`, `762`, `870/871/872`, `969`, `980`, `1151`, `1231`, `1234`, `1300`,
   `5151`, `6937`, `6938`, `7595`, `9748`, `9749`, and sometimes `320/322/393/560`.
-  Our builder covers only a subset of that shape today.
+  The sandbox now emits a meaningful subset derived from the existing reference
+  model (`15`, `63`, `64`, `107`, `120`, `200`, `225`, `231`, `541`, `762`,
+  `969`, `1151`, `320/322/393/560`, `6937`, `9749`), but many rarer fields
+  remain unimplemented because no natural source exists in the current metadata.
 
 #### Secondary schema sanity check
 
@@ -294,11 +296,13 @@ Issue #108 added a manual/offline comparison pass against the local B3 sample
   close field-for-field reproduction of observed B3 production payloads.
 - If stricter production mirroring becomes important, the highest-value follow-up
   items are:
-  1. enrich `W`/`X` instrument identity and report-count fields (`22`, `207`,
-     `911`, and selected entry-level metadata);
-  2. revisit `SecurityStatus (f)` to match the much smaller production shape;
-  3. expand `SecurityList (y)` coverage for the consistently populated
-     instrument/reference fields seen in the real capture.
+  1. replace fixed placeholder values in `X` (`276`, `286`, `290`, `346`,
+     `1500`, `9325`) with richer per-entry sources if the upstream book/trade
+     model is extended;
+  2. continue expanding `SecurityList (y)` for fields still absent from the
+     current in-memory reference model;
+  3. decide whether exact production ordering / optional omission of `55` in
+     snapshots is worth the compatibility trade-off.
 
 ## Explicit deviations from the real B3 product
 

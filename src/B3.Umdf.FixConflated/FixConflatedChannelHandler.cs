@@ -68,8 +68,8 @@ public sealed class FixConflatedChannelHandler : IBookEventHandler, IMarketDataE
             Instrument = instrument!,
             SecurityTradingStatus = tradingStatus,
             SourceTimestampNanoseconds = GetTimestampNanoseconds(info.LastUpdateTimestamp),
-            TradSesOpenTimeNanoseconds = info.TradSesOpenTime is ulong openTime ? checked((long)openTime) : null,
-            SecurityTradingEvent = info.TradingEvent,
+            TradingSessionId = "1",
+            TradingSessionSubId = tradingStatus.ToString(CultureInfo.InvariantCulture),
             TradeDate = info.LastUpdateTimestamp == 0
                 ? DateOnly.FromDateTime(_clock.UtcNow.UtcDateTime)
                 : DateOnly.FromDateTime(DateTimeOffset.FromUnixTimeMilliseconds((long)info.LastUpdateTimestamp / 1_000_000).UtcDateTime),
@@ -90,11 +90,11 @@ public sealed class FixConflatedChannelHandler : IBookEventHandler, IMarketDataE
         {
             OrigTimeNanoseconds = origTimeNanos > 0 ? origTimeNanos : GetTimestampNanoseconds(0),
             Headline = DecodeUtf8(headline),
-            NewsSource = source.ToString(CultureInfo.InvariantCulture),
             BodyText = DecodeUtf8(text),
             NewsId = newsId == 0 ? null : newsId.ToString(CultureInfo.InvariantCulture),
             LanguageCode = language == 0 ? null : language.ToString(CultureInfo.InvariantCulture),
             UrlLink = url.IsEmpty ? null : DecodeUtf8(url),
+            NewsSourceCode = source == 0 ? "17" : source.ToString(CultureInfo.InvariantCulture),
         }));
     }
 
