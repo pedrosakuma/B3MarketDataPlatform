@@ -105,6 +105,8 @@ constants in `FixMsgTypes` / `FixApplicationMsgTypes`.
 | `MarketDataIncrementalRefresh` | `X` | `FixConflatedMarketDataPublisher` batches book deltas per instrument/side over the configured conflation window; trade entries (`MDEntryType=2`) bypass that window and flush immediately |
 | `SecurityStatus` | `f` | `FixConflatedChannelHandler.OnSecurityStatusChanged` |
 | `News` | `B` | `FixConflatedChannelHandler.OnNews`, fed by the existing `NewsReassembler` pipeline |
+| `MarketDataRequest` | `V` | inbound only — parsed by `FixMarketDataRequestHandler` (`FixMarketDataSubscriptionSupport.cs`); drives per-session `SecurityID` subscription filtering (issue #116) |
+| `MarketDataRequestReject` | `Y` | outbound only — emitted by `FixMarketDataRequestHandler` for malformed/unknown-instrument `MarketDataRequest`s |
 
 ### Additional UMDF-specific message definitions modeled in code/schema
 
@@ -120,6 +122,22 @@ yet auto-publish them on its own:
 | `MarketTotalsComposition` | `UTOTC` | Builder implemented; not automatically broadcast by the current TCP server wiring |
 | `MarketTotalsRequest` | `UTOTQ` | Request/builder shape implemented; no automatic request/response flow is wired today |
 | `MarketTotalsResponse` | `UTOTP` | Builder implemented; not automatically broadcast by the current TCP server wiring |
+
+### Schema messages with no implementation at all
+
+These MsgTypes exist in the vendored dictionary
+(`schemas/fix-conflated/FIX44_UMDFConflated.xml`) but have **no builder and
+no handling** anywhere in `src/B3.Umdf.FixConflated` today:
+
+| Message | MsgType | Notes |
+|---|---|---|
+| `BusinessMessageReject` | `j` | No generic session-level business-reject path; malformed application messages other than `MarketDataRequest` (`V`) have no reject response at all |
+| `LicenseKeyRequest` | `ULRQ` | Not modeled |
+| `LicenseKeyResponse` | `ULRP` | Not modeled |
+| `LicenseLogoutReport` | `ULRL` | Not modeled |
+| `NetworkStatusResponse` | `BD` | Not modeled |
+| `TradeHistoryRequest` | `UTHQ` | Not modeled |
+| `TradeHistoryResponse` | `UTHP` | Not modeled |
 
 ## Conflation model
 
@@ -314,6 +332,30 @@ Issue #108 added a manual/offline comparison pass against the local B3 sample
      current in-memory reference model;
   3. decide whether exact production ordering / optional omission of `55` in
      snapshots is worth the compatibility trade-off.
+
+## Consolidated drift map vs. the real B3 UMDF PUMA Conflated spec (issue #115)
+
+This section is the single authoritative inventory of every known
+behavioral/content divergence from the real B3 UMDF PUMA Conflated Market
+Data Specification (v2.2.0, 2025-10-21). It exists to stop re-discovering the
+same drifts piecemeal (compression wiring #107, content gaps #108/#111/#114,
+WS snapshot bug #110, subscription model #116, late-join timing #117) — every
+new drift found from here on should be added as a row here, not just fixed
+silently. Rows that duplicate detail already covered elsewhere in this
+document link out instead of repeating it.
+
+| Area | Spec expectation | Sandbox behavior | Impact | Tracking issue |
+|---|---|---|---|---|
+| Instrument subscription | Clients scope their feed via inbound `MarketDataRequest` (`V`) with `NoRelatedSym`/`SecurityID`/`SecurityIDSource`/`SecurityExchange`, `SubscriptionRequestType`, optional `MDBookType`/`MarketDepth`/`SecurityType`/`CFICode`/`Product`/`NoSecurityGroups`; server may reply `MarketDataRequestReject` (`Y`) | **Resolved.** `V` is parsed by `FixMarketDataRequestHandler`, drives per-session `SecurityID` subscription state, gates snapshot/incremental fan-out per session, and rejects malformed/unknown instruments with `Y`. `NoSecurityGroups` and `MDBookType`/`MarketDepth`-based filtering are still deferred (only `SecurityID`-level filtering exists). Sessions that never send an explicit `V` still fall back to the legacy full-broadcast (every known instrument) for compatibility. | Functional — was previously full-broadcast-only (no way to scope a feed); now closer to spec but `NoSecurityGroups`/book-type/depth filters remain unimplemented | #116 (closed via PR #118); residual `NoSecurityGroups`/`MDBookType` filtering not separately tracked yet |
+| Late-join snapshot correctness | A client connecting mid-session at any point during an active feed must receive a correct, current full snapshot via `MarketDataSnapshotFullRefresh`, then continue cleanly from subsequent incrementals with no gap | Automated end-to-end coverage now exists (`FixConflatedLateJoinSnapshotEndToEndTests`) proving two clients joining at different points each get a correct current snapshot and correct subsequent incrementals. Manual staged-replay validation (`tools/fix-conflated-late-join-validate.sh`) remains inconclusive due to test-harness timing/instability, not a proven server-side bug. | Functional (core guarantee) — now proven at the unit/integration level; real-replay timing behavior still not conclusively demonstrated | #117 (closed via PR #119) |
+| `BusinessMessageReject` (`j`) | Generic session-level reject for malformed/unsupported application messages | Not modeled at all; only `MarketDataRequest` has a dedicated reject (`MarketDataRequestReject`, `Y`) | Cosmetic/protocol — malformed messages of other types are silently ignored rather than explicitly rejected | Not yet tracked — candidate for a new issue if this becomes relevant |
+| `LicenseKeyRequest`/`LicenseKeyResponse`/`LicenseLogoutReport` (`ULRQ`/`ULRP`/`ULRL`) | B3 entitlement/licensing handshake messages | Not modeled at all | Cosmetic — this sandbox has no authentication/entitlement layer at all (see "Explicit deviations" below) | Not tracked (out of scope; sandbox has no licensing model) |
+| `NetworkStatusResponse` (`BD`) | Network/connectivity status reporting message | Not modeled at all | Cosmetic | Not tracked |
+| `TradeHistoryRequest`/`TradeHistoryResponse` (`UTHQ`/`UTHP`) | On-demand historical trade query/response | Not modeled at all | Functional gap only if historical trade replay/query becomes a requirement; current channel is live-feed only | Not tracked |
+| `SecurityListRequest`/`SecurityList` (`x`/`y`) | Request/response flow for instrument reference data | Builders exist but are not wired to any automatic trigger; no request/response flow | Functional — `y` content itself is now reasonably close to production per #111/#114, but there is no way for a client to actually request it | Not separately tracked; content gaps covered by #111/#114 |
+| `MarketTotalsBroadcast`/`MarketTotalsComposition`/`MarketTotalsRequest`/`MarketTotalsResponse` (`UTOT`/`UTOTC`/`UTOTQ`/`UTOTP`) | Market-totals broadcast/request-response messages | Builders exist but nothing triggers them automatically | Functional gap if market-totals data becomes a requirement | Not tracked |
+| `W`/`X`/`f`/`y`/`B` content-level field coverage | See "Message-content validation against real B3 sample captures" below for the full per-tag breakdown | Substantially improved by #111/#114 but still not a byte-for-byte reproduction (fixed placeholders in some `X` entry-level fields, partial `y` field set, `55=Symbol` retained in `W` for compatibility, incremental tag ordering not exact) | Cosmetic to moderate — content is parseable and close to production shape, some fields still synthetic | #108 (initial gap analysis), #111/#114 (majority closed) |
+| Explicit deviations (auth, certification, reconnect model, conflation cadence, acceptor/initiator role) | See spec sections on session authentication, cross-session gap-fill, and connectivity roles | Already fully documented in "Explicit deviations from the real B3 product" below — intentional sandbox simplifications, not accidental drift | By design — not a bug | See "Explicit deviations" section below |
 
 ## Explicit deviations from the real B3 product
 
