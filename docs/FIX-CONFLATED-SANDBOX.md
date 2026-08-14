@@ -276,13 +276,6 @@ Issue #108 added a manual/offline comparison pass against the local B3 sample
   model (`15`, `63`, `64`, `107`, `120`, `200`, `225`, `231`, `541`, `762`,
   `969`, `1151`, `320/322/393/560`, `6937`, `9749`), but many rarer fields
   remain unimplemented because no natural source exists in the current metadata.
-- **Incremental (`X`) messages use production-specific tags the sandbox never
-  writes.** Real captures consistently include message-level `75=TradeDate`,
-  sometimes `1021=MDBookType`, and entry-level `22`, `207`, frequent `276`,
-  `286`, `289`, `290`, `346`, `1500`, `9325`, and timestamp/order metadata
-  such as `37016`/`37017`. The sandbox currently writes only
-  `279`, `269`, `55`, `48`, optional `270/271`, `272`, `273`, optional `37`,
-  and optional `1003`.
 
 #### Secondary schema sanity check
 
