@@ -14,7 +14,7 @@ public sealed class FixApplicationMessageWriterTests
             "CLIENT",
             7,
             new DateTimeOffset(2026, 8, 12, 19, 10, 11, 123, TimeSpan.Zero));
-        var instrument = new FixMarketDataInstrument("PETR4", 1234, priceScale: 2);
+        var instrument = new FixMarketDataInstrument("PETR4", 1234, priceScale: 2, deliverToCompId: "LUX00");
         FixMarketDataIncrementalEntry[] entries =
         [
             new(
@@ -43,16 +43,22 @@ public sealed class FixApplicationMessageWriterTests
         Assert.Equal("CLIENT", GetRequired(decoded, FixTags.TargetCompId));
         Assert.Equal("7", GetRequired(decoded, FixTags.MsgSeqNum));
         Assert.Equal("2", GetRequired(decoded, FixTags.NoMDEntries));
+        Assert.Equal("20260812", GetRequired(decoded, FixTags.TradeDate));
+        Assert.Equal("3", GetRequired(decoded, FixTags.MDBookType));
 
         IReadOnlyList<IReadOnlyDictionary<int, string>> parsedEntries = ParseIncrementalEntries(decoded);
         Assert.Equal(2, parsedEntries.Count);
 
         Assert.Equal("0", parsedEntries[0][FixTags.MDUpdateAction]);
+        Assert.Equal("8", parsedEntries[0][FixTags.SecurityIdSource]);
+        Assert.Equal("BVMF", parsedEntries[0][FixTags.SecurityExchange]);
         Assert.Equal("0", parsedEntries[0][FixTags.MDEntryType]);
         Assert.Equal("PETR4", parsedEntries[0][FixTags.Symbol]);
         Assert.Equal("1234", parsedEntries[0][FixTags.SecurityId]);
         Assert.Equal("28.10", parsedEntries[0][FixTags.MDEntryPx]);
         Assert.Equal("100", parsedEntries[0][FixTags.MDEntrySize]);
+        Assert.Equal("3", parsedEntries[0][FixTags.MDStreamId]);
+        Assert.Equal("1", parsedEntries[0][FixTags.NumberOfOrders]);
         Assert.Equal("501", parsedEntries[0][FixTags.OrderId]);
 
         Assert.Equal("1", parsedEntries[1][FixTags.MDUpdateAction]);
@@ -71,7 +77,7 @@ public sealed class FixApplicationMessageWriterTests
             new DateTimeOffset(2026, 8, 12, 19, 15, 00, TimeSpan.Zero));
         var request = new FixMarketDataSnapshotRequest(
             "snap-1",
-            new FixMarketDataInstrument("PETR4", 1234, priceScale: 2));
+            new FixMarketDataInstrument("PETR4", 1234, priceScale: 2, deliverToCompId: "LUX00"));
         OrderBook book = CreateBook(
             (1UL, BookSideType.Bid, 2810L, 100L),
             (2UL, BookSideType.Bid, 2809L, 150L),
@@ -85,12 +91,17 @@ public sealed class FixApplicationMessageWriterTests
         Assert.Equal("snap-1", GetRequired(decoded, FixTags.MDReqId));
         Assert.Equal("PETR4", GetRequired(decoded, FixTags.Symbol));
         Assert.Equal("1234", GetRequired(decoded, FixTags.SecurityId));
+        Assert.Equal("8", GetRequired(decoded, FixTags.SecurityIdSource));
+        Assert.Equal("BVMF", GetRequired(decoded, FixTags.SecurityExchange));
+        Assert.Equal("LUX00", GetRequired(decoded, FixTags.DeliverToCompID));
         Assert.Equal("4", GetRequired(decoded, FixTags.NoMDEntries));
+        Assert.Equal("4", GetRequired(decoded, FixTags.TotNumReports));
 
         IReadOnlyList<IReadOnlyDictionary<int, string>> entries = ParseSnapshotEntries(decoded);
         Assert.Equal(4, entries.Count);
         Assert.Equal("0", entries[0][FixTags.MDEntryType]);
         Assert.Equal("28.10", entries[0][FixTags.MDEntryPx]);
+        Assert.Equal("1", entries[0][FixTags.MDEntryPositionNo]);
         Assert.Equal("1", entries[0][FixTags.OrderId]);
         Assert.Equal("1", entries[2][FixTags.MDEntryType]);
         Assert.Equal("28.12", entries[2][FixTags.MDEntryPx]);

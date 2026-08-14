@@ -5,7 +5,7 @@ namespace B3.Umdf.FixConflated.Tests;
 public sealed class SecurityStatusMessageBuilderTests
 {
     [Fact]
-    public void Build_Produces_Parseable_SecurityStatus_WithRequiredAndMappedFields()
+    public void Build_Produces_Compact_ProductionLike_SecurityStatus()
     {
         var message = SecurityStatusMessageBuilder.Build(new FixSecurityStatusDefinition
         {
@@ -26,27 +26,21 @@ public sealed class SecurityStatusMessageBuilderTests
             },
             SecurityTradingStatus = 2,
             SourceTimestampNanoseconds = 1_786_544_116_789_000_000,
-            SecurityTradingEvent = 1,
-            UnsolicitedIndicator = true,
-            Text = "Trading halted",
-            BuyVolume = 1200m,
-            SellVolume = 800m,
-            HighPrice = 31.25m,
-            LowPrice = 29.80m,
-            LastPrice = 30.15m
+            TradingSessionId = "1",
+            TradingSessionSubId = "18"
         });
 
         Assert.Equal(FixApplicationMsgTypes.SecurityStatus, FixApplicationMessageTestHelpers.GetRequired(message, FixTags.MsgType));
         Assert.Equal("PETR4", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.Symbol));
         Assert.Equal("12345", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.SecurityId));
-        Assert.Equal("2", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.SecurityTradingStatus));
         Assert.Equal("20260812", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.TradeDate));
         Assert.Equal("20260812-14:15:16.789", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.TransactTime));
-        Assert.Equal("1", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.SecurityTradingEvent));
-        Assert.Equal("Y", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.UnsolicitedIndicator));
+        Assert.Equal("1", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.TradingSessionId));
+        Assert.Equal("18", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.TradingSessionSubId));
+        Assert.Equal("EQUITY", FixApplicationMessageTestHelpers.GetRequired(message, FixApplicationTags.SecurityGroup));
 
         FixMessage decoded = FixApplicationMessageTestHelpers.RoundTrip(message);
-        Assert.Equal("Trading halted", FixApplicationMessageTestHelpers.GetRequired(decoded, FixApplicationTags.Text));
-        Assert.Equal("30.15", FixApplicationMessageTestHelpers.GetRequired(decoded, FixApplicationTags.LastPx));
+        Assert.False(decoded.TryGetString(FixApplicationTags.SecurityTradingStatus, out _));
+        Assert.False(decoded.TryGetString(FixApplicationTags.Text, out _));
     }
 }

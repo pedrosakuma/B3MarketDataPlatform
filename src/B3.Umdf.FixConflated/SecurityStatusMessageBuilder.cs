@@ -14,29 +14,18 @@ public static class SecurityStatusMessageBuilder
         var message = new FixMessage();
         message.Add(FixTags.MsgType, FixApplicationMsgTypes.SecurityStatus);
 
-        FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.SecurityStatusReqId, definition.SecurityStatusReqId);
         FixApplicationMessageBuilderSupport.AppendInstrumentPrefix(message, definition.Instrument);
-        FixApplicationMessageBuilderSupport.AppendInstrumentSuffix(message, definition.Instrument);
-        FixApplicationMessageBuilderSupport.AddOptionalBoolean(message, FixApplicationTags.UnsolicitedIndicator, definition.UnsolicitedIndicator);
-        FixApplicationMessageBuilderSupport.AddOptionalUnixNanosTimestamp(message, FixApplicationTags.TradSesOpenTime, definition.TradSesOpenTimeNanoseconds);
-        message.Add(FixApplicationTags.SecurityTradingStatus, definition.SecurityTradingStatus);
 
         DateOnly tradeDate = definition.TradeDate
             ?? DateOnly.FromDateTime(FixApplicationMessageBuilderSupport.FromUnixNanoseconds(definition.SourceTimestampNanoseconds).UtcDateTime);
-        message.Add(FixApplicationTags.TradeDate, FixApplicationMessageBuilderSupport.FormatLocalDate(tradeDate));
-
-        FixApplicationMessageBuilderSupport.AddOptionalChar(message, FixApplicationTags.HaltReason, definition.HaltReason);
-        FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.BuyVolume, definition.BuyVolume);
-        FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.SellVolume, definition.SellVolume);
-        FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.HighPrice, definition.HighPrice);
-        FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.LowPrice, definition.LowPrice);
-        FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.LastPx, definition.LastPrice);
         message.Add(
             FixApplicationTags.TransactTime,
             FixValueFormatting.FormatUtcTimestamp(
                 FixApplicationMessageBuilderSupport.FromUnixNanoseconds(definition.SourceTimestampNanoseconds)));
-        FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.Text, definition.Text);
-        FixApplicationMessageBuilderSupport.AddOptionalInt(message, FixApplicationTags.SecurityTradingEvent, definition.SecurityTradingEvent);
+        message.Add(FixApplicationTags.TradeDate, FixApplicationMessageBuilderSupport.FormatLocalDate(tradeDate));
+        FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.TradingSessionId, definition.TradingSessionId);
+        FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.TradingSessionSubId, definition.TradingSessionSubId);
+        FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.SecurityGroup, definition.Instrument.SecurityGroup);
 
         return message;
     }

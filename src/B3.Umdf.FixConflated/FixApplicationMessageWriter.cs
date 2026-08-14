@@ -109,14 +109,18 @@ public sealed class FixApplicationMessageWriter : IDisposable
         if (!string.IsNullOrEmpty(mdReqId))
             offset += WriteStringField(destination[offset..], FixTags.MDReqId, mdReqId);
 
+        offset += WriteUtcDateField(destination[offset..], FixTags.TradeDate, header.SendingTime);
+        offset += WriteIntField(destination[offset..], FixTags.MDBookType, 3);
         offset += WriteIntField(destination[offset..], FixTags.NoMDEntries, entries.Length);
 
         foreach (ref readonly var entry in entries)
         {
             offset += WriteCharField(destination[offset..], FixTags.MDUpdateAction, (char)entry.UpdateAction);
+            offset += WriteStringField(destination[offset..], FixTags.SecurityIdSource, instrument.SecurityIdSource);
+            offset += WriteUInt64Field(destination[offset..], FixTags.SecurityId, instrument.SecurityId);
+            offset += WriteStringField(destination[offset..], FixTags.SecurityExchange, instrument.SecurityExchange);
             offset += WriteCharField(destination[offset..], FixTags.MDEntryType, (char)entry.EntryType);
             offset += WriteStringField(destination[offset..], FixTags.Symbol, instrument.Symbol);
-            offset += WriteUInt64Field(destination[offset..], FixTags.SecurityId, instrument.SecurityId);
 
             if ((entry.Fields & FixMarketDataEntryFields.Price) != 0)
                 offset += WriteScaledInt64Field(destination[offset..], FixTags.MDEntryPx, entry.Price, instrument.PriceScale);
@@ -125,11 +129,21 @@ public sealed class FixApplicationMessageWriter : IDisposable
 
             offset += WriteUtcDateField(destination[offset..], FixTags.MDEntryDate, entry.EntryTime);
             offset += WriteUtcTimeField(destination[offset..], FixTags.MDEntryTime, entry.EntryTime);
+            offset += WriteUtcDateField(destination[offset..], FixTags.MDInsertDate, entry.EntryTime);
+            offset += WriteUtcTimeField(destination[offset..], FixTags.MDInsertTime, entry.EntryTime);
+            offset += WriteStringField(destination[offset..], FixTags.MDStreamId, instrument.MdStreamId);
+            offset += WriteIntField(destination[offset..], FixTags.MDEntryPositionNo, 1);
+            offset += WriteIntField(destination[offset..], FixTags.NumberOfOrders, 1);
+            offset += WriteStringField(destination[offset..], FixTags.QuoteCondition, "A");
+            offset += WriteStringField(destination[offset..], FixTags.OpenCloseSettlFlag, "0");
 
             if ((entry.Fields & FixMarketDataEntryFields.OrderId) != 0)
                 offset += WriteUInt64Field(destination[offset..], FixTags.OrderId, entry.OrderId);
             if ((entry.Fields & FixMarketDataEntryFields.TradeId) != 0)
+            {
                 offset += WriteInt64Field(destination[offset..], FixTags.TradeId, entry.TradeId);
+                offset += WriteUtcDateField(destination[offset..], FixTags.LastTradeDate, entry.EntryTime);
+            }
         }
 
         return offset;
@@ -144,9 +158,14 @@ public sealed class FixApplicationMessageWriter : IDisposable
     {
         int offset = 0;
         offset += WriteSessionHeader(destination[offset..], header, FixMsgTypes.MarketDataSnapshotFullRefresh);
+        if (!string.IsNullOrEmpty(request.Instrument.DeliverToCompId))
+            offset += WriteStringField(destination[offset..], FixTags.DeliverToCompID, request.Instrument.DeliverToCompId!);
+        offset += WriteStringField(destination[offset..], FixTags.SecurityIdSource, request.Instrument.SecurityIdSource);
+        offset += WriteStringField(destination[offset..], FixTags.SecurityExchange, request.Instrument.SecurityExchange);
         offset += WriteStringField(destination[offset..], FixTags.MDReqId, request.MdReqId);
         offset += WriteStringField(destination[offset..], FixTags.Symbol, request.Instrument.Symbol);
         offset += WriteUInt64Field(destination[offset..], FixTags.SecurityId, request.Instrument.SecurityId);
+        offset += WriteIntField(destination[offset..], FixTags.TotNumReports, entryCount);
         offset += WriteIntField(destination[offset..], FixTags.NoMDEntries, entryCount);
 
         offset += WriteSnapshotSide(destination[offset..], book.Bids, FixMdEntryType.Bid, request.Instrument.PriceScale, header.SendingTime);
@@ -171,6 +190,9 @@ public sealed class FixApplicationMessageWriter : IDisposable
                 offset += WriteInt64Field(destination[offset..], FixTags.MDEntrySize, order.Quantity);
                 offset += WriteUtcDateField(destination[offset..], FixTags.MDEntryDate, entryTime);
                 offset += WriteUtcTimeField(destination[offset..], FixTags.MDEntryTime, entryTime);
+                offset += WriteUtcDateField(destination[offset..], FixTags.MDInsertDate, entryTime);
+                offset += WriteUtcTimeField(destination[offset..], FixTags.MDInsertTime, entryTime);
+                offset += WriteIntField(destination[offset..], FixTags.MDEntryPositionNo, 1);
                 offset += WriteUInt64Field(destination[offset..], FixTags.OrderId, order.OrderId);
             }
         }

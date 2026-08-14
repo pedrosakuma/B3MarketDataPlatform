@@ -38,6 +38,15 @@ public static class SecurityListMessageBuilder
                 }
 
                 FixApplicationMessageBuilderSupport.AppendInstrumentSuffix(message, security.Instrument);
+                FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.Currency, security.Currency);
+                FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.SettlType, security.SettlType);
+                FixApplicationMessageBuilderSupport.AddOptionalDate(message, FixApplicationTags.SettlDate, security.SettlDate);
+                FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.MaturityMonthYear, security.MaturityMonthYear);
+                FixApplicationMessageBuilderSupport.AddOptionalDate(message, FixApplicationTags.IssueDate, security.IssueDate);
+                FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.SettlCurrency, security.SettlCurrency);
+                FixApplicationMessageBuilderSupport.AddOptionalString(message, FixApplicationTags.Asset, security.Asset);
+                FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.MinPriceIncrement, security.MinPriceIncrement);
+                FixApplicationMessageBuilderSupport.AddOptionalDecimal(message, FixApplicationTags.TickSizeDenominator, security.TickSizeDenominator);
             }
         }
 
