@@ -33,10 +33,26 @@ node tools/fix/fix-validate.mjs localhost 9200
 
 If you omit `symbol`, the validator adopts the first snapshot symbol it sees.
 That is useful for quick smoke runs when you do not yet know which symbols are
-present in the current replay.
+present in the current replay. In this legacy auto-discovery mode the
+validator does **not** send an explicit `MarketDataRequest`; it simply waits
+for the server's legacy full-broadcast snapshot (sent automatically after
+`Logon` to any session that never subscribes explicitly) and tracks whatever
+instrument shows up first.
+
+To exercise the real per-session subscription/filtering model instead (issue
+#116), set `FIX_SECURITY_ID` to a known numeric `SecurityID` — the validator
+then sends an explicit `MarketDataRequest` (`V`, `SubscriptionRequestType=1`)
+for that instrument right after `Logon`, and the server scopes the snapshot
+and all subsequent incrementals to just that `SecurityID`. An unknown
+`SecurityID` gets a `MarketDataRequestReject` (`Y`) instead of a snapshot.
 
 Useful environment overrides:
 
+- `FIX_SECURITY_ID` — numeric `SecurityID` to subscribe to explicitly via
+  `MarketDataRequest` (`V`). When unset (and no CLI `symbol` has produced a
+  tracked `SecurityID` yet), the validator skips sending `V` entirely and
+  relies on the legacy automatic full-broadcast snapshot instead — it never
+  crashes or blocks waiting for a value that was never provided.
 - `FIX_SENDER_COMP_ID` / `FIX_TARGET_COMP_ID` — override the default CompIDs. The script defaults to a unique sender ID per run so repeated manual runs do not trip the sandbox reconnect rule for stale `MsgSeqNum` values.
 - `FIX_HEARTBEAT_SEC` — requested heartbeat interval (default `30`).
 - `CHECK_INTERVAL_MS` — `/book` comparison interval (default `5000`).

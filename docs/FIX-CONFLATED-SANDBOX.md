@@ -79,6 +79,19 @@ it needs the `schema-upgrade` label.
   `SequenceReset`-based gap-fill across reconnects), matching B3's
   documented behavior. Recovery after such a disconnect happens via a
   fresh `MarketDataSnapshotFullRefresh` on the new session.
+- Instrument subscription is per-session: a client that sends an inbound
+  `MarketDataRequest` (`V`) is scoped to just the requested `SecurityID`(s)
+  for both the initial snapshot and subsequent incrementals, with
+  `MarketDataRequestReject` (`Y`) for malformed/unknown instruments. A
+  client that never sends `V` still gets the legacy full-broadcast
+  (every known instrument) automatically after `Logon`, for backward
+  compatibility with older tooling. See "Message catalog" and the
+  consolidated drift map below for details (issue #116).
+- A client may join at any point during an active session (mid-replay,
+  not just immediately after startup) and still receives a correct,
+  current full snapshot on `Logon`/subscribe, followed by clean
+  incrementals from that point forward — proven by an automated
+  multi-client, staggered-join end-to-end test (issue #117).
 
 ## Message catalog
 
