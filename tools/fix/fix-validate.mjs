@@ -39,6 +39,8 @@ const TAG = {
   TestReqId: 112,
   CheckSum: 10,
   MDReqId: 262,
+  SubscriptionRequestType: 263,
+  NoRelatedSym: 146,
   NoMDEntries: 268,
   MDEntryType: 269,
   MDEntryPx: 270,
@@ -54,7 +56,9 @@ const MSG = {
   TestRequest: '1',
   Logout: '5',
   Logon: 'A',
+  MarketDataRequest: 'V',
   MarketDataSnapshotFullRefresh: 'W',
+  MarketDataRequestReject: 'Y',
   MarketDataIncrementalRefresh: 'X',
 };
 
@@ -329,6 +333,7 @@ function handleMessage(message, currentSocket) {
       sessionActive = true;
       heartbeatIntervalSeconds = parseNonNegativeInt(message.get(TAG.HeartBtInt) || String(heartbeatIntervalSeconds), heartbeatIntervalSeconds);
       console.log(`Logon ack seq=${message.get(TAG.MsgSeqNum) ?? '?'} heartbeat=${heartbeatIntervalSeconds}s sender=${message.get(TAG.SenderCompId) ?? '?'} target=${message.get(TAG.TargetCompId) ?? '?'}`);
+      sendMarketDataRequest(currentSocket);
       break;
     }
     case MSG.Heartbeat:
@@ -350,6 +355,10 @@ function handleMessage(message, currentSocket) {
       break;
     case MSG.MarketDataSnapshotFullRefresh:
       applySnapshot(message);
+      break;
+    case MSG.MarketDataRequestReject:
+      console.error(`MarketDataRequestReject mdReqId=${message.get(TAG.MDReqId) ?? '?'} text=${message.get(TAG.Text) ?? '(none)'}`);
+      requestShutdown('mdreq-reject');
       break;
     case MSG.MarketDataIncrementalRefresh:
       applyIncremental(message);
@@ -492,6 +501,30 @@ function acceptInstrument(symbol, securityId) {
     return false;
 
   return true;
+}
+
+
+function sendMarketDataRequest(currentSocket) {
+  const requestSecurityId = resolveRequestedSecurityId();
+  sendSessionMessage(currentSocket, MSG.MarketDataRequest, [
+    [TAG.MDReqId, `mdreq-${REQUESTED_SYMBOL}`],
+    [TAG.SubscriptionRequestType, '1'],
+    [TAG.NoRelatedSym, '1'],
+    [TAG.SecurityId, resolveRequestedSecurityId()],
+    [TAG.SecurityIdSource, '8'],
+    [TAG.SecurityExchange, 'BVMF'],
+  ]);
+}
+
+function resolveRequestedSecurityId() {
+  if (trackedSecurityId)
+    return trackedSecurityId;
+
+  const envSecurityId = process.env.FIX_SECURITY_ID || '';
+  if (envSecurityId)
+    return envSecurityId;
+
+  throw new Error('FIX_SECURITY_ID env var is required for explicit MarketDataRequest subscriptions.');
 }
 
 function sendSessionMessage(currentSocket, msgType, extraFields) {

@@ -61,7 +61,11 @@ internal static class FixSocketClientTestHelpers
         public async Task<FixMessage> ReadMessageAsync(TimeSpan? timeout = null)
         {
             using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(5));
+            return await ReadMessageAsync(cts.Token).ConfigureAwait(false);
+        }
 
+        public async Task<FixMessage> ReadMessageAsync(CancellationToken cancellationToken)
+        {
             while (true)
             {
                 FixDecodeResult decoded = FixMessageCodec.Decode(_buffer.AsSpan(0, _buffered));
@@ -76,7 +80,7 @@ internal static class FixSocketClientTestHelpers
                     throw new XunitException($"Expected a full FIX frame but decode failed with {decoded.Error}.");
 
                 EnsureCapacity();
-                int read = await _inflateStream.ReadAsync(_buffer.AsMemory(_buffered), cts.Token);
+                int read = await _inflateStream.ReadAsync(_buffer.AsMemory(_buffered), cancellationToken);
                 Assert.True(read > 0, "Expected the FIX server to send a FIX frame before closing the socket.");
                 _buffered += read;
             }

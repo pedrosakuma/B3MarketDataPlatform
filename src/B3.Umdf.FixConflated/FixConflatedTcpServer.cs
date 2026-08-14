@@ -12,6 +12,7 @@ public sealed class FixConflatedTcpServer : IAsyncDisposable
     private readonly FixConflatedTcpServerOptions _options;
     private readonly FixSessionStateStore _stateStore = new();
     private readonly Func<IEnumerable<FixMessage>>? _initialMessagesProvider;
+    private readonly FixMarketDataRequestHandler? _marketDataRequestHandler;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<FixConflatedTcpServer> _logger;
     private readonly ConcurrentDictionary<long, FixTcpClientSession> _sessions = new();
@@ -24,12 +25,14 @@ public sealed class FixConflatedTcpServer : IAsyncDisposable
         FixConflatedSessionHub hub,
         FixConflatedTcpServerOptions? options = null,
         Func<IEnumerable<FixMessage>>? initialMessagesProvider = null,
+        FixMarketDataRequestHandler? marketDataRequestHandler = null,
         ILoggerFactory? loggerFactory = null,
         ILogger<FixConflatedTcpServer>? logger = null)
     {
         _hub = hub ?? throw new ArgumentNullException(nameof(hub));
         _options = options ?? new FixConflatedTcpServerOptions();
         _initialMessagesProvider = initialMessagesProvider;
+        _marketDataRequestHandler = marketDataRequestHandler;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _logger = logger ?? (_loggerFactory == NullLoggerFactory.Instance
             ? NullLogger<FixConflatedTcpServer>.Instance
@@ -92,6 +95,7 @@ public sealed class FixConflatedTcpServer : IAsyncDisposable
                     new FixSessionConnection(_stateStore, _options.SessionOptions),
                     _options.OutboundQueueCapacity,
                     _initialMessagesProvider,
+                    _marketDataRequestHandler,
                     OnSessionClosed,
                     _loggerFactory.CreateLogger<FixTcpClientSession>());
 
