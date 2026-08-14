@@ -181,12 +181,22 @@ fi
 
 echo "[ready] symbol=$SYMBOL_TO_USE"
 
+SECURITY_ID_TO_USE="${FIX_SECURITY_ID:-}"
+if [ -z "$SECURITY_ID_TO_USE" ]; then
+  SECURITY_ID_TO_USE="$(dotnet run --project src/B3.Umdf.ConsoleApp -- --pcap-prefix "$PREFIX" --ws-port 0 --speed 0 --symbols | awk -v sym="$SYMBOL_TO_USE" '$1==sym {print $2; exit}')"
+fi
+
+if [ -z "$SECURITY_ID_TO_USE" ]; then
+  echo "[error] failed to resolve securityId for symbol $SYMBOL_TO_USE; set FIX_SECURITY_ID explicitly"
+  exit 1
+fi
+
 RUN_SECONDS="$DURATION_SECONDS" \
 CHECK_INTERVAL_MS="$CHECK_INTERVAL_MS" \
 HTTP_BASE="http://$HOST:$WS_PORT" \
 WS_SNAPSHOT_COMPARE_URL="ws://$HOST:$WS_PORT/ws" \
 WS_SNAPSHOT_TIMEOUT_MS="$((VALIDATOR_SHUTDOWN_TIMEOUT_SECONDS * 1000))" \
-node tools/fix/fix-validate.mjs "$HOST" "$FIX_PORT" "$SYMBOL_TO_USE" >"$FIX_LOG" 2>&1 &
+FIX_SECURITY_ID="$SECURITY_ID_TO_USE" node tools/fix/fix-validate.mjs "$HOST" "$FIX_PORT" "$SYMBOL_TO_USE" >"$FIX_LOG" 2>&1 &
 FIX_PID=$!
 
 set +e

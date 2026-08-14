@@ -152,7 +152,9 @@ internal static class FixMsgTypes
     public const string SequenceReset = "4";
     public const string Logout = "5";
     public const string Logon = "A";
+    public const string MarketDataRequest = "V";
     public const string MarketDataSnapshotFullRefresh = "W";
+    public const string MarketDataRequestReject = "Y";
     public const string MarketDataIncrementalRefresh = "X";
 }
 

@@ -90,6 +90,7 @@ public sealed class FixSessionConnection
             FixMsgTypes.Logout => HandleLogout(nowUtc, nowTicks),
             FixMsgTypes.Reject => FixSessionUpdate.None,
             FixMsgTypes.Logon => DisconnectImmediately("Unexpected secondary Logon."),
+            FixMsgTypes.MarketDataRequest => FixSessionUpdate.None,
             _ => DisconnectWithLogout($"Unsupported session MsgType {msgType}.", nowUtc, nowTicks),
         };
     }

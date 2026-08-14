@@ -63,7 +63,8 @@ public sealed class FixConflatedChannelHandler : IBookEventHandler, IMarketDataE
         if (info.TradingStatus is not int tradingStatus || !TryCreateInstrumentReference(securityId, info, out FixInstrumentReference? instrument))
             return;
 
-        _hub.BroadcastApplication(SecurityStatusMessageBuilder.Build(new FixSecurityStatusDefinition
+        _hub.BroadcastApplication(new FixApplicationDispatch(
+            SecurityStatusMessageBuilder.Build(new FixSecurityStatusDefinition
         {
             Instrument = instrument!,
             SecurityTradingStatus = tradingStatus,
@@ -73,7 +74,7 @@ public sealed class FixConflatedChannelHandler : IBookEventHandler, IMarketDataE
             TradeDate = info.LastUpdateTimestamp == 0
                 ? DateOnly.FromDateTime(_clock.UtcNow.UtcDateTime)
                 : DateOnly.FromDateTime(DateTimeOffset.FromUnixTimeMilliseconds((long)info.LastUpdateTimestamp / 1_000_000).UtcDateTime),
-        }));
+        }), securityId));
     }
 
     public void OnNews(

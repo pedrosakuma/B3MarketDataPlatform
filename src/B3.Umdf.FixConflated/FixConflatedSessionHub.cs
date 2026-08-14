@@ -31,14 +31,20 @@ public sealed class FixConflatedSessionHub : IFixApplicationMessageSink
         => BroadcastApplication(FixApplicationMessageAdapter.FromEncodedFrame(message.Span));
 
     public void BroadcastApplication(FixMessage message)
+        => BroadcastApplication(new FixApplicationDispatch(message, FixApplicationMessageClassifier.TryGetSecurityId(message)));
+
+    public void BroadcastApplication(FixApplicationDispatch dispatch)
     {
-        ArgumentNullException.ThrowIfNull(message);
+        ArgumentNullException.ThrowIfNull(dispatch.Message);
 
         foreach (KeyValuePair<long, FixTcpClientSession> entry in _sessions)
         {
             try
             {
-                entry.Value.TrySendApplication(message);
+                if (dispatch.SecurityId is ulong securityId && !entry.Value.IsSubscribedTo(securityId))
+                    continue;
+
+                entry.Value.TrySendApplication(dispatch.Message);
             }
             catch (ObjectDisposedException)
             {

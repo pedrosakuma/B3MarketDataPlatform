@@ -13,12 +13,14 @@ public sealed class FixTcpClientSession : IAsyncDisposable
     private readonly Stream _compressedWriteStream;
     private readonly FixSessionConnection _session;
     private readonly Func<IEnumerable<FixMessage>>? _initialMessagesProvider;
+    private readonly FixMarketDataRequestHandler? _marketDataRequestHandler;
     private readonly Action<long> _onClosed;
     private readonly ILogger<FixTcpClientSession> _logger;
     private readonly Channel<byte[]> _outbound;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _sessionGate = new();
     private readonly ConcurrentBag<Task> _tasks = new();
+    private readonly FixSessionSubscriptionState _subscriptionState = new();
     private int _closed;
 
     public FixTcpClientSession(
@@ -27,6 +29,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         FixSessionConnection session,
         int outboundQueueCapacity,
         Func<IEnumerable<FixMessage>>? initialMessagesProvider,
+        FixMarketDataRequestHandler? marketDataRequestHandler,
         Action<long> onClosed,
         ILogger<FixTcpClientSession>? logger = null)
     {
@@ -39,6 +42,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         _compressedWriteStream = FixZlibCompression.CreateCompressionStream(_stream, leaveOpen: true);
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _initialMessagesProvider = initialMessagesProvider;
+        _marketDataRequestHandler = marketDataRequestHandler;
         _onClosed = onClosed ?? throw new ArgumentNullException(nameof(onClosed));
         _logger = logger ?? NullLogger<FixTcpClientSession>.Instance;
         _outbound = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(outboundQueueCapacity)
@@ -58,6 +62,8 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         _tasks.Add(Task.Run(WriteLoopAsync));
         _tasks.Add(Task.Run(HeartbeatLoopAsync));
     }
+
+    public bool IsSubscribedTo(ulong securityId) => _subscriptionState.IsSubscribedTo(securityId);
 
     public bool TrySendApplication(FixMessage applicationMessage)
     {
@@ -145,6 +151,11 @@ public sealed class FixTcpClientSession : IAsyncDisposable
                     if (activated)
                         SendInitialMessages();
 
+                    if (decoded.Message.TryGetString(FixTags.MsgType, out string? inboundMsgType) &&
+                        string.Equals(inboundMsgType, FixMsgTypes.MarketDataRequest, StringComparison.Ordinal) &&
+                        !HandleInboundApplicationMessage(decoded.Message))
+                        return;
+
                     consumed += decoded.BytesConsumed;
                 }
 
@@ -228,6 +239,21 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         }
     }
 
+    private bool HandleInboundApplicationMessage(FixMessage message)
+    {
+        if (_marketDataRequestHandler is null)
+            return true;
+
+        FixMarketDataRequestResult result = _marketDataRequestHandler.Handle(message, _subscriptionState);
+        foreach (FixMessage outbound in result.OutboundMessages)
+        {
+            if (!TrySendApplication(outbound))
+                return false;
+        }
+
+        return true;
+    }
+
     private bool ProcessUpdate(FixSessionUpdate update)
     {
         foreach (FixMessage outbound in update.OutboundMessages)
@@ -251,7 +277,9 @@ public sealed class FixTcpClientSession : IAsyncDisposable
 
     private void SendInitialMessages()
     {
-        if (_initialMessagesProvider is null)
+        // Compatibility shim: until all tooling is migrated, sessions with no explicit
+        // MarketDataRequest still receive the legacy full snapshot immediately after Logon.
+        if (_subscriptionState.HasExplicitRequest || _initialMessagesProvider is null)
             return;
 
         foreach (FixMessage message in _initialMessagesProvider())

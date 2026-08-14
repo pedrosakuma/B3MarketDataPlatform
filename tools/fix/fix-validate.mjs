@@ -39,6 +39,8 @@ const TAG = {
   TestReqId: 112,
   CheckSum: 10,
   MDReqId: 262,
+  SubscriptionRequestType: 263,
+  NoRelatedSym: 146,
   NoMDEntries: 268,
   MDEntryType: 269,
   MDEntryPx: 270,
@@ -54,7 +56,9 @@ const MSG = {
   TestRequest: '1',
   Logout: '5',
   Logon: 'A',
+  MarketDataRequest: 'V',
   MarketDataSnapshotFullRefresh: 'W',
+  MarketDataRequestReject: 'Y',
   MarketDataIncrementalRefresh: 'X',
 };
 
@@ -329,6 +333,7 @@ function handleMessage(message, currentSocket) {
       sessionActive = true;
       heartbeatIntervalSeconds = parseNonNegativeInt(message.get(TAG.HeartBtInt) || String(heartbeatIntervalSeconds), heartbeatIntervalSeconds);
       console.log(`Logon ack seq=${message.get(TAG.MsgSeqNum) ?? '?'} heartbeat=${heartbeatIntervalSeconds}s sender=${message.get(TAG.SenderCompId) ?? '?'} target=${message.get(TAG.TargetCompId) ?? '?'}`);
+      maybeSendMarketDataRequest(currentSocket);
       break;
     }
     case MSG.Heartbeat:
@@ -350,6 +355,10 @@ function handleMessage(message, currentSocket) {
       break;
     case MSG.MarketDataSnapshotFullRefresh:
       applySnapshot(message);
+      break;
+    case MSG.MarketDataRequestReject:
+      console.error(`MarketDataRequestReject mdReqId=${message.get(TAG.MDReqId) ?? '?'} text=${message.get(TAG.Text) ?? '(none)'}`);
+      requestShutdown('mdreq-reject');
       break;
     case MSG.MarketDataIncrementalRefresh:
       applyIncremental(message);
@@ -492,6 +501,44 @@ function acceptInstrument(symbol, securityId) {
     return false;
 
   return true;
+}
+
+
+function maybeSendMarketDataRequest(currentSocket) {
+  const request = buildMarketDataRequest();
+  if (!request) {
+    console.log('No symbol/securityId supplied; skipping explicit MarketDataRequest and waiting for legacy automatic snapshot fallback.');
+    return;
+  }
+
+  sendSessionMessage(currentSocket, MSG.MarketDataRequest, request);
+}
+
+function buildMarketDataRequest() {
+  const requestSecurityId = resolveRequestedSecurityId();
+  if (!requestSecurityId)
+    return null;
+
+  const mdReqIdSuffix = REQUESTED_SYMBOL || requestSecurityId;
+  return [
+    [TAG.MDReqId, `mdreq-${mdReqIdSuffix}`],
+    [TAG.SubscriptionRequestType, '1'],
+    [TAG.NoRelatedSym, '1'],
+    [TAG.SecurityId, requestSecurityId],
+    [TAG.SecurityIdSource, '8'],
+    [TAG.SecurityExchange, 'BVMF'],
+  ];
+}
+
+function resolveRequestedSecurityId() {
+  if (trackedSecurityId)
+    return trackedSecurityId;
+
+  const envSecurityId = process.env.FIX_SECURITY_ID || '';
+  if (envSecurityId)
+    return envSecurityId;
+
+  return null;
 }
 
 function sendSessionMessage(currentSocket, msgType, extraFields) {
