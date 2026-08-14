@@ -333,7 +333,7 @@ function handleMessage(message, currentSocket) {
       sessionActive = true;
       heartbeatIntervalSeconds = parseNonNegativeInt(message.get(TAG.HeartBtInt) || String(heartbeatIntervalSeconds), heartbeatIntervalSeconds);
       console.log(`Logon ack seq=${message.get(TAG.MsgSeqNum) ?? '?'} heartbeat=${heartbeatIntervalSeconds}s sender=${message.get(TAG.SenderCompId) ?? '?'} target=${message.get(TAG.TargetCompId) ?? '?'}`);
-      sendMarketDataRequest(currentSocket);
+      maybeSendMarketDataRequest(currentSocket);
       break;
     }
     case MSG.Heartbeat:
@@ -504,16 +504,30 @@ function acceptInstrument(symbol, securityId) {
 }
 
 
-function sendMarketDataRequest(currentSocket) {
+function maybeSendMarketDataRequest(currentSocket) {
+  const request = buildMarketDataRequest();
+  if (!request) {
+    console.log('No symbol/securityId supplied; skipping explicit MarketDataRequest and waiting for legacy automatic snapshot fallback.');
+    return;
+  }
+
+  sendSessionMessage(currentSocket, MSG.MarketDataRequest, request);
+}
+
+function buildMarketDataRequest() {
   const requestSecurityId = resolveRequestedSecurityId();
-  sendSessionMessage(currentSocket, MSG.MarketDataRequest, [
-    [TAG.MDReqId, `mdreq-${REQUESTED_SYMBOL}`],
+  if (!requestSecurityId)
+    return null;
+
+  const mdReqIdSuffix = REQUESTED_SYMBOL || requestSecurityId;
+  return [
+    [TAG.MDReqId, `mdreq-${mdReqIdSuffix}`],
     [TAG.SubscriptionRequestType, '1'],
     [TAG.NoRelatedSym, '1'],
-    [TAG.SecurityId, resolveRequestedSecurityId()],
+    [TAG.SecurityId, requestSecurityId],
     [TAG.SecurityIdSource, '8'],
     [TAG.SecurityExchange, 'BVMF'],
-  ]);
+  ];
 }
 
 function resolveRequestedSecurityId() {
@@ -524,7 +538,7 @@ function resolveRequestedSecurityId() {
   if (envSecurityId)
     return envSecurityId;
 
-  throw new Error('FIX_SECURITY_ID env var is required for explicit MarketDataRequest subscriptions.');
+  return null;
 }
 
 function sendSessionMessage(currentSocket, msgType, extraFields) {
