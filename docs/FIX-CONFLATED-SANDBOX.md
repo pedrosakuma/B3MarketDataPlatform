@@ -195,6 +195,17 @@ the existing `WireV2` WebSocket path (tracked by issue #103). All listed tooling
   `fix-validate.mjs` for the replay window, and reports the final fresh-WS
   `BookSnapshot` comparison as the pass/fail verdict. Mirrors the conventions
   of `tools/loss-resilience-test.sh`.
+- **Staged late-join replay harness** — `tools/fix-conflated-late-join-validate.sh`
+  keeps one replay running, then launches multiple fresh FIX validator clients
+  at staggered offsets (default `10,50,90%` of the run) so each connection gets
+  its own late-join `MarketDataSnapshotFullRefresh` cross-checked against a
+  simultaneous fresh WS subscribe snapshot. Example:
+  `WS_PORT=18080 FIX_PORT=19200 SPEED=1 FRESH_WS_COMPARE=0 tools/fix-conflated-late-join-validate.sh pcap/20250331_MBO_084_EQT 60 CPLE3 45`.
+  The optional fourth argument adds an initial delay before the staged joins,
+  useful when a replay needs time to leave instrument-definition bootstrap and
+  build a non-trivial book before the first "late join" probe. Set
+  `FRESH_WS_COMPARE=1` to require the extra fresh-WS cross-check when the
+  replay/window being used is known to answer WS subscribe snapshots promptly.
 - **Soak test coverage** — `tools/soak-test.sh` optionally starts the FIX
   listener alongside the WebSocket host (`ENABLE_FIX_CONFLATED=true`) and
   samples `FixConflatedMetrics` via the Prometheus `/metrics` endpoint into
