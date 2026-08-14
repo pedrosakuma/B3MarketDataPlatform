@@ -201,6 +201,103 @@ the existing `WireV2` WebSocket path (tracked by issue #103). All listed tooling
 - **Perf-smoke benchmark coverage** — not yet added (deliberately deferred,
   best-effort/optional item in issue #103).
 
+### Message-content validation against real B3 sample captures
+
+Issue #108 added a manual/offline comparison pass against the local B3 sample
+ kit (`prodreplay-equities-23apr2014.zip`, with a secondary spot-check against
+ `prodreplay-derivatives-28apr2014.zip`). The comparison intentionally stayed
+ at **message-content level**: which tags a real capture actually populates,
+ their order, and repeating-group shape. The sample files are proprietary and
+ remain outside this repo; only tiny single-message snippets are reproduced
+ here for illustration.
+
+#### Confirmed matches
+
+- **Session Logon shape matches closely.** Real captures start with the same
+  minimal `A` pattern the sandbox emits today: `35=A`, `34`, `49`, `52`, `56`,
+  `98=0`, `108=30`, optional `141=Y`, then trailer. Example real snippet:
+  `35=A|34=1|49=UMDFTCP5|52=...|56=LUX00|98=0|108=30|141=Y`.
+- **News (`B`) core mapping is aligned.** Real messages consistently populate
+  `33`/`58`/`42` plus one `146=1` related instrument block containing
+  `48`/`22`/`207`, then `148`/`149`/`1474` and a trailing status-like code
+  (`6940`). Our builder already models the same headline/orig-time/related
+  instrument/url/language structure.
+- **SecurityList (`y`) is really present in production-style captures.** The
+  replay starts with `35=A` and then many `35=y` messages, confirming the doc's
+  earlier note that `SecurityList` is part of the observed catalog, not just a
+  schema-only possibility.
+- **Nested `SecurityList` feed groups look right.** Real `y` messages populate
+  `146` followed by repeated per-instrument blocks and nested feed-type tuples
+  like `1141=2|1022=STD|264=0|1021=3|1022=STD|264=10|1021=2`, which matches the
+  sandbox's choice to model `NoRelatedSym` with nested `NoMDFeedTypes`.
+
+#### Observed discrepancies / gaps
+
+- **Snapshot (`W`) instrument identity differs materially.** Real captures use
+  an instrument-only header such as
+  `35=W|...|128=LUX00|22=8|48=910000|207=BVMF|262=...|268=0|911=33943`,
+  typically **without `55=Symbol`**, and include optional header `128` plus
+  `911=TotNumReports`. The sandbox currently emits `262`, `55`, `48`, `268`
+  and omits `22`, `207`, `128`, and `911`.
+- **Snapshot entry content is much thinner in the sandbox.** The derivatives
+  sample shows populated snapshot entries like
+  `269=0|270=14|271=200|272=...|273=...|37017=...|37=...|288=88|290=1|1021=3`
+  and status-style entries like `269=c|...|336=1|625=21|342=...`. Our current
+  snapshot builder only writes `269/270/271/272/273/37`.
+- **Incremental (`X`) messages use production-specific tags the sandbox never
+  writes.** Real captures consistently include message-level `75=TradeDate`,
+  sometimes `1021=MDBookType`, and entry-level `22`, `207`, frequent `276`,
+  `286`, `289`, `290`, `346`, `1500`, `9325`, and timestamp/order metadata
+  such as `37016`/`37017`. The sandbox currently writes only
+  `279`, `269`, `55`, `48`, optional `270/271`, `272`, `273`, optional `37`,
+  and optional `1003`.
+- **Incremental tag order differs.** Real captures lead each entry with
+  `279`, then usually instrument identity (`22/48/207`) before or around
+  `269`, whereas the sandbox emits `279`, `269`, `55`, `48`, then price/size
+  fields. FIX allows this, but matching production ordering more closely may
+  help downstream interoperability testing.
+- **SecurityStatus (`f`) coverage is currently far from production.** Real
+  samples are compact, typically
+  `35=f|...|60=...|75=...|336=1|625=18|1151=69`, with no broad instrument block
+  or descriptive text. The sandbox instead emits a much richer instrument-heavy
+  message (`55/48/22/207/...`) plus optional `58`, `1149`, `1020`, volumes and
+  prices. This is valid per schema, but does **not** match what the sampled B3
+  feed actually populated.
+- **News (`B`) has at least one unmapped production tag.** Real samples end
+  with `6940=17` (equities) or `6940=3` (derivatives); the sandbox `News`
+  builder does not currently expose that field.
+- **SecurityList (`y`) is missing several production-populated fields in the
+  sandbox builder.** The real capture repeatedly includes tags such as `15`,
+  `63`, `64`, `107`, `120`, `200`, `225`, `231`, `454/455/456`, `470`, `541`,
+  `667`, `762`, `870/871/872`, `969`, `980`, `1151`, `1231`, `1234`, `1300`,
+  `5151`, `6937`, `6938`, `7595`, `9748`, `9749`, and sometimes `320/322/393/560`.
+  Our builder covers only a subset of that shape today.
+
+#### Secondary schema sanity check
+
+- The older sample-kit dictionary (`FIX44UMDFConflated-016.xml`) still shows
+  the same broad structures observed in the real captures: `W` with optional
+  `TotNumReports`/`LastFragment`, `X` with rich `NoMDEntries` instrument and
+  market-data fields, `B` with `NoRelatedSym`, and `y` with nested
+  `NoMDFeedTypes`.
+- No obvious case was found where the older dictionary contradicted the real
+  capture in a way that suggests the vendored v1.0.0.37 schema is wrong.
+  The actionable differences observed here are therefore implementation/content
+  gaps in the sandbox, not evidence that the vendored schema should regress.
+
+#### Recommended follow-up
+
+- Treat the current sandbox as **transport-faithful but content-simplified**.
+  It is already good for parser/session/conflation experiments, but not yet a
+  close field-for-field reproduction of observed B3 production payloads.
+- If stricter production mirroring becomes important, the highest-value follow-up
+  items are:
+  1. enrich `W`/`X` instrument identity and report-count fields (`22`, `207`,
+     `911`, and selected entry-level metadata);
+  2. revisit `SecurityStatus (f)` to match the much smaller production shape;
+  3. expand `SecurityList (y)` coverage for the consistently populated
+     instrument/reference fields seen in the real capture.
+
 ## Explicit deviations from the real B3 product
 
 - **Logon always succeeds.** There is no password, certificate, CompID
