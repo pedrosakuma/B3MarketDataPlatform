@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using B3.Umdf.FixConflated;
 
 namespace B3.Umdf.FixConflated.Tests;
@@ -24,10 +25,11 @@ public sealed class FixConflatedTcpServerTests
         using var client = new TcpClient();
         await client.ConnectAsync(IPAddress.Loopback, port);
         using NetworkStream stream = client.GetStream();
+        await using var fixClient = new FixSocketClientTestHelpers.InflatingFixClient(stream);
 
-        await stream.WriteAsync(FixMessageCodec.Encode(CreateLogon("CLIENT-A", "SANDBOX", 1)));
+        await fixClient.SendAsync(CreateLogon("CLIENT-A", "SANDBOX", 1));
 
-        FixMessage logonAck = await ReadMessageAsync(stream);
+        FixMessage logonAck = await fixClient.ReadMessageAsync();
         Assert.Equal(FixMsgTypes.Logon, GetRequired(logonAck, FixTags.MsgType));
         Assert.Equal("1", GetRequired(logonAck, FixTags.MsgSeqNum));
         Assert.Equal("SANDBOX", GetRequired(logonAck, FixTags.SenderCompId));
@@ -35,10 +37,42 @@ public sealed class FixConflatedTcpServerTests
 
         hub.BroadcastApplication(CreateApplicationMessage("md-1"));
 
-        FixMessage incremental = await ReadMessageAsync(stream);
+        FixMessage incremental = await fixClient.ReadMessageAsync();
         Assert.Equal(FixMsgTypes.MarketDataIncrementalRefresh, GetRequired(incremental, FixTags.MsgType));
         Assert.Equal("2", GetRequired(incremental, FixTags.MsgSeqNum));
         Assert.Equal("md-1", GetRequired(incremental, FixTags.MDReqId));
+    }
+
+    [Fact]
+    public async Task Wire_Bytes_Are_ZlibCompressed_And_Inflate_To_Fix_Logon()
+    {
+        var hub = new FixConflatedSessionHub();
+        int port = GetFreeTcpPort();
+        await using var server = new FixConflatedTcpServer(
+            hub,
+            new FixConflatedTcpServerOptions
+            {
+                OutboundQueueCapacity = 64,
+                SessionOptions = new FixSessionOptions { ApplicationResendBufferCapacity = 8 },
+            });
+        await server.StartAsync(port);
+
+        using var client = new TcpClient { NoDelay = true };
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        using NetworkStream stream = client.GetStream();
+
+        await stream.WriteAsync(FixMessageCodec.Encode(CreateLogon("CLIENT-A", "SANDBOX", 1)));
+
+        byte[] rawBytes = await FixSocketClientTestHelpers.ReadRawBytesAsync(stream, minimumBytes: 12);
+        string rawAscii = Encoding.ASCII.GetString(rawBytes);
+
+        Assert.Equal(0x78, rawBytes[0]);
+        Assert.DoesNotContain("8=FIX.4.4", rawAscii, StringComparison.Ordinal);
+
+        FixMessage logonAck = FixSocketClientTestHelpers.InflateSingleMessage(rawBytes, out string inflatedText);
+        Assert.StartsWith($"8=FIX.4.4{(char)FixMessageCodec.Soh}", inflatedText, StringComparison.Ordinal);
+        Assert.Equal(FixMsgTypes.Logon, GetRequired(logonAck, FixTags.MsgType));
+        Assert.Equal("1", GetRequired(logonAck, FixTags.MsgSeqNum));
     }
 
     private static FixMessage CreateLogon(string senderCompId, string targetCompId, int seqNum)
@@ -62,26 +96,6 @@ public sealed class FixConflatedTcpServerTests
         message.Add(FixTags.MDReqId, mdReqId);
         message.Add(FixTags.NoMDEntries, 0);
         return message;
-    }
-
-    private static async Task<FixMessage> ReadMessageAsync(NetworkStream stream)
-    {
-        byte[] buffer = new byte[4096];
-        int buffered = 0;
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-
-        while (true)
-        {
-            FixDecodeResult decoded = FixMessageCodec.Decode(buffer.AsSpan(0, buffered));
-            if (decoded.Success)
-                return decoded.Message!;
-            if (decoded.Error != FixDecodeError.Incomplete)
-                throw new Xunit.Sdk.XunitException($"Expected a full FIX frame but decode failed with {decoded.Error}.");
-
-            int read = await stream.ReadAsync(buffer.AsMemory(buffered), cts.Token);
-            Assert.True(read > 0, "Expected the server to send a FIX frame before closing the socket.");
-            buffered += read;
-        }
     }
 
     private static int GetFreeTcpPort()

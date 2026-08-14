@@ -1,6 +1,6 @@
 # FIX validator tooling
 
-`tools/fix/fix-validate.mjs` is a standalone FIX 4.4 tag=value validator for the opt-in FIX Conflated sandbox channel. It opens a real TCP session, performs `Logon`, consumes the automatic `MarketDataSnapshotFullRefresh` plus later `MarketDataIncrementalRefresh` messages, rebuilds the book locally, and periodically compares that state with `GET /book/{symbol}` from the HTTP side that `tools/ws/ws-validate.mjs` already expects.
+`tools/fix/fix-validate.mjs` is a standalone FIX 4.4 tag=value validator for the opt-in FIX Conflated sandbox channel. It opens a real TCP session, performs `Logon`, inflates the sandbox's continuous RFC 1950 ZLIB transport stream, consumes the automatic `MarketDataSnapshotFullRefresh` plus later `MarketDataIncrementalRefresh` messages, rebuilds the book locally, and periodically compares that state with `GET /book/{symbol}` from the HTTP side that `tools/ws/ws-validate.mjs` already expects.
 
 Today the server does **not** expose a production `/book/{symbol}` route, so
 that HTTP check is intentionally non-fatal and usually logs the cross-check as
@@ -65,3 +65,11 @@ HTTP_BASE=http://localhost:8080 node tools/fix/fix-validate.mjs localhost 9200 P
 
 This is the standalone client piece for issue #103 item 1. For the replay
 harness from issue #103 item 2, run `tools/fix-conflated-replay-validate.sh`.
+
+
+## Compression note
+
+The FIX sandbox now matches the real B3 UMDF Conflated wire contract: the TCP
+session carries one continuous ZLIB-compressed byte stream, not individually
+compressed messages. `fix-validate.mjs` handles that inflate step internally,
+so you still point it at the raw FIX TCP port.

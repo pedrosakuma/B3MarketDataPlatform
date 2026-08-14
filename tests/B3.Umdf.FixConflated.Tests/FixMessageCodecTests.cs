@@ -63,17 +63,27 @@ public sealed class FixMessageCodecTests
     }
 
     [Fact]
-    public void Compress_UsesZlibWrapper()
+    public void StreamingCompression_RoundTrips_ConcatenatedMessages()
     {
-        byte[] raw = FixMessageCodec.Encode(CreateHeartbeat(seqNum: 7));
+        byte[] first = FixMessageCodec.Encode(CreateHeartbeat(seqNum: 7));
+        byte[] second = FixMessageCodec.Encode(CreateHeartbeat(seqNum: 8));
+        byte[] expected = [.. first, .. second];
 
-        byte[] compressed = FixZlibCompression.Compress(raw);
-        using var input = new MemoryStream(compressed);
-        using var zlib = new ZLibStream(input, CompressionMode.Decompress);
+        using var compressed = new MemoryStream();
+        using (var zlib = FixZlibCompression.CreateCompressionStream(compressed, leaveOpen: true, CompressionLevel.Fastest))
+        {
+            zlib.Write(first);
+            zlib.Flush();
+            zlib.Write(second);
+            zlib.Flush();
+        }
+
+        using var input = new MemoryStream(compressed.ToArray());
+        using var inflate = FixZlibCompression.CreateDecompressionStream(input);
         using var output = new MemoryStream();
-        zlib.CopyTo(output);
+        inflate.CopyTo(output);
 
-        Assert.Equal(raw, output.ToArray());
+        Assert.Equal(expected, output.ToArray());
     }
 
     private static FixMessage CreateHeartbeat(int seqNum)

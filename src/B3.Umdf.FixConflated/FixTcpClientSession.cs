@@ -10,6 +10,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
 {
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
+    private readonly Stream _compressedWriteStream;
     private readonly FixSessionConnection _session;
     private readonly Func<IEnumerable<FixMessage>>? _initialMessagesProvider;
     private readonly Action<long> _onClosed;
@@ -35,6 +36,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         Id = id;
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _stream = client.GetStream();
+        _compressedWriteStream = FixZlibCompression.CreateCompressionStream(_stream, leaveOpen: true);
         _session = session ?? throw new ArgumentNullException(nameof(session));
         _initialMessagesProvider = initialMessagesProvider;
         _onClosed = onClosed ?? throw new ArgumentNullException(nameof(onClosed));
@@ -91,6 +93,7 @@ public sealed class FixTcpClientSession : IAsyncDisposable
         }
         finally
         {
+            _compressedWriteStream.Dispose();
             _stream.Dispose();
             _client.Dispose();
             _cts.Dispose();
@@ -177,7 +180,8 @@ public sealed class FixTcpClientSession : IAsyncDisposable
             {
                 while (_outbound.Reader.TryRead(out byte[]? payload))
                 {
-                    await _stream.WriteAsync(payload, _cts.Token).ConfigureAwait(false);
+                    await _compressedWriteStream.WriteAsync(payload, _cts.Token).ConfigureAwait(false);
+                    await _compressedWriteStream.FlushAsync(_cts.Token).ConfigureAwait(false);
                     FixConflatedMetrics.MessagesSent.Add(1);
                     FixConflatedMetrics.BytesSent.Add(payload.Length);
                 }
@@ -264,6 +268,8 @@ public sealed class FixTcpClientSession : IAsyncDisposable
 
         _cts.Cancel();
         _outbound.Writer.TryComplete();
+        try { _compressedWriteStream.Dispose(); }
+        catch (ObjectDisposedException) { }
         try { _client.Client.Shutdown(SocketShutdown.Both); }
         catch (SocketException) { }
         catch (ObjectDisposedException) { }
